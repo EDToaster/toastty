@@ -1,0 +1,18 @@
+[package]
+name = "toastty-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+memchr.workspace = true
+thiserror.workspace = true
+vte.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+toastty-pty.workspace = true
+
+[lints]
+workspace = true

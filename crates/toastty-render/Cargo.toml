@@ -1,0 +1,30 @@
+[package]
+name = "toastty-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
+bytemuck.workspace = true
+cosmic-text.workspace = true
+naga.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wgpu.workspace = true
+
+toastty-term.workspace = true
+
+[dev-dependencies]
+image.workspace = true
+image-compare.workspace = true
+insta.workspace = true
+pollster.workspace = true
+proptest.workspace = true
+
+[build-dependencies]
+naga.workspace = true
+
+[lints]
+workspace = true

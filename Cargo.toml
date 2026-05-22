@@ -1,6 +1,84 @@
-[package]
-name = "toastty"
+[workspace]
+resolver = "2"
+members = [
+    "crates/toastty",
+    "crates/toastty-pty",
+    "crates/toastty-io",
+    "crates/toastty-window",
+    "crates/toastty-parser",
+    "crates/toastty-term",
+    "crates/toastty-protocols",
+    "crates/toastty-graphics",
+    "crates/toastty-render",
+    "crates/toastty-config",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
 
-[dependencies]
+[workspace.dependencies]
+# Pinned exactly — validated by decision prototypes; see docs/decisions/.
+winit = "=0.30.13"
+wgpu = "=29.0.3"
+naga = { version = "29", features = ["wgsl-in", "wgsl-out", "glsl-in"] }
+vte = "=0.15.0"
+cosmic-text = "=0.19.0"
+memchr = "=2.8.0"
+
+# Range-pinned utilities.
+mio = "1"
+rustix = { version = "1", features = ["pty", "process", "termios"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+smallvec = "1"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+
+# Test-only.
+insta = "1"
+image = "0.25"
+image-compare = "0.4"
+proptest = "1"
+
+# Internal crates.
+toastty-pty = { path = "crates/toastty-pty" }
+toastty-io = { path = "crates/toastty-io" }
+toastty-window = { path = "crates/toastty-window" }
+toastty-parser = { path = "crates/toastty-parser" }
+toastty-term = { path = "crates/toastty-term" }
+toastty-protocols = { path = "crates/toastty-protocols" }
+toastty-graphics = { path = "crates/toastty-graphics" }
+toastty-render = { path = "crates/toastty-render" }
+toastty-config = { path = "crates/toastty-config" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"     # noisy on builders
+cast_sign_loss = "allow"               # common in FFI byte counts
+cast_possible_truncation = "allow"     # common in FFI / fd ints
+cast_possible_wrap = "allow"
+cast_lossless = "allow"                # `as _` is right for cross-platform FFI
+unreadable_literal = "allow"
+unnecessary_wraps = "allow"            # `main() -> Result` is normal even when trivial
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

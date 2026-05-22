@@ -1,0 +1,26 @@
+[package]
+name = "toastty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "toastty"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+toastty-config.workspace = true
+toastty-io.workspace = true
+toastty-parser.workspace = true
+toastty-pty.workspace = true
+toastty-render.workspace = true
+toastty-term.workspace = true
+toastty-window.workspace = true
+
+[lints]
+workspace = true
