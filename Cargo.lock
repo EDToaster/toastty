@@ -2878,6 +2878,7 @@ dependencies = [
  "smallvec",
  "thiserror 2.0.18",
  "toastty-parser",
+ "toastty-pty",
 ]
 
 [[package]]
