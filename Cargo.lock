@@ -2864,9 +2864,12 @@ dependencies = [
  "naga",
  "pollster",
  "proptest",
+ "raw-window-handle",
  "thiserror 2.0.18",
  "toastty-term",
+ "toastty-window",
  "tracing",
+ "tracing-subscriber",
  "wgpu",
 ]
 
@@ -2885,6 +2888,8 @@ dependencies = [
 name = "toastty-window"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.11.1",
+ "raw-window-handle",
  "thiserror 2.0.18",
  "tracing",
  "winit",
