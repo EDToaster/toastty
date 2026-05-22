@@ -7,9 +7,48 @@ use std::thread;
 use std::time::{Duration, Instant};
 use toastty_pty::{Pty, PtySpec, WinSize};
 
-/// Read everything from the PTY until child exits + a short grace period
-/// drains the kernel buffer. Non-blocking; bounded by `max_ms`.
-fn drain(pty: &Pty, max_ms: u64) -> Vec<u8> {
+/// Run a child and collect its output. Reads non-blockingly while the
+/// child is alive — important because slave-close behaviour after
+/// `wait()` is OS- and load-sensitive (macOS may drop buffered bytes;
+/// Linux returns EIO). Bounded by `max_ms`.
+fn run_and_drain(pty: &mut Pty, max_ms: u64) -> Vec<u8> {
+    pty.set_nonblocking(true).expect("nonblocking");
+    let deadline = Instant::now() + Duration::from_millis(max_ms);
+    let mut all = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut child_exited = false;
+    loop {
+        if Instant::now() > deadline {
+            break;
+        }
+        match pty.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => all.extend_from_slice(&buf[..n]),
+            Err(toastty_pty::PtyError::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                if child_exited {
+                    break;
+                }
+                match pty.try_wait() {
+                    Ok(Some(_)) => {
+                        child_exited = true;
+                        // Give the kernel a beat to surface any trailing bytes.
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Ok(None) => thread::sleep(Duration::from_millis(5)),
+                    Err(_) => break,
+                }
+            }
+            Err(_) => break, // EIO on Linux once slave is closed.
+        }
+    }
+    all
+}
+
+/// Drain whatever is currently available without waiting for the child.
+/// For tests that talk to a long-running child (like `cat`).
+fn drain_now(pty: &Pty, max_ms: u64) -> Vec<u8> {
     pty.set_nonblocking(true).expect("nonblocking");
     let deadline = Instant::now() + Duration::from_millis(max_ms);
     let mut all = Vec::new();
@@ -23,7 +62,7 @@ fn drain(pty: &Pty, max_ms: u64) -> Vec<u8> {
             {
                 thread::sleep(Duration::from_millis(5));
             }
-            Err(_) => break, // EIO on Linux once slave is closed
+            Err(_) => break,
         }
     }
     all
@@ -33,8 +72,7 @@ fn drain(pty: &Pty, max_ms: u64) -> Vec<u8> {
 fn spawn_echo_captures_output() {
     let spec = PtySpec::program("/bin/echo").arg("hello, toastty");
     let mut pty = Pty::spawn(&spec).expect("spawn");
-    let _ = pty.wait();
-    let out = drain(&pty, 1000);
+    let out = run_and_drain(&mut pty, 3000);
     let s = String::from_utf8_lossy(&out);
     assert!(s.contains("hello, toastty"), "got: {s:?}");
 }
@@ -60,8 +98,8 @@ fn write_input_reaches_child() {
     let spec = PtySpec::program("/bin/cat");
     let pty = Pty::spawn(&spec).expect("spawn");
     pty.write(b"ping\n").expect("write");
-    thread::sleep(Duration::from_millis(100));
-    let out = drain(&pty, 500);
+    // Cat is long-running — drain without waiting.
+    let out = drain_now(&pty, 1000);
     let s = String::from_utf8_lossy(&out);
     assert!(s.contains("ping"), "expected echoed 'ping' in: {s:?}");
 }
@@ -79,8 +117,7 @@ fn winsize_is_set_on_spawn() {
         .arg("stty size")
         .size(size);
     let mut pty = Pty::spawn(&spec).expect("spawn");
-    let _ = pty.wait();
-    let out = drain(&pty, 1000);
+    let out = run_and_drain(&mut pty, 3000);
     let s = String::from_utf8_lossy(&out);
     assert!(s.contains("30 100"), "expected '30 100' in: {s:?}");
 }
@@ -98,8 +135,7 @@ fn resize_propagates_to_child() {
         pixel_height: 0,
     })
     .expect("resize");
-    let _ = pty.wait();
-    let out = drain(&pty, 1000);
+    let out = run_and_drain(&mut pty, 3000);
     let s = String::from_utf8_lossy(&out);
     assert!(s.contains("50 200"), "expected '50 200' in: {s:?}");
 }
