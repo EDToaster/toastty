@@ -13,6 +13,7 @@ toastty-parser.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+toastty-pty.workspace = true
 
 [lints]
 workspace = true
