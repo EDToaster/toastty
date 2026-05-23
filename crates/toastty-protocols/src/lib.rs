@@ -12,5 +12,6 @@
 
 #![forbid(unsafe_code)]
 
+pub mod resize_inband;
 pub mod synchronized;
 pub mod unicode_core;
