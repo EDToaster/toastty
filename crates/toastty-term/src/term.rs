@@ -285,7 +285,7 @@ impl Term {
         self.sync_output.active = false;
         self.sync_output.started_at = None;
         self.sync_output.timeout_force_flushed = true;
-        self.mark_all_dirty_internal();
+        self.mark_all_dirty();
     }
 
     /// Internal: handle a DECSET 2026 toggle. Enable-side captures the
@@ -308,7 +308,7 @@ impl Term {
             // ESU: clear and force a corrective full redraw.
             self.sync_output.active = false;
             self.sync_output.started_at = None;
-            self.mark_all_dirty_internal();
+            self.mark_all_dirty();
         }
     }
 
@@ -464,14 +464,6 @@ impl Term {
         }
     }
 
-    /// Mark every visible row dirty without going through the public
-    /// API. Used for scrollback motion and screen clears.
-    fn mark_all_dirty_internal(&mut self) {
-        for d in &mut self.dirty {
-            *d = true;
-        }
-    }
-
     /// Resize the visible viewport. **Does not reflow** — that's a
     /// decision #6 / scrollback.md follow-up. The cursor is clamped to the
     /// new dimensions.
@@ -525,7 +517,7 @@ impl Term {
             // Every visible row's content shifted up; the cached shape
             // for each row no longer matches its position. Force a
             // re-shape of all rows.
-            self.mark_all_dirty_internal();
+            self.mark_all_dirty();
         } else {
             self.cursor.row += 1;
         }
@@ -794,7 +786,7 @@ impl Term {
             // 2/3: entire screen (3 = also scrollback, which we treat the same in M3).
             _ => {
                 grid.clear_visible(style);
-                self.mark_all_dirty_internal();
+                self.mark_all_dirty();
             }
         }
     }
@@ -975,7 +967,7 @@ impl Term {
         // Reset cursor to home and clear style for the alt screen.
         self.cursor = Cursor::default();
         // Switching screens invalidates every cached shaped line.
-        self.mark_all_dirty_internal();
+        self.mark_all_dirty();
     }
 
     fn exit_alt_screen(&mut self) {
@@ -986,7 +978,7 @@ impl Term {
         self.cursor = self.saved_cursor;
         self.clamp_cursor();
         // Switching back: re-shape the primary screen contents.
-        self.mark_all_dirty_internal();
+        self.mark_all_dirty();
     }
 }
 
