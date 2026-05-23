@@ -19,9 +19,11 @@ _toastty_esc=$'\033'
 _toastty_set_cwd() {
     local host="${HOST:-localhost}"
     # zsh has a built-in URL-encoder via parameter expansion (q-style)
-    # but we hand-roll for portability across versions.
+    # but we hand-roll for portability across versions. We feed the raw
+    # `$PWD` (not `%~`, which would expand the tilde) so spaces and
+    # `%` survive the round-trip to a valid `file://` URL.
     local encoded
-    encoded="$(print -nrP -- "%~" | command awk 'BEGIN{
+    encoded="$(print -nr -- "$PWD" | command awk 'BEGIN{
         for (i=0; i<256; i++) ord[sprintf("%c",i)] = i
     } { s=$0; out="";
         for (i=1; i<=length(s); i++) {
@@ -31,7 +33,11 @@ _toastty_set_cwd() {
         }
         print out
     }')"
-    print -n "${_toastty_esc}]7;file://${host}${PWD}${_toastty_esc}\\"
+    # M10-followup C3: emit the percent-encoded path, not the raw `$PWD`.
+    # Without this, a directory like `/tmp/with space` produces
+    # `file:///tmp/with space` — invalid; the toastty OSC 7 parser
+    # would percent-decode the wrong bytes.
+    print -n "${_toastty_esc}]7;file://${host}${encoded}${_toastty_esc}\\"
 }
 
 # OSC 133 markers, wrapped for prompt math.

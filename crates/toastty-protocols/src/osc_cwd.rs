@@ -119,6 +119,18 @@ mod tests {
         );
     }
 
+    /// M10-followup C3: the zsh integration emits percent-encoded paths
+    /// (with `%20` for spaces). Verify the parser accepts a path made up
+    /// of multiple space-separated segments — exercises the
+    /// straightforward "one or more `%20` per path" round trip.
+    #[test]
+    fn percent_decodes_path_with_space() {
+        assert_eq!(
+            parse_file_url(b"file:///path%20with%20space").as_deref(),
+            Some("/path with space"),
+        );
+    }
+
     #[test]
     fn percent_decodes_multibyte_utf8() {
         // `%E4%BD%A0` is U+4F60 ("你") in UTF-8.
