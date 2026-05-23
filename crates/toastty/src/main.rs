@@ -477,6 +477,12 @@ impl App for Toastty {
                 self.physical_size = (width, height);
                 if let Some(r) = self.renderer.as_mut() {
                     r.resize(width, height);
+                    // The new back-buffer has undefined contents — the
+                    // renderer must clear on the next frame regardless
+                    // of damage state. `Renderer::resize` already sets
+                    // this internally, but the explicit call documents
+                    // the contract.
+                    r.invalidate_framebuffer();
                 }
                 self.resync_grid();
                 // DECSET 2048 — emit an in-band resize report so apps
@@ -508,6 +514,7 @@ impl App for Toastty {
                 {
                     self.term.force_flush_sync_output();
                 }
+                let mut next_blink: Option<Duration> = None;
                 if let Some(r) = self.renderer.as_mut() {
                     match r.render_term(&self.term) {
                         Ok(RenderOutcome::Rendered) => {
@@ -521,15 +528,25 @@ impl App for Toastty {
                         }
                         Ok(RenderOutcome::Skipped) => {
                             // Frame skipped (pause-gated or surface
-                            // hiccup): leave the dirty bitset and the
+                            // hiccup): leave the damage signal and the
                             // BSU force-flushed flag alone so the next
                             // non-skipped frame still issues the
                             // corrective redraw.
                         }
                         Err(e) => warn!("render_term error: {e}"),
                     }
+                    // Schedule a wake-up at the next cursor blink tick
+                    // so the renderer can toggle visibility even when
+                    // the PTY is silent. `next_redraw_deadline` returns
+                    // None when the term has blink disabled (DECSCUSR
+                    // Ps=2/4/6) so we don't pointlessly wake the event
+                    // loop.
+                    next_blink = r.next_redraw_deadline(&self.term);
                 }
-                ControlSignal::Continue
+                match next_blink {
+                    Some(d) => ControlSignal::RedrawIn(d),
+                    None => ControlSignal::Continue,
+                }
             }
             Event::Key {
                 logical,
