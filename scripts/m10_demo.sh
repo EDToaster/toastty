@@ -21,13 +21,25 @@ csi="${esc}["
 st="${esc}\\"
 
 # OSC 4 ? and OSC 52 ? both make toastty write a reply back on the PTY.
-# Inside this script those bytes pile up in stdin; if we exit without
-# consuming them they become "typed" input at the interactive shell
-# prompt. Drain on exit (and on Ctrl-C) so the prompt comes back clean.
+# Two cleanup duties:
+#   1) TTY ECHO is on by default. Replies land in the PTY slave's input
+#      buffer; cooked-mode echoes each byte back to the master, which
+#      toastty renders as text mid-demo. Disable echo for the duration.
+#   2) Bytes still pile up in stdin. Drain on exit so they don't show
+#      up as "typed" input at the next prompt.
+old_stty=$(stty -g 2>/dev/null || true)
+stty -echo 2>/dev/null || true
+
 drain_stdin() {
     while IFS= read -r -t 0.05 -n 1024 -s _drain 2>/dev/null; do :; done
 }
-trap drain_stdin EXIT
+restore_terminal() {
+    if [ -n "${old_stty:-}" ]; then
+        stty "$old_stty" 2>/dev/null || true
+    fi
+    drain_stdin
+}
+trap restore_terminal EXIT
 
 section() {
     printf '\n%s1;7m %s %s0m\n' "$csi" "$1" "$csi"
