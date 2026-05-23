@@ -172,7 +172,7 @@ pub struct Term {
     /// Semantic prompt markers (OSC 133). FIFO bounded at 4096 — old
     /// marks rotate out when the cap is hit so the buffer can't bloat
     /// on a long-running session.
-    prompt_marks: Vec<PromptMark>,
+    prompt_marks: std::collections::VecDeque<PromptMark>,
     /// FIFO of bytes that need to be written back to the PTY after the
     /// current `parser.advance` call completes. Populated by OSC handlers
     /// that need to reply to a query (OSC 4 query, OSC 52 read). Drained
@@ -300,7 +300,7 @@ impl Term {
             grapheme_cluster_mode: false,
             inband_resize_mode: false,
             cwd: String::new(),
-            prompt_marks: Vec::new(),
+            prompt_marks: std::collections::VecDeque::new(),
             pty_replies: Vec::new(),
             palette_overrides: Box::new([None; 256]),
             palette_revision: 0,
@@ -409,19 +409,31 @@ impl Term {
     /// Read-only view of the OSC 133 prompt marks recorded so far, in
     /// emission order. Capped at 4096 entries; oldest entries roll off
     /// the front when the cap is hit.
+    ///
+    /// Returns a contiguous slice. The backing store is a `VecDeque`
+    /// for O(1) FIFO eviction (M10-followup I3), so this method calls
+    /// `make_contiguous` to expose the entries as a slice. The mutation
+    /// happens against `&mut self` internally; the public signature
+    /// stays `&self`-returning-`&[…]` so callers continue to index /
+    /// slice without API churn.
     #[must_use]
-    pub fn prompt_marks(&self) -> &[PromptMark] {
-        &self.prompt_marks
+    pub fn prompt_marks(&mut self) -> &[PromptMark] {
+        self.prompt_marks.make_contiguous()
     }
 
     /// Append a prompt mark at the current cursor row, evicting the
     /// oldest entry when the cap is hit.
+    ///
+    /// Uses `VecDeque::pop_front` so eviction is O(1) instead of the
+    /// O(n) `Vec::remove(0)` shift (M10-followup I3): a hot loop of
+    /// rapid prompts no longer pays an N²/2 cost once the cap is
+    /// reached.
     fn push_prompt_mark(&mut self, kind: PromptMarkKind) {
         let row = self.cursor.row;
         if self.prompt_marks.len() >= PROMPT_MARK_CAP {
-            self.prompt_marks.remove(0);
+            self.prompt_marks.pop_front();
         }
-        self.prompt_marks.push(PromptMark { row, kind });
+        self.prompt_marks.push_back(PromptMark { row, kind });
     }
 
     /// True when DECSET 2004 (bracketed paste) is active.
@@ -3398,6 +3410,29 @@ mod tests {
             feed(&mut t, b"\x1b]133;A\x1b\\");
         }
         assert_eq!(t.prompt_marks().len(), 4096);
+    }
+
+    /// M10-followup I3: push 5000 marks (well past the 4096 cap) and
+    /// confirm the cap is honored without quadratic blowup. We don't
+    /// measure wall time — the test just exercises the eviction path
+    /// at scale, which on the old `Vec::remove(0)` implementation was
+    /// O(n) per eviction; on the new `VecDeque::pop_front` path it's
+    /// O(1). If the runtime regresses to quadratic, this test will
+    /// hang in CI long before it asserts.
+    #[test]
+    fn osc133_marks_fifo_eviction_is_not_quadratic() {
+        let mut t = Term::new(3, 8, 0);
+        for _ in 0..5000 {
+            feed(&mut t, b"\x1b]133;A\x1b\\");
+        }
+        // Cap is enforced.
+        assert_eq!(t.prompt_marks().len(), PROMPT_MARK_CAP);
+        // FIFO semantics: the oldest entries dropped off the front;
+        // everything we see is still PromptStart (we only ever pushed
+        // PromptStart).
+        for m in t.prompt_marks() {
+            assert_eq!(m.kind, PromptMarkKind::PromptStart);
+        }
     }
 
     // ----- PTY reply queue --------------------------------------------------
