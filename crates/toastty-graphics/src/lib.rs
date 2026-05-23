@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod image_grid;
+pub mod kitty;
 pub mod registry;
 
 pub use image_grid::{ImageGrid, Placement, PlacementHandle, SrcRect};
