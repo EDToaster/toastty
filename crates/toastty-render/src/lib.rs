@@ -433,6 +433,19 @@ impl Renderer {
             return Ok(RenderOutcome::Skipped);
         }
 
+        // M9 skip-submit: if no cells changed AND no animation tick is
+        // due, there's nothing to draw. Skip the surface acquire +
+        // encode + submit entirely. The binary preserves the damage
+        // signal across skipped frames (followup C2).
+        //
+        // Cursor blink animation is checked here so a "no-op" frame
+        // that lands on the blink toggle still goes through. Step 9
+        // wires the actual blink tick.
+        let cursor_animation_due = false;
+        if term.damage().is_empty() && !cursor_animation_due && !self.needs_full_clear {
+            return Ok(RenderOutcome::Skipped);
+        }
+
         let trace = std::env::var_os("TOASTTY_TRACE_RENDER").is_some();
         let t_total = if trace { Some(std::time::Instant::now()) } else { None };
 
