@@ -27,6 +27,7 @@ use toastty_window::{
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use toastty::cli;
 use toastty::geometry::grid_dims_from_pixels;
 use toastty::keyboard::encode_key;
 use toastty::shell::resolve_shell;
@@ -37,6 +38,33 @@ use toastty::theme_bridge::theme_from_config;
 const DEFAULT_WINDOW_SIZE: (u32, u32) = (1280, 800);
 
 fn main() -> Result<()> {
+    // Parse args BEFORE tracing init — otherwise --print-default-config
+    // would have log lines interleaved with the TOML we want to write
+    // straight into a file.
+    let action = match cli::parse(std::env::args().skip(1)) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}\n\n{}", cli::help_text());
+            std::process::exit(2);
+        }
+    };
+    match action {
+        cli::Action::PrintHelp => {
+            print!("{}", cli::help_text());
+            return Ok(());
+        }
+        cli::Action::PrintVersion => {
+            println!("{}", cli::version_text());
+            return Ok(());
+        }
+        cli::Action::PrintDefaultConfig => {
+            cli::write_default_config(&mut std::io::stdout())
+                .context("write default config")?;
+            return Ok(());
+        }
+        cli::Action::Run => {}
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

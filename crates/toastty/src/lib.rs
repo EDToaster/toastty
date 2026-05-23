@@ -9,6 +9,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod cli;
 pub mod geometry;
 pub mod keyboard;
 pub mod shell;

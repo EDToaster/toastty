@@ -2972,6 +2972,7 @@ dependencies = [
  "toastty-render",
  "toastty-term",
  "toastty-window",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
