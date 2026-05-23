@@ -51,12 +51,20 @@ fn build_term_instances_into(
     term: &Term,
     cell_size: (f32, f32),
     theme: &Theme,
+    ext_palette: &[[f32; 4]; 256],
     row_glyphs: &[Option<LineGlyphs>],
 ) {
-    crate::text::instance::build_instances_into(out, term, cell_size, theme, |row, col, ch, _style| {
-        let lg = row_glyphs.get(row as usize)?.as_ref()?;
-        lg.by_column.get(&(col, ch)).copied()
-    });
+    crate::text::instance::build_instances_into(
+        out,
+        term,
+        cell_size,
+        theme,
+        Some(ext_palette),
+        |row, col, ch, _style| {
+            let lg = row_glyphs.get(row as usize)?.as_ref()?;
+            lg.by_column.get(&(col, ch)).copied()
+        },
+    );
 }
 
 /// Append partial-redraw instances for `term` into `out` using the
@@ -67,6 +75,7 @@ fn build_term_dirty_instances_into(
     term: &Term,
     cell_size: (f32, f32),
     theme: &Theme,
+    ext_palette: &[[f32; 4]; 256],
     cursor_visible: bool,
     row_glyphs: &[Option<LineGlyphs>],
 ) {
@@ -76,6 +85,7 @@ fn build_term_dirty_instances_into(
         term.damage(),
         cell_size,
         theme,
+        Some(ext_palette),
         cursor_visible,
         |row, col, ch, _style| {
             let lg = row_glyphs.get(row as usize)?.as_ref()?;
@@ -736,6 +746,13 @@ impl Renderer {
         // can't hold two borrows of TextState at once.
         let damage_all = term.damage().all;
         let cursor_visible = self.blink.visible;
+        // Split-borrow: take a shared borrow of `ext_palette` and a
+        // mutable borrow of `text` from disjoint fields of `self` so
+        // the builders can read the cached OSC 4 palette while we hold
+        // an exclusive borrow of TextState. Coercing via `&*` then
+        // `&[[f32;4];256]` avoids the implicit `self` reborrow that
+        // would otherwise alias `self.text`.
+        let ext_palette: &[[f32; 4]; 256] = &self.ext_palette;
         let text = self.text.as_mut().expect("text init");
         let mut instances = std::mem::take(&mut text.instances_scratch);
         let t_bi = if trace { Some(std::time::Instant::now()) } else { None };
@@ -743,7 +760,14 @@ impl Renderer {
         // cleared (LoadOp::Clear); partial build under LoadOp::Load
         // so we only emit instances for cells that actually changed.
         if self.needs_full_clear || damage_all {
-            build_term_instances_into(&mut instances, term, cell_size, &theme, &text.line_cache);
+            build_term_instances_into(
+                &mut instances,
+                term,
+                cell_size,
+                &theme,
+                ext_palette,
+                &text.line_cache,
+            );
             if !cursor_visible {
                 instances.pop();
             }
@@ -753,6 +777,7 @@ impl Renderer {
                 term,
                 cell_size,
                 &theme,
+                ext_palette,
                 cursor_visible,
                 &text.line_cache,
             );
@@ -1239,6 +1264,7 @@ mod tests {
             term.damage(),
             cell_size,
             &theme,
+            None,
             false, // cursor_visible == OFF frame
             |_, _, _, _| None,
         );

@@ -168,6 +168,7 @@ impl Harness {
             term,
             cell_size,
             &theme,
+            None,
             |row, col, ch, _style| {
                 let lg = line_cache_ref.get(row as usize)?.as_ref()?;
                 lg.by_column.get(&(col, ch)).copied()
@@ -301,6 +302,7 @@ impl Harness {
             term,
             cell_size,
             &theme,
+            None,
             |row, col, ch, _style| {
                 let lg = line_cache_ref.get(row as usize)?.as_ref()?;
                 lg.by_column.get(&(col, ch)).copied()

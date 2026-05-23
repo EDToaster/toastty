@@ -108,6 +108,7 @@ pub(crate) fn render_term_offscreen(term: &Term, width: u32, height: u32) -> Rgb
         term,
         cell_size,
         &theme,
+        None,
         |row, col, ch, _style| {
             let lg = row_glyphs_ref.get(row as usize)?;
             lg.by_column.get(&(col, ch)).copied()
