@@ -376,7 +376,7 @@ impl Renderer {
     /// [`Renderer::with_font`] must be called first; returns
     /// [`RenderError::FontNotConfigured`] otherwise.
     ///
-    /// Honors `term.dirty_rows()` for the row-shape cache (decision §7,
+    /// Honors `term.damage()` for the row-shape cache (decision §7,
     /// minimum-viable subset for M5; full skip-submit / cell-level
     /// damage lands in M9).
     ///
@@ -427,11 +427,15 @@ impl Renderer {
             // Re-shape only dirty rows; reuse cached `LineGlyphs` for
             // the rest. The atlas itself never shrinks, so a clean row's
             // glyph slots stay valid across frames.
-            let dirty = term.dirty_rows();
+            let damage = term.damage();
             let mut shaped = 0u32;
             let t_shape = if trace { Some(std::time::Instant::now()) } else { None };
             for r in 0..rows {
-                let is_dirty = dirty.get(r as usize).copied().unwrap_or(true)
+                let is_dirty = damage.all
+                    || damage
+                        .rows
+                        .get(r as usize)
+                        .is_some_and(|rd| !rd.is_empty())
                     || text.line_cache[r as usize].is_none();
                 if !is_dirty {
                     continue;

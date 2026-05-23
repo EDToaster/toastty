@@ -441,30 +441,10 @@ impl Term {
         &self.damage
     }
 
-    /// Compatibility shim: per-row dirty view derived from `damage()`.
-    /// Returns `true` for any row with non-empty damage. Used during
-    /// M9.2 while the renderer still reads a `&[bool]`; deleted in
-    /// M9.3 once the renderer migrates to `damage()`.
-    #[must_use]
-    pub fn dirty_rows(&self) -> Vec<bool> {
-        self.damage
-            .rows
-            .iter()
-            .map(|r| !r.is_empty())
-            .collect()
-    }
-
     /// Reset the damage set. Renderer's host (the binary) calls this
     /// once a frame has consumed the damage signal.
     pub fn clear_damage(&mut self) {
         self.damage.clear();
-    }
-
-    /// Compatibility shim — same semantics as [`Term::clear_damage`].
-    /// Kept while the renderer/binary haven't migrated yet (M9.2);
-    /// removed in M9.3 along with `dirty_rows()`.
-    pub fn clear_dirty(&mut self) {
-        self.clear_damage();
     }
 
     /// Force every visible cell to be reported dirty on the next read,
@@ -1263,6 +1243,18 @@ mod tests {
         s
     }
 
+    /// Test helper: per-row dirty view derived from the damage set.
+    /// Mirrors the old `Term::dirty_rows()` shim that the renderer used
+    /// to read. Kept tests-only so the migration to per-cell damage
+    /// doesn't churn 20+ assert sites.
+    fn dirty_rows(t: &Term) -> Vec<bool> {
+        t.damage()
+            .rows
+            .iter()
+            .map(|r| !r.is_empty())
+            .collect()
+    }
+
     #[test]
     fn new_initialises_blank_grid_and_cursor() {
         let t = Term::new(3, 4, 8);
@@ -1865,17 +1857,17 @@ mod tests {
         feed(&mut t, b"\x1b[5;5H");
         assert_eq!(t.cursor().row, 4);
         assert_eq!(t.cursor().col, 4);
-        let dirty = t.dirty_rows();
+        let dirty = dirty_rows(&t);
         assert!(dirty[0], "row 0 (cursor left) should be dirty");
         assert!(dirty[4], "row 4 (cursor entered) should be dirty");
 
         // Clear the bitset, then CUU 2 → (2, 4): rows 4 and 2 must be
         // dirty.
-        t.clear_dirty();
+        t.clear_damage();
         feed(&mut t, b"\x1b[2A");
         assert_eq!(t.cursor().row, 2);
         assert_eq!(t.cursor().col, 4);
-        let dirty = t.dirty_rows();
+        let dirty = dirty_rows(&t);
         assert!(dirty[4], "row 4 (cursor left) should be dirty");
         assert!(dirty[2], "row 2 (cursor entered) should be dirty");
     }
@@ -2281,9 +2273,9 @@ mod tests {
         // Title-setting must not pollute the dirty bitset — the title
         // lives outside the grid.
         let mut t = Term::new(2, 4, 0);
-        t.clear_dirty();
+        t.clear_damage();
         feed(&mut t, b"\x1b]2;quiet\x1b\\");
-        for (i, &d) in t.dirty_rows().iter().enumerate() {
+        for (i, &d) in dirty_rows(&t).iter().enumerate() {
             assert!(!d, "row {i} should not be dirty after OSC title set");
         }
     }
@@ -2373,13 +2365,13 @@ mod tests {
         let mut t = Term::new(2, 4, 0);
         feed(&mut t, b"\x1b[?2026h");
         // Clear dirty so we can observe the disable-side effect.
-        t.clear_dirty();
+        t.clear_damage();
         feed(&mut t, b"\x1b[?2026l");
         assert!(!t.pause_rendering());
         assert!(t.sync_output_started_at().is_none());
         // Every visible row should now be dirty so the post-ESU frame
         // does a full redraw.
-        for (i, &d) in t.dirty_rows().iter().enumerate() {
+        for (i, &d) in dirty_rows(&t).iter().enumerate() {
             assert!(d, "row {i} should be dirty after ESU");
         }
     }
@@ -2451,11 +2443,11 @@ mod tests {
         let mut t = Term::new(2, 4, 0);
         feed(&mut t, b"\x1b[?2026h");
         assert!(t.pause_rendering());
-        t.clear_dirty();
+        t.clear_damage();
         t.force_flush_sync_output();
         assert!(!t.pause_rendering());
         assert!(t.sync_output_force_flushed());
-        for (i, &d) in t.dirty_rows().iter().enumerate() {
+        for (i, &d) in dirty_rows(&t).iter().enumerate() {
             assert!(d, "row {i} should be dirty after timeout flush");
         }
     }
@@ -2463,11 +2455,11 @@ mod tests {
     #[test]
     fn force_flush_sync_output_is_idempotent_when_no_bsu() {
         let mut t = Term::new(2, 4, 0);
-        t.clear_dirty();
+        t.clear_damage();
         // No BSU in flight — flush is a no-op.
         t.force_flush_sync_output();
         assert!(!t.sync_output_force_flushed());
-        for d in t.dirty_rows() {
+        for d in dirty_rows(&t) {
             assert!(!d, "no row should be dirty when there was no BSU to flush");
         }
     }
@@ -2564,12 +2556,12 @@ mod tests {
         // - every row is dirty (post-ESU full redraw)
         // - the cell content is what the app wrote
         let mut t = Term::new(2, 4, 0);
-        t.clear_dirty();
+        t.clear_damage();
         feed(&mut t, b"\x1b[?2026hAB\x1b[?2026l");
         assert!(!t.pause_rendering());
         assert_eq!(row_text(&t, 0), "AB");
         // All rows dirty (the ESU disable path marks everything).
-        for (i, &d) in t.dirty_rows().iter().enumerate() {
+        for (i, &d) in dirty_rows(&t).iter().enumerate() {
             assert!(d, "row {i} should be dirty after batch ESU");
         }
     }
@@ -2594,21 +2586,21 @@ mod tests {
         // Precondition: every row dirty, flag set, pause cleared.
         assert!(!t.pause_rendering());
         assert!(t.sync_output_force_flushed());
-        for (i, &d) in t.dirty_rows().iter().enumerate() {
+        for (i, &d) in dirty_rows(&t).iter().enumerate() {
             assert!(d, "row {i} should be dirty after timeout flush");
         }
         // A pause-gated Skipped frame: the binary does NOT call
         // clear_dirty / clear_sync_output_force_flushed. State must be
         // identical when we observe it again.
         assert!(t.sync_output_force_flushed());
-        for (i, &d) in t.dirty_rows().iter().enumerate() {
+        for (i, &d) in dirty_rows(&t).iter().enumerate() {
             assert!(d, "row {i} dirty bit must survive a skipped frame");
         }
         // Now simulate a Rendered frame that consumes the signals.
-        t.clear_dirty();
+        t.clear_damage();
         t.clear_sync_output_force_flushed();
         assert!(!t.sync_output_force_flushed());
-        for (i, &d) in t.dirty_rows().iter().enumerate() {
+        for (i, &d) in dirty_rows(&t).iter().enumerate() {
             assert!(!d, "row {i} should be clean after a real render");
         }
     }
@@ -2624,11 +2616,11 @@ mod tests {
         // Pre-condition: paused, content written.
         assert!(t.pause_rendering());
         assert_eq!(row_text(&t, 0), "AB");
-        t.clear_dirty();
+        t.clear_damage();
         t.force_flush_sync_output();
         assert!(!t.pause_rendering());
         assert!(t.sync_output_force_flushed());
-        for (i, &d) in t.dirty_rows().iter().enumerate() {
+        for (i, &d) in dirty_rows(&t).iter().enumerate() {
             assert!(d, "row {i} should be dirty after timeout flush");
         }
         // Content is still there.

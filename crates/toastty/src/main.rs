@@ -511,12 +511,12 @@ impl App for Toastty {
                 if let Some(r) = self.renderer.as_mut() {
                     match r.render_term(&self.term) {
                         Ok(RenderOutcome::Rendered) => {
-                            // Consume the per-row damage signal so the
-                            // next render only re-shapes rows that
+                            // Consume the per-cell damage signal so the
+                            // next render only re-emits cells that
                             // changed. Clear the BSU timeout-flush
                             // flag too so the renderer observes it for
                             // exactly one frame.
-                            self.term.clear_dirty();
+                            self.term.clear_damage();
                             self.term.clear_sync_output_force_flushed();
                         }
                         Ok(RenderOutcome::Skipped) => {
