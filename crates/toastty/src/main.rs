@@ -155,9 +155,12 @@ impl Toastty {
 
     fn handle_pty_bytes(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
-        if let Some(w) = self.window.as_ref() {
-            w.request_redraw();
-        }
+        // Redraw is requested via ControlSignal::RedrawIn(ZERO) from the
+        // PtyBytes handler — that path wakes the event loop reliably on
+        // macOS. Bare `request_redraw()` + ControlSignal::Continue queues
+        // a redraw via setNeedsDisplay but doesn't wake the loop until
+        // the next external event, leaving the window stale until a
+        // keystroke. See `Event::PtyBytes` below.
     }
 }
 
@@ -230,6 +233,14 @@ impl App for Toastty {
         self.window = Some(window);
         self.pty = Some(pty);
         self.reader = Some(reader);
+
+        // Kick off the first frame. macOS doesn't always fire an
+        // initial RedrawRequested on first display — without this,
+        // the window stays black until the user moves the mouse or
+        // types a key.
+        if let Some(w) = self.window.as_ref() {
+            w.request_redraw();
+        }
     }
 
     fn event(&mut self, event: Event) -> ControlSignal {
@@ -277,7 +288,11 @@ impl App for Toastty {
             }
             Event::PtyBytes(bytes) => {
                 self.handle_pty_bytes(&bytes);
-                ControlSignal::Continue
+                // RedrawIn(ZERO) — not Continue — to force the event
+                // loop to wake immediately. On macOS, plain
+                // `request_redraw()` doesn't wake from Wait reliably;
+                // RedrawIn sets ControlFlow::WaitUntil(now) which does.
+                ControlSignal::RedrawIn(Duration::ZERO)
             }
             Event::PtyClosed => {
                 debug!("pty closed; exiting");
