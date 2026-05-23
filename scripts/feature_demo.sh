@@ -201,7 +201,7 @@ note "switching cursor through all 6 DECSCUSR shapes (Ps=1..6)"
 note "Ps=1 → block blinking, Ps=2 → block steady"
 note "Ps=3 → underline blinking, Ps=4 → underline steady"
 note "Ps=5 → bar blinking, Ps=6 → bar steady"
-note "blink doesn't animate yet (M9); shape change is visible"
+note "blink now animates (M9 wired the ticker — see M9 section below)"
 for ps in 1 2 3 4 5 6; do
     printf '%s%d q' "$csi" "$ps"
     printf '   Ps=%d (watch the cursor)\n' "$ps"
@@ -321,6 +321,24 @@ note "Press Enter when you're done resizing."
 printf '%s?2048h' "$csi"
 read -r _
 printf '%s?2048l' "$csi"
+
+# ─────────────────────────────────────────────────────────────────
+section "M9 — Damage tracking + cursor blink"
+note "M9's redraw policy is mostly invisible — its 30x idle CPU saving"
+note "is observable only via Activity Monitor / top. The user-facing"
+note "piece is cursor blink: a 530ms ticker on the renderer toggles the"
+note "cursor cell while the term is otherwise quiet."
+note ""
+note "Demo: switch to a blinking shape and pause for ~3 cycles."
+printf '%s5 q' "$csi"          # bar blinking
+note "  Ps=5 (bar blinking): cursor should toggle on/off every ~530ms"
+sleep 2.5
+printf '%s6 q' "$csi"          # bar steady
+note "  Ps=6 (bar steady): cursor should stop blinking, stay visible"
+sleep 1.5
+printf '%s1 q' "$csi"          # back to block blinking
+note "  Ps=1 (block blinking): default — back to the steady ticker"
+sleep 1
 
 # ─────────────────────────────────────────────────────────────────
 section "M10.1 — OSC 7 (current working directory)"
