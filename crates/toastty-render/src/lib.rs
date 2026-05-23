@@ -155,6 +155,11 @@ pub struct Renderer {
     text: Option<TextState>,
     /// Theme used by `render_term` when emitting instances.
     theme: Theme,
+    /// True when the next frame must use `LoadOp::Clear` instead of
+    /// `LoadOp::Load`. Set on construction (so the very first frame
+    /// fully paints), on resize / theme / font swap, and whenever the
+    /// term reports `damage.all` (M8 corrective-flush path).
+    needs_full_clear: bool,
 }
 
 struct TextState {
@@ -267,6 +272,9 @@ impl Renderer {
             clear_color: [0.07, 0.07, 0.09, 1.0],
             text: None,
             theme: Theme::default_dark(),
+            // First frame after construction always clears: the
+            // back-buffer's initial contents are undefined.
+            needs_full_clear: true,
         })
     }
 
@@ -316,6 +324,9 @@ impl Renderer {
             line_cache: Vec::new(),
             instances_scratch: Vec::new(),
         });
+        // Font swap invalidates the cell grid — force the next frame
+        // to clear.
+        self.needs_full_clear = true;
     }
 
     /// Current cell size in pixels (width, height). Returns `(0, 0)` if
@@ -330,9 +341,21 @@ impl Renderer {
     /// Set the theme used by [`Renderer::render_term`]. Also syncs the
     /// clear color to the theme background so cells with the default bg
     /// (which emit no instance) show through with the right color.
+    ///
+    /// Theme changes invalidate the framebuffer (background color, all
+    /// foreground colors); the next frame uses `LoadOp::Clear`.
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
         self.clear_color = theme.bg;
+        self.needs_full_clear = true;
+    }
+
+    /// Force the next frame to use `LoadOp::Clear` instead of
+    /// `LoadOp::Load`. Called by the binary on resize / theme / font
+    /// swap — any event that invalidates the GPU framebuffer's prior
+    /// contents.
+    pub fn invalidate_framebuffer(&mut self) {
+        self.needs_full_clear = true;
     }
 
     /// Current theme.
@@ -342,10 +365,14 @@ impl Renderer {
 
     /// Resize the surface. Width or height of 0 is clamped to 1 (configuring
     /// a zero-sized surface panics in wgpu).
+    ///
+    /// The new surface back-buffer has undefined contents — the next
+    /// frame must use `LoadOp::Clear`.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
         self.surface.configure(&self.device, &self.config);
+        self.needs_full_clear = true;
     }
 
     /// Set the clear color (linear RGBA, `[0, 1]` range).
@@ -538,6 +565,23 @@ impl Renderer {
             ],
         };
 
+        // damage.all is the M8 corrective-flush path: cascade it into
+        // a full clear for this frame.
+        if term.damage().all {
+            self.needs_full_clear = true;
+        }
+
+        let load_op = if self.needs_full_clear {
+            wgpu::LoadOp::Clear(wgpu::Color {
+                r: f64::from(self.theme.bg[0]),
+                g: f64::from(self.theme.bg[1]),
+                b: f64::from(self.theme.bg[2]),
+                a: f64::from(self.theme.bg[3]),
+            })
+        } else {
+            wgpu::LoadOp::Load
+        };
+
         {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("toastty-render term pass"),
@@ -546,12 +590,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: f64::from(self.theme.bg[0]),
-                            g: f64::from(self.theme.bg[1]),
-                            b: f64::from(self.theme.bg[2]),
-                            a: f64::from(self.theme.bg[3]),
-                        }),
+                        load: load_op,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -593,6 +632,10 @@ impl Renderer {
         if let Some(text) = self.text.as_mut() {
             text.instances_scratch = instances;
         }
+        // Successful submit — the framebuffer now holds known contents,
+        // so the next frame can use LoadOp::Load unless someone
+        // explicitly invalidates again.
+        self.needs_full_clear = false;
         Ok(RenderOutcome::Rendered)
     }
 
