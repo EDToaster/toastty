@@ -64,6 +64,12 @@ pub trait KittySink {
     fn pending_budget_remaining(&self) -> u64 {
         u64::MAX
     }
+
+    /// Hint: the cursor should advance after a TransmitAndPlace that
+    /// didn't set `C=1`. The host translates this into actual cursor
+    /// motion. Default is a no-op so simple test sinks don't need to
+    /// care about cursor state.
+    fn advance_cursor_after_placement(&mut self, _rows: u16, _cols: u16) {}
 }
 
 /// In-flight chunked transmission state.
@@ -289,9 +295,16 @@ impl KittyHandler {
         // the cursor. The host's adapter uses the cursor's current
         // (row, col) and the configured cell dims to size the rect.
         if matches!(header.action, Action::TransmitAndPlace) {
-            sink.place_image(default_placement_from_header(
-                &header, final_id, img_w, img_h,
-            ));
+            let placement = default_placement_from_header(&header, final_id, img_w, img_h);
+            let rows_span = placement.row_range.end - placement.row_range.start;
+            let cols_span = placement.col_range.end - placement.col_range.start;
+            sink.place_image(placement);
+            // Kitty spec: T advances the cursor by the placement size
+            // unless `C=1`. We delegate to the host so the cursor
+            // motion respects scroll/wrap.
+            if !header.cursor_no_move {
+                sink.advance_cursor_after_placement(rows_span, cols_span);
+            }
         }
 
         // Reply OK (subject to quietness).

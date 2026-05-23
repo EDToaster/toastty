@@ -3321,6 +3321,7 @@ dependencies = [
 name = "toastty-term"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "proptest",
  "smallvec",
  "thiserror 2.0.18",

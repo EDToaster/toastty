@@ -16,6 +16,7 @@ toastty-parser.workspace = true
 toastty-protocols.workspace = true
 
 [dev-dependencies]
+base64 = "0.22"
 proptest.workspace = true
 toastty-pty.workspace = true
 

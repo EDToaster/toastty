@@ -887,6 +887,12 @@ impl Term {
             // for each row no longer matches its position. Force a
             // re-shape of all rows.
             self.mark_all_dirty();
+            // Slide image placements up by 1 row (alt screen has no
+            // image placements but the call is cheap).
+            let dropped = self.image_grid.shift_rows_up(1, 0);
+            if !dropped.is_empty() {
+                self.image_revision = self.image_revision.wrapping_add(1);
+            }
         } else {
             // Followup C3: a mid-screen LF moves the cursor without
             // touching any cell content. Under partial redraw, the
@@ -1423,6 +1429,12 @@ impl Term {
         self.cursor = Cursor::default();
         // Switching screens invalidates every cached shaped line.
         self.mark_all_dirty();
+        // Alt screen has no image placements in M11a — clear so apps
+        // can't accidentally see stale images from the primary screen.
+        let dropped = self.image_grid.clear();
+        if !dropped.is_empty() {
+            self.image_revision = self.image_revision.wrapping_add(1);
+        }
     }
 
     fn exit_alt_screen(&mut self) {
@@ -1434,6 +1446,13 @@ impl Term {
         self.clamp_cursor();
         // Switching back: re-shape the primary screen contents.
         self.mark_all_dirty();
+        // Same policy on exit: clear image placements (the primary
+        // screen's images were not preserved across the alt-screen
+        // switch in M11a).
+        let dropped = self.image_grid.clear();
+        if !dropped.is_empty() {
+            self.image_revision = self.image_revision.wrapping_add(1);
+        }
     }
 }
 
@@ -1795,6 +1814,198 @@ impl Perform for Term {
 
     // DCS / APC / hyperlinks / kitty keyboard / mode 2026 etc. all
     // deferred. TODOs live in lib-level docs.
+
+    fn apc_start(&mut self) {
+        self.apc_buffer.clear();
+    }
+
+    fn apc_chunk(&mut self, bytes: &[u8]) {
+        // Cap on a single APC packet's buffered bytes — defends against
+        // a hostile stream sending an unbounded APC payload that's
+        // larger than the kitty handler's per-upload cap. 256 MiB
+        // here matches the registry default cap.
+        const APC_BUFFER_CAP: usize = 256 * 1024 * 1024;
+        if self.apc_buffer.len().saturating_add(bytes.len()) > APC_BUFFER_CAP {
+            // Drop further chunks for this packet — `apc_end` will see
+            // a truncated buffer and fail header parsing cleanly.
+            return;
+        }
+        self.apc_buffer.extend_from_slice(bytes);
+    }
+
+    fn apc_end(&mut self) {
+        // Take ownership of the buffered payload so we can borrow
+        // `self` mutably as the sink. Defensive: if the payload doesn't
+        // start with `G`, it's not a Kitty graphics packet — silently
+        // drop. (Other APC users — e.g. tmux passthrough — might pass
+        // through; we ignore them for M11a.)
+        let payload = std::mem::take(&mut self.apc_buffer);
+        if payload.is_empty() || payload[0] != b'G' {
+            return;
+        }
+        // Split on the first `;` into header vs body.
+        let split = payload.iter().position(|&b| b == b';');
+        let (header_bytes, body): (&[u8], &[u8]) = match split {
+            Some(idx) => (&payload[..idx], &payload[idx + 1..]),
+            None => (&payload[..], &[]),
+        };
+        // Pull the handler out so we can pass &mut self as the sink.
+        let mut handler = std::mem::take(&mut self.image_handler);
+        // Swallow the Result — header errors do not reach the sink so
+        // there's no reply to emit. (A future enhancement could push a
+        // synthetic error reply here.)
+        let _ = handler.process(header_bytes, body, self);
+        self.image_handler = handler;
+    }
+}
+
+// ---- M11a: KittySink ----
+
+impl KittySink for Term {
+    fn register_image(&mut self, id_request: u32, data: ImageData) -> Option<u32> {
+        match self.image_registry.insert(id_request, data) {
+            Ok(inserted) => {
+                // Evicted ids no longer exist in the registry; drop their
+                // placements + mark cells dirty.
+                for evicted in &inserted.evicted {
+                    let dropped = self.image_grid.remove_image(*evicted);
+                    for p in dropped {
+                        mark_placement_dirty(self, &p);
+                    }
+                }
+                self.image_revision = self.image_revision.wrapping_add(1);
+                Some(inserted.id)
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn place_image(&mut self, mut placement: Placement) {
+        // The handler emits placements with row/col fields populated
+        // from header.cell_x / cell_y. For a *transmit-and-place*, the
+        // semantic is "place at the current cursor" — translate the
+        // placement against the cursor row/col so the placement lands
+        // where the app expects.
+        //
+        // For a standalone `a=p` (place an already-transmitted image),
+        // the cell_x/cell_y fields are absolute; we leave them alone.
+        // Distinguishing the two paths from inside the sink isn't
+        // possible without extra state — the handler always carries the
+        // header's cell_x/cell_y. For M11a we treat all placements as
+        // relative-to-cursor, which matches the way `tput` / `kitty
+        // +kitten icat` actually drive the protocol.
+        let cur_row = self.cursor.row;
+        let cur_col = self.cursor.col.min(self.cols.saturating_sub(1));
+        let row_span = placement.row_range.end - placement.row_range.start;
+        let col_span = placement.col_range.end - placement.col_range.start;
+        placement.row_range = cur_row..cur_row.saturating_add(row_span);
+        placement.col_range = cur_col..cur_col.saturating_add(col_span);
+        // Clamp to grid.
+        if placement.row_range.end > self.rows {
+            placement.row_range.end = self.rows;
+        }
+        if placement.col_range.end > self.cols {
+            placement.col_range.end = self.cols;
+        }
+        // Mark dirty BEFORE consuming `placement` into the grid.
+        mark_placement_dirty(self, &placement);
+        self.image_grid.add(placement);
+        self.image_revision = self.image_revision.wrapping_add(1);
+    }
+
+    fn delete_image(&mut self, delete: DeleteSpec, header: &toastty_graphics::kitty::header::Header) {
+        // Treat empty / unknown specs the same as `a` (all).
+        let spec_byte = if delete.byte == 0 { b'a' } else { delete.byte };
+        let mut dropped_placements = Vec::new();
+        let drop_bytes = delete.free_bytes();
+        match spec_byte {
+            // `a` / `A` — delete all visible placements (and bytes if
+            // uppercase).
+            b'a' | b'A' => {
+                dropped_placements.extend(self.image_grid.clear());
+                if drop_bytes {
+                    let ids: Vec<u32> = self.image_registry.ids().collect();
+                    for id in ids {
+                        self.image_registry.remove(id);
+                    }
+                }
+            }
+            // `i` / `I` — by image id (provided via `i=`).
+            b'i' | b'I' => {
+                if header.image_id != 0 {
+                    dropped_placements.extend(self.image_grid.remove_image(header.image_id));
+                    if drop_bytes {
+                        self.image_registry.remove(header.image_id);
+                    }
+                }
+            }
+            // `n` / `N` — by image *number* (provided via `I=`). We
+            // don't track image-number→id mapping yet; fall through as
+            // a no-op.
+            // `p` / `P` — by (image id, placement id). The grid filter
+            // matches both fields.
+            b'p' | b'P' => {
+                let img = header.image_id;
+                let pid = header.placement_id;
+                dropped_placements.extend(self.image_grid.remove_where(|p| {
+                    p.image_id == img && p.placement_id == pid
+                }));
+            }
+            // `r` / `R` — by row.
+            b'r' | b'R' => {
+                if header.cell_y < u32::from(self.rows) {
+                    let row = header.cell_y as u16;
+                    dropped_placements.extend(self.image_grid.clear_row(row));
+                }
+            }
+            // Other specs (`c` cell, `x`/`y` columns/rows, `z` by z, `q`
+            // by ranges, ...) are deferred for M11a follow-ups.
+            _ => {}
+        }
+        for p in &dropped_placements {
+            mark_placement_dirty(self, p);
+        }
+        if !dropped_placements.is_empty() || drop_bytes {
+            self.image_revision = self.image_revision.wrapping_add(1);
+        }
+    }
+
+    fn queue_reply(&mut self, bytes: &[u8]) {
+        self.pty_replies.extend_from_slice(bytes);
+    }
+
+    fn pending_budget_remaining(&self) -> u64 {
+        // Take registry budget minus the bytes already buffered in the
+        // APC reassembly buffer.
+        let used_buf = self.apc_buffer.len() as u64;
+        self.image_registry
+            .budget_remaining()
+            .saturating_sub(used_buf)
+    }
+
+    fn advance_cursor_after_placement(&mut self, rows: u16, _cols: u16) {
+        // Kitty docs say: after T, the cursor moves to the cell *below*
+        // the bottom-left of the placement. We approximate by moving
+        // down by `rows` and resetting column to 0 — close enough for
+        // common `kitty +kitten icat` usage.
+        //
+        // If the cursor would land below the visible viewport, we let
+        // `linefeed` scroll the grid (which also shifts image rows up).
+        for _ in 0..rows {
+            self.linefeed();
+        }
+        self.cursor.col = 0;
+    }
+}
+
+fn mark_placement_dirty(t: &mut Term, p: &Placement) {
+    let rows = t.rows;
+    let cols = t.cols;
+    let r_end = p.row_range.end.min(rows);
+    let c_end = p.col_range.end.min(cols);
+    for r in p.row_range.start..r_end {
+        t.mark_cells(r, p.col_range.start, c_end);
+    }
 }
 
 #[cfg(test)]
@@ -3812,5 +4023,141 @@ mod tests {
         });
         feed(&mut t, b"\x1b]52;c;!!\x1b\\");
         assert!(t.drain_clipboard_requests().is_empty());
+    }
+
+    // ----- M11a: kitty APC integration -----
+
+    /// Helper: produce a 1x1 red RGBA pixel base64-encoded.
+    fn b64_red_1x1() -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .encode([255u8, 0, 0, 255])
+            .into_bytes()
+    }
+
+    #[test]
+    fn apc_kitty_transmit_registers_image() {
+        let mut t = Term::new(4, 8, 0);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=t,f=32,s=1,v=1,i=42;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        assert!(t.image_registry().contains(42));
+        // OK reply was queued.
+        let replies = t.drain_pty_replies();
+        assert!(!replies.is_empty());
+        let s = String::from_utf8_lossy(&replies);
+        assert!(s.contains(";OK"), "expected OK reply, got {s:?}");
+    }
+
+    #[test]
+    fn apc_kitty_non_graphics_is_ignored() {
+        // tmux / other APC users — payload doesn't start with 'G'.
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b_tmux passthrough payload\x1b\\");
+        assert_eq!(t.image_registry().len(), 0);
+    }
+
+    #[test]
+    fn apc_kitty_oversized_payload_replies_efbig() {
+        let mut t = Term::new(2, 4, 0);
+        // Shrink the cap so the test isn't sensitive to the default.
+        t.set_image_cap(1024);
+        // Declare a payload bigger than the cap.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=t,f=32,s=8192,v=8192,i=1,S=268435456;\x1b\\");
+        feed(&mut t, &payload);
+        let replies = t.drain_pty_replies();
+        let s = String::from_utf8_lossy(&replies);
+        assert!(s.contains("EFBIG"), "expected EFBIG, got {s:?}");
+    }
+
+    #[test]
+    fn apc_kitty_transmit_and_place_advances_cursor() {
+        let mut t = Term::new(8, 8, 0);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=2,r=2;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        // Image placed.
+        assert!(t.image_registry().contains(1));
+        assert_eq!(t.image_grid().len(), 1);
+        // Cursor advanced by `r=2` rows (column reset to 0).
+        let cur = t.cursor();
+        assert_eq!(cur.row, 2);
+        assert_eq!(cur.col, 0);
+    }
+
+    #[test]
+    fn apc_kitty_delete_all_clears_grid() {
+        let mut t = Term::new(8, 8, 0);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=1,r=1;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        assert_eq!(t.image_grid().len(), 1);
+        // Now delete all.
+        feed(&mut t, b"\x1b_Ga=d,d=A\x1b\\");
+        assert_eq!(t.image_grid().len(), 0);
+        // Uppercase 'A' also frees the bytes.
+        assert_eq!(t.image_registry().len(), 0);
+    }
+
+    #[test]
+    fn apc_kitty_animate_replies_enotsup() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b_Ga=a,i=1\x1b\\");
+        let replies = t.drain_pty_replies();
+        let s = String::from_utf8_lossy(&replies);
+        assert!(s.contains("ENOTSUP"), "got {s:?}");
+    }
+
+    #[test]
+    fn linefeed_shifts_image_placements_up_on_scroll() {
+        let mut t = Term::new(2, 4, 0);
+        // Place an image at the cursor (row 0).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=1,r=1;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        // The placement was at row 0..1.
+        let p_before = t.image_grid().iter().next().unwrap().row_range.clone();
+        assert_eq!(p_before, 0..1);
+        // Force a few newlines so the grid scrolls (only 2 rows total).
+        feed(&mut t, b"\n\n\n");
+        // Placement either shifted off-screen (dropped) or moved up.
+        // With 2 rows + 3 newlines, the placement should be dropped.
+        assert!(t.image_grid().is_empty());
+    }
+
+    #[test]
+    fn alt_screen_enter_clears_image_grid() {
+        let mut t = Term::new(4, 8, 0);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=1,r=1;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        assert_eq!(t.image_grid().len(), 1);
+        // Enter alt screen.
+        feed(&mut t, b"\x1b[?1049h");
+        assert_eq!(t.image_grid().len(), 0);
+    }
+
+    #[test]
+    fn image_revision_bumps_on_register_and_place() {
+        let mut t = Term::new(4, 8, 0);
+        let rev0 = t.image_revision();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=1,r=1;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        let rev1 = t.image_revision();
+        assert_ne!(rev0, rev1);
     }
 }
