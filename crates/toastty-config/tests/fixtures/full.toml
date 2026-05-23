@@ -1,0 +1,26 @@
+[font]
+family       = "Fira Mono"
+size_px      = 16.0
+line_height  = 1.4
+
+[theme]
+fg     = "#d9d9d9"
+bg     = "#121214"
+cursor = "#f2d94c"
+palette = [
+  "#000000", "#cc3030", "#30cc30", "#cccc30",
+  "#3030cc", "#cc30cc", "#30cccc", "#cccccc",
+  "#666666", "#ff5050", "#50ff50", "#ffff50",
+  "#5050ff", "#ff50ff", "#50ffff", "#ffffff",
+]
+
+[cursor]
+shape = "block"
+blink = true
+
+[shell]
+program = "auto"
+args    = []
+
+[scrollback]
+lines = 10000

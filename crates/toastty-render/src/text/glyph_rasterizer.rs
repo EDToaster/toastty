@@ -23,6 +23,12 @@ use crate::text::instance::GlyphSlot;
 pub const ATLAS_W: u32 = 1024;
 pub const ATLAS_H: u32 = 1024;
 
+/// Default line-height multiplier (× `font_size_px`). 1.25 was too tight
+/// (descenders kissed the next line's ascenders); 1.4 matches what most
+/// terminals use. The `toastty-config` schema defaults to the same value
+/// so default-no-config renders match the M4b snapshots byte-for-byte.
+pub const DEFAULT_LINE_HEIGHT_RATIO: f32 = 1.4;
+
 struct PendingGlyph {
     glyph: LayoutGlyph,
     col: u16,
@@ -77,14 +83,19 @@ pub struct GlyphRasterizer {
 }
 
 impl GlyphRasterizer {
-    /// Build a rasterizer with `font_size` in pixels and an optional
-    /// font name (falls back to monospace if absent or unloaded).
+    /// Build a rasterizer with `font_size` in pixels, the
+    /// line-height ratio (× `font_size`), and an optional font name
+    /// (falls back to monospace if absent or unloaded).
     ///
     /// Also bundles a "fallback" TTF as a guaranteed-present monospace
     /// face — see `Renderer::with_font`.
+    ///
+    /// Pass [`DEFAULT_LINE_HEIGHT_RATIO`] for the value the M4b snapshots
+    /// were captured at.
     pub fn new(
         device: &Device,
         font_size: f32,
+        line_height_ratio: f32,
         font_name: Option<&str>,
         bundled_font: Option<&[u8]>,
     ) -> Self {
@@ -98,9 +109,9 @@ impl GlyphRasterizer {
                 )));
         }
 
-        // Line height ratio: 1.25 was too tight (descenders kissed the
-        // next line's ascenders). 1.4 matches what most terminals use.
-        let metrics = Metrics::new(font_size, font_size * 1.4);
+        // Line height = `font_size * line_height_ratio`. See
+        // [`DEFAULT_LINE_HEIGHT_RATIO`] for the rationale on `1.4`.
+        let metrics = Metrics::new(font_size, font_size * line_height_ratio);
 
         // Determine cell size by shaping the reference glyph "M".
         let cell_size = measure_cell(&mut font_system, metrics, font_name);

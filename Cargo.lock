@@ -2798,6 +2798,7 @@ name = "toastty-config"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "toml",
 ]
@@ -2866,6 +2867,7 @@ dependencies = [
  "proptest",
  "raw-window-handle",
  "thiserror 2.0.18",
+ "toastty-config",
  "toastty-parser",
  "toastty-term",
  "toastty-window",
