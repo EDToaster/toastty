@@ -10,6 +10,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::cell::{Cell, Color, Style};
 use crate::cursor::Cursor;
+use crate::damage::Damage;
 use crate::grid::Grid;
 use toastty_config::CursorShape;
 use toastty_parser::{Params, Perform};
@@ -118,16 +119,17 @@ pub struct Term {
     cols: u16,
     /// Primary-grid scrollback capacity (visible rows + history).
     scrollback: u16,
-    /// Per-row dirty bitset (visible rows only). Set by every mutation
-    /// that touches a row; consumed by the renderer's row-shape cache so
-    /// clean rows skip re-shaping. Minimum-viable damage signal — the
-    /// rest of decision #7 (skip-submit, cell-level damage) lands in M9.
+    /// Per-cell sparse damage (visible rows only). Set by every mutation
+    /// that touches a cell or range of cells; consumed by the renderer's
+    /// row-shape cache and partial-redraw builder so clean cells skip
+    /// re-emission.
     ///
-    /// Bare cursor moves (CUU/CUD/CUF/CUB/CUP — no cell write) also flip
-    /// the bit for both the row being left and the row being entered, so
-    /// the cursor block repaints correctly under `hjkl`-style navigation.
+    /// Bare cursor moves (CUU/CUD/CUF/CUB/CUP — no cell write) flip the
+    /// damage bit for both the column being left and the column being
+    /// entered (across both rows when the cursor changes row), so the
+    /// cursor block repaints correctly under `hjkl`-style navigation.
     /// See [`Term::move_cursor`].
-    dirty: Vec<bool>,
+    damage: Damage,
     /// Window title, last set via OSC 0 or OSC 2. Empty when the app has
     /// not set one (the binary picks a default at startup). Title updates
     /// do NOT mark any row dirty — the title doesn't live in the grid.
@@ -180,7 +182,7 @@ impl Term {
             scrollback,
             // Start with everything dirty so the first render shapes
             // every row.
-            dirty: vec![true; rows as usize],
+            damage: Damage::new(rows),
             title: String::new(),
             // Defaults match `toastty_config::CursorConfig::defaults`.
             // Callers can override via `set_cursor_default` at init time;
@@ -429,38 +431,73 @@ impl Term {
         self.alt_active
     }
 
-    /// Borrow the per-row dirty bitset (visible rows only). The renderer
-    /// reads this to decide which rows to re-shape and which to reuse
-    /// from cache. Length equals `self.size().0`.
+    /// Borrow the per-cell damage set (visible rows only). The renderer
+    /// reads this to decide which cells to re-emit. Length of
+    /// `damage().rows` equals `self.size().0`.
     ///
-    /// Call [`Term::clear_dirty`] after consuming. Decision #7 / M9.
+    /// Call [`Term::clear_damage`] after consuming. Decision #7 / M9.
     #[must_use]
-    pub fn dirty_rows(&self) -> &[bool] {
-        &self.dirty
+    pub fn damage(&self) -> &Damage {
+        &self.damage
     }
 
-    /// Reset the per-row dirty bitset. Renderer calls this once a frame
-    /// has consumed the damage signal.
+    /// Compatibility shim: per-row dirty view derived from `damage()`.
+    /// Returns `true` for any row with non-empty damage. Used during
+    /// M9.2 while the renderer still reads a `&[bool]`; deleted in
+    /// M9.3 once the renderer migrates to `damage()`.
+    #[must_use]
+    pub fn dirty_rows(&self) -> Vec<bool> {
+        self.damage
+            .rows
+            .iter()
+            .map(|r| !r.is_empty())
+            .collect()
+    }
+
+    /// Reset the damage set. Renderer's host (the binary) calls this
+    /// once a frame has consumed the damage signal.
+    pub fn clear_damage(&mut self) {
+        self.damage.clear();
+    }
+
+    /// Compatibility shim — same semantics as [`Term::clear_damage`].
+    /// Kept while the renderer/binary haven't migrated yet (M9.2);
+    /// removed in M9.3 along with `dirty_rows()`.
     pub fn clear_dirty(&mut self) {
-        for d in &mut self.dirty {
-            *d = false;
-        }
+        self.clear_damage();
     }
 
-    /// Force every visible row to be reported dirty on the next read.
-    /// Used by the renderer when its row-shape cache is invalidated
-    /// (resize, font change, etc.) to force a re-shape.
+    /// Force every visible cell to be reported dirty on the next read,
+    /// and flip the top-level "framebuffer is stale" flag so the
+    /// renderer issues a full clear on the next frame. Used by the
+    /// renderer when its row-shape cache is invalidated (resize, font
+    /// change, BSU watchdog) to force a re-shape.
     pub fn mark_all_dirty(&mut self) {
-        for d in &mut self.dirty {
-            *d = true;
+        self.damage.mark_all();
+    }
+
+    /// Mark cell `(r, c)` dirty. Bounds-checked; out-of-range writes
+    /// are a no-op so callers don't have to guard.
+    fn mark_cell(&mut self, r: u16, c: u16) {
+        if let Some(row) = self.damage.rows.get_mut(r as usize) {
+            row.mark(c);
         }
     }
 
-    /// Mark row `r` dirty. Bounds-checked; out-of-range writes are a
-    /// no-op so callers don't have to guard.
-    fn mark_dirty(&mut self, r: u16) {
-        if let Some(slot) = self.dirty.get_mut(r as usize) {
-            *slot = true;
+    /// Mark cells `[start, end)` on row `r` dirty. Saturates at the
+    /// row's column count and is a no-op if `r` is out of range.
+    fn mark_cells(&mut self, r: u16, start: u16, end: u16) {
+        let cols = self.cols;
+        if let Some(row) = self.damage.rows.get_mut(r as usize) {
+            row.mark_range(start, end, cols);
+        }
+    }
+
+    /// Mark every cell in row `r` dirty. Used by erase_line(2), wrap,
+    /// and other whole-row events.
+    fn mark_row(&mut self, r: u16) {
+        if let Some(row) = self.damage.rows.get_mut(r as usize) {
+            row.mark_all();
         }
     }
 
@@ -479,7 +516,7 @@ impl Term {
         self.cols = cols;
         self.clamp_cursor();
         // Resize invalidates every cached shaped line — re-shape all.
-        self.dirty = vec![true; rows as usize];
+        self.damage.resize(rows);
     }
 
     fn active_grid(&self) -> &Grid {
@@ -563,11 +600,21 @@ impl Term {
             || (cell_w == 2 && self.cursor.col + 1 >= self.cols);
         if needs_wrap {
             // Mark the row we're leaving as soft-wrapped (decision #6).
+            // The cursor block was sitting on the last column of the
+            // leaving row, so mark that cell dirty so the trailing
+            // cursor block gets overpainted. The fresh row 0-col is
+            // marked once the cursor lands there below.
             let leaving = self.cursor.row;
             self.active_grid_mut().row_mut(leaving).soft_wrap = true;
-            self.mark_dirty(leaving);
+            let last_col = self.cols.saturating_sub(1);
+            self.mark_cell(leaving, last_col);
             self.cursor.col = 0;
             self.linefeed();
+            // After linefeed, mark the new row's col 0 (the cursor's
+            // resting position). Marking the cell where the cursor
+            // lands keeps the cursor block in sync under partial
+            // redraw.
+            self.mark_cell(self.cursor.row, 0);
         }
         let primary = Cell {
             ch: c,
@@ -589,7 +636,13 @@ impl Term {
                 .row_mut(row)
                 .put(col + 1, cont, max_cols);
         }
-        self.mark_dirty(row);
+        // Mark the cell(s) just written. For a width-2 cluster, the
+        // continuation cell is marked too so partial-redraw still
+        // sees it.
+        self.mark_cell(row, col);
+        if cell_w == 2 {
+            self.mark_cell(row, col + 1);
+        }
         self.cursor.col += cell_w;
     }
 
@@ -684,23 +737,26 @@ impl Term {
     }
 
     /// Move the cursor to (`new_row`, `new_col`) without touching any
-    /// cell, clamping to the visible grid, and mark both the row being
-    /// left and the row being entered dirty so the cursor block
-    /// repaints. Used by the bare cursor-movement CSIs
+    /// cell, clamping to the visible grid, and mark both the old and
+    /// new cells dirty so the cursor block at the old position gets
+    /// overpainted under partial redraw, and the new cell gets the
+    /// fresh cursor block. Used by the bare cursor-movement CSIs
     /// (CUU/CUD/CUF/CUB/CUP) — `print` / `execute(LF/CR/BS/TAB)` mark
-    /// their own rows dirty via the cell write itself.
+    /// their own cells dirty via the cell write itself.
     fn move_cursor(&mut self, new_row: u16, new_col: u16) {
         let max_row = self.rows.saturating_sub(1);
         let max_col = self.cols.saturating_sub(1);
         let new_row = new_row.min(max_row);
         let new_col = new_col.min(max_col);
         let old_row = self.cursor.row;
+        let old_col = self.cursor.col.min(max_col);
         self.cursor.row = new_row;
         self.cursor.col = new_col;
-        self.mark_dirty(old_row);
-        if new_row != old_row {
-            self.mark_dirty(new_row);
-        }
+        // Mark the old cell so the cursor block at that position gets
+        // overpainted; mark the new cell so the fresh cursor block
+        // shows up under partial redraw.
+        self.mark_cell(old_row, old_col);
+        self.mark_cell(new_row, new_col);
     }
 
     fn cursor_up(&mut self, n: u16) {
@@ -765,9 +821,11 @@ impl Term {
                     row.erase(0, cols, style);
                     row.soft_wrap = false;
                 }
-                // Dirty: cur_row .. rows.
-                for r in cur_row..rows {
-                    self.mark_dirty(r);
+                // Mark only the erased range on the cursor row; full
+                // row on rows below.
+                self.mark_cells(cur_row, cur_col, cols);
+                for r in (cur_row + 1)..rows {
+                    self.mark_row(r);
                 }
             }
             // 1: beginning of screen to cursor (inclusive).
@@ -779,14 +837,15 @@ impl Term {
                 }
                 grid.row_mut(cur_row)
                     .erase(0, cur_col.saturating_add(1), style);
-                for r in 0..=cur_row {
-                    self.mark_dirty(r);
+                for r in 0..cur_row {
+                    self.mark_row(r);
                 }
+                self.mark_cells(cur_row, 0, cur_col.saturating_add(1));
             }
             // 2/3: entire screen (3 = also scrollback, which we treat the same in M3).
             _ => {
                 grid.clear_visible(style);
-                self.mark_all_dirty();
+                self.damage.mark_all();
             }
         }
     }
@@ -797,12 +856,13 @@ impl Term {
         let cols = self.cols;
         let style = self.cursor.style;
         let row = self.active_grid_mut().row_mut(cur_row);
-        match mode {
-            0 => row.erase(cur_col, cols, style),
-            1 => row.erase(0, cur_col.saturating_add(1), style),
-            _ => row.erase(0, cols, style),
-        }
-        self.mark_dirty(cur_row);
+        let (start, end) = match mode {
+            0 => (cur_col, cols),
+            1 => (0, cur_col.saturating_add(1)),
+            _ => (0, cols),
+        };
+        row.erase(start, end, style);
+        self.mark_cells(cur_row, start, end);
     }
 
     fn apply_sgr(&mut self, params: &Params) {
@@ -2407,7 +2467,7 @@ mod tests {
         // No BSU in flight — flush is a no-op.
         t.force_flush_sync_output();
         assert!(!t.sync_output_force_flushed());
-        for &d in t.dirty_rows() {
+        for d in t.dirty_rows() {
             assert!(!d, "no row should be dirty when there was no BSU to flush");
         }
     }
@@ -2599,5 +2659,116 @@ mod tests {
         let slices: Vec<&[u16]> = vec![];
         let mut it = slices.into_iter();
         assert!(super::parse_extended_color_from_iter(&mut it).is_none());
+    }
+
+    // ---- M9 damage-tracking tests --------------------------------------
+
+    /// Convenience: are cells `(r, c)` marked dirty in the damage set?
+    fn damage_has_cell(t: &Term, r: u16, c: u16) -> bool {
+        let row = match t.damage().rows.get(r as usize) {
+            Some(r) => r,
+            None => return false,
+        };
+        row.all_cols || row.cols.binary_search(&c).is_ok()
+    }
+
+    #[test]
+    fn damage_print_marks_only_written_cell() {
+        let mut t = Term::new(2, 8, 0);
+        t.clear_damage();
+        feed(&mut t, b"A");
+        // Only (0, 0) should be dirty.
+        assert!(damage_has_cell(&t, 0, 0));
+        // Cells past the write shouldn't be in the dirty set.
+        let row = &t.damage().rows[0];
+        assert!(!row.all_cols);
+        // The marked column list should contain only column 0.
+        assert_eq!(&row.cols[..], &[0]);
+    }
+
+    #[test]
+    fn damage_cup_marks_old_and_new_cell() {
+        let mut t = Term::new(5, 5, 0);
+        feed(&mut t, b"abc"); // cursor at (0, 3)
+        t.clear_damage();
+        feed(&mut t, b"\x1b[3;3H"); // CUP to (2, 2) — cursor was at (0, 3)
+        // old (0, 3): mark old cell. new (2, 2): mark new cell.
+        assert!(damage_has_cell(&t, 0, 3), "old cursor cell must be dirty");
+        assert!(damage_has_cell(&t, 2, 2), "new cursor cell must be dirty");
+        // No other cells should be dirty.
+        assert_eq!(&t.damage().rows[0].cols[..], &[3]);
+        assert_eq!(&t.damage().rows[2].cols[..], &[2]);
+        assert!(t.damage().rows[1].is_empty());
+    }
+
+    #[test]
+    fn damage_erase_line_marks_range_only() {
+        // EL mode 0 (cursor to end of line) — marks [cur_col, cols).
+        let mut t = Term::new(2, 8, 0);
+        feed(&mut t, b"abcdef"); // cursor at (0, 6)
+        t.clear_damage();
+        feed(&mut t, b"\x1b[K"); // EL 0
+        let row = &t.damage().rows[0];
+        // Range marked: [6, 8) — two cells.
+        assert!(!row.all_cols);
+        assert_eq!(&row.cols[..], &[6, 7]);
+        // Row 1 stayed clean.
+        assert!(t.damage().rows[1].is_empty());
+    }
+
+    #[test]
+    fn damage_erase_line_mode2_marks_all_cells_in_row() {
+        let mut t = Term::new(2, 4, 0);
+        t.clear_damage();
+        feed(&mut t, b"\x1b[2K"); // EL 2 — entire line
+        // The full-row range collapses to all_cols.
+        let row = &t.damage().rows[0];
+        assert!(row.all_cols);
+    }
+
+    #[test]
+    fn damage_mark_all_dirty_sets_all_flag() {
+        let mut t = Term::new(3, 4, 0);
+        t.clear_damage();
+        t.mark_all_dirty();
+        assert!(t.damage().all);
+        for r in &t.damage().rows {
+            assert!(r.all_cols);
+        }
+    }
+
+    #[test]
+    fn damage_resize_sets_all_flag() {
+        let mut t = Term::new(2, 4, 0);
+        t.clear_damage();
+        t.resize(5, 8);
+        assert!(t.damage().all);
+        assert_eq!(t.damage().rows.len(), 5);
+    }
+
+    #[test]
+    fn damage_clear_resets() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"A");
+        assert!(!t.damage().is_empty());
+        t.clear_damage();
+        assert!(t.damage().is_empty());
+    }
+
+    #[test]
+    fn damage_erase_display_mode0_marks_partial_row_and_full_subsequent_rows() {
+        let mut t = Term::new(4, 8, 0);
+        feed(&mut t, b"\x1b[2;3Hab"); // cursor at (1, 4)
+        t.clear_damage();
+        feed(&mut t, b"\x1b[J"); // ED 0
+        // Row 1: range [4, 8) marked.
+        let row1 = &t.damage().rows[1];
+        assert!(!row1.all_cols);
+        assert_eq!(&row1.cols[..], &[4, 5, 6, 7]);
+        // Rows 2, 3: full row marked.
+        assert!(t.damage().rows[2].all_cols);
+        assert!(t.damage().rows[3].all_cols);
+        // Row 0: not touched (clear_damage was called).
+        assert!(t.damage().rows[0].is_empty());
     }
 }
