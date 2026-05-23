@@ -942,6 +942,52 @@ impl Term {
             }
             // `CSI ? u` (query) is handled at the binary level: it needs
             // to write the reply back to the PTY.
+
+            // DA1 — Primary Device Attributes (`CSI c` or `CSI 0 c`).
+            // Apps probe terminal capabilities at startup; many TUIs
+            // (yazi, helix, neovim) wait for this reply with a short
+            // timeout and refuse to start if it doesn't arrive.
+            // Advertise VT220 (`62`) + ANSI color (`22`). That's enough
+            // for every check we've seen and avoids the
+            // "sixel?"/"unicode-core?"/"images?" probes opening up.
+            'c' if priv_marker.is_none() => {
+                self.pty_replies.extend_from_slice(b"\x1b[?62;22c");
+            }
+            // DA2 — Secondary Device Attributes (`CSI > c` / `CSI > 0 c`).
+            // Reply with `CSI > <type> ; <version> ; <cartridge> c`. We
+            // claim type 0 (VT100), version 0, cartridge 0 — same shape
+            // as xterm/alacritty.
+            'c' if priv_marker == Some(b'>') => {
+                self.pty_replies.extend_from_slice(b"\x1b[>0;0;0c");
+            }
+            // DSR — Device Status Report.
+            //   `CSI 5 n` → reply `CSI 0 n` (OK).
+            //   `CSI 6 n` → cursor position; reply `CSI <row> ; <col> R`
+            //               with 1-based coords.
+            //   `CSI ? 6 n` → DECXCPR; same coords, `?` prefix on reply.
+            'n' if priv_marker.is_none() => {
+                let ps = first_param(params, 0);
+                match ps {
+                    5 => self.pty_replies.extend_from_slice(b"\x1b[0n"),
+                    6 => {
+                        let row = self.cursor.row.saturating_add(1);
+                        let col = self.cursor.col.min(self.cols.saturating_sub(1)).saturating_add(1);
+                        let reply = format!("\x1b[{row};{col}R");
+                        self.pty_replies.extend_from_slice(reply.as_bytes());
+                    }
+                    _ => {}
+                }
+            }
+            'n' if priv_marker == Some(b'?') => {
+                let ps = first_param(params, 0);
+                if ps == 6 {
+                    let row = self.cursor.row.saturating_add(1);
+                    let col = self.cursor.col.min(self.cols.saturating_sub(1)).saturating_add(1);
+                    let reply = format!("\x1b[?{row};{col}R");
+                    self.pty_replies.extend_from_slice(reply.as_bytes());
+                }
+            }
+
             _ => {}
         }
     }
@@ -3455,6 +3501,52 @@ mod tests {
     }
 
     // ----- OSC 4 (palette) -------------------------------------------------
+
+    #[test]
+    fn da1_replies_with_vt220_plus_color() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[c");
+        let bytes = t.drain_pty_replies();
+        assert_eq!(&bytes[..], b"\x1b[?62;22c");
+    }
+
+    #[test]
+    fn da1_with_explicit_zero_param_also_replies() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[0c");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?62;22c");
+    }
+
+    #[test]
+    fn da2_replies_with_type_version_cartridge() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[>c");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[>0;0;0c");
+    }
+
+    #[test]
+    fn dsr_status_report_replies_ok() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[5n");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[0n");
+    }
+
+    #[test]
+    fn dsr_cursor_position_replies_1_based() {
+        let mut t = Term::new(5, 10, 0);
+        // Move cursor to row 3, col 4 (1-based via CUP).
+        feed(&mut t, b"\x1b[3;4H");
+        feed(&mut t, b"\x1b[6n");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[3;4R");
+    }
+
+    #[test]
+    fn decxcpr_replies_with_question_mark_prefix() {
+        let mut t = Term::new(5, 10, 0);
+        feed(&mut t, b"\x1b[2;5H");
+        feed(&mut t, b"\x1b[?6n");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?2;5R");
+    }
 
     #[test]
     fn osc4_set_records_override_and_bumps_revision() {
