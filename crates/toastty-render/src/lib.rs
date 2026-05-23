@@ -900,7 +900,9 @@ mod tests {
     fn cursor_blink_animation_due_after_interval() {
         let now = Instant::now();
         let blink = CursorBlink {
-            last_at: now - Duration::from_millis(600),
+            last_at: now
+                .checked_sub(Duration::from_millis(600))
+                .expect("now is past UNIX epoch"),
             visible: true,
             interval: Duration::from_millis(530),
         };
@@ -930,7 +932,9 @@ mod tests {
     fn cursor_blink_disabled_when_term_blink_off() {
         let now = Instant::now();
         let blink = CursorBlink {
-            last_at: now - Duration::from_secs(10),
+            last_at: now
+                .checked_sub(Duration::from_secs(10))
+                .expect("now is past UNIX epoch"),
             visible: true,
             interval: Duration::from_millis(530),
         };
@@ -955,7 +959,9 @@ mod tests {
     fn next_redraw_deadline_saturates_at_zero_when_overdue() {
         let now = Instant::now();
         let blink = CursorBlink {
-            last_at: now - Duration::from_secs(5),
+            last_at: now
+                .checked_sub(Duration::from_secs(5))
+                .expect("now is past UNIX epoch"),
             visible: true,
             interval: Duration::from_millis(530),
         };

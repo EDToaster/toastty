@@ -18,14 +18,14 @@
 //!
 //! Why a sorted `SmallVec` instead of a `BitVec`? Most editing happens
 //! in tight clusters (one keystroke moves the cursor by 1; CSI K erases
-//! a contiguous range). A 4-slot inline SmallVec covers the typical case
+//! a contiguous range). A 4-slot inline `SmallVec` covers the typical case
 //! without heap-allocating, and `mark_range` is the only operation that
 //! grows past it.
 
 use smallvec::SmallVec;
 
 /// Per-row damage. Either "everything in this row is dirty" (set by
-/// scroll / erase_line / wrap) or a sorted list of dirty columns.
+/// scroll / `erase_line` / wrap) or a sorted list of dirty columns.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RowDamage {
     /// If true, every cell in this row is dirty — the renderer must not

@@ -473,8 +473,8 @@ impl Term {
         }
     }
 
-    /// Mark every cell in row `r` dirty. Used by erase_line(2), wrap,
-    /// and other whole-row events.
+    /// Mark every cell in row `r` dirty. Used by `erase_line(2)`,
+    /// wrap, and other whole-row events.
     fn mark_row(&mut self, r: u16) {
         if let Some(row) = self.damage.rows.get_mut(r as usize) {
             row.mark_all();
@@ -2683,9 +2683,8 @@ mod tests {
 
     /// Convenience: are cells `(r, c)` marked dirty in the damage set?
     fn damage_has_cell(t: &Term, r: u16, c: u16) -> bool {
-        let row = match t.damage().rows.get(r as usize) {
-            Some(r) => r,
-            None => return false,
+        let Some(row) = t.damage().rows.get(r as usize) else {
+            return false;
         };
         row.all_cols || row.cols.binary_search(&c).is_ok()
     }
