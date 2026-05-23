@@ -820,7 +820,20 @@ impl Renderer {
                     .cells
                     .iter()
                     .filter(|c| !c.is_continuation)
-                    .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
+                    .map(|c| {
+                        // Replace Kitty Unicode placeholder cells
+                        // (U+10EEEE) with a space before shaping. The
+                        // codepoint shapes to `.notdef` and its
+                        // cluster width can throw off the snap of
+                        // neighboring chars — we don't want it in the
+                        // glyph cache and the image pipeline draws
+                        // the real pixels anyway.
+                        if c.ch == '\0' || c.ch == toastty_term::PLACEHOLDER {
+                            ' '
+                        } else {
+                            c.ch
+                        }
+                    })
                     .collect();
                 let lg = text.rasterizer.shape_line(
                     &self.queue,
