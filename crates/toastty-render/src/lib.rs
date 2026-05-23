@@ -421,7 +421,11 @@ impl Renderer {
                     .iter()
                     .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
                     .collect();
-                let lg = text.rasterizer.shape_line(&self.queue, &line_text);
+                let lg = text.rasterizer.shape_line(
+                    &self.queue,
+                    &line_text,
+                    term.grapheme_cluster_mode(),
+                );
                 text.line_cache[r as usize] = Some(lg);
                 shaped += 1;
             }
