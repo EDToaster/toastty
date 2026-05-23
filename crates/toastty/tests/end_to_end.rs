@@ -17,7 +17,7 @@ use toastty::geometry::grid_dims_from_pixels;
 use toastty::keyboard::encode_key;
 use toastty::shell::resolve_shell;
 use toastty_config::ShellConfig;
-use toastty_window::{LogicalKey, Modifiers, NamedKey};
+use toastty_window::{KeyState, LogicalKey, Modifiers, NamedKey};
 
 struct ChannelSink(Mutex<mpsc::Sender<UserEvent>>);
 impl EventSink for ChannelSink {
@@ -98,18 +98,27 @@ fn keyboard_encoder_round_trips_through_cat() {
         &LogicalKey::Character("h".into()),
         Some("h"),
         Modifiers::empty(),
+        0,
+        KeyState::Pressed,
+        false,
     )
     .unwrap();
     let bytes_i = encode_key(
         &LogicalKey::Character("i".into()),
         Some("i"),
         Modifiers::empty(),
+        0,
+        KeyState::Pressed,
+        false,
     )
     .unwrap();
     let bytes_enter = encode_key(
         &LogicalKey::Named(NamedKey::Enter),
         None,
         Modifiers::empty(),
+        0,
+        KeyState::Pressed,
+        false,
     )
     .unwrap();
     pty.write(&bytes_h).unwrap();
@@ -190,6 +199,79 @@ fn resize_propagates_through_pty_and_term() {
         "expected '40 128' in shell output: {s:?}"
     );
 
+    drop(pty);
+}
+
+/// End-to-end mode handshake: feed `\x1b[?2004h` into the parser via a real
+/// PTY, then verify `Term::bracketed_paste()` is on.
+#[test]
+fn pty_drives_bracketed_paste_mode_through_term() {
+    let spec = PtySpec::program("/bin/sh")
+        .args(["-c", "printf '\\033[?2004h'; exit 0"])
+        .size(WinSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+        });
+    let pty = Pty::spawn(&spec).expect("spawn sh");
+
+    let (tx, rx) = mpsc::channel();
+    let sink = ChannelSink(Mutex::new(tx));
+    let _reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("reader");
+
+    let mut parser = Parser::new();
+    let mut term = Term::new(24, 80, 0);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(UserEvent::PtyBytes(b)) => {
+                parser.advance(&mut term, &b);
+            }
+            Ok(UserEvent::PtyClosed) => break,
+            Err(_) => {}
+        }
+        if term.bracketed_paste() {
+            break;
+        }
+    }
+    assert!(term.bracketed_paste(), "DECSET 2004 should set bracketed_paste");
+    drop(pty);
+}
+
+/// End-to-end mode handshake: same idea for focus reporting (DECSET 1004).
+#[test]
+fn pty_drives_focus_reporting_mode_through_term() {
+    let spec = PtySpec::program("/bin/sh")
+        .args(["-c", "printf '\\033[?1004h'; exit 0"])
+        .size(WinSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+        });
+    let pty = Pty::spawn(&spec).expect("spawn sh");
+
+    let (tx, rx) = mpsc::channel();
+    let sink = ChannelSink(Mutex::new(tx));
+    let _reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("reader");
+
+    let mut parser = Parser::new();
+    let mut term = Term::new(24, 80, 0);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(UserEvent::PtyBytes(b)) => {
+                parser.advance(&mut term, &b);
+            }
+            Ok(UserEvent::PtyClosed) => break,
+            Err(_) => {}
+        }
+        if term.report_focus() {
+            break;
+        }
+    }
+    assert!(term.report_focus(), "DECSET 1004 should enable focus reporting");
     drop(pty);
 }
 

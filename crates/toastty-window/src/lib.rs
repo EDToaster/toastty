@@ -19,9 +19,13 @@
 //! `ControlFlow::WaitUntil(now + d)` for that frame only. No constant
 //! 60Hz redraw when nothing is happening.
 
-#![forbid(unsafe_code)]
+// `deny` rather than `forbid` so the `led` module can opt back in to
+// unsafe FFI for platform LED-state reads (a narrowly-scoped need —
+// see `led/mod.rs`).
+#![deny(unsafe_code)]
 
 mod event;
+pub mod led;
 
 pub use event::{
     ControlSignal, Event, KeyState, LogicalKey, Modifiers, MouseButton, NamedKey, PhysicalKey,
@@ -445,7 +449,15 @@ pub(crate) fn translate_scroll(delta: MouseScrollDelta) -> (f64, f64) {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn translate_modifiers(m: ModifiersState) -> Modifiers {
+    translate_modifiers_with_leds(m, led::LedState::default())
+}
+
+pub(crate) fn translate_modifiers_with_leds(
+    m: ModifiersState,
+    leds: led::LedState,
+) -> Modifiers {
     let mut out = Modifiers::empty();
     if m.shift_key() {
         out |= Modifiers::SHIFT;
@@ -459,9 +471,12 @@ pub(crate) fn translate_modifiers(m: ModifiersState) -> Modifiers {
     if m.super_key() {
         out |= Modifiers::SUPER;
     }
-    // TODO(kitty-keyboard): read CAPS_LOCK / NUM_LOCK LED state per platform
-    // and OR into `out` here. See `docs/decisions/window-input.md` §1
-    // (this file:translate_modifiers).
+    if leds.caps_lock {
+        out |= Modifiers::CAPS_LOCK;
+    }
+    if leds.num_lock {
+        out |= Modifiers::NUM_LOCK;
+    }
     out
 }
 
@@ -522,12 +537,13 @@ fn translate_key(event: &KeyEvent, mods: ModifiersState, is_synthetic: bool) -> 
     let text = event
         .text_with_all_modifiers()
         .map(std::string::ToString::to_string);
+    let leds = led::read_led_state();
 
     Event::Key {
         logical: translate_logical_key(&event.logical_key),
         physical: translate_physical_key(event.physical_key),
         text,
-        modifiers: translate_modifiers(mods),
+        modifiers: translate_modifiers_with_leds(mods, leds),
         state: translate_state(event.state),
         repeat: event.repeat,
         is_synthetic,
@@ -638,6 +654,40 @@ mod tests {
         // CAPS_LOCK / NUM_LOCK come from platform LED state, not from winit.
         assert!(!out.contains(Modifiers::CAPS_LOCK));
         assert!(!out.contains(Modifiers::NUM_LOCK));
+    }
+
+    #[test]
+    fn translate_modifiers_with_caps_lock_led() {
+        let leds = led::LedState {
+            caps_lock: true,
+            num_lock: false,
+        };
+        let out = translate_modifiers_with_leds(ModifiersState::empty(), leds);
+        assert!(out.contains(Modifiers::CAPS_LOCK));
+        assert!(!out.contains(Modifiers::NUM_LOCK));
+    }
+
+    #[test]
+    fn translate_modifiers_with_num_lock_led() {
+        let leds = led::LedState {
+            caps_lock: false,
+            num_lock: true,
+        };
+        let out = translate_modifiers_with_leds(ModifiersState::empty(), leds);
+        assert!(out.contains(Modifiers::NUM_LOCK));
+        assert!(!out.contains(Modifiers::CAPS_LOCK));
+    }
+
+    #[test]
+    fn translate_modifiers_combines_winit_and_leds() {
+        let leds = led::LedState {
+            caps_lock: true,
+            num_lock: true,
+        };
+        let out = translate_modifiers_with_leds(ModifiersState::SHIFT, leds);
+        assert!(out.contains(Modifiers::SHIFT));
+        assert!(out.contains(Modifiers::CAPS_LOCK));
+        assert!(out.contains(Modifiers::NUM_LOCK));
     }
 
     #[test]

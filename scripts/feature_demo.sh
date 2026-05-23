@@ -1,20 +1,29 @@
 #!/usr/bin/env bash
-# Exercise everything toastty currently supports (post-M5 + perf fixes
-# + redraw fix). Run inside toastty to evaluate output visually.
+# Exercise everything toastty currently supports. Run inside toastty
+# to evaluate output visually.
 #
 # Usage:
 #   cargo run --release          # launches toastty
 #   # then in the shell that opens:
 #   ./scripts/feature_demo.sh
-#
-# Sections that are *expected* to misbehave (the bugs we know about)
-# are flagged with [BROKEN] so you can confirm what's currently wrong.
 
 set -u
 
 esc=$'\033'
 csi="${esc}["
 st="${esc}\\"
+
+cleanup() {
+    # Restore any modes the M7 sections leave dangling if you Ctrl-C
+    # out partway through.
+    printf '%s?2004l' "$csi"
+    printf '%s?1004l' "$csi"
+    printf '%s?1002l' "$csi"
+    printf '%s?1000l' "$csi"
+    printf '%s?1006l' "$csi"
+    printf '%s<u' "$csi"
+}
+trap cleanup EXIT
 
 section() {
     printf '\n%s1;7m %s %s0m\n' "$csi" "$1" "$csi"
@@ -206,6 +215,47 @@ printf '%s]8;;https://example.com%sclick me%s]8;;%s\n' "$esc" "$st" "$esc" "$st"
 note "  ^ should be underlined + clickable in M10"
 
 # ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+section "M7.1 — Bracketed paste (DECSET 2004)"
+note "Enabling bracketed paste. Press Cmd+V (macOS) or Ctrl+Shift+V."
+note "Your pasted text will be wrapped in ESC[200~ ... ESC[201~"
+note "(visible as the surrounding control sequences in the readout below)."
+printf '%s?2004h' "$csi"
+printf 'paste here, then press Enter > '
+read -r pasted
+printf '%s?2004l' "$csi"
+printf 'received: %q\n' "$pasted"
+
+# ─────────────────────────────────────────────────────────────────
+section "M7.2 — Focus events (DECSET 1004)"
+note "Enabling focus reporting. Click outside toastty, then back in."
+note "You should see ESC[O on blur and ESC[I on focus."
+note "Press Enter when done."
+printf '%s?1004h' "$csi"
+read -r _
+printf '%s?1004l' "$csi"
+
+# ─────────────────────────────────────────────────────────────────
+section "M7.3 — Mouse reporting (SGR 1006 + 1002)"
+note "Enabling click + drag tracking with SGR encoding."
+note "Click and drag the mouse inside the window."
+note "You'll see ESC[<0;C;R M (press) / m (release) sequences."
+note "Press Enter when done."
+printf '%s?1002h%s?1006h' "$csi" "$csi"
+read -r _
+printf '%s?1002l%s?1006l' "$csi" "$csi"
+
+# ─────────────────────────────────────────────────────────────────
+section "M7.4 — Kitty keyboard protocol (CSI u, disambiguate + events)"
+note "Pushing flags = 3 (disambiguate + report event types)."
+note "Press a, A, Ctrl+A, Ctrl+Shift+A. They should now emit"
+note "distinct CSI u sequences (e.g. CSI 97;6:1 u for Ctrl+Shift+A)."
+note "Press Enter when done."
+printf '%s>3u' "$csi"
+read -r _
+printf '%s<u' "$csi"
+
+# ─────────────────────────────────────────────────────────────────
 section "Done"
-note "If colors leak between sections (esp. into this final line), report"
+note "If colors leak between sections (esp. into this final line),"
 note "the SGR multi-param parsing fix is incomplete."
