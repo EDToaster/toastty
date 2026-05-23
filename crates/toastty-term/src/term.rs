@@ -31,12 +31,12 @@ pub struct Term {
     /// that touches a row; consumed by the renderer's row-shape cache so
     /// clean rows skip re-shaping. Minimum-viable damage signal — the
     /// rest of decision #7 (skip-submit, cell-level damage) lands in M9.
+    ///
+    /// Bare cursor moves (CUU/CUD/CUF/CUB/CUP — no cell write) also flip
+    /// the bit for both the row being left and the row being entered, so
+    /// the cursor block repaints correctly under `hjkl`-style navigation.
+    /// See [`Term::move_cursor`].
     dirty: Vec<bool>,
-    /// Last-known cursor position, retained across frames so the renderer
-    /// can mark the row the cursor was on (and the row it moves to) when
-    /// the bare cursor moves with no cell write — otherwise a cursor blink
-    /// won't repaint.
-    last_cursor_row: u16,
 }
 
 impl Term {
@@ -62,7 +62,6 @@ impl Term {
             // Start with everything dirty so the first render shapes
             // every row.
             dirty: vec![true; rows as usize],
-            last_cursor_row: 0,
         }
     }
 
@@ -145,9 +144,6 @@ impl Term {
         self.clamp_cursor();
         // Resize invalidates every cached shaped line — re-shape all.
         self.dirty = vec![true; rows as usize];
-        if self.last_cursor_row >= rows {
-            self.last_cursor_row = rows - 1;
-        }
     }
 
     fn active_grid(&self) -> &Grid {
@@ -234,27 +230,50 @@ impl Term {
         }
     }
 
+    /// Move the cursor to (`new_row`, `new_col`) without touching any
+    /// cell, clamping to the visible grid, and mark both the row being
+    /// left and the row being entered dirty so the cursor block
+    /// repaints. Used by the bare cursor-movement CSIs
+    /// (CUU/CUD/CUF/CUB/CUP) — `print` / `execute(LF/CR/BS/TAB)` mark
+    /// their own rows dirty via the cell write itself.
+    fn move_cursor(&mut self, new_row: u16, new_col: u16) {
+        let max_row = self.rows.saturating_sub(1);
+        let max_col = self.cols.saturating_sub(1);
+        let new_row = new_row.min(max_row);
+        let new_col = new_col.min(max_col);
+        let old_row = self.cursor.row;
+        self.cursor.row = new_row;
+        self.cursor.col = new_col;
+        self.mark_dirty(old_row);
+        if new_row != old_row {
+            self.mark_dirty(new_row);
+        }
+    }
+
     fn cursor_up(&mut self, n: u16) {
-        self.cursor.row = self.cursor.row.saturating_sub(n);
+        let new_row = self.cursor.row.saturating_sub(n);
+        self.move_cursor(new_row, self.cursor.col);
     }
 
     fn cursor_down(&mut self, n: u16) {
-        let r = self.cursor.row.saturating_add(n);
-        self.cursor.row = r.min(self.rows.saturating_sub(1));
+        let new_row = self.cursor.row.saturating_add(n);
+        self.move_cursor(new_row, self.cursor.col);
     }
 
     fn cursor_forward(&mut self, n: u16) {
-        let c = self.cursor.col.saturating_add(n);
-        self.cursor.col = c.min(self.cols.saturating_sub(1));
+        let new_col = self.cursor.col.saturating_add(n);
+        self.move_cursor(self.cursor.row, new_col);
     }
 
     fn cursor_back(&mut self, n: u16) {
-        self.cursor.col = self.cursor.col.saturating_sub(n);
+        let new_col = self.cursor.col.saturating_sub(n);
+        self.move_cursor(self.cursor.row, new_col);
     }
 
     fn cursor_position(&mut self, row_1based: u16, col_1based: u16) {
-        self.cursor.row = row_1based.saturating_sub(1).min(self.rows - 1);
-        self.cursor.col = col_1based.saturating_sub(1).min(self.cols - 1);
+        let new_row = row_1based.saturating_sub(1);
+        let new_col = col_1based.saturating_sub(1);
+        self.move_cursor(new_row, new_col);
     }
 
     fn erase_display(&mut self, mode: u16) {
@@ -928,6 +947,36 @@ mod tests {
         // exercise it here since callers normally bound the index 0..=7.
         assert_eq!(super::ansi_color(99, false), Color::Default);
         assert_eq!(super::ansi_color(99, true), Color::Default);
+    }
+
+    #[test]
+    fn cursor_only_moves_mark_dirty() {
+        // Bare cursor moves (no cell write) must still flip the dirty
+        // bits for both the row being left and the row being entered,
+        // otherwise vim `hjkl` / `less ^B^F` leave a stale cursor block
+        // behind. See the `move_cursor` helper in term.rs.
+        let mut t = Term::new(10, 10, 0);
+        assert_eq!(t.cursor().row, 0);
+        assert_eq!(t.cursor().col, 0);
+
+        // CUP to (4, 4): both the old row (0) and the new row (4) must
+        // be dirty.
+        feed(&mut t, b"\x1b[5;5H");
+        assert_eq!(t.cursor().row, 4);
+        assert_eq!(t.cursor().col, 4);
+        let dirty = t.dirty_rows();
+        assert!(dirty[0], "row 0 (cursor left) should be dirty");
+        assert!(dirty[4], "row 4 (cursor entered) should be dirty");
+
+        // Clear the bitset, then CUU 2 → (2, 4): rows 4 and 2 must be
+        // dirty.
+        t.clear_dirty();
+        feed(&mut t, b"\x1b[2A");
+        assert_eq!(t.cursor().row, 2);
+        assert_eq!(t.cursor().col, 4);
+        let dirty = t.dirty_rows();
+        assert!(dirty[4], "row 4 (cursor left) should be dirty");
+        assert!(dirty[2], "row 2 (cursor entered) should be dirty");
     }
 
     #[test]

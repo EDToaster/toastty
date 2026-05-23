@@ -3057,6 +3057,7 @@ dependencies = [
  "toastty-window",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
  "wgpu",
 ]
 
