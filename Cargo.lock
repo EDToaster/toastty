@@ -2866,6 +2866,7 @@ dependencies = [
  "proptest",
  "raw-window-handle",
  "thiserror 2.0.18",
+ "toastty-parser",
  "toastty-term",
  "toastty-window",
  "tracing",

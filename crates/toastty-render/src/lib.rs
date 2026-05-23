@@ -25,14 +25,41 @@
 
 pub mod color;
 pub mod surface_format;
+pub mod text;
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
+use toastty_term::Term;
 use wgpu::{
     BackendOptions, Backends, CompositeAlphaMode, Device, DeviceDescriptor, Instance,
     InstanceDescriptor, InstanceFlags, MemoryBudgetThresholds, PowerPreference, PresentMode, Queue,
     RequestAdapterOptions, Surface, SurfaceConfiguration, TextureFormat, TextureUsages,
 };
+
+use crate::text::glyph_rasterizer::{GlyphRasterizer, LineGlyphs};
+use crate::text::instance::{build_instances, CellInstance, Theme};
+use crate::text::pipeline::{GlobalsUbo, TextPipeline};
+
+fn build_term_instances(
+    term: &Term,
+    cell_size: (f32, f32),
+    theme: &Theme,
+    row_glyphs: &[LineGlyphs],
+) -> Vec<CellInstance> {
+    build_instances(term, cell_size, theme, |row, col, ch, _style| {
+        let lg = row_glyphs.get(row as usize)?;
+        lg.by_column.get(&(col, ch)).copied()
+    })
+}
+
+/// Bundled fallback font: `FiraMono Medium` (OFL).
+///
+/// Even when the host has system monospace fonts, embedding one makes
+/// snapshot tests deterministic across machines.
+const BUNDLED_FONT: &[u8] = include_bytes!("../fonts/FiraMono-Medium.ttf");
+
+/// Default font pixel size for the demo and snapshot tests.
+pub const DEFAULT_FONT_SIZE_PX: f32 = 16.0;
 
 /// Errors from [`Renderer`] construction or rendering.
 #[derive(Debug, Error)]
@@ -47,6 +74,8 @@ pub enum RenderError {
     NoSurfaceFormat,
     #[error("surface lost; recreate")]
     SurfaceLost,
+    #[error("font not configured — call Renderer::with_font first")]
+    FontNotConfigured,
 }
 
 /// Instance flags to use in tests / the snapshot harness.
@@ -90,6 +119,26 @@ pub struct Renderer {
     surface: Surface<'static>,
     config: SurfaceConfiguration,
     clear_color: [f32; 4],
+    /// Text pipeline lives lazily — `with_font` initializes it; `render`
+    /// (M4a path) tolerates its absence; `render_term` requires it.
+    text: Option<TextState>,
+    /// Theme used by `render_term` when emitting instances.
+    theme: Theme,
+}
+
+struct TextState {
+    rasterizer: GlyphRasterizer,
+    pipeline: TextPipeline,
+    bind_group: wgpu::BindGroup,
+}
+
+impl std::fmt::Debug for TextState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TextState")
+            .field("rasterizer", &self.rasterizer)
+            .field("pipeline", &self.pipeline)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Renderer {
@@ -172,8 +221,60 @@ impl Renderer {
             queue,
             surface,
             config,
-            clear_color: [0.0, 0.0, 0.0, 1.0],
+            clear_color: [0.07, 0.07, 0.09, 1.0],
+            text: None,
+            theme: Theme::default_dark(),
         })
+    }
+
+    /// Initialize the text rendering pipeline.
+    ///
+    /// `font_name` is forwarded to cosmic-text's `Attrs::family(...)`.
+    /// If `None`, falls back to the bundled `FiraMono`. `font_size_px` is
+    /// the pixel size of the glyph cell.
+    ///
+    /// Idempotent: calling twice rebuilds with new params. Must be
+    /// called before [`Renderer::render_term`].
+    pub fn with_font(&mut self, font_name: Option<&str>, font_size_px: f32) {
+        // Resolve the font family. We always bundle FiraMono so the
+        // caller can pass `None` and still get text.
+        let family = font_name.unwrap_or("Fira Mono");
+        let rasterizer = GlyphRasterizer::new(
+            &self.device,
+            font_size_px,
+            Some(family),
+            Some(BUNDLED_FONT),
+        );
+        let pipeline = TextPipeline::new(&self.device, self.config.format);
+
+        let mask_view = text::pipeline::default_view(rasterizer.mask_texture());
+        let color_view = text::pipeline::default_view(rasterizer.color_texture());
+        let bind_group = pipeline.make_bind_group(&self.device, &mask_view, &color_view);
+
+        self.text = Some(TextState {
+            rasterizer,
+            pipeline,
+            bind_group,
+        });
+    }
+
+    /// Current cell size in pixels (width, height). Returns `(0, 0)` if
+    /// `with_font` hasn't been called.
+    #[must_use]
+    pub fn cell_size(&self) -> (f32, f32) {
+        self.text
+            .as_ref()
+            .map_or((0.0, 0.0), |t| t.rasterizer.cell_size())
+    }
+
+    /// Set the theme used by [`Renderer::render_term`].
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
+    /// Current theme.
+    pub fn theme(&self) -> Theme {
+        self.theme
     }
 
     /// Resize the surface. Width or height of 0 is clamped to 1 (configuring
@@ -205,6 +306,127 @@ impl Renderer {
     #[must_use]
     pub fn size(&self) -> (u32, u32) {
         (self.config.width, self.config.height)
+    }
+
+    /// Render `term` to the surface: clear → text/cell pass.
+    ///
+    /// [`Renderer::with_font`] must be called first; returns
+    /// [`RenderError::FontNotConfigured`] otherwise.
+    ///
+    /// TODO(damage): full-frame redraw for now; the dirty-set integration
+    /// lands in M5 (decision §7).
+    pub fn render_term(&mut self, term: &Term) -> Result<(), RenderError> {
+        if self.text.is_none() {
+            return Err(RenderError::FontNotConfigured);
+        }
+
+        // Shape every row up front so atlas slots are populated before
+        // we touch the borrow on `self.text` for the render pass.
+        let (rows, _) = term.size();
+        let cell_size;
+        let atlas_dims;
+        let mut row_glyphs: Vec<text::glyph_rasterizer::LineGlyphs> =
+            Vec::with_capacity(rows as usize);
+        {
+            let text = self.text.as_mut().expect("text initialised above");
+            cell_size = text.rasterizer.cell_size();
+            atlas_dims = text.rasterizer.atlas_dims();
+            for r in 0..rows {
+                let row = term.row(r);
+                let line_text: String = row
+                    .cells
+                    .iter()
+                    .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
+                    .collect();
+                let lg = text.rasterizer.shape_line(&self.queue, &line_text);
+                row_glyphs.push(lg);
+            }
+            // Rebuild bind group in case the atlas textures grew (M4b
+            // they don't, but writes through `queue.write_texture` are
+            // visible without rebinding so this is precautionary).
+            let mask_view = text::pipeline::default_view(text.rasterizer.mask_texture());
+            let color_view = text::pipeline::default_view(text.rasterizer.color_texture());
+            text.bind_group =
+                text.pipeline
+                    .make_bind_group(&self.device, &mask_view, &color_view);
+        }
+
+        let theme = self.theme;
+        let instances = build_term_instances(term, cell_size, &theme, &row_glyphs);
+
+        // Acquire surface frame.
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                self.surface.configure(&self.device, &self.config);
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(RenderError::SurfaceLost);
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(());
+            }
+        };
+
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("toastty-render encoder (term)"),
+            });
+
+        #[allow(clippy::cast_precision_loss)] // viewport/atlas sizes fit comfortably in 24 bits.
+        let globals = GlobalsUbo {
+            viewport_and_atlas: [
+                self.config.width as f32,
+                self.config.height as f32,
+                atlas_dims.0 as f32,
+                atlas_dims.1 as f32,
+            ],
+        };
+
+        {
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("toastty-render term pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: f64::from(self.theme.bg[0]),
+                            g: f64::from(self.theme.bg[1]),
+                            b: f64::from(self.theme.bg[2]),
+                            a: f64::from(self.theme.bg[3]),
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            let text = self.text.as_mut().expect("text init checked above");
+            text.pipeline.render(
+                &self.device,
+                &self.queue,
+                &mut rp,
+                &text.bind_group,
+                globals,
+                &instances,
+            );
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        frame.present();
+        Ok(())
     }
 
     /// Render one frame. M4a: just a clear-color pass.
