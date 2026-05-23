@@ -39,3 +39,8 @@ pub use term::{
 /// cursor shape via `toastty_term` instead of taking a direct dep on
 /// `toastty-config`.
 pub use toastty_config::CursorShape;
+
+/// Re-exports for the image protocol layer so the renderer can refer
+/// to graphics types via `toastty_term` instead of taking a direct dep
+/// on `toastty-graphics`.
+pub use toastty_graphics::{ImageData, ImageGrid, ImageRegistry, Placement, SrcRect};
