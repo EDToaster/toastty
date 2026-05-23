@@ -37,19 +37,24 @@ use wgpu::{
 };
 
 use crate::text::glyph_rasterizer::{DEFAULT_LINE_HEIGHT_RATIO, GlyphRasterizer, LineGlyphs};
-use crate::text::instance::{CellInstance, Theme, build_instances};
+use crate::text::instance::{CellInstance, Theme};
 use crate::text::pipeline::{GlobalsUbo, TextPipeline};
 
-fn build_term_instances(
+/// Append instances for `term` into `out`. The closure pulls glyph
+/// slots from the line cache; missing entries fall through to a
+/// background-only instance (the next frame, after re-shape, will fill
+/// in the glyph).
+fn build_term_instances_into(
+    out: &mut Vec<CellInstance>,
     term: &Term,
     cell_size: (f32, f32),
     theme: &Theme,
-    row_glyphs: &[LineGlyphs],
-) -> Vec<CellInstance> {
-    build_instances(term, cell_size, theme, |row, col, ch, _style| {
-        let lg = row_glyphs.get(row as usize)?;
+    row_glyphs: &[Option<LineGlyphs>],
+) {
+    crate::text::instance::build_instances_into(out, term, cell_size, theme, |row, col, ch, _style| {
+        let lg = row_glyphs.get(row as usize)?.as_ref()?;
         lg.by_column.get(&(col, ch)).copied()
-    })
+    });
 }
 
 /// Bundled fallback font: `FiraMono Medium` (OFL).
@@ -135,6 +140,18 @@ struct TextState {
     rasterizer: GlyphRasterizer,
     pipeline: TextPipeline,
     bind_group: wgpu::BindGroup,
+    /// Row-shape cache. `line_cache[r]` holds the shaped glyphs for row
+    /// `r` of the active grid; `None` slots are re-shaped on the next
+    /// frame. Sized to match the term's current visible-row count;
+    /// resized in `render_term` on geometry change.
+    ///
+    /// This is the minimum-viable subset of decision #7 / M9 needed to
+    /// kill the per-keystroke render cost — shape only dirty rows, reuse
+    /// cached glyphs for the rest.
+    line_cache: Vec<Option<LineGlyphs>>,
+    /// Reusable instance buffer. Cleared (not freed) at the start of
+    /// every `render_term` so the allocation survives across frames.
+    instances_scratch: Vec<CellInstance>,
 }
 
 impl std::fmt::Debug for TextState {
@@ -275,6 +292,8 @@ impl Renderer {
             rasterizer,
             pipeline,
             bind_group,
+            line_cache: Vec::new(),
+            instances_scratch: Vec::new(),
         });
     }
 
@@ -336,48 +355,95 @@ impl Renderer {
     /// [`Renderer::with_font`] must be called first; returns
     /// [`RenderError::FontNotConfigured`] otherwise.
     ///
-    /// TODO(damage): full-frame redraw for now; the dirty-set integration
-    /// lands in M5 (decision §7).
+    /// Honors `term.dirty_rows()` for the row-shape cache (decision §7,
+    /// minimum-viable subset for M5; full skip-submit / cell-level
+    /// damage lands in M9).
+    ///
+    /// Setting `TOASTTY_TRACE_RENDER=1` in the environment makes this
+    /// function emit a per-phase timing line via `tracing::info!`. Use it
+    /// to attribute per-frame cost in real workloads (the criterion
+    /// bench under `benches/render_term.rs` runs in release mode; this
+    /// env var works in the debug build too).
+    #[allow(clippy::too_many_lines)] // optional tracing branches add ~30 LoC
     pub fn render_term(&mut self, term: &Term) -> Result<(), RenderError> {
         if self.text.is_none() {
             return Err(RenderError::FontNotConfigured);
         }
 
-        // Shape every row up front so atlas slots are populated before
-        // we touch the borrow on `self.text` for the render pass.
+        let trace = std::env::var_os("TOASTTY_TRACE_RENDER").is_some();
+        let t_total = if trace { Some(std::time::Instant::now()) } else { None };
+
         let (rows, _) = term.size();
         let cell_size;
         let atlas_dims;
-        let mut row_glyphs: Vec<text::glyph_rasterizer::LineGlyphs> =
-            Vec::with_capacity(rows as usize);
         {
             let text = self.text.as_mut().expect("text initialised above");
             cell_size = text.rasterizer.cell_size();
             atlas_dims = text.rasterizer.atlas_dims();
+
+            // Resize the row-shape cache to match the visible row count.
+            // Growth is dirty (new entries are `None`); shrinking just
+            // drops old slots.
+            if text.line_cache.len() != rows as usize {
+                text.line_cache.resize(rows as usize, None);
+            }
+
+            // Re-shape only dirty rows; reuse cached `LineGlyphs` for
+            // the rest. The atlas itself never shrinks, so a clean row's
+            // glyph slots stay valid across frames.
+            let dirty = term.dirty_rows();
+            let mut shaped = 0u32;
+            let t_shape = if trace { Some(std::time::Instant::now()) } else { None };
             for r in 0..rows {
+                let is_dirty = dirty.get(r as usize).copied().unwrap_or(true)
+                    || text.line_cache[r as usize].is_none();
+                if !is_dirty {
+                    continue;
+                }
                 let row = term.row(r);
+                // Reuse a per-call String allocation; under release LLVM
+                // hoists the small allocation per row, but a future
+                // optimization could move the buffer into TextState.
                 let line_text: String = row
                     .cells
                     .iter()
                     .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
                     .collect();
                 let lg = text.rasterizer.shape_line(&self.queue, &line_text);
-                row_glyphs.push(lg);
+                text.line_cache[r as usize] = Some(lg);
+                shaped += 1;
             }
-            // Rebuild bind group in case the atlas textures grew (M4b
-            // they don't, but writes through `queue.write_texture` are
-            // visible without rebinding so this is precautionary).
-            let mask_view = text::pipeline::default_view(text.rasterizer.mask_texture());
-            let color_view = text::pipeline::default_view(text.rasterizer.color_texture());
-            text.bind_group = text
-                .pipeline
-                .make_bind_group(&self.device, &mask_view, &color_view);
+            if let Some(t) = t_shape {
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                tracing::info!(target: "render_trace", "shape rows={shaped} took={ms:.3}ms");
+            }
+            // make_bind_group used to be rebuilt every frame "in case
+            // the atlas textures grew". They don't grow inside the
+            // render path — `queue.write_texture` makes uploads visible
+            // through the existing view. So we keep the bind group from
+            // `with_font_ex` until either resize or font swap rebuilds
+            // it for real.
         }
 
         let theme = self.theme;
-        let instances = build_term_instances(term, cell_size, &theme, &row_glyphs);
+        // Build instances using the cached row glyphs. Reuse the
+        // scratch vec across frames. We have to temporarily extract
+        // the scratch out of TextState because `build_term_instances_into`
+        // needs to read `text.line_cache` immutably while writing to the
+        // scratch; can't hold two borrows of TextState at once.
+        let text = self.text.as_mut().expect("text init");
+        let mut instances = std::mem::take(&mut text.instances_scratch);
+        let t_bi = if trace { Some(std::time::Instant::now()) } else { None };
+        build_term_instances_into(&mut instances, term, cell_size, &theme, &text.line_cache);
+        if let Some(t) = t_bi {
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            tracing::info!(target: "render_trace", "build_instances n={} took={ms:.3}ms", instances.len());
+        }
 
-        // Acquire surface frame.
+        // Acquire surface frame. This is where `Fifo` present mode
+        // blocks waiting for vsync; if any prior frame is still queued,
+        // we sit here for ~16.7ms.
+        let t_acq = if trace { Some(std::time::Instant::now()) } else { None };
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -392,11 +458,16 @@ impl Renderer {
                 return Ok(());
             }
         };
+        if let Some(t) = t_acq {
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            tracing::info!(target: "render_trace", "surface_acquire took={ms:.3}ms (blocks on vsync under Fifo)");
+        }
 
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        let t_enc = if trace { Some(std::time::Instant::now()) } else { None };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -447,8 +518,27 @@ impl Renderer {
             );
         }
 
+        if let Some(t) = t_enc {
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            tracing::info!(target: "render_trace", "encode_pass took={ms:.3}ms");
+        }
+        let t_sub = if trace { Some(std::time::Instant::now()) } else { None };
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
+        if let Some(t) = t_sub {
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            tracing::info!(target: "render_trace", "submit+present took={ms:.3}ms");
+        }
+        if let Some(t) = t_total {
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            tracing::info!(target: "render_trace", "render_term TOTAL={ms:.3}ms ----");
+        }
+
+        // Return the scratch vec to TextState so the next frame reuses
+        // the allocation.
+        if let Some(text) = self.text.as_mut() {
+            text.instances_scratch = instances;
+        }
         Ok(())
     }
 

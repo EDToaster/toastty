@@ -222,10 +222,13 @@ impl App for Toastty {
                 ControlSignal::RedrawIn(Duration::ZERO)
             }
             Event::Redraw => {
-                if let Some(r) = self.renderer.as_mut()
-                    && let Err(e) = r.render_term(&self.term)
-                {
-                    warn!("render_term error: {e}");
+                if let Some(r) = self.renderer.as_mut() {
+                    if let Err(e) = r.render_term(&self.term) {
+                        warn!("render_term error: {e}");
+                    }
+                    // Consume the per-row damage signal so the next
+                    // render only re-shapes rows that changed.
+                    self.term.clear_dirty();
                 }
                 ControlSignal::Continue
             }
