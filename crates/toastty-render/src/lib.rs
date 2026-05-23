@@ -201,6 +201,12 @@ pub(crate) struct CursorBlink {
     pub last_at: Instant,
     pub visible: bool,
     pub interval: Duration,
+    /// Last observed value of the term's `cursor_blink` flag.
+    /// Used by [`CursorBlink::sync_enabled`] to detect the false→true
+    /// edge (DECSCUSR Ps=2/4/6 → Ps=1/3/5 / blink restore) and reset
+    /// the phase so the next tick fires `interval` from the
+    /// re-enable, not from a stale `last_at` (followup I1).
+    pub prev_enabled: bool,
 }
 
 impl CursorBlink {
@@ -209,6 +215,7 @@ impl CursorBlink {
             last_at: now,
             visible: true,
             interval: DEFAULT_CURSOR_BLINK_INTERVAL,
+            prev_enabled: true,
         }
     }
 
@@ -241,6 +248,23 @@ impl CursorBlink {
     /// mid-cycle.
     fn force_visible(&mut self) {
         self.visible = true;
+    }
+
+    /// Followup I1: observe the term's current `cursor_blink` flag.
+    /// On the false→true edge (steady → blinking), reset the phase by
+    /// stamping `last_at = now` and forcing `visible = true`, so the
+    /// first tick after re-enable fires a full `interval` later — not
+    /// instantly (which would visually flicker the cursor).
+    ///
+    /// Must be called before [`CursorBlink::animation_due`] each
+    /// frame so the edge detection runs at most once per frame.
+    fn sync_enabled(&mut self, enabled: bool, now: Instant) {
+        if enabled && !self.prev_enabled {
+            // false → true: fresh cycle.
+            self.last_at = now;
+            self.visible = true;
+        }
+        self.prev_enabled = enabled;
     }
 }
 
@@ -554,6 +578,10 @@ impl Renderer {
         // blink enabled, force the frame through so the renderer can
         // toggle `cursor_visible` and emit the updated cursor instance.
         let now = Instant::now();
+        // Followup I1: detect the steady→blinking edge BEFORE computing
+        // animation_due so the freshly-stamped `last_at` doesn't
+        // immediately fire a tick (which would flash the cursor).
+        self.blink.sync_enabled(term.cursor_blink(), now);
         let cursor_animation_due = self.blink.animation_due(term.cursor_blink(), now);
         if term.damage().is_empty() && !cursor_animation_due && !self.needs_full_clear {
             return Ok(RenderOutcome::Skipped);
@@ -931,6 +959,7 @@ mod tests {
                 .expect("now is past UNIX epoch"),
             visible: true,
             interval: Duration::from_millis(530),
+            prev_enabled: true,
         };
         assert!(blink.animation_due(true, now));
     }
@@ -942,6 +971,7 @@ mod tests {
             last_at: now,
             visible: true,
             interval: Duration::from_millis(530),
+            prev_enabled: true,
         };
         assert!(!blink.animation_due(true, now));
     }
@@ -963,6 +993,7 @@ mod tests {
                 .expect("now is past UNIX epoch"),
             visible: true,
             interval: Duration::from_millis(530),
+            prev_enabled: true,
         };
         // Term has blink disabled → animation NEVER due.
         assert!(!blink.animation_due(false, now));
@@ -990,6 +1021,7 @@ mod tests {
                 .expect("now is past UNIX epoch"),
             visible: true,
             interval: Duration::from_millis(530),
+            prev_enabled: true,
         };
         let d = blink.next_deadline(true, now).unwrap();
         assert_eq!(d, Duration::ZERO, "overdue deadline must saturate to 0");
@@ -1001,6 +1033,90 @@ mod tests {
         blink.visible = false;
         blink.force_visible();
         assert!(blink.visible);
+    }
+
+    /// Followup I1: on the steady → blinking edge, the previous
+    /// `last_at` is stale (the term was disabled), so `animation_due`
+    /// would return true immediately and the cursor would flicker on
+    /// the very first frame after re-enable. `sync_enabled` must reset
+    /// `last_at` and `visible` on the edge so the next tick is a full
+    /// `interval` away.
+    #[test]
+    fn cursor_blink_re_enable_resets_phase() {
+        // Set up a blink with a tiny interval (1 ms) and an ancient
+        // `last_at`, then mark it as "previously disabled". The
+        // simulated "now" is well past `last_at + interval`, which
+        // without the fix would trigger an instant flash.
+        let then = Instant::now();
+        let mut blink = CursorBlink {
+            last_at: then
+                .checked_sub(Duration::from_secs(5))
+                .expect("now is past UNIX epoch"),
+            visible: false,
+            interval: Duration::from_millis(1),
+            prev_enabled: false,
+        };
+        // Simulate "later" (no real sleep needed — the edge check
+        // operates on the `now` parameter).
+        let later = then;
+        blink.sync_enabled(true, later);
+
+        // After the edge: visible is back ON, and the next deadline
+        // is close to `interval` (not zero / overdue).
+        assert!(blink.visible, "re-enable must force visible ON");
+        let d = blink
+            .next_deadline(true, later)
+            .expect("blink is enabled now");
+        assert_eq!(d, blink.interval, "fresh cycle: deadline == interval");
+        // And no tick should be due right now.
+        assert!(
+            !blink.animation_due(true, later),
+            "no instant flicker — first tick should be a full interval away"
+        );
+    }
+
+    /// Followup I1: `sync_enabled` must be a no-op on the true → true
+    /// edge so it doesn't reset the phase mid-cycle.
+    #[test]
+    fn cursor_blink_sync_enabled_noop_when_already_enabled() {
+        let now = Instant::now();
+        let original_last_at = now
+            .checked_sub(Duration::from_millis(100))
+            .expect("now is past UNIX epoch");
+        let mut blink = CursorBlink {
+            last_at: original_last_at,
+            visible: false,
+            interval: Duration::from_millis(530),
+            prev_enabled: true,
+        };
+        blink.sync_enabled(true, now);
+        // true → true: nothing changed.
+        assert_eq!(blink.last_at, original_last_at);
+        assert!(!blink.visible);
+        assert!(blink.prev_enabled);
+    }
+
+    /// Followup I1: on the true → false edge `sync_enabled` should
+    /// only record `prev_enabled = false`; it must not touch
+    /// `last_at` or `visible` (the steady-cursor force-visible path
+    /// lives elsewhere — `force_visible` — and a stale `last_at`
+    /// while disabled is harmless since `animation_due` short-circuits).
+    #[test]
+    fn cursor_blink_sync_enabled_disable_only_records_edge() {
+        let now = Instant::now();
+        let original_last_at = now
+            .checked_sub(Duration::from_millis(100))
+            .expect("now is past UNIX epoch");
+        let mut blink = CursorBlink {
+            last_at: original_last_at,
+            visible: false,
+            interval: Duration::from_millis(530),
+            prev_enabled: true,
+        };
+        blink.sync_enabled(false, now);
+        assert_eq!(blink.last_at, original_last_at);
+        assert!(!blink.visible);
+        assert!(!blink.prev_enabled);
     }
 
     /// Followup C1: when the blink toggles visible→invisible, the
