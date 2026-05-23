@@ -127,7 +127,9 @@ impl Theme {
     pub fn resolve_fg(&self, c: TColor) -> [f32; 4] {
         match c {
             TColor::Default => self.fg,
-            other => self.palette[palette_index(other)],
+            TColor::Indexed256(idx) => self.resolve_indexed256(idx),
+            TColor::Rgb(r, g, b) => srgb_to_linear_rgba(r, g, b),
+            named => self.palette[palette_index(named)],
         }
     }
 
@@ -135,14 +137,66 @@ impl Theme {
     pub fn resolve_bg(&self, c: TColor) -> [f32; 4] {
         match c {
             TColor::Default => self.bg,
-            other => self.palette[palette_index(other)],
+            TColor::Indexed256(idx) => self.resolve_indexed256(idx),
+            TColor::Rgb(r, g, b) => srgb_to_linear_rgba(r, g, b),
+            named => self.palette[palette_index(named)],
         }
+    }
+
+    /// Resolve an xterm 256-color index against this theme.
+    ///
+    /// - `0..16` aliases the 16-entry palette (so the user's theme colors apply).
+    /// - `16..232` is the 6×6×6 RGB cube using the canonical xterm levels
+    ///   `[0, 95, 135, 175, 215, 255]` (sRGB).
+    /// - `232..256` is the 24-step grayscale ramp at sRGB values
+    ///   `8 + 10*step` (8, 18, …, 238).
+    #[must_use]
+    pub fn resolve_indexed256(&self, idx: u8) -> [f32; 4] {
+        if idx < 16 {
+            return self.palette[idx as usize];
+        }
+        if idx < 232 {
+            let n = idx - 16;
+            let r = CUBE_LEVELS[(n / 36) as usize];
+            let g = CUBE_LEVELS[((n / 6) % 6) as usize];
+            let b = CUBE_LEVELS[(n % 6) as usize];
+            return srgb_to_linear_rgba(r, g, b);
+        }
+        let step = idx - 232;
+        let v = 8 + 10 * step;
+        srgb_to_linear_rgba(v, v, v)
     }
 }
 
+/// xterm 6×6×6 cube levels in sRGB (8-bit). Same on every common implementation.
+const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+/// Convert one sRGB byte channel to linear-light float.
+fn srgb_channel_to_linear(v: u8) -> f32 {
+    let c = f32::from(v) / 255.0;
+    if c <= 0.040_45 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn srgb_to_linear_rgba(r: u8, g: u8, b: u8) -> [f32; 4] {
+    [
+        srgb_channel_to_linear(r),
+        srgb_channel_to_linear(g),
+        srgb_channel_to_linear(b),
+        1.0,
+    ]
+}
+
 fn palette_index(c: TColor) -> usize {
+    // Extended colors (`Indexed256`, `Rgb`) are resolved before reaching
+    // this function inside `Theme::resolve_fg/bg`. If a future caller
+    // forgets that, the fallback below maps them to palette[0] (Black)
+    // rather than UB — clippy folds it into the `Default | Black` arm.
     match c {
-        TColor::Default | TColor::Black => 0,
+        TColor::Default | TColor::Black | TColor::Indexed256(_) | TColor::Rgb(_, _, _) => 0,
         TColor::Red => 1,
         TColor::Green => 2,
         TColor::Yellow => 3,
@@ -575,5 +629,74 @@ mod tests {
             let v = theme.resolve_fg(c);
             assert!(v[3] > 0.99);
         }
+    }
+
+    // ----- Extended-color resolution ---------------------------------
+
+    #[test]
+    fn resolve_indexed256_0_through_15_aliases_palette() {
+        let theme = Theme::default_dark();
+        for i in 0u8..16 {
+            assert_eq!(
+                theme.resolve_indexed256(i),
+                theme.palette[i as usize],
+                "indexed256({i}) should alias palette[{i}]"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_indexed256_cube_corners_match_xterm_levels() {
+        // Cube index 16 = (0,0,0) → black.
+        let theme = Theme::default_dark();
+        let black = theme.resolve_indexed256(16);
+        assert!(black[0] < 1e-6);
+        assert!(black[1] < 1e-6);
+        assert!(black[2] < 1e-6);
+        // Cube index 231 = (255,255,255) → white.
+        let white = theme.resolve_indexed256(231);
+        assert!((white[0] - 1.0).abs() < 1e-6);
+        assert!((white[1] - 1.0).abs() < 1e-6);
+        assert!((white[2] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resolve_indexed256_grayscale_ramp_is_monotonic() {
+        let theme = Theme::default_dark();
+        let mut last = -1.0_f32;
+        for i in 232u8..=255 {
+            let g = theme.resolve_indexed256(i);
+            // R == G == B for grayscale.
+            assert!((g[0] - g[1]).abs() < 1e-6);
+            assert!((g[1] - g[2]).abs() < 1e-6);
+            assert!(g[0] > last, "grayscale[{i}] not strictly increasing");
+            last = g[0];
+        }
+    }
+
+    #[test]
+    fn resolve_rgb_round_trips_pure_white_and_black() {
+        let theme = Theme::default_dark();
+        let white = theme.resolve_fg(TColor::Rgb(255, 255, 255));
+        assert!((white[0] - 1.0).abs() < 1e-6);
+        let black = theme.resolve_bg(TColor::Rgb(0, 0, 0));
+        assert!(black[0] < 1e-6);
+    }
+
+    #[test]
+    fn resolve_rgb_uses_srgb_to_linear() {
+        let theme = Theme::default_dark();
+        // 128 in sRGB → ~0.2159 linear (not 0.5).
+        let mid = theme.resolve_fg(TColor::Rgb(128, 128, 128));
+        assert!(mid[0] > 0.2 && mid[0] < 0.23, "linearised mid = {}", mid[0]);
+    }
+
+    #[test]
+    fn palette_index_defensive_branch_for_extended_variants() {
+        // `palette_index` is only invoked for the named-variant branch
+        // inside `resolve_fg/bg`, but the defensive arm exists so a future
+        // refactor can't UB. Exercise it directly.
+        assert_eq!(super::palette_index(TColor::Indexed256(200)), 0);
+        assert_eq!(super::palette_index(TColor::Rgb(1, 2, 3)), 0);
     }
 }

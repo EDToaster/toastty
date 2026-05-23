@@ -4,10 +4,13 @@
 //! as the memory dominator. Pack `Style` into a `u32` stylesheet ID once the
 //! SGR coverage stabilises (decision #6 + open question in architecture.md).
 
-/// Standard ANSI color, plus a "default" sentinel.
+/// Standard ANSI color, plus a "default" sentinel, the 256-color (xterm
+/// `CSI 38;5;N m`) index, and 24-bit truecolor (xterm `CSI 38;2;R;G;B m`).
 ///
-/// 256-color and 24-bit truecolor are deliberately out of scope for M3;
-/// they live in a future SGR pass once the parser surface settles.
+/// The 16 named variants are resolved by the renderer through the active
+/// theme's palette. `Indexed256(0..16)` is treated identically to the named
+/// variants by convention; `16..232` is the 6×6×6 RGB cube and `232..256` is
+/// the 24-step grayscale ramp (the standard xterm table).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Color {
     /// Use the terminal's default foreground / background.
@@ -29,6 +32,12 @@ pub enum Color {
     BrightMagenta,
     BrightCyan,
     BrightWhite,
+    /// 256-color palette entry. Indices 0..16 alias the named palette, 16..232
+    /// are the 6×6×6 RGB cube, 232..256 are 24 grayscale steps.
+    Indexed256(u8),
+    /// 24-bit truecolor in sRGB (gamma-encoded) space. The renderer converts
+    /// to linear light at resolve time.
+    Rgb(u8, u8, u8),
 }
 
 /// Per-cell rendering attribute flags.
