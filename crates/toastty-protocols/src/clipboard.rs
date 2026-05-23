@@ -101,7 +101,7 @@ mod tests {
                 assert_eq!(selection.0, b"c");
                 assert_eq!(payload, b"hello");
             }
-            _ => panic!("expected Set"),
+            Osc52Op::Query { .. } => panic!("expected Set"),
         }
     }
 
@@ -110,7 +110,7 @@ mod tests {
         let op = parse(b"c;?").unwrap();
         match op {
             Osc52Op::Query { selection } => assert_eq!(selection.0, b"c"),
-            _ => panic!("expected Query"),
+            Osc52Op::Set { .. } => panic!("expected Query"),
         }
     }
 
@@ -121,7 +121,7 @@ mod tests {
         let op = parse(b"cs;aGVsbG8=").unwrap();
         match op {
             Osc52Op::Set { selection, .. } => assert_eq!(selection.0, b"cs"),
-            _ => panic!("expected Set"),
+            Osc52Op::Query { .. } => panic!("expected Set"),
         }
     }
 

@@ -1187,12 +1187,15 @@ mod tests {
         assert_ne!(override_rgb, default);
 
         // Linearisation must differ too (i.e. the rebuild path doesn't
-        // collapse them into the same float vec).
+        // collapse them into the same float vec). Comparison done
+        // channel-by-channel with an epsilon to satisfy clippy's
+        // `float_cmp` lint.
         let default_lin =
             crate::text::instance::srgb_to_linear_rgba(default[0], default[1], default[2]);
         let override_lin =
             crate::text::instance::srgb_to_linear_rgba(override_rgb[0], override_rgb[1], override_rgb[2]);
-        assert_ne!(default_lin, override_lin);
+        let any_differs = (0..4).any(|i| (default_lin[i] - override_lin[i]).abs() > 1e-6);
+        assert!(any_differs, "override should yield a different linear rgba");
     }
 
     /// Followup C1: when the blink toggles visible→invisible, the

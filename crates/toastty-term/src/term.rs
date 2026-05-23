@@ -106,7 +106,14 @@ pub const KITTY_FLAG_REPORT_ALL_AS_ESC: u8 = 0b0_1000;
 pub const KITTY_FLAG_REPORT_TEXT: u8 = 0b1_0000;
 
 /// Top-level terminal state object.
+///
+/// `clippy::struct_excessive_bools` is suppressed: the boolean fields
+/// here track orthogonal DECSET modes (bracketed paste / focus report /
+/// grapheme cluster / inband resize / OSC 52 read+write security) plus
+/// the cursor-blink + alt-screen flags. Each is independent state, not
+/// a 7-bit state machine.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Term {
     primary: Grid,
     alt: Grid,
@@ -1462,6 +1469,7 @@ impl Perform for Term {
     /// Note: title changes do **not** mark any row dirty. The renderer's
     /// per-frame cursor pass already runs every frame; the title lives
     /// outside the grid entirely.
+    #[allow(clippy::too_many_lines)] // each OSC arm is small but the table is wide.
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         // OSC must have at least one param: the code.
         let Some(code_bytes) = params.first() else {
@@ -3546,7 +3554,7 @@ mod tests {
         assert_eq!(reqs.len(), 1);
         match &reqs[0] {
             ClipboardRequest::Set { data } => assert_eq!(data, b"hello"),
-            _ => panic!("expected Set"),
+            ClipboardRequest::Query { .. } => panic!("expected Set"),
         }
     }
 
@@ -3569,7 +3577,7 @@ mod tests {
         assert_eq!(reqs.len(), 1);
         match &reqs[0] {
             ClipboardRequest::Query { selection } => assert_eq!(selection, b"c"),
-            _ => panic!("expected Query"),
+            ClipboardRequest::Set { .. } => panic!("expected Query"),
         }
     }
 

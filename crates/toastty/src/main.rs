@@ -512,10 +512,10 @@ impl Toastty {
         // on press only. Consume the event so the mouse encoder doesn't
         // also forward it to the foreground app.
         if state == KeyState::Pressed && is_open_link_binding(button, modifiers) {
-            if let Some(url) = self.hyperlink_under_cursor(position) {
-                if let Err(e) = webbrowser::open(&url) {
-                    warn!("open URL failed: {e}");
-                }
+            if let Some(url) = self.hyperlink_under_cursor(position)
+                && let Err(e) = webbrowser::open(&url)
+            {
+                warn!("open URL failed: {e}");
             }
             return ControlSignal::Continue;
         }

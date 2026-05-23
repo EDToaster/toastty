@@ -1,5 +1,15 @@
 # M10 — Shell integration
 
+**Status.** Landed.
+
+- OSC 7 → `Term::cwd()` (`crates/toastty-term/src/term.rs` + `crates/toastty-protocols/src/osc_cwd.rs`).
+- OSC 8 → `Cell.hyperlink_id` + `Term::hyperlink_url(id)` (intern table). Renderer emits a 2 px underline strip via `FLAG_UNDERLINE`. Binary opens with `Cmd-Left` on macOS / `Ctrl-Left` elsewhere via `webbrowser`.
+- OSC 52 → `ClipboardRequest` queue + `arboard`. Gated by `[security] osc_52_read / osc_52_write`; both default `false`.
+- OSC 133 → `Term::prompt_marks()` (FIFO cap 4096).
+- OSC 4 → palette set + query. Term keeps a 256-entry override table + revision counter; renderer caches a linear-light `[[f32; 4]; 256]` palette rebuilt on revision bump.
+- Replies (OSC 4 query, OSC 52 read) flow through `Term::pty_replies` drained by the binary post-`parser.advance`.
+- Shell snippets shipped in `share/shell-integration/{bash.sh,zsh.sh,fish.fish}` + README; binary exports `TOASTTY=1` so they gate cleanly.
+
 **Goal.** Shell snippets light up. Clickable URLs. Hot-swappable themes. The terminal feels like part of the shell, not just a dumb tty.
 
 **Scope.** Five OSCs and the platform glue around them:

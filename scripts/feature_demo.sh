@@ -323,6 +323,64 @@ read -r _
 printf '%s?2048l' "$csi"
 
 # ─────────────────────────────────────────────────────────────────
+section "M10.1 — OSC 7 (current working directory)"
+note "Advertise the cwd. toastty stores it on Term::cwd(); future UI"
+note "can surface it. Try with a path containing a space."
+printf '%s]7;file://localhost%s%s' "$esc" "$PWD" "$st"
+note "Emitted: ESC ] 7 ; file://localhost${PWD} ESC \\\\"
+sleep 1
+
+# ─────────────────────────────────────────────────────────────────
+section "M10.2 — OSC 133 (semantic prompt markers)"
+note "Mark prompt start / end / command start / command finished with"
+note "exit code. toastty records these for command-level navigation."
+printf '%s]133;A%s' "$esc" "$st"  # prompt start
+printf '%s]133;B%s' "$esc" "$st"  # prompt end
+echo "(simulated: A=prompt_start, B=prompt_end emitted around this line)"
+printf '%s]133;C%s' "$esc" "$st"  # command start
+printf '%s]133;D;0%s' "$esc" "$st" # command finished
+note "Emitted: A,B,C,D markers; check t.prompt_marks() in tests."
+sleep 1
+
+# ─────────────────────────────────────────────────────────────────
+section "M10.3 — OSC 4 (palette query + set)"
+note "Override palette index 1 (red) to bright magenta, then echo a red"
+note "char — it should show up magenta. Reset with default afterwards."
+printf '%s]4;1;rgb:ff/00/ff%s' "$esc" "$st"
+printf '%s[31mred-but-magenta-now%s[0m\n' "$csi" "$csi"
+sleep 1
+note "Querying index 1 — toastty replies on the PTY with the new value:"
+printf '%s]4;1;?%s' "$esc" "$st"
+note "(the reply is consumed by your shell; look for an ESC ] 4 ; 1 ;"
+note " rgb:ffff/0000/ffff ESC \\\\ sequence)"
+sleep 1
+# Restore the default red so the rest of the demo isn't tinted.
+printf '%s]4;1;rgb:80/00/00%s' "$esc" "$st"
+
+# ─────────────────────────────────────────────────────────────────
+section "M10.4 — OSC 8 (hyperlinks)"
+note "Wrap text in an OSC 8 hyperlink. toastty stamps the cells with a"
+note "hyperlink id, renders an underline strip, and Cmd-click (macOS) /"
+note "Ctrl-click (Linux) opens the URL via the OS browser."
+printf '  Visit '
+printf '%s]8;;https://example.com%sexample.com%s]8;;%s' "$esc" "$st" "$esc" "$st"
+echo ' (Cmd/Ctrl-click)'
+sleep 1
+
+# ─────────────────────────────────────────────────────────────────
+section "M10.5 — OSC 52 (clipboard, gated by [security])"
+note "OSC 52 set + query. Both gates default OFF — to exercise this,"
+note "enable osc_52_read/osc_52_write in your toastty config first."
+note "Emitting OSC 52 ; c ; <base64-of-hello>:"
+printf '%s]52;c;aGVsbG8=%s' "$esc" "$st"
+note "If write is enabled, your clipboard now contains \"hello\"."
+note "Emitting OSC 52 ; c ; ? (read request):"
+printf '%s]52;c;?%s' "$esc" "$st"
+note "If read is enabled, your shell will see an OSC 52 reply byte"
+note "stream — the reply contains the base64-encoded clipboard."
+sleep 1
+
+# ─────────────────────────────────────────────────────────────────
 section "Done"
 note "If colors leak between sections (esp. into this final line),"
 note "the SGR multi-param parsing fix is incomplete."
