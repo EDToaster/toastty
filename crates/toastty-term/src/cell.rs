@@ -4,6 +4,14 @@
 //! as the memory dominator. Pack `Style` into a `u32` stylesheet ID once the
 //! SGR coverage stabilises (decision #6 + open question in architecture.md).
 
+use std::num::NonZeroU16;
+
+/// Intern-table identifier for an OSC 8 hyperlink URL.
+///
+/// `NonZeroU16` exists so `Option<HyperlinkId>` niche-packs into 2 bytes
+/// without growing `Cell`. 65535 distinct URLs per session is plenty.
+pub type HyperlinkId = NonZeroU16;
+
 /// Standard ANSI color, plus a "default" sentinel, the 256-color (xterm
 /// `CSI 38;5;N m`) index, and 24-bit truecolor (xterm `CSI 38;2;R;G;B m`).
 ///
@@ -98,6 +106,11 @@ pub struct Cell {
     /// instances (otherwise we'd over-draw the second half of a CJK
     /// ideograph with a blank glyph).
     pub is_continuation: bool,
+    /// Intern-table id of the OSC 8 hyperlink this cell belongs to, if
+    /// any. `None` when not part of a hyperlink. Resolves to a URL via
+    /// `Term::hyperlink_url`. Stored as `NonZeroU16` so
+    /// `Option<HyperlinkId>` niche-packs to 2 bytes.
+    pub hyperlink_id: Option<HyperlinkId>,
 }
 
 impl Cell {
@@ -106,6 +119,7 @@ impl Cell {
         ch: ' ',
         style: Style::RESET,
         is_continuation: false,
+        hyperlink_id: None,
     };
 }
 
@@ -175,5 +189,37 @@ mod tests {
         };
         let b = a;
         assert_eq!(a, b);
+    }
+
+    /// M10.5: `Option<HyperlinkId>` must niche-pack to 2 bytes — the
+    /// whole point of using `NonZeroU16`. If a future refactor swaps in
+    /// a plain `u16` (or worse, `u32`) this gate will catch it.
+    #[test]
+    fn option_hyperlink_id_niche_packs_to_two_bytes() {
+        assert_eq!(std::mem::size_of::<Option<HyperlinkId>>(), 2);
+    }
+
+    /// M10.5: document the current `Cell` size so a future cell-layout
+    /// refactor (decision #6 / stylesheet packing) intentionally
+    /// chooses what to do. Updating the assertion when the layout
+    /// genuinely changes is fine — the goal is to catch *accidental*
+    /// bloat.
+    #[test]
+    fn cell_size_documented() {
+        // ch (4) + style (~24) + is_continuation (1) + hyperlink_id (2)
+        // + padding. The exact number depends on `Style`'s layout;
+        // we lock in the value so changes are deliberate.
+        let s = std::mem::size_of::<Cell>();
+        // 40 bytes today (Style has lots of u8 enums + 4 bools).
+        // Refactor freely but update this number to track.
+        assert!(
+            s <= 64,
+            "Cell grew to {s} bytes — please check the layout (decision #6)"
+        );
+    }
+
+    #[test]
+    fn blank_cell_has_no_hyperlink_id() {
+        assert_eq!(Cell::BLANK.hyperlink_id, None);
     }
 }

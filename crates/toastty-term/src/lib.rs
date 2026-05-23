@@ -25,7 +25,7 @@ mod damage;
 mod grid;
 mod term;
 
-pub use cell::{Cell, Color, Style, StyleFlags};
+pub use cell::{Cell, Color, HyperlinkId, Style, StyleFlags};
 pub use cursor::Cursor;
 pub use damage::{Damage, RowDamage};
 pub use grid::{Grid, Row};

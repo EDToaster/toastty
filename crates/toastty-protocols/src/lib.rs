@@ -12,6 +12,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod hyperlink;
 pub mod osc_cwd;
 pub mod palette;
 pub mod resize_inband;

@@ -21,6 +21,13 @@ pub const FLAG_COLOR_GLYPH: u32 = 1 << 1;
 /// Flag bit: this instance has no glyph at all (background-only fill).
 pub const FLAG_NO_GLYPH: u32 = 1 << 2;
 
+/// Flag bit: this instance is the underline strip for a cell flagged
+/// with SGR underline or an active OSC 8 hyperlink. The shader doesn't
+/// branch on this bit (current shader treats it the same as
+/// `FLAG_NO_GLYPH`); we still flag it so future shader work can pick
+/// it out without re-scanning the instance buffer.
+pub const FLAG_UNDERLINE: u32 = 1 << 3;
+
 /// GPU-side instance layout. `repr(C)` + `Pod + Zeroable` so it round-trips
 /// through `bytemuck::cast_slice` cleanly.
 ///
@@ -314,6 +321,30 @@ pub fn is_blank_for_render(cell: &Cell) -> bool {
         && cell.style.fg == TColor::Default
         && !cell.style.flags.reverse
         && !cell.style.flags.underline
+        // A hyperlinked cell needs the underline strip even when its
+        // text is empty / styled the same as the surroundings.
+        && cell.hyperlink_id.is_none()
+}
+
+/// Build an underline-strip instance for a cell. 2 px thick, flush with
+/// the bottom of the cell, using `fg` as the color (same as the glyph).
+/// Called for cells with SGR underline or an active OSC 8 hyperlink.
+fn underline_instance(pos: [f32; 2], cell_size: [f32; 2], fg: [f32; 4]) -> CellInstance {
+    let thickness = 2.0_f32.min(cell_size[1]);
+    let y = pos[1] + cell_size[1] - thickness;
+    CellInstance {
+        pos: [pos[0], y],
+        size: [cell_size[0], thickness],
+        uv_min: [0.0, 0.0],
+        uv_max: [0.0, 0.0],
+        // Render as `bg = fg` so the underline shows up regardless of
+        // whether the shader currently routes through the FLAG_UNDERLINE
+        // branch — it'll fall through `FLAG_NO_GLYPH` and emit `bg`.
+        fg,
+        bg: fg,
+        flags: FLAG_NO_GLYPH | FLAG_UNDERLINE,
+        pad: [0; 3],
+    }
 }
 
 /// Effective fg/bg for a cell after applying SGR `reverse` (mode 7).
@@ -435,6 +466,11 @@ pub fn build_instances_into<F>(
                     flags,
                     pad: [0; 3],
                 });
+            }
+
+            // Underline strip for SGR underline or OSC 8 hyperlink.
+            if cell.style.flags.underline || cell.hyperlink_id.is_some() {
+                out.push(underline_instance(pos, [cell_w, cell_h], fg));
             }
         }
     }
@@ -568,6 +604,13 @@ pub fn build_dirty_instances_into<F>(
                     flags,
                     pad: [0; 3],
                 });
+            }
+
+            // Underline strip for SGR underline or OSC 8 hyperlink. Emit
+            // *after* the glyph so it draws on top of any descender
+            // (matches xterm).
+            if cell.style.flags.underline || cell.hyperlink_id.is_some() {
+                out.push(underline_instance(pos, [cell_w, cell_h], fg));
             }
         }
     }
@@ -777,6 +820,11 @@ mod tests {
         assert!(!is_blank_for_render(&c));
         let mut c = Cell::BLANK;
         c.ch = 'a';
+        assert!(!is_blank_for_render(&c));
+        // M10.5: a hyperlinked cell must NOT be considered blank — the
+        // underline strip must still emit.
+        let mut c = Cell::BLANK;
+        c.hyperlink_id = std::num::NonZeroU16::new(1);
         assert!(!is_blank_for_render(&c));
     }
 
@@ -1032,6 +1080,39 @@ mod tests {
         assert!(cols.contains(&1), "'你' at col 1");
         assert!(cols.contains(&3), "'b' at col 3 (after continuation)");
         assert!(!cols.contains(&2), "col 2 (continuation) must be skipped");
+    }
+
+    // ----- OSC 8 hyperlink underline emission -----------------------------
+
+    #[test]
+    fn hyperlinked_cell_emits_underline_instance() {
+        // A printed cell with an active OSC 8 hyperlink must produce
+        // an underline strip in the instance buffer regardless of SGR
+        // underline state.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b]8;;https://example.com\x1b\\X");
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        let underline_count = v.iter().filter(|i| i.flags & FLAG_UNDERLINE != 0).count();
+        assert_eq!(underline_count, 1, "hyperlinked cell must emit one underline strip");
+    }
+
+    #[test]
+    fn sgr_underline_cell_emits_underline_instance() {
+        // Same as above but via SGR mode 4 (\\x1b[4mX).
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[4mX");
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        let underline_count = v.iter().filter(|i| i.flags & FLAG_UNDERLINE != 0).count();
+        assert_eq!(underline_count, 1);
+    }
+
+    #[test]
+    fn no_underline_when_neither_sgr_nor_hyperlink_set() {
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"X");
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        let underline_count = v.iter().filter(|i| i.flags & FLAG_UNDERLINE != 0).count();
+        assert_eq!(underline_count, 0);
     }
 
     #[test]

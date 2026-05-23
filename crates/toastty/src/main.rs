@@ -431,6 +431,7 @@ impl Toastty {
         button: MouseButton,
         state: KeyState,
         position: (f64, f64),
+        modifiers: Modifiers,
     ) -> ControlSignal {
         self.mouse_pos = position;
         match state {
@@ -441,15 +442,42 @@ impl Toastty {
                 }
             }
         }
+        // OSC 8 click-to-open: Cmd-Left on macOS / Ctrl-Left elsewhere
+        // on press only. Consume the event so the mouse encoder doesn't
+        // also forward it to the foreground app.
+        if state == KeyState::Pressed && is_open_link_binding(button, modifiers) {
+            if let Some(url) = self.hyperlink_under_cursor(position) {
+                if let Err(e) = webbrowser::open(&url) {
+                    warn!("open URL failed: {e}");
+                }
+            }
+            return ControlSignal::Continue;
+        }
         let kind = classify_button_event(button, state);
         let mode = self.term.mouse_mode();
         if protocol_wants_event(mode, &kind) {
             let cell = self.current_cell();
-            if let Some(bytes) = encode_mouse(kind, cell, Modifiers::empty(), mode) {
+            if let Some(bytes) = encode_mouse(kind, cell, modifiers, mode) {
                 self.write_pty(&bytes);
             }
         }
         ControlSignal::Continue
+    }
+
+    /// Look up the OSC 8 hyperlink URL at pixel `(x, y)`, if any.
+    fn hyperlink_under_cursor(&self, position: (f64, f64)) -> Option<String> {
+        let cell_size = self.renderer.as_ref()?.cell_size();
+        let (rows, cols) = self.term.size();
+        // `pixel_to_cell` returns 1-based (col, row). Convert to
+        // 0-based with a saturating sub so column 1 / row 1 map to
+        // (0, 0) instead of underflowing.
+        let (col_1based, row_1based) = pixel_to_cell(position, cell_size, (rows, cols));
+        let col = col_1based.checked_sub(1)?;
+        let row = row_1based.checked_sub(1)?;
+        let row_ref = self.term.row(row);
+        let cell = row_ref.cells.get(col as usize)?;
+        let id = cell.hyperlink_id?;
+        self.term.hyperlink_url(id).map(str::to_string)
     }
 
     fn handle_scroll(&mut self, delta_x: f64, delta_y: f64) -> ControlSignal {
@@ -583,7 +611,8 @@ impl App for Toastty {
                 button,
                 state,
                 position,
-            } => self.handle_mouse(button, state, position),
+                modifiers,
+            } => self.handle_mouse(button, state, position, modifiers),
             Event::Scroll { delta_x, delta_y } => self.handle_scroll(delta_x, delta_y),
             Event::PtyBytes(bytes) => {
                 let fresh_bsu = self.handle_pty_bytes(&bytes);
@@ -616,6 +645,20 @@ impl App for Toastty {
             // Unhandled variants (e.g. Event::User, synthetic wakeups).
             Event::User => ControlSignal::Continue,
         }
+    }
+}
+
+/// True when `(button, modifiers)` is the "open hyperlink under cursor"
+/// binding. On macOS it's `Cmd-Left`; on every other platform it's
+/// `Ctrl-Left` (matching iTerm2 / Alacritty conventions).
+fn is_open_link_binding(button: MouseButton, modifiers: Modifiers) -> bool {
+    if button != MouseButton::Left {
+        return false;
+    }
+    if cfg!(target_os = "macos") {
+        modifiers.contains(Modifiers::SUPER)
+    } else {
+        modifiers.contains(Modifiers::CONTROL)
     }
 }
 
@@ -689,5 +732,42 @@ mod tests {
             &LogicalKey::Named(toastty_window::NamedKey::Enter),
             Modifiers::SUPER
         ));
+    }
+
+    // ----- is_open_link_binding truth table (M10.5) -----------------------
+
+    #[test]
+    fn left_click_without_modifier_is_not_open_link() {
+        assert!(!is_open_link_binding(MouseButton::Left, Modifiers::empty()));
+    }
+
+    #[test]
+    fn right_click_is_never_open_link() {
+        assert!(!is_open_link_binding(MouseButton::Right, Modifiers::SUPER));
+        assert!(!is_open_link_binding(
+            MouseButton::Right,
+            Modifiers::CONTROL
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cmd_left_is_open_link_on_macos() {
+        assert!(is_open_link_binding(MouseButton::Left, Modifiers::SUPER));
+        // Ctrl-Left is NOT open-link on macOS.
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::CONTROL
+        ));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn ctrl_left_is_open_link_on_non_macos() {
+        assert!(is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::CONTROL
+        ));
+        assert!(!is_open_link_binding(MouseButton::Left, Modifiers::SUPER));
     }
 }

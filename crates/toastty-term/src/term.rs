@@ -185,6 +185,16 @@ pub struct Term {
     /// renderer keeps a cached linear-light palette and compares
     /// revisions to decide when to rebuild.
     palette_revision: u32,
+    /// Intern table for OSC 8 hyperlink URLs. The cell stores a
+    /// `NonZeroU16` index into this `Vec`; closing the hyperlink
+    /// (`OSC 8 ; ; ST`) clears `current_hyperlink` without touching
+    /// previously-stamped cells. Bounded at 65535 distinct URLs per
+    /// session — well above anything reasonable.
+    hyperlinks: Vec<String>,
+    /// Currently active hyperlink id stamped onto every cell written by
+    /// [`Term::print_char`] until the next `OSC 8 ; ; ST` (closer) or
+    /// a new `OSC 8 ; ... ; url` (which switches to a fresh id).
+    current_hyperlink: Option<crate::cell::HyperlinkId>,
 }
 
 /// One semantic prompt marker recorded from OSC 133.
@@ -259,6 +269,8 @@ impl Term {
             pty_replies: Vec::new(),
             palette_overrides: Box::new([None; 256]),
             palette_revision: 0,
+            hyperlinks: Vec::new(),
+            current_hyperlink: None,
         }
     }
 
@@ -301,6 +313,35 @@ impl Term {
         self.palette_overrides[idx as usize] = Some(rgb);
         self.palette_revision = self.palette_revision.wrapping_add(1);
         self.mark_all_dirty();
+    }
+
+    /// Resolve a hyperlink id (as stamped on a [`Cell`]) back to its URL.
+    /// Returns `None` if the id is out of range — defensive against
+    /// future bugs since ids are minted by [`Term::intern_hyperlink`]
+    /// and stored as `NonZeroU16`.
+    #[must_use]
+    pub fn hyperlink_url(&self, id: crate::cell::HyperlinkId) -> Option<&str> {
+        // Ids are 1-based: `NonZeroU16::new(1)` indexes `hyperlinks[0]`.
+        let idx = id.get() as usize - 1;
+        self.hyperlinks.get(idx).map(String::as_str)
+    }
+
+    /// Intern `url` into the hyperlink table and return its id. Dedups
+    /// against existing entries so the same URL across many cells
+    /// shares one id. Returns `None` if the table is full (65535
+    /// distinct URLs in one session — practically unreachable).
+    fn intern_hyperlink(&mut self, url: &str) -> Option<crate::cell::HyperlinkId> {
+        if let Some(pos) = self.hyperlinks.iter().position(|u| u == url) {
+            // Convert position (0-based) to 1-based NonZero id.
+            return crate::cell::HyperlinkId::new((pos + 1) as u16);
+        }
+        // Cap at u16::MAX - 1 (since ids start at 1).
+        if self.hyperlinks.len() >= (u16::MAX as usize) {
+            return None;
+        }
+        self.hyperlinks.push(url.to_string());
+        let id = u16::try_from(self.hyperlinks.len()).ok()?;
+        crate::cell::HyperlinkId::new(id)
     }
 
     /// Most recent cwd advertised via OSC 7. Empty when the shell hasn't
@@ -764,6 +805,7 @@ impl Term {
             ch: c,
             style: self.cursor.style,
             is_continuation: false,
+            hyperlink_id: self.current_hyperlink,
         };
         let col = self.cursor.col;
         let row = self.cursor.row;
@@ -775,6 +817,7 @@ impl Term {
                 ch: '\0',
                 style: self.cursor.style,
                 is_continuation: true,
+                hyperlink_id: self.current_hyperlink,
             };
             self.active_grid_mut()
                 .row_mut(row)
@@ -1420,6 +1463,31 @@ impl Perform for Term {
                         }
                     }
                     i += 2;
+                }
+            }
+            // OSC 8 — hyperlinks.
+            //
+            // Payload format past `8;` is `<params>;<url>`. vte splits
+            // on `;`, so an emitted `OSC 8 ; id=foo ; https://x` arrives
+            // as `params = [b"8", b"id=foo", b"https://x"]`. Rejoin past
+            // the leading code so the parser sees one byte string.
+            //
+            // `OSC 8 ; ; ST` (empty URL) closes the active hyperlink —
+            // future printed cells are stamped with `None`.
+            8 => {
+                let mut joined = Vec::new();
+                for (i, p) in params.iter().enumerate().skip(1) {
+                    if i > 1 {
+                        joined.push(b';');
+                    }
+                    joined.extend_from_slice(p);
+                }
+                if let Some(parsed) = toastty_protocols::hyperlink::parse(&joined) {
+                    if parsed.url.is_empty() {
+                        self.current_hyperlink = None;
+                    } else {
+                        self.current_hyperlink = self.intern_hyperlink(parsed.url);
+                    }
                 }
             }
             // OSC 7 — current working directory (`file://<host>/<path>`).
@@ -3318,5 +3386,59 @@ mod tests {
         feed(&mut t, b"\x1b]4;notanumber;rgb:ab/cd/ef\x1b\\");
         // No override applied, no panic.
         assert!(t.palette_overrides.iter().all(Option::is_none));
+    }
+
+    // ----- OSC 8 (hyperlinks) ----------------------------------------------
+
+    #[test]
+    fn osc8_stamps_hyperlink_id_on_printed_cells() {
+        let mut t = Term::new(2, 16, 0);
+        feed(&mut t, b"\x1b]8;;https://example.com\x1b\\link");
+        // First 4 cells must share the same non-None hyperlink id.
+        let id0 = t.row(0).cells[0].hyperlink_id;
+        assert!(id0.is_some());
+        for c in 0..4 {
+            assert_eq!(t.row(0).cells[c].hyperlink_id, id0);
+        }
+        // Resolves back to the URL.
+        let url = t.hyperlink_url(id0.unwrap()).unwrap();
+        assert_eq!(url, "https://example.com");
+    }
+
+    #[test]
+    fn osc8_closer_clears_subsequent_cells() {
+        let mut t = Term::new(2, 16, 0);
+        feed(
+            &mut t,
+            b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\after",
+        );
+        assert!(t.row(0).cells[0].hyperlink_id.is_some());
+        assert!(t.row(0).cells[4].hyperlink_id.is_none(), "after closer");
+    }
+
+    #[test]
+    fn osc8_dedupes_same_url() {
+        let mut t = Term::new(2, 16, 0);
+        feed(&mut t, b"\x1b]8;;https://example.com\x1b\\a\x1b]8;;\x1b\\");
+        feed(&mut t, b"\x1b]8;;https://example.com\x1b\\b\x1b]8;;\x1b\\");
+        // Both cells reference the same intern id (interning dedupes).
+        assert_eq!(
+            t.row(0).cells[0].hyperlink_id,
+            t.row(0).cells[1].hyperlink_id,
+        );
+    }
+
+    #[test]
+    fn osc8_id_param_parsed_but_unused_for_dedup() {
+        // id= is parsed but not used as the dedup key (URL is). Two
+        // sequences with the same URL but different `id=` still share
+        // the same hyperlink id.
+        let mut t = Term::new(2, 16, 0);
+        feed(&mut t, b"\x1b]8;id=a;https://x.com\x1b\\X\x1b]8;;\x1b\\");
+        feed(&mut t, b"\x1b]8;id=b;https://x.com\x1b\\Y\x1b]8;;\x1b\\");
+        assert_eq!(
+            t.row(0).cells[0].hyperlink_id,
+            t.row(0).cells[1].hyperlink_id,
+        );
     }
 }

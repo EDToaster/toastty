@@ -75,6 +75,7 @@ impl Row {
             ch: ' ',
             style,
             is_continuation: false,
+            hyperlink_id: None,
         };
         for c in &mut self.cells[start..end] {
             *c = blank;
@@ -169,6 +170,7 @@ impl Grid {
                 ch: ' ',
                 style,
                 is_continuation: false,
+                hyperlink_id: None,
             });
             row.soft_wrap = false;
         }
@@ -232,6 +234,7 @@ mod tests {
             ch: 'x',
             style: red_style(),
             is_continuation: false,
+            hyperlink_id: None,
         };
         r.soft_wrap = true;
         r.clear();
@@ -261,6 +264,7 @@ mod tests {
                 ch: 'z',
                 style: Style::RESET,
                 is_continuation: false,
+            hyperlink_id: None,
             },
             8,
         );
@@ -281,6 +285,7 @@ mod tests {
                 ch: 'x',
                 style: Style::RESET,
                 is_continuation: false,
+            hyperlink_id: None,
             },
             3,
         );
@@ -296,6 +301,7 @@ mod tests {
                 ch: char::from(b'a' + i as u8),
                 style: Style::RESET,
                 is_continuation: false,
+            hyperlink_id: None,
             };
         }
         r.erase(1, 3, red_style());
@@ -306,6 +312,7 @@ mod tests {
                 ch: ' ',
                 style: red_style(),
                 is_continuation: false,
+            hyperlink_id: None,
             }
         );
         assert_eq!(
@@ -314,6 +321,7 @@ mod tests {
                 ch: ' ',
                 style: red_style(),
                 is_continuation: false,
+            hyperlink_id: None,
             }
         );
         assert_eq!(r.cells[3].ch, 'd');
@@ -351,6 +359,7 @@ mod tests {
                 ch: 'a',
                 style: Style::RESET,
                 is_continuation: false,
+            hyperlink_id: None,
             },
             3,
         );
@@ -360,6 +369,7 @@ mod tests {
                 ch: 'b',
                 style: Style::RESET,
                 is_continuation: false,
+            hyperlink_id: None,
             },
             3,
         );
@@ -379,6 +389,7 @@ mod tests {
                 ch: 'x',
                 style: Style::RESET,
                 is_continuation: false,
+            hyperlink_id: None,
             },
             3,
         );
@@ -404,6 +415,7 @@ mod tests {
                 ch: 'a',
                 style: Style::RESET,
                 is_continuation: false,
+            hyperlink_id: None,
             },
             4,
         );
@@ -422,6 +434,7 @@ mod tests {
                 ch: 'a',
                 style: Style::RESET,
                 is_continuation: false,
+            hyperlink_id: None,
             },
             3,
         );
@@ -431,6 +444,7 @@ mod tests {
                 ch: 'b',
                 style: Style::RESET,
                 is_continuation: false,
+            hyperlink_id: None,
             },
             3,
         );
