@@ -531,15 +531,17 @@ impl Term {
         }
     }
 
-    /// Cell width of `c` per `unicode-width` (legacy `wcwidth` table).
+    /// Cell-width lookup for a single codepoint.
+    ///
+    /// `Term::print` operates per-codepoint, not per-grapheme. M8 wires
+    /// mode 2027 into the *renderer's* cluster-width snap only; the cell
+    /// grid uses `UnicodeWidthChar` here. For VS16 / ZWJ clusters this
+    /// means grid columns and rendered geometry can disagree — picked up
+    /// in M9 when `Term::print` grows cluster awareness.
     ///
     /// Returns `1` for ordinary text / unknown chars, `2` for CJK
     /// ideographs / emoji / fullwidth forms, `0` for combining marks
-    /// and other zero-width controls. Mode 2027 (
-    /// [`Term::grapheme_cluster_mode`]) only re-shapes the renderer's
-    /// width snap — `Term::print` operates per-char and trusts the
-    /// `unicode-width` table either way (matching xterm / kitty
-    /// behaviour for the legacy stream-of-chars `print` path).
+    /// and other zero-width controls.
     fn char_cell_width(c: char) -> u16 {
         match UnicodeWidthChar::width(c) {
             Some(0) => 0,
