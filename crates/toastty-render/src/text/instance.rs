@@ -500,8 +500,25 @@ pub fn build_instances_into<F>(
             }
 
             // Underline strip for SGR underline or OSC 8 hyperlink.
+            // M10-followup I6: peek the next cell — width-2 (CJK)
+            // primaries underline the FULL cluster (both columns), not
+            // just the primary column. Without this, hyperlinked CJK
+            // text underlined only the leading half of every wide
+            // glyph. (We do the same in `build_dirty_instances_into`;
+            // the bg quad path stays single-column for now, matching
+            // the existing pre-fix behavior the reviewer called out as
+            // out of scope.)
             if cell.style.flags.underline || cell.hyperlink_id.is_some() {
-                out.push(underline_instance(pos, [cell_w, cell_h], fg));
+                let strip_w = if row
+                    .cells
+                    .get(c as usize + 1)
+                    .is_some_and(|next| next.is_continuation)
+                {
+                    2.0 * cell_w
+                } else {
+                    cell_w
+                };
+                out.push(underline_instance(pos, [strip_w, cell_h], fg));
             }
         }
     }
@@ -640,9 +657,19 @@ pub fn build_dirty_instances_into<F>(
 
             // Underline strip for SGR underline or OSC 8 hyperlink. Emit
             // *after* the glyph so it draws on top of any descender
-            // (matches xterm).
+            // (matches xterm). M10-followup I6: same width-2 widening
+            // as the full builder above.
             if cell.style.flags.underline || cell.hyperlink_id.is_some() {
-                out.push(underline_instance(pos, [cell_w, cell_h], fg));
+                let strip_w = if row
+                    .cells
+                    .get(c as usize + 1)
+                    .is_some_and(|next| next.is_continuation)
+                {
+                    2.0 * cell_w
+                } else {
+                    cell_w
+                };
+                out.push(underline_instance(pos, [strip_w, cell_h], fg));
             }
         }
     }
@@ -1463,4 +1490,89 @@ mod tests {
         assert_ne!(v, ext[1], "base 16 must come from theme, not ext_palette");
     }
 
+    // ----- M10-followup I6: width-2 hyperlink underline spans both columns -
+
+    /// Followup I6: a width-2 (CJK) primary with an active OSC 8
+    /// hyperlink must produce an underline strip spanning the FULL
+    /// cluster — two columns — not just the primary column.
+    #[test]
+    fn width2_hyperlinked_cluster_underline_spans_two_columns() {
+        // OSC 8 open + width-2 CJK char + OSC 8 close.
+        let mut t = Term::new(1, 6, 0);
+        feed(
+            &mut t,
+            "\x1b]8;;https://example.com\x1b\\你\x1b]8;;\x1b\\".as_bytes(),
+        );
+        let cell_w = 8.0_f32;
+        let v = build_instances(&t, (cell_w, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let underline = v
+            .iter()
+            .find(|i| i.flags & FLAG_UNDERLINE != 0)
+            .expect("hyperlinked width-2 cluster must emit one underline strip");
+        // Width must be exactly 2 * cell_w — covers both the primary
+        // column AND the continuation column.
+        assert!(
+            (underline.size[0] - 2.0 * cell_w).abs() < 1e-3,
+            "width-2 underline strip width = {} (expected {})",
+            underline.size[0],
+            2.0 * cell_w,
+        );
+    }
+
+    /// Followup I6: a width-1 (ASCII) hyperlinked cell underlines just
+    /// its own column — the width-doubling logic must NOT misfire when
+    /// the next cell isn't a continuation.
+    #[test]
+    fn width1_hyperlinked_cell_underline_is_one_column() {
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b]8;;https://example.com\x1b\\X");
+        let cell_w = 8.0_f32;
+        let v = build_instances(&t, (cell_w, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let underline = v
+            .iter()
+            .find(|i| i.flags & FLAG_UNDERLINE != 0)
+            .expect("underline strip");
+        assert!(
+            (underline.size[0] - cell_w).abs() < 1e-3,
+            "width-1 underline strip width = {} (expected {})",
+            underline.size[0],
+            cell_w,
+        );
+    }
+
+    /// Followup I6: same widening must apply to the partial-redraw
+    /// builder. Mark the width-2 primary dirty (continuation skipped),
+    /// run the dirty builder, and assert the underline spans both
+    /// columns.
+    #[test]
+    fn width2_hyperlinked_cluster_underline_in_dirty_builder() {
+        let mut t = Term::new(1, 6, 0);
+        feed(
+            &mut t,
+            "\x1b]8;;https://example.com\x1b\\你\x1b]8;;\x1b\\".as_bytes(),
+        );
+        let cell_w = 8.0_f32;
+        let damage = t.damage().clone();
+        let mut out = Vec::new();
+        super::build_dirty_instances_into(
+            &mut out,
+            &t,
+            &damage,
+            (cell_w, 16.0),
+            &Theme::default_dark(),
+            None,
+            true,
+            |_, _, _, _| None,
+        );
+        let underline = out
+            .iter()
+            .find(|i| i.flags & FLAG_UNDERLINE != 0)
+            .expect("dirty builder must emit underline strip for width-2 hyperlink");
+        assert!(
+            (underline.size[0] - 2.0 * cell_w).abs() < 1e-3,
+            "dirty width-2 underline strip width = {} (expected {})",
+            underline.size[0],
+            2.0 * cell_w,
+        );
+    }
 }
