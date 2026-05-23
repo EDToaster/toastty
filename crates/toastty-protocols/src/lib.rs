@@ -12,6 +12,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod osc_cwd;
 pub mod resize_inband;
 pub mod synchronized;
 pub mod unicode_core;

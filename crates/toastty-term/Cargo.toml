@@ -12,6 +12,7 @@ unicode-width.workspace = true
 
 toastty-config.workspace = true
 toastty-parser.workspace = true
+toastty-protocols.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

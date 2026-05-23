@@ -158,6 +158,10 @@ pub struct Term {
     grapheme_cluster_mode: bool,
     /// DECSET 2048 — in-band resize notifications opt-in.
     inband_resize_mode: bool,
+    /// Last cwd advertised via `OSC 7 ; file://<host>/<path> ST`. Empty
+    /// when the shell hasn't sent one yet. Not validated against the
+    /// host — we accept whatever the shell told us.
+    cwd: String,
 }
 
 impl Term {
@@ -196,7 +200,15 @@ impl Term {
             sync_output: SyncOutput::default(),
             grapheme_cluster_mode: false,
             inband_resize_mode: false,
+            cwd: String::new(),
         }
+    }
+
+    /// Most recent cwd advertised via OSC 7. Empty when the shell hasn't
+    /// emitted one yet.
+    #[must_use]
+    pub fn cwd(&self) -> &str {
+        &self.cwd
     }
 
     /// True when DECSET 2004 (bracketed paste) is active.
@@ -1263,11 +1275,30 @@ impl Perform for Term {
                 let title = String::from_utf8_lossy(payload).into_owned();
                 self.title = title;
             }
+            // OSC 7 — current working directory (`file://<host>/<path>`).
+            //
+            // The URL itself shouldn't contain semicolons, but `;` is a
+            // valid byte inside a percent-decoded path (RFC 3986 reserves
+            // it). vte will have split on it already, so rejoin params
+            // past the code so we don't drop trailing segments.
+            7 => {
+                let mut joined = Vec::new();
+                for (i, p) in params.iter().enumerate().skip(1) {
+                    if i > 1 {
+                        joined.push(b';');
+                    }
+                    joined.extend_from_slice(p);
+                }
+                if let Some(path) = toastty_protocols::osc_cwd::parse_file_url(&joined) {
+                    self.cwd = path;
+                }
+            }
             // 1 = icon-title only — accepted but not acted on (we have
             // no tray icon). Folded into the wildcard arm: same body
             // either way.
             _ => {
-                // 1 + unknown OSC: silently ignored. M10 will add 4 / 8 / 52 etc.
+                // 1 + unknown OSC: silently ignored. M10 adds 4 / 8 / 52
+                // in later steps.
             }
         }
     }
@@ -2924,4 +2955,42 @@ mod tests {
         t.mark_cell_dirty(99, 0);
         assert!(t.damage().is_empty());
     }
+
+    // ----- OSC 7 (cwd) ------------------------------------------------------
+
+    #[test]
+    fn osc7_sets_cwd_from_file_url() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]7;file://host/home/user\x1b\\");
+        assert_eq!(t.cwd(), "/home/user");
+    }
+
+    #[test]
+    fn osc7_handles_hostless_form() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]7;file:///srv/data\x1b\\");
+        assert_eq!(t.cwd(), "/srv/data");
+    }
+
+    #[test]
+    fn osc7_percent_decodes_spaces() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]7;file:///tmp/space%20dir\x1b\\");
+        assert_eq!(t.cwd(), "/tmp/space dir");
+    }
+
+    #[test]
+    fn osc7_non_file_scheme_is_ignored() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]7;http://example.com/\x1b\\");
+        assert_eq!(t.cwd(), "");
+    }
+
+    #[test]
+    fn osc7_bel_terminator_works_too() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]7;file:///home\x07");
+        assert_eq!(t.cwd(), "/home");
+    }
+
 }

@@ -10,6 +10,8 @@ thiserror.workspace = true
 unicode-width.workspace = true
 
 toastty-parser.workspace = true
+
+[dev-dependencies]
 toastty-term.workspace = true
 
 [lints]
