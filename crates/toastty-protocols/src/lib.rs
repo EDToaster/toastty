@@ -13,3 +13,4 @@
 #![forbid(unsafe_code)]
 
 pub mod synchronized;
+pub mod unicode_core;
