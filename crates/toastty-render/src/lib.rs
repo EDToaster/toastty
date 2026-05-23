@@ -36,7 +36,7 @@ use wgpu::{
     RequestAdapterOptions, Surface, SurfaceConfiguration, TextureFormat, TextureUsages,
 };
 
-use crate::text::glyph_rasterizer::{GlyphRasterizer, LineGlyphs};
+use crate::text::glyph_rasterizer::{GlyphRasterizer, LineGlyphs, DEFAULT_LINE_HEIGHT_RATIO};
 use crate::text::instance::{build_instances, CellInstance, Theme};
 use crate::text::pipeline::{GlobalsUbo, TextPipeline};
 
@@ -60,6 +60,11 @@ const BUNDLED_FONT: &[u8] = include_bytes!("../fonts/FiraMono-Medium.ttf");
 
 /// Default font pixel size for the demo and snapshot tests.
 pub const DEFAULT_FONT_SIZE_PX: f32 = 16.0;
+
+/// Re-export the renderer's default line-height ratio so callers can
+/// build the matching `with_font_ex` invocation without depending on the
+/// `text` submodule directly.
+pub use crate::text::glyph_rasterizer::DEFAULT_LINE_HEIGHT_RATIO as DEFAULT_LINE_HEIGHT;
 
 /// Errors from [`Renderer`] construction or rendering.
 #[derive(Debug, Error)]
@@ -227,7 +232,8 @@ impl Renderer {
         })
     }
 
-    /// Initialize the text rendering pipeline.
+    /// Initialize the text rendering pipeline at the default line-height
+    /// ratio.
     ///
     /// `font_name` is forwarded to cosmic-text's `Attrs::family(...)`.
     /// If `None`, falls back to the bundled `FiraMono`. `font_size_px` is
@@ -235,13 +241,32 @@ impl Renderer {
     ///
     /// Idempotent: calling twice rebuilds with new params. Must be
     /// called before [`Renderer::render_term`].
+    ///
+    /// Equivalent to
+    /// `with_font_ex(font_name, font_size_px, DEFAULT_LINE_HEIGHT)`.
     pub fn with_font(&mut self, font_name: Option<&str>, font_size_px: f32) {
+        self.with_font_ex(font_name, font_size_px, DEFAULT_LINE_HEIGHT_RATIO);
+    }
+
+    /// Initialize the text rendering pipeline with an explicit
+    /// line-height multiplier.
+    ///
+    /// `line_height` is `× font_size_px`. The renderer's snapshots were
+    /// captured at [`DEFAULT_LINE_HEIGHT`] (`1.4`). Callers loading a
+    /// `toastty_config::FontConfig` should pass `font.line_height` here.
+    pub fn with_font_ex(
+        &mut self,
+        font_name: Option<&str>,
+        font_size_px: f32,
+        line_height: f32,
+    ) {
         // Resolve the font family. We always bundle FiraMono so the
         // caller can pass `None` and still get text.
         let family = font_name.unwrap_or("Fira Mono");
         let rasterizer = GlyphRasterizer::new(
             &self.device,
             font_size_px,
+            line_height,
             Some(family),
             Some(BUNDLED_FONT),
         );

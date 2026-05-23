@@ -23,6 +23,7 @@ image-compare.workspace = true
 insta.workspace = true
 pollster.workspace = true
 proptest.workspace = true
+toastty-config.workspace = true
 toastty-parser.workspace = true
 toastty-window.workspace = true
 tracing-subscriber.workspace = true

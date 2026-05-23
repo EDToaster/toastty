@@ -72,7 +72,15 @@ pub(crate) fn render_term_offscreen(term: &Term, width: u32, height: u32) -> Rgb
     let view = target.create_view(&TextureViewDescriptor::default());
 
     // Construct the text path manually (no Renderer; that needs a window).
-    let mut rasterizer = GlyphRasterizer::new(&device, 16.0, Some("Fira Mono"), Some(TEST_FONT));
+    // Use the same default line-height ratio the renderer applies so
+    // snapshots stay byte-comparable to the M4b goldens.
+    let mut rasterizer = GlyphRasterizer::new(
+        &device,
+        16.0,
+        toastty_render::DEFAULT_LINE_HEIGHT,
+        Some("Fira Mono"),
+        Some(TEST_FONT),
+    );
     let mut text_pipeline = TextPipeline::new(&device, format);
     let mask_view = pipeline::default_view(rasterizer.mask_texture());
     let color_view = pipeline::default_view(rasterizer.color_texture());
