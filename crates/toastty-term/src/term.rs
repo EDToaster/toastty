@@ -2121,9 +2121,28 @@ impl KittySink for Term {
         let cur_col = self.cursor.col.min(self.cols.saturating_sub(1));
         let row_span = placement.row_range.end - placement.row_range.start;
         let col_span = placement.col_range.end - placement.col_range.start;
-        placement.row_range = cur_row..cur_row.saturating_add(row_span);
+
+        // Make room. Per the kitty spec: "If the image is larger than
+        // the available space, the rest of the image will scroll the
+        // screen up." Without this the placement clamps to whatever
+        // rows are left below the cursor — which is often 0 or 1 by
+        // the time multiple images have been placed, so the image
+        // collapses to a single-row band at the bottom.
+        let scroll_n = cur_row
+            .saturating_add(row_span)
+            .saturating_sub(self.rows);
+        if scroll_n > 0 {
+            for _ in 0..scroll_n {
+                self.active_grid_mut().scroll_up();
+                self.image_grid.shift_rows_up(1, 0);
+            }
+            self.mark_all_dirty();
+        }
+        let start_row = cur_row.saturating_sub(scroll_n);
+
+        placement.row_range = start_row..start_row.saturating_add(row_span);
         placement.col_range = cur_col..cur_col.saturating_add(col_span);
-        // Clamp to grid.
+        // Defensive clamp (shouldn't trigger after the scroll fix).
         if placement.row_range.end > self.rows {
             placement.row_range.end = self.rows;
         }
@@ -2208,16 +2227,23 @@ impl KittySink for Term {
 
     fn advance_cursor_after_placement(&mut self, rows: u16, _cols: u16, start_col: u16) {
         // Kitty spec: after T, the cursor moves to (start_row + rows,
-        // start_col). M11a-followup.N6: previously this reset col to
-        // 0, which broke apps that placed images mid-line (e.g.
-        // inline icons inside a sentence) — the cursor would jump
-        // back to column 0 and overwrite the leading text.
+        // start_col) — i.e. the cell directly below the image's
+        // bottom-left. `place_image` already scrolled the screen when
+        // the image didn't fit below the cursor, so we don't issue
+        // additional linefeeds here — each linefeed at the bottom
+        // calls `image_grid.shift_rows_up`, which would shift the
+        // image we just placed UP by one cell per linefeed. With
+        // `row_span` linefeeds the image would shrink to a one-row
+        // band at the top (the M11a "1 cell tall" regression).
         //
-        // If the cursor would land below the visible viewport, we let
-        // `linefeed` scroll the grid (which also shifts image rows up).
-        for _ in 0..rows {
-            self.linefeed();
-        }
+        // M11a-followup.N6: cursor.col follows start_col so mid-line
+        // placements don't snap back to column 0.
+        let target_row = self
+            .cursor
+            .row
+            .saturating_add(rows)
+            .min(self.rows.saturating_sub(1));
+        self.cursor.row = target_row;
         self.cursor.col = start_col.min(self.cols.saturating_sub(1));
     }
 
@@ -4371,6 +4397,36 @@ mod tests {
         let replies = t.drain_pty_replies();
         let s = String::from_utf8_lossy(&replies);
         assert!(s.contains("ENOTSUP"), "got {s:?}");
+    }
+
+    /// Regression: placing an image taller than the rows remaining
+    /// below the cursor used to silently clamp the placement to a
+    /// single-row band at the bottom. The terminal must scroll the
+    /// screen up to make room (per the kitty spec) so the image
+    /// renders at its declared row span.
+    #[test]
+    fn place_image_at_bottom_scrolls_to_make_room() {
+        // 10-row terminal. Move cursor to row 8 so only 2 rows fit
+        // below.
+        let mut t = Term::new(10, 8, 0);
+        feed(&mut t, b"\x1b[9;1H"); // CUP row 9 (1-based) → row 8
+        assert_eq!(t.cursor.row, 8);
+        // Place an image with r=5 (needs 5 rows; only 2 available).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=4,r=5;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        let p = t.image_grid().iter().next().expect("placement registered");
+        let span = p.row_range.end - p.row_range.start;
+        assert_eq!(
+            span, 5,
+            "placement should be 5 rows tall after scroll; got {p:?}"
+        );
+        // The placement should extend to the bottom of the grid.
+        assert_eq!(p.row_range.end, 10);
+        // Top of the image sits at row 5 (10 - 5).
+        assert_eq!(p.row_range.start, 5);
     }
 
     #[test]
