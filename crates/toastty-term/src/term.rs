@@ -2219,6 +2219,10 @@ impl KittySink for Term {
         }
         self.cursor.col = 0;
     }
+
+    fn image_exists(&self, id: u32) -> bool {
+        self.image_registry.contains(id)
+    }
 }
 
 fn mark_placement_dirty(t: &mut Term, p: &Placement) {

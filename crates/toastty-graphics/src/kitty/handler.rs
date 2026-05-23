@@ -70,6 +70,17 @@ pub trait KittySink {
     /// motion. Default is a no-op so simple test sinks don't need to
     /// care about cursor state.
     fn advance_cursor_after_placement(&mut self, _rows: u16, _cols: u16) {}
+
+    /// True iff the host's image registry holds an entry for `id`.
+    ///
+    /// Consulted on `a=q` (Query) so the handler can reply with
+    /// [`ErrorCode::Enoent`] when the queried image is not present
+    /// rather than falsely confirming "yes, we have it". Default
+    /// returns `false` so existing test sinks see the conservative
+    /// answer without having to override the method.
+    fn image_exists(&self, _id: u32) -> bool {
+        false
+    }
 }
 
 /// In-flight chunked transmission state.
@@ -142,15 +153,13 @@ impl KittyHandler {
                 self.handle_delete(header, sink);
             }
             Action::Query => {
-                // Query: respond OK if we have the image, ENOENT otherwise.
-                // Quietness gating below.
-                if header.image_id != 0 {
-                    // We can't see the registry from here; defer to
-                    // sink via place_image? No — query is a pure read.
-                    // Without sink access we approximate: assume OK
-                    // when an id is provided. The host can be more
-                    // strict if it likes. For M11a this is acceptable
-                    // — apps mostly use `t`/`T`/`p`/`d`, not `q`.
+                // Query: ENOENT if no id was provided OR the host's
+                // registry doesn't hold the queried image. OK only
+                // when the host confirms presence via
+                // `KittySink::image_exists`. (Before M11a-followup.I2
+                // we unconditionally replied OK when `i!=0`, which
+                // told apps we owned images we'd never received.)
+                if header.image_id != 0 && sink.image_exists(header.image_id) {
                     reply_ok_if_verbose(&header, sink);
                 } else {
                     reply_error_if_verbose(&header, sink, ErrorCode::Enoent, "");
@@ -479,6 +488,9 @@ mod tests {
             self.registered.push((id, data));
             Some(id)
         }
+        fn image_exists(&self, id: u32) -> bool {
+            self.registered.iter().any(|(rid, _)| *rid == id)
+        }
         fn place_image(&mut self, placement: Placement) {
             self.placements.push(placement);
         }
@@ -676,6 +688,50 @@ mod tests {
             .process(b"NotG", b"", &mut sink)
             .unwrap_err();
         assert!(matches!(err, HandlerError::BadHeader(_)));
+    }
+
+    #[test]
+    fn query_unknown_image_returns_enoent() {
+        // M11a-followup.I2: an `a=q` for an id we don't hold MUST
+        // reply ENOENT — apps query before transmitting and expect
+        // the truth.
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        h.process(b"Ga=q,i=42", b"", &mut sink).unwrap();
+        let joined: String = sink
+            .replies
+            .iter()
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .collect();
+        assert!(
+            joined.contains("ENOENT"),
+            "expected ENOENT for unknown image, got {joined:?}",
+        );
+        assert!(!joined.contains(";OK"));
+    }
+
+    #[test]
+    fn query_known_image_returns_ok() {
+        // Transmit id=7 first, then query it — must reply OK.
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        let body = b64_red_pixel();
+        h.process(
+            b"Ga=t,f=32,s=1,v=1,i=7",
+            body.as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
+        // Drop the transmit reply so we only inspect query replies.
+        sink.replies.clear();
+        h.process(b"Ga=q,i=7", b"", &mut sink).unwrap();
+        let joined: String = sink
+            .replies
+            .iter()
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .collect();
+        assert!(joined.contains(";OK"), "expected OK, got {joined:?}");
+        assert!(!joined.contains("ENOENT"));
     }
 
     #[test]
