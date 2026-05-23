@@ -195,6 +195,34 @@ pub struct Term {
     /// [`Term::print_char`] until the next `OSC 8 ; ; ST` (closer) or
     /// a new `OSC 8 ; ... ; url` (which switches to a fresh id).
     current_hyperlink: Option<crate::cell::HyperlinkId>,
+    /// FIFO of OSC 52 clipboard requests waiting on the binary to
+    /// service through `arboard`. Drained by [`Term::drain_clipboard_requests`].
+    clipboard_requests: Vec<ClipboardRequest>,
+    /// Security gates from the user's `[security]` config.
+    security: SecurityFlags,
+}
+
+/// One pending OSC 52 clipboard operation, queued by [`Term`] and
+/// serviced by the binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardRequest {
+    /// Replace the system clipboard with `data`.
+    Set { data: Vec<u8> },
+    /// Read the system clipboard and reply via
+    /// [`Term::push_pty_reply`] with a `selection`-tagged OSC 52
+    /// response.
+    Query { selection: Vec<u8> },
+}
+
+/// Security flags mirrored on `Term` from
+/// [`toastty_config::SecurityConfig`]. Kept separate from the config
+/// struct so the term crate doesn't depend on config wire types.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SecurityFlags {
+    /// Allow OSC 52 clipboard reads. Off by default.
+    pub osc_52_read: bool,
+    /// Allow OSC 52 clipboard writes. Off by default.
+    pub osc_52_write: bool,
 }
 
 /// One semantic prompt marker recorded from OSC 133.
@@ -271,7 +299,27 @@ impl Term {
             palette_revision: 0,
             hyperlinks: Vec::new(),
             current_hyperlink: None,
+            clipboard_requests: Vec::new(),
+            security: SecurityFlags::default(),
         }
+    }
+
+    /// Set the security flags. Called by the binary right after
+    /// `Term::new` to thread the user's `[security]` config through.
+    pub fn set_security(&mut self, flags: SecurityFlags) {
+        self.security = flags;
+    }
+
+    /// Current security flags (read-only).
+    #[must_use]
+    pub fn security(&self) -> SecurityFlags {
+        self.security
+    }
+
+    /// Drain queued OSC 52 clipboard requests. Called by the binary
+    /// after every `parser.advance` and serviced via `arboard`.
+    pub fn drain_clipboard_requests(&mut self) -> Vec<ClipboardRequest> {
+        std::mem::take(&mut self.clipboard_requests)
     }
 
     /// Drain bytes queued for the PTY back-channel and return them. The
@@ -1463,6 +1511,40 @@ impl Perform for Term {
                         }
                     }
                     i += 2;
+                }
+            }
+            // OSC 52 — clipboard. Gated by `security.osc_52_read /
+            // osc_52_write`. Both gates default to off (silently drop)
+            // so a casual escape sequence in a less(1) output can't
+            // hijack the clipboard.
+            //
+            // vte splits the payload on `;`, so an emitted
+            // `OSC 52 ; c ; aGVsbG8=` arrives as
+            // `params = [b"52", b"c", b"aGVsbG8="]`. Rejoin past the
+            // leading code.
+            52 => {
+                let mut joined = Vec::new();
+                for (i, p) in params.iter().enumerate().skip(1) {
+                    if i > 1 {
+                        joined.push(b';');
+                    }
+                    joined.extend_from_slice(p);
+                }
+                if let Some(op) = toastty_protocols::clipboard::parse(&joined) {
+                    match op {
+                        toastty_protocols::clipboard::Osc52Op::Set { payload, .. } => {
+                            if self.security.osc_52_write {
+                                self.clipboard_requests
+                                    .push(ClipboardRequest::Set { data: payload });
+                            }
+                        }
+                        toastty_protocols::clipboard::Osc52Op::Query { selection } => {
+                            if self.security.osc_52_read {
+                                self.clipboard_requests
+                                    .push(ClipboardRequest::Query { selection: selection.0 });
+                            }
+                        }
+                    }
                 }
             }
             // OSC 8 — hyperlinks.
@@ -3440,5 +3522,65 @@ mod tests {
             t.row(0).cells[0].hyperlink_id,
             t.row(0).cells[1].hyperlink_id,
         );
+    }
+
+    // ----- OSC 52 (clipboard) ----------------------------------------------
+
+    #[test]
+    fn osc52_set_with_write_disabled_is_dropped() {
+        let mut t = Term::new(2, 4, 0);
+        // Default security = both gates closed.
+        feed(&mut t, b"\x1b]52;c;aGVsbG8=\x1b\\");
+        assert!(t.drain_clipboard_requests().is_empty());
+    }
+
+    #[test]
+    fn osc52_set_with_write_enabled_queues_request() {
+        let mut t = Term::new(2, 4, 0);
+        t.set_security(SecurityFlags {
+            osc_52_read: false,
+            osc_52_write: true,
+        });
+        feed(&mut t, b"\x1b]52;c;aGVsbG8=\x1b\\");
+        let reqs = t.drain_clipboard_requests();
+        assert_eq!(reqs.len(), 1);
+        match &reqs[0] {
+            ClipboardRequest::Set { data } => assert_eq!(data, b"hello"),
+            _ => panic!("expected Set"),
+        }
+    }
+
+    #[test]
+    fn osc52_query_with_read_disabled_is_dropped() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]52;c;?\x1b\\");
+        assert!(t.drain_clipboard_requests().is_empty());
+    }
+
+    #[test]
+    fn osc52_query_with_read_enabled_queues_request() {
+        let mut t = Term::new(2, 4, 0);
+        t.set_security(SecurityFlags {
+            osc_52_read: true,
+            osc_52_write: false,
+        });
+        feed(&mut t, b"\x1b]52;c;?\x1b\\");
+        let reqs = t.drain_clipboard_requests();
+        assert_eq!(reqs.len(), 1);
+        match &reqs[0] {
+            ClipboardRequest::Query { selection } => assert_eq!(selection, b"c"),
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn osc52_malformed_does_not_panic() {
+        let mut t = Term::new(2, 4, 0);
+        t.set_security(SecurityFlags {
+            osc_52_read: true,
+            osc_52_write: true,
+        });
+        feed(&mut t, b"\x1b]52;c;!!\x1b\\");
+        assert!(t.drain_clipboard_requests().is_empty());
     }
 }

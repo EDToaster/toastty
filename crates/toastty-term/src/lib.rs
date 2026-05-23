@@ -30,9 +30,9 @@ pub use cursor::Cursor;
 pub use damage::{Damage, RowDamage};
 pub use grid::{Grid, Row};
 pub use term::{
-    KITTY_FLAG_DISAMBIGUATE, KITTY_FLAG_REPORT_ALL_AS_ESC, KITTY_FLAG_REPORT_ALTERNATE,
-    KITTY_FLAG_REPORT_EVENTS, KITTY_FLAG_REPORT_TEXT, MouseMode, MouseProtocol, PromptMark,
-    PromptMarkKind, Term,
+    ClipboardRequest, KITTY_FLAG_DISAMBIGUATE, KITTY_FLAG_REPORT_ALL_AS_ESC,
+    KITTY_FLAG_REPORT_ALTERNATE, KITTY_FLAG_REPORT_EVENTS, KITTY_FLAG_REPORT_TEXT, MouseMode,
+    MouseProtocol, PromptMark, PromptMarkKind, SecurityFlags, Term,
 };
 
 /// Re-export so the renderer / window crates can refer to the runtime

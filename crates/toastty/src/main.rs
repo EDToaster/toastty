@@ -22,7 +22,7 @@ use toastty_protocols::resize_inband::encode_resize_report;
 use toastty_protocols::synchronized::{BSU_TIMEOUT, should_force_flush};
 use toastty_pty::{Pty, PtySpec, WinSize};
 use toastty_render::{RenderOutcome, Renderer};
-use toastty_term::Term;
+use toastty_term::{ClipboardRequest, SecurityFlags, Term};
 use toastty_window::{
     App, ControlSignal, Event, KeyState, LogicalKey, Modifiers, MouseButton, ToasttyWindow,
     WindowHandle, WindowOptions, run,
@@ -139,6 +139,12 @@ impl Toastty {
         // Thread the `[cursor]` config table through to the runtime —
         // DECSCUSR can still override at runtime per app.
         term.set_cursor_default(config.cursor.shape, config.cursor.blink);
+        // Thread the `[security]` flags through so OSC 52 dispatch can
+        // gate before queueing a clipboard request.
+        term.set_security(SecurityFlags {
+            osc_52_read: config.security.osc_52_read,
+            osc_52_write: config.security.osc_52_write,
+        });
         Self {
             config,
             window: None,
@@ -221,6 +227,53 @@ impl Toastty {
         }
     }
 
+    /// Service one OSC 52 clipboard request.
+    ///
+    /// `arboard` is synchronous; on Wayland in particular the read
+    /// path can briefly stall while the data device negotiates. We
+    /// accept that — clipboard requests are user-initiated by the app
+    /// they're rare enough that a millisecond-scale stall on the
+    /// render thread is invisible. (TODO if real workloads disagree:
+    /// move clipboard I/O onto a dedicated worker thread.)
+    fn service_clipboard_request(&mut self, req: &ClipboardRequest) {
+        if self.clipboard.is_none() {
+            match arboard::Clipboard::new() {
+                Ok(c) => self.clipboard = Some(c),
+                Err(e) => {
+                    warn!("clipboard init failed: {e}");
+                    return;
+                }
+            }
+        }
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            return;
+        };
+        match req {
+            ClipboardRequest::Set { data } => {
+                // OSC 52 set must be UTF-8 text to round-trip through
+                // arboard's typed API; lossy-decode if the app sent
+                // garbage bytes.
+                let text = String::from_utf8_lossy(data);
+                if let Err(e) = clipboard.set_text(text.into_owned()) {
+                    warn!("clipboard write failed: {e}");
+                }
+            }
+            ClipboardRequest::Query { selection } => {
+                let bytes = match clipboard.get_text() {
+                    Ok(s) => s.into_bytes(),
+                    Err(e) => {
+                        debug!("clipboard read failed: {e}");
+                        return;
+                    }
+                };
+                let sel =
+                    toastty_protocols::clipboard::SelectionChars(selection.clone());
+                let reply = toastty_protocols::clipboard::encode_reply(&sel, &bytes);
+                self.term.push_pty_reply(&reply);
+            }
+        }
+    }
+
     fn current_cell(&self) -> (u16, u16) {
         let cell_size = self
             .renderer
@@ -270,6 +323,15 @@ impl Toastty {
         // decoration. `sync_title` is a no-op when the title is
         // unchanged, so calling on every batch is cheap.
         self.sync_title();
+
+        // Service any OSC 52 clipboard requests. We have to do this
+        // BEFORE draining `pty_replies` because the read path
+        // (`ClipboardRequest::Query`) populates `pty_replies` with the
+        // encoded reply via `push_pty_reply`.
+        let requests = self.term.drain_clipboard_requests();
+        for req in requests {
+            self.service_clipboard_request(&req);
+        }
 
         // Drain any OSC replies the parsed batch wants written back to
         // the PTY (OSC 4 palette query, OSC 52 clipboard read). The
