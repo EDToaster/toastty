@@ -91,6 +91,14 @@ pub struct GlyphSlot {
     pub uv_max: [f32; 2],
     /// True if the glyph is sampled from the color atlas.
     pub is_color: bool,
+    /// Pixel offset of the glyph quad within the cell. `glyph_offset.0`
+    /// is the left-side bearing; `glyph_offset.1` is `baseline_y - top`.
+    /// This is what stops every glyph from being stretched to fill the
+    /// whole cell — the glyph quad is glyph-sized and positioned
+    /// correctly inside the cell-sized background quad.
+    pub glyph_offset: [f32; 2],
+    /// Pixel size of the glyph quad (matches the atlas region size).
+    pub glyph_size: [f32; 2],
 }
 
 /// Default theme — used when [`TColor::Default`] is in play and the
@@ -243,46 +251,45 @@ where
             let pos = [f32::from(c) * cell_w, f32::from(r) * cell_h];
             let (fg, bg) = resolve_cell_colors(cell, theme);
 
-            let glyph = if cell.ch.is_whitespace() {
-                None
-            } else {
-                locate_glyph(r, c, cell.ch, &cell.style)
-            };
+            // Always emit a cell-sized background quad. The glyph (if
+            // present) is rendered as a separate, glyph-sized quad on
+            // top of it — so a narrow `l` does not stretch to fill the
+            // whole cell.
+            out.push(CellInstance {
+                pos,
+                size: [cell_w, cell_h],
+                uv_min: [0.0, 0.0],
+                uv_max: [0.0, 0.0],
+                fg,
+                bg,
+                flags: FLAG_NO_GLYPH,
+                pad: [0; 3],
+            });
 
-            match glyph {
-                Some(slot) => {
-                    let flags = if slot.is_color {
-                        FLAG_COLOR_GLYPH
-                    } else {
-                        0
-                    };
-                    out.push(CellInstance {
-                        pos,
-                        size: [cell_w, cell_h],
-                        uv_min: slot.uv_min,
-                        uv_max: slot.uv_max,
-                        fg,
-                        bg,
-                        flags,
-                        pad: [0; 3],
-                    });
-                }
-                None => {
-                    // No atlas slot yet — emit a background instance
-                    // that still carries the resolved fg/bg so the
-                    // dispatcher sees the SGR state. The glyph will
-                    // appear on a later frame.
-                    out.push(CellInstance {
-                        pos,
-                        size: [cell_w, cell_h],
-                        uv_min: [0.0, 0.0],
-                        uv_max: [0.0, 0.0],
-                        fg,
-                        bg,
-                        flags: FLAG_NO_GLYPH,
-                        pad: [0; 3],
-                    });
-                }
+            if cell.ch.is_whitespace() {
+                continue;
+            }
+
+            if let Some(slot) = locate_glyph(r, c, cell.ch, &cell.style) {
+                let flags = if slot.is_color {
+                    FLAG_COLOR_GLYPH
+                } else {
+                    0
+                };
+                // Glyph quad: position is cell + glyph bearing; size is
+                // the glyph's own pixel extent (matches the atlas
+                // region). The fragment shader's UV interpolation then
+                // maps the quad 1:1 to the atlas region.
+                out.push(CellInstance {
+                    pos: [pos[0] + slot.glyph_offset[0], pos[1] + slot.glyph_offset[1]],
+                    size: slot.glyph_size,
+                    uv_min: slot.uv_min,
+                    uv_max: slot.uv_max,
+                    fg,
+                    bg,
+                    flags,
+                    pad: [0; 3],
+                });
             }
         }
     }
@@ -429,13 +436,14 @@ mod tests {
                 uv_min: [0.0, 0.0],
                 uv_max: [8.0, 16.0],
                 is_color: true,
+                glyph_offset: [0.0, 0.0],
+                glyph_size: [8.0, 16.0],
             })
         });
         let glyph_inst = v
             .iter()
-            .find(|i| i.flags & FLAG_CURSOR == 0)
+            .find(|i| i.flags & FLAG_COLOR_GLYPH != 0)
             .expect("expected glyph instance");
-        assert!(glyph_inst.flags & FLAG_COLOR_GLYPH != 0);
         assert!(glyph_inst.flags & FLAG_NO_GLYPH == 0);
     }
 

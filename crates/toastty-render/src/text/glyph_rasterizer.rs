@@ -41,6 +41,15 @@ pub struct LineGlyphs {
 /// Cached layout per (text, style fingerprint). M4b doesn't actually
 /// cache rows — every render shapes fresh. That's fine for the demo;
 /// the dirty-set optimization is in M5.
+/// Per-glyph pixel placement relative to a cell origin. Stays in a
+/// parallel cache to the atlas slot so cache-hit paths can rebuild the
+/// `GlyphSlot` without re-rasterizing.
+#[derive(Debug, Clone, Copy)]
+struct GlyphPlacement {
+    offset: [f32; 2],
+    size: [f32; 2],
+}
+
 #[derive(Debug)]
 pub struct GlyphRasterizer {
     font_system: FontSystem,
@@ -50,6 +59,9 @@ pub struct GlyphRasterizer {
     mask_texture: Texture,
     /// GPU texture for color (BGRA8) glyphs.
     color_texture: Texture,
+    /// Placement (bearing + extent) cache keyed by `GlyphKey`. Parallel
+    /// to `atlas`'s slot cache; same lifetime semantics.
+    placements: HashMap<GlyphKey, GlyphPlacement>,
     /// Per-line buffer reused across shapings to avoid re-allocating.
     buffer: Buffer,
     /// Font metrics in pixels (`size`, `line_height`). Retained so
@@ -112,6 +124,7 @@ impl GlyphRasterizer {
             atlas,
             mask_texture,
             color_texture,
+            placements: HashMap::new(),
             buffer,
             metrics,
             cell_size,
@@ -148,9 +161,14 @@ impl GlyphRasterizer {
 
         let cell_w = self.cell_size.0;
 
-        let mut pending: Vec<PendingGlyph> = Vec::new();
+        let mut pending: Vec<(PendingGlyph, f32)> = Vec::new();
 
         for run in self.buffer.layout_runs() {
+            // Baseline within the cell: cosmic-text reports `line_y`
+            // (baseline) and `line_top` in buffer coords; the difference
+            // is the baseline-from-cell-top offset.
+            let baseline_y = run.line_y - run.line_top;
+
             let positions: Vec<GlyphPos> = run
                 .glyphs
                 .iter()
@@ -166,17 +184,20 @@ impl GlyphRasterizer {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let col = (snap.x / cell_w).round() as u16;
                 let ch = run.text[g.start..g.end].chars().next().unwrap_or(' ');
-                pending.push(PendingGlyph {
-                    glyph: g.clone(),
-                    col,
-                    ch,
-                });
+                pending.push((
+                    PendingGlyph {
+                        glyph: g.clone(),
+                        col,
+                        ch,
+                    },
+                    baseline_y,
+                ));
             }
         }
 
         let mut out = LineGlyphs::default();
-        for p in &pending {
-            if let Some(slot) = self.ensure_atlas_slot(queue, &p.glyph) {
+        for (p, baseline_y) in &pending {
+            if let Some(slot) = self.ensure_atlas_slot(queue, &p.glyph, *baseline_y) {
                 out.by_column.insert((p.col, p.ch), slot);
             }
         }
@@ -186,7 +207,16 @@ impl GlyphRasterizer {
 
     /// Rasterize `glyph` if not already in the atlas; return its slot
     /// translated into `GlyphSlot` form for `build_instances`.
-    fn ensure_atlas_slot(&mut self, queue: &Queue, glyph: &LayoutGlyph) -> Option<GlyphSlot> {
+    ///
+    /// `baseline_y` is the baseline's offset from the cell's top edge
+    /// (pixels). Used to convert swash's bearing into a cell-relative
+    /// offset.
+    fn ensure_atlas_slot(
+        &mut self,
+        queue: &Queue,
+        glyph: &LayoutGlyph,
+        baseline_y: f32,
+    ) -> Option<GlyphSlot> {
         let physical = glyph.physical((0.0, 0.0), 1.0);
         let cache_key: CacheKey = physical.cache_key;
 
@@ -194,9 +224,13 @@ impl GlyphRasterizer {
         // glyph_id + integer-quantised size.
         let key = GlyphKey(stable_key(cache_key));
 
-        // Atlas slot already? Fast path.
+        // Atlas slot already? Fast path. Placement was cached alongside.
         if let Some(existing) = self.atlas.lookup(key) {
-            return Some(atlas_slot_to_glyph_slot(existing, self.atlas.dimensions()));
+            let placement = self.placements.get(&key).copied().unwrap_or(GlyphPlacement {
+                offset: [0.0, 0.0],
+                size: [0.0, 0.0],
+            });
+            return Some(make_glyph_slot(existing, placement));
         }
 
         let image = self
@@ -205,12 +239,22 @@ impl GlyphRasterizer {
 
         let w = image.placement.width;
         let h = image.placement.height;
+        #[allow(clippy::cast_precision_loss)]
+        let placement = GlyphPlacement {
+            offset: [
+                image.placement.left as f32,
+                baseline_y - image.placement.top as f32,
+            ],
+            size: [w as f32, h as f32],
+        };
+
         if w == 0 || h == 0 || image.data.is_empty() {
             // Whitespace / zero-extent: cache an empty slot so we don't
             // re-rasterize next time.
             let slot = self.atlas.reserve(key, AtlasLayer::Mask, 1, 1)?;
+            self.placements.insert(key, placement);
             // Don't upload anything.
-            return Some(atlas_slot_to_glyph_slot(slot, self.atlas.dimensions()));
+            return Some(make_glyph_slot(slot, placement));
         }
 
         let layer = match image.content {
@@ -226,7 +270,8 @@ impl GlyphRasterizer {
 
         upload_glyph_pixels(queue, self.atlas_texture_for(layer), slot, &image.data);
 
-        Some(atlas_slot_to_glyph_slot(slot, self.atlas.dimensions()))
+        self.placements.insert(key, placement);
+        Some(make_glyph_slot(slot, placement))
     }
 
     fn atlas_texture_for(&self, layer: AtlasLayer) -> &Texture {
@@ -259,11 +304,13 @@ fn font_id_to_u64(id: cosmic_text::fontdb::ID) -> u64 {
 }
 
 #[allow(clippy::cast_precision_loss)] // atlas coords fit in 24 bits easily
-fn atlas_slot_to_glyph_slot(slot: AtlasSlot, _atlas_dims: (u32, u32)) -> GlyphSlot {
+fn make_glyph_slot(slot: AtlasSlot, placement: GlyphPlacement) -> GlyphSlot {
     GlyphSlot {
         uv_min: [slot.x as f32, slot.y as f32],
         uv_max: [(slot.x + slot.w) as f32, (slot.y + slot.h) as f32],
         is_color: matches!(slot.layer, AtlasLayer::Color),
+        glyph_offset: placement.offset,
+        glyph_size: placement.size,
     }
 }
 

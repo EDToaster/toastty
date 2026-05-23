@@ -267,9 +267,12 @@ impl Renderer {
             .map_or((0.0, 0.0), |t| t.rasterizer.cell_size())
     }
 
-    /// Set the theme used by [`Renderer::render_term`].
+    /// Set the theme used by [`Renderer::render_term`]. Also syncs the
+    /// clear color to the theme background so cells with the default bg
+    /// (which emit no instance) show through with the right color.
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
+        self.clear_color = theme.bg;
     }
 
     /// Current theme.
