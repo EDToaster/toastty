@@ -862,7 +862,11 @@ impl Renderer {
         // read `text.line_cache` immutably while writing to the scratch;
         // can't hold two borrows of TextState at once.
         let damage_all = term.damage().all;
-        let cursor_visible = self.blink.visible;
+        // Combine blink state with the app-side hide flag (DECSET 25).
+        // Apps like yazi / helix / neovim toggle 25 to hide the cursor
+        // during their alt-screen UI; if we ignored it the cursor block
+        // sat over their layout.
+        let cursor_visible = self.blink.visible && term.cursor_visible();
         // Split-borrow: take a shared borrow of `ext_palette` and a
         // mutable borrow of `text` from disjoint fields of `self` so
         // the builders can read the cached OSC 4 palette while we hold

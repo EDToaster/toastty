@@ -238,6 +238,22 @@ pub struct Term {
     cursor_underline_color: Option<Color>,
     /// Unicode placeholder run-in-progress.
     placeholder_run: Option<PlaceholderRun>,
+    /// Cell pixel size (width, height). Set by the binary at startup
+    /// and on resize. Read by the `CSI 16 t` (XTWINOPS) handler to
+    /// report char cell pixel dimensions back to apps. Apps like yazi
+    /// use it to compute kitty-graphics image placement sizes.
+    /// Defaults to a plausible (8, 16) until the binary updates it.
+    cell_pixel_size: (u16, u16),
+    /// Default background color in sRGB bytes. Set by the binary from
+    /// the renderer's theme. Read by the OSC 11 `?` query handler.
+    /// Apps use it to decide dark vs light rendering modes.
+    default_bg_rgb: [u8; 3],
+    /// DECSET 25 — show/hide the cursor. Defaults to `true` (shown).
+    /// Apps that take over the screen (yazi, helix, neovim, btop)
+    /// toggle this off so their layout isn't disrupted by the cursor
+    /// block. The renderer ANDs this with the blink state when
+    /// deciding whether to emit the cursor instance.
+    cursor_visible: bool,
 }
 
 /// In-progress run of Kitty Unicode placeholder cells.
@@ -248,11 +264,18 @@ pub struct Term {
 /// arrives, then materialize placements.
 #[derive(Debug)]
 pub(crate) struct PlaceholderRun {
-    /// Image id whose low byte was taken from the cursor fg color.
-    pub image_id_low: u8,
-    /// Cursor underline color encoded the optional 8-bit MSB extension
-    /// of the image id (kitty supports a 24-bit id via SGR 38;5 + 58;5).
-    pub image_id_high: Option<u8>,
+    /// Pre-computed image id derived from the SGR fg color at run
+    /// start. The kitty spec defines three encodings:
+    ///
+    /// - **Truecolor RGB** (`SGR 38;2;R;G;B`): id = `(R << 16) | (G << 8) | B`.
+    ///   Used by yazi, helix's `image.nvim`, and any client that wants
+    ///   24-bit ids without needing the SGR 58 extension. This is the
+    ///   most common encoding in the wild.
+    /// - **256-color + SGR 58** (`SGR 38;5;L` plus `SGR 58;5;H`): id =
+    ///   `(H << 8) | L`. The third diacritic on the first cell can
+    ///   extend to bits 16..24 (not yet wired).
+    /// - **256-color only** (`SGR 38;5;L`): id = `L`. 8-bit ids only.
+    pub image_id: u32,
     /// Cells collected so far: `(row, col, diacritics)`.
     pub cells: Vec<PlaceholderCell>,
     /// Starting row (so future extensions can detect newline
@@ -380,6 +403,11 @@ impl Term {
             image_revision: 0,
             cursor_underline_color: None,
             placeholder_run: None,
+            // Reasonable defaults until the binary plumbs the real
+            // values from the renderer.
+            cell_pixel_size: (8, 16),
+            default_bg_rgb: [0x12, 0x12, 0x17],
+            cursor_visible: true,
         }
     }
 
@@ -442,6 +470,20 @@ impl Term {
     #[must_use]
     pub fn cursor_underline_color(&self) -> Option<Color> {
         self.cursor_underline_color
+    }
+
+    /// Plumb the renderer's cell pixel size into Term so the
+    /// `CSI 16 t` (XTWINOPS) handler can report it back to apps.
+    /// Called by the binary at startup and on resize.
+    pub fn set_cell_pixel_size(&mut self, width: u16, height: u16) {
+        self.cell_pixel_size = (width.max(1), height.max(1));
+    }
+
+    /// Plumb the renderer's theme background color (sRGB bytes) into
+    /// Term so the OSC 11 query handler can report it. Apps use this
+    /// to choose dark/light rendering modes.
+    pub fn set_default_bg(&mut self, rgb: [u8; 3]) {
+        self.default_bg_rgb = rgb;
     }
 
     /// Override the per-Term image-cache byte budget. May evict.
@@ -572,6 +614,15 @@ impl Term {
     #[must_use]
     pub fn inband_resize_mode(&self) -> bool {
         self.inband_resize_mode
+    }
+
+    /// True when the cursor should be drawn. Apps toggle this via
+    /// DECSET 25 (`CSI ?25h` show, `CSI ?25l` hide). The renderer ANDs
+    /// this with the blink state when deciding whether to emit the
+    /// cursor instance.
+    #[must_use]
+    pub fn cursor_visible(&self) -> bool {
+        self.cursor_visible
     }
 
     /// Wall-clock instant the current BSU went high. `None` if no BSU is
@@ -957,9 +1008,11 @@ impl Term {
         // M11a: Unicode placeholder pipeline.
         //
         // Apps emit `<U+10EEEE><diacritic*>` cells where:
-        // - The cursor's SGR fg is Indexed256(N): low byte of image id.
-        // - SGR 58 (cursor_underline_color) Indexed256(M): high byte
-        //   of image id (optional).
+        // - The cursor's SGR fg encodes the image id. Three forms are
+        //   accepted per the kitty spec:
+        //     * Rgb(R, G, B)      → id = (R<<16) | (G<<8) | B  (yazi uses this)
+        //     * Indexed256(L) + SGR 58 = Indexed256(H) → id = (H<<8) | L
+        //     * Indexed256(L) alone → id = L
         // - 0..3 diacritics encode source-image row, source-image col,
         //   and (optionally) the image id MSB extension.
         //
@@ -968,15 +1021,13 @@ impl Term {
         // finalize → emit image placements.
         if toastty_graphics::is_placeholder(c) {
             if self.placeholder_run.is_none()
-                && let Color::Indexed256(low) = self.cursor.style.fg
+                && let Some(image_id) = placeholder_image_id_from_sgr(
+                    self.cursor.style.fg,
+                    self.cursor_underline_color,
+                )
             {
-                let high = match self.cursor_underline_color {
-                    Some(Color::Indexed256(h)) => Some(h),
-                    _ => None,
-                };
                 self.placeholder_run = Some(PlaceholderRun {
-                    image_id_low: low,
-                    image_id_high: high,
+                    image_id,
                     cells: Vec::new(),
                     start_row: self.cursor.row,
                 });
@@ -1082,18 +1133,10 @@ impl Term {
         if run.cells.is_empty() {
             return;
         }
-        // Compute the image id. SGR fg supplies the low byte; SGR 58
-        // (cursor_underline_color) optionally supplies the high byte;
-        // a third diacritic on the first cell supplies a 16-bit
-        // extension. We support the common 8-bit form (fg → id),
-        // optionally promoted to 16-bit via SGR 58. The 32-bit kitty
-        // extension via three diacritics is documented but rare; for
-        // M11a we accept the 16-bit form only.
-        let id = if let Some(high) = run.image_id_high {
-            u32::from(high) << 8 | u32::from(run.image_id_low)
-        } else {
-            u32::from(run.image_id_low)
-        };
+        // Image id is pre-computed at run-start from the SGR fg
+        // (and optionally SGR 58) — see [`PlaceholderRun::image_id`]
+        // and [`placeholder_image_id_from_sgr`].
+        let id = run.image_id;
         // The cells in the run form contiguous rectangles (apps emit
         // them row-by-row). For each contiguous (row, col-range)
         // segment, emit a placement with a sub-rect derived from the
@@ -1120,81 +1163,49 @@ impl Term {
         // cells along the relevant axis. Apps typically emit the same
         // row diacritic across one display row, with the column
         // diacritic varying. We treat the FIRST diacritic as the
-        // image row, the SECOND as the image column. Without
-        // metadata about cell dims we synthesize a uniform tiling: if
-        // an app emits R rows worth of placeholders, the image is
-        // tiled into R rows; same for columns.
+        // image row, the SECOND as the image column. Per the kitty
+        // spec the tile size is the terminal's cell-pixel dimensions
+        // (CSI 16t value): each placeholder cell renders a
+        // cell_w × cell_h sub-rect at (col_d * cell_w, row_d * cell_h)
+        // in the source image. Apps (yazi, image.nvim) pre-downscale
+        // their image to `area_cells_w * cell_w` × `area_cells_h *
+        // cell_h` before transmit, so the resulting placements tile
+        // the image perfectly with no leftover edges.
         //
-        // To keep this M11a-minimal, build a single placement per
-        // cell whose src_rect spans (col_diacritic, row_diacritic) on
-        // a uniform grid based on the maximum diacritic seen across
-        // the run.
-        let mut max_row_d = 0u16;
-        let mut max_col_d = 0u16;
-        for cell in &run.cells {
-            if let Some(&r) = cell.diacritics.first() {
-                max_row_d = max_row_d.max(r);
-            }
-            if let Some(&c) = cell.diacritics.get(1) {
-                max_col_d = max_col_d.max(c);
-            }
-        }
-        // Tile dimensions in source pixels. If diacritics are zero
-        // everywhere (single-cell placement covering the full image),
-        // emit a single full-image placement spanning the run's
-        // bounding rect.
-        let single_cell = max_row_d == 0 && max_col_d == 0;
+        // The previous implementation tried to infer tile size from
+        // the maximum diacritic seen in the run, but `finalize` runs
+        // per row (each newline between yazi's placeholder rows ends
+        // a run), so `max_row_d` was always 0 within a single row and
+        // every row painted the full-height image squashed into one
+        // cell of vertical space.
+        let (cell_pw, cell_ph) = self.cell_pixel_size;
+        let cell_pw = u32::from(cell_pw).max(1);
+        let cell_ph = u32::from(cell_ph).max(1);
         let mut placements = Vec::new();
-        if single_cell {
-            // Bounding rect of the run.
-            let mut min_r = u16::MAX;
-            let mut max_r = 0;
-            let mut min_c = u16::MAX;
-            let mut max_c = 0;
-            for cell in &run.cells {
-                min_r = min_r.min(cell.row);
-                max_r = max_r.max(cell.row);
-                min_c = min_c.min(cell.col);
-                max_c = max_c.max(cell.col);
-            }
+        for cell in &run.cells {
+            let row_d = cell.diacritics.first().copied().unwrap_or(0);
+            let col_d = cell.diacritics.get(1).copied().unwrap_or(0);
+            let sx_full = u32::from(col_d) * cell_pw;
+            let sy_full = u32::from(row_d) * cell_ph;
+            // Clamp to image bounds — a stray diacritic past the
+            // image's edge would otherwise sample outside the texture.
+            let sx = sx_full.min(img_w.saturating_sub(1));
+            let sy = sy_full.min(img_h.saturating_sub(1));
+            let sw = cell_pw.min(img_w.saturating_sub(sx));
+            let sh = cell_ph.min(img_h.saturating_sub(sy));
             placements.push(Placement {
                 image_id: id,
                 placement_id: 0,
-                row_range: min_r..max_r.saturating_add(1),
-                col_range: min_c..max_c.saturating_add(1),
-                src_rect: toastty_graphics::SrcRect::FULL,
+                row_range: cell.row..cell.row.saturating_add(1),
+                col_range: cell.col..cell.col.saturating_add(1),
+                src_rect: toastty_graphics::SrcRect {
+                    x: sx,
+                    y: sy,
+                    w: sw,
+                    h: sh,
+                },
                 z: 0,
             });
-        } else {
-            let tile_w = if max_col_d == 0 {
-                img_w
-            } else {
-                img_w / u32::from(max_col_d.saturating_add(1)).max(1)
-            };
-            let tile_h = if max_row_d == 0 {
-                img_h
-            } else {
-                img_h / u32::from(max_row_d.saturating_add(1)).max(1)
-            };
-            for cell in &run.cells {
-                let row_d = cell.diacritics.first().copied().unwrap_or(0);
-                let col_d = cell.diacritics.get(1).copied().unwrap_or(0);
-                let sx = u32::from(col_d) * tile_w;
-                let sy = u32::from(row_d) * tile_h;
-                placements.push(Placement {
-                    image_id: id,
-                    placement_id: 0,
-                    row_range: cell.row..cell.row.saturating_add(1),
-                    col_range: cell.col..cell.col.saturating_add(1),
-                    src_rect: toastty_graphics::SrcRect {
-                        x: sx,
-                        y: sy,
-                        w: tile_w,
-                        h: tile_h,
-                    },
-                    z: 0,
-                });
-            }
         }
         for placement in placements {
             mark_placement_dirty(self, &placement);
@@ -1288,6 +1299,50 @@ impl Term {
                     let col = self.cursor.col.min(self.cols.saturating_sub(1)).saturating_add(1);
                     let reply = format!("\x1b[?{row};{col}R");
                     self.pty_replies.extend_from_slice(reply.as_bytes());
+                }
+            }
+            // XTVERSION — `CSI > q`. Apps probe this to identify the
+            // terminal flavor and route to the matching backend. yazi
+            // (and helix, neovim image.nvim) substring-match the reply
+            // on the brand string to enable the modern KGP driver;
+            // unrecognised brands fall back to a legacy path that
+            // exercises code we haven't validated. Reply with a
+            // brand string containing "kitty" so apps treat us as
+            // kitty-protocol-grade.
+            //
+            // Reply format: DCS > | <brand> <version> ST.
+            'q' if priv_marker == Some(b'>') => {
+                self.pty_replies
+                    .extend_from_slice(b"\x1bP>|toastty (kitty 0.42.0)\x1b\\");
+            }
+            // XTWINOPS — window-manipulation reports.
+            //   CSI 14 t → report text-area pixel size: CSI 4 ; H ; W t.
+            //   CSI 16 t → report cell pixel size:       CSI 6 ; H ; W t.
+            //   CSI 18 t → report text-area cell size:   CSI 8 ; H ; W t.
+            // Apps (yazi, kitty +kitten icat, neovim with image.nvim,
+            // helix with image previews) gate image rendering on the
+            // `16 t` reply because they need to know how many pixels
+            // are in a cell. Without it they fall back to half-block /
+            // colored-cell rendering even when kitty graphics works.
+            't' if priv_marker.is_none() => {
+                let ps = first_param(params, 0);
+                let (cw, ch) = self.cell_pixel_size;
+                match ps {
+                    14 => {
+                        let h = u32::from(ch) * u32::from(self.rows);
+                        let w = u32::from(cw) * u32::from(self.cols);
+                        let reply = format!("\x1b[4;{h};{w}t");
+                        self.pty_replies.extend_from_slice(reply.as_bytes());
+                    }
+                    16 => {
+                        let reply = format!("\x1b[6;{ch};{cw}t");
+                        self.pty_replies.extend_from_slice(reply.as_bytes());
+                    }
+                    18 => {
+                        let reply = format!("\x1b[8;{};{}t", self.rows, self.cols);
+                        self.pty_replies.extend_from_slice(reply.as_bytes());
+                    }
+                    _ => {}
                 }
             }
 
@@ -1578,6 +1633,21 @@ impl Term {
                         self.enter_alt_screen();
                     } else {
                         self.exit_alt_screen();
+                    }
+                }
+                // 25 — DECTCEM, show/hide the cursor. `enable` = show.
+                // Apps that take over the screen (yazi, helix, neovim,
+                // btop) toggle this off during their alt-screen UI so
+                // the cursor block doesn't sit over their layout.
+                25 => {
+                    if self.cursor_visible != enable {
+                        let row = self.cursor.row;
+                        let col = self.cursor.col.min(self.cols.saturating_sub(1));
+                        self.cursor_visible = enable;
+                        // Repaint the cursor cell so the block
+                        // appears / disappears under partial redraw
+                        // with LoadOp::Load.
+                        self.mark_cell(row, col);
                     }
                 }
                 // 1000 — X10 / VT200 button reporting (press + release).
@@ -1885,6 +1955,31 @@ impl Perform for Term {
                 let payload = params.get(1).copied().unwrap_or(b"");
                 let title = String::from_utf8_lossy(payload).into_owned();
                 self.title = title;
+            }
+            // OSC 10/11/12 — fg / bg / cursor color query (and set).
+            // M11a+ wires query-only for OSC 11 (bg) because apps like
+            // yazi probe it at startup to decide dark vs light
+            // rendering. A query payload is `?`; a set is
+            // `rgb:RR/GG/BB` (or `RRRR/GGGG/BBBB`). We currently
+            // honor the query only — set is silently accepted but not
+            // applied (the binary still owns the theme).
+            10 | 11 | 12 => {
+                let payload = params.get(1).copied().unwrap_or(b"");
+                if payload == b"?" {
+                    let rgb = match code {
+                        10 => [0xd8, 0xd8, 0xd8], // theme.fg approx
+                        11 => self.default_bg_rgb,
+                        12 => [0xf2, 0xd9, 0x4d], // theme.cursor approx
+                        _ => unreachable!(),
+                    };
+                    // xterm-style reply: replicate each byte into the
+                    // 16-bit channel slot (0xAB → "ABAB").
+                    let reply = format!(
+                        "\x1b]{code};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\",
+                        rgb[0], rgb[0], rgb[1], rgb[1], rgb[2], rgb[2],
+                    );
+                    self.pty_replies.extend_from_slice(reply.as_bytes());
+                }
             }
             // OSC 4 — extended palette query / set.
             //
@@ -2253,6 +2348,41 @@ impl KittySink for Term {
 
     fn cursor_col(&self) -> u16 {
         self.cursor.col.min(self.cols.saturating_sub(1))
+    }
+}
+
+/// Decode a kitty unicode-placeholder image id from the active SGR
+/// foreground (and optionally the SGR 58 underline color slot).
+///
+/// Three encodings are recognized, in priority order:
+///
+/// 1. **Truecolor RGB** — `SGR 38;2;R;G;B`. The image id is packed as
+///    `(R << 16) | (G << 8) | B`. This is what `yazi`, `image.nvim`,
+///    and most kitty-graphics clients in the wild emit.
+/// 2. **Indexed256 + SGR 58 Indexed256** — `SGR 38;5;L` plus
+///    `SGR 58;5;H`. The id is `(H << 8) | L` (16-bit).
+/// 3. **Indexed256 only** — `SGR 38;5;L`. The id is `L` (8-bit).
+///
+/// Returns `None` for any other fg color (Default, Rgb with a third
+/// path not yet seen) — placeholder runs without a recognised id
+/// encoding are silently dropped per the kitty spec.
+fn placeholder_image_id_from_sgr(
+    fg: Color,
+    underline_color: Option<Color>,
+) -> Option<u32> {
+    match fg {
+        Color::Rgb(r, g, b) => {
+            Some((u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b))
+        }
+        Color::Indexed256(low) => {
+            let low = u32::from(low);
+            let high = match underline_color {
+                Some(Color::Indexed256(h)) => u32::from(h),
+                _ => 0,
+            };
+            Some((high << 8) | low)
+        }
+        _ => None,
     }
 }
 
@@ -3469,6 +3599,33 @@ mod tests {
     }
 
     #[test]
+    fn decset_25_toggles_cursor_visibility() {
+        let mut t = Term::new(4, 8, 0);
+        assert!(t.cursor_visible(), "cursor visible by default");
+        feed(&mut t, b"\x1b[?25l");
+        assert!(!t.cursor_visible(), "?25l hides cursor");
+        feed(&mut t, b"\x1b[?25h");
+        assert!(t.cursor_visible(), "?25h shows cursor");
+    }
+
+    #[test]
+    fn decset_25_hide_marks_cursor_cell_dirty() {
+        // Under partial redraw with LoadOp::Load the cursor block from
+        // the previous frame would persist if we didn't mark the cell
+        // dirty when the visibility toggles.
+        let mut t = Term::new(4, 8, 0);
+        t.clear_damage();
+        feed(&mut t, b"\x1b[?25l");
+        let damage = t.damage();
+        // The cursor cell (0, 0) must be in the damage set.
+        let row_damage = &damage.rows[0];
+        assert!(
+            row_damage.all_cols || row_damage.cols.contains(&0),
+            "expected cursor cell (0,0) dirty after ?25l; got {row_damage:?}",
+        );
+    }
+
+    #[test]
     fn decset_2048_toggles_inband_resize_mode() {
         let mut t = Term::new(2, 4, 0);
         assert!(!t.inband_resize_mode());
@@ -4102,6 +4259,35 @@ mod tests {
         feed(&mut t, b"\x1b[3;4H");
         feed(&mut t, b"\x1b[6n");
         assert_eq!(&t.drain_pty_replies()[..], b"\x1b[3;4R");
+    }
+
+    #[test]
+    fn xtwinops_16_replies_with_cell_pixel_size() {
+        // CSI 16 t — apps need the cell pixel size to compute kitty
+        // graphics placements. Reply is CSI 6 ; <cell_h> ; <cell_w> t.
+        let mut t = Term::new(24, 80, 0);
+        t.set_cell_pixel_size(9, 18);
+        feed(&mut t, b"\x1b[16t");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[6;18;9t");
+    }
+
+    #[test]
+    fn xtwinops_18_replies_with_text_area_cell_size() {
+        let mut t = Term::new(24, 80, 0);
+        feed(&mut t, b"\x1b[18t");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[8;24;80t");
+    }
+
+    #[test]
+    fn osc_11_query_replies_with_bg_rgb() {
+        // OSC 11 ; ? — apps probe bg to choose dark vs light rendering.
+        let mut t = Term::new(2, 4, 0);
+        t.set_default_bg([0xab, 0xcd, 0xef]);
+        feed(&mut t, b"\x1b]11;?\x1b\\");
+        assert_eq!(
+            &t.drain_pty_replies()[..],
+            b"\x1b]11;rgb:abab/cdcd/efef\x1b\\"
+        );
     }
 
     #[test]

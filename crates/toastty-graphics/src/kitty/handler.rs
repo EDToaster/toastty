@@ -115,6 +115,16 @@ pub struct KittyHandler {
     /// (image number) we don't currently maintain a parallel slot —
     /// `i=` is the canonical id (pre-approved trade-off).
     pending: HashMap<u32, PendingUpload>,
+    /// Image id of the upload currently in progress. Set by the first
+    /// chunk (which carries `a=t|T,i=N,m=1`); consulted by continuation
+    /// chunks that omit `i=` (yazi, kitty +kitten icat, every
+    /// real-world client). Cleared when `m=0` finalizes or the upload
+    /// is abandoned with an error.
+    ///
+    /// The kitty spec doesn't strictly require `i=` on continuation
+    /// chunks — terminals are expected to track an active upload — so
+    /// rejecting headerless continuations would break every client.
+    active_upload_id: Option<u32>,
     /// Per-instance override of [`DEFAULT_PENDING_CAP`].
     pending_cap: usize,
 }
@@ -125,6 +135,7 @@ impl KittyHandler {
     pub fn new() -> Self {
         Self {
             pending: HashMap::new(),
+            active_upload_id: None,
             pending_cap: DEFAULT_PENDING_CAP,
         }
     }
@@ -167,17 +178,22 @@ impl KittyHandler {
                 self.handle_delete(header, sink);
             }
             Action::Query => {
-                // Query: ENOENT if no id was provided OR the host's
-                // registry doesn't hold the queried image. OK only
-                // when the host confirms presence via
-                // `KittySink::image_exists`. (Before M11a-followup.I2
-                // we unconditionally replied OK when `i!=0`, which
-                // told apps we owned images we'd never received.)
-                if header.image_id != 0 && sink.image_exists(header.image_id) {
-                    reply_ok_if_verbose(&header, sink);
-                } else {
-                    reply_error_if_verbose(&header, sink, ErrorCode::Enoent, "");
-                }
+                // Per the kitty spec, `a=q` is "transmit + test": the
+                // app sends a (typically tiny) image and the terminal
+                // replies OK if it could decode it, or the appropriate
+                // error code if not. The terminal must NOT store or
+                // display the payload.
+                //
+                // This is what apps use to probe kitty-graphics support
+                // at startup (yazi, helix, btop, ...). Replying ENOENT
+                // here — which M11a-followup.I2 did by looking the id
+                // up in the registry — tells the probing app "no
+                // support", which is the opposite of what we want.
+                //
+                // `KittySink::image_exists` is still exposed for future
+                // use cases (e.g. a hypothetical "does cache hold N"
+                // action) but is NOT consulted by `a=q`.
+                self.handle_query(header, body, sink);
             }
             Action::Frame | Action::Animate => {
                 // Animation: pre-approved Enotsup.
@@ -189,6 +205,60 @@ impl KittyHandler {
         }
     }
 
+    fn handle_query<S: KittySink>(&mut self, header: Header, body: &[u8], sink: &mut S) {
+        // Empty body: app is probing for protocol support, not testing
+        // a specific payload. Reply OK directly.
+        if body.is_empty() {
+            reply_ok_if_verbose(&header, sink);
+            return;
+        }
+        if !matches!(header.transmission, Transmission::Direct) {
+            reply_error_if_verbose(&header, sink, ErrorCode::Enotsup, "transmission medium");
+            return;
+        }
+        // Decode and validate. Same pipeline as `finalize_transmit`
+        // but we discard the result (Query must not store/display).
+        let decoded = match decode_base64(body) {
+            Ok(d) => d,
+            Err(e) => {
+                reply_error_if_verbose(
+                    &header,
+                    sink,
+                    ErrorCode::Einval,
+                    &format!("bad base64: {e}"),
+                );
+                return;
+            }
+        };
+        let raw = match header.compression {
+            Compression::None => decoded,
+            Compression::Zlib => match inflate_zlib(&decoded) {
+                Ok(d) => d,
+                Err(e) => {
+                    reply_error_if_verbose(
+                        &header,
+                        sink,
+                        ErrorCode::Einval,
+                        &format!("zlib decompress: {e}"),
+                    );
+                    return;
+                }
+            },
+        };
+        match decode(header.format, &raw, header.source_width, header.source_height) {
+            Ok(_) => reply_ok_if_verbose(&header, sink),
+            Err(e) => {
+                let code = match e {
+                    DecodeError::BadPng(_) => ErrorCode::Ebadf,
+                    DecodeError::LengthMismatch { .. } | DecodeError::MissingDims { .. } => {
+                        ErrorCode::Einval
+                    }
+                };
+                reply_error_if_verbose(&header, sink, code, &e.to_string());
+            }
+        }
+    }
+
     fn handle_transmit<S: KittySink>(&mut self, header: Header, body: &[u8], sink: &mut S) {
         // Only direct base64 transmission is supported in M11a.
         if !matches!(header.transmission, Transmission::Direct) {
@@ -196,23 +266,41 @@ impl KittyHandler {
             return;
         }
 
-        let key = header.image_id;
+        // Resolve which pending upload this chunk targets. Real-world
+        // clients (yazi, kitty +kitten icat) emit the first chunk with
+        // `a=T,i=N,m=1,<other params>` and subsequent chunks with just
+        // `m={1|0}` — no `i=`. Per the kitty spec the terminal must
+        // remember the active upload and route headerless continuations
+        // to it. Without this, `m=0` would be parsed as a brand-new
+        // single-chunk transmit with no `s=`/`v=`, which trips the
+        // decoder's "missing required dimensions" check.
+        let key = if header.image_id != 0 {
+            header.image_id
+        } else {
+            self.active_upload_id.unwrap_or(0)
+        };
 
         // Continuation: append to the existing pending buffer.
         if let Some(pending) = self.pending.get_mut(&key)
             && key != 0
         {
             // Compare critical header fields. Mismatches → Einval and
-            // abandon the upload.
-            if !headers_continuation_compatible(&pending.head, &header) {
+            // abandon the upload. Skip the check when the continuation
+            // chunk was routed via `active_upload_id` (its header is
+            // intentionally bare — only `m=` is set — so comparing it
+            // against the first-chunk header would always fail).
+            let bare_continuation = header.image_id == 0;
+            if !bare_continuation && !headers_continuation_compatible(&pending.head, &header) {
                 let head = pending.head.clone();
                 self.pending.remove(&key);
+                self.active_upload_id = None;
                 reply_error_if_verbose(&head, sink, ErrorCode::Einval, "header mismatch");
                 return;
             }
             if pending.buf.len() + body.len() > self.pending_cap {
                 let head = pending.head.clone();
                 self.pending.remove(&key);
+                self.active_upload_id = None;
                 reply_error_if_verbose(&head, sink, ErrorCode::Efbig, "pending overflow");
                 return;
             }
@@ -222,6 +310,7 @@ impl KittyHandler {
             }
             // Final chunk — pop and finalize.
             let pending = self.pending.remove(&key).unwrap();
+            self.active_upload_id = None;
             self.finalize_transmit(pending.head, pending.buf, sink);
             return;
         }
@@ -238,11 +327,13 @@ impl KittyHandler {
         }
 
         if header.more {
-            // Spec requires `i=` for chunked uploads (so continuation
-            // chunks can reference the in-flight payload). If the
-            // client omitted it, accept under a synthesized id of 0
-            // — but in practice clients always include `i=`. We
-            // tolerate the absence so we don't reject valid streams.
+            // First chunk of a multi-chunk upload. Record `active_upload_id`
+            // so continuation chunks that omit `i=` (which is every
+            // real-world client per docs/specs) get routed back to
+            // this pending entry.
+            if key != 0 {
+                self.active_upload_id = Some(key);
+            }
             self.pending.insert(
                 key,
                 PendingUpload {
@@ -587,6 +678,46 @@ mod tests {
         assert_eq!(h.pending_uploads(), 0);
     }
 
+    /// Regression: real-world clients (yazi, `kitty +kitten icat`) send
+    /// the first chunk with the full header (`i=N,a=T,...,m=1`) and
+    /// every subsequent chunk with only `m={1|0}` — `i=` is omitted.
+    /// Per the kitty spec the terminal must remember the active upload
+    /// and route headerless continuations to it. Before this fix the
+    /// bare continuations were treated as new single-chunk transmits
+    /// and the final `m=0` chunk's missing `s=`/`v=` tripped the
+    /// decoder's "missing required dimensions" check (EINVAL).
+    #[test]
+    fn bare_continuation_chunks_route_to_active_upload() {
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        let body = b64_red_pixel();
+        let third = body.len() / 3;
+        let (a, rest) = body.split_at(third);
+        let (b, c) = rest.split_at(third);
+        // First chunk: full header (i=, s=, v=, format, m=1).
+        h.process(
+            b"Ga=t,f=32,s=1,v=1,i=42,m=1",
+            a.as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
+        // Continuation: only m=1, no i= and no s=/v=.
+        h.process(b"Gm=1", b.as_bytes(), &mut sink).unwrap();
+        // Final: only m=0.
+        h.process(b"Gm=0", c.as_bytes(), &mut sink).unwrap();
+        assert_eq!(sink.registered.len(), 1, "expected one registered image");
+        assert_eq!(sink.registered[0].0, 42);
+        let joined: String = sink
+            .replies
+            .iter()
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .collect();
+        assert!(
+            !joined.contains("EINVAL") && !joined.contains("EBADF"),
+            "expected no error reply, got {joined:?}"
+        );
+    }
+
     #[test]
     fn chunked_header_mismatch_is_einval() {
         let mut h = KittyHandler::new();
@@ -710,10 +841,12 @@ mod tests {
     }
 
     #[test]
-    fn query_unknown_image_returns_enoent() {
-        // M11a-followup.I2: an `a=q` for an id we don't hold MUST
-        // reply ENOENT — apps query before transmitting and expect
-        // the truth.
+    fn query_with_empty_body_replies_ok() {
+        // Per kitty spec, `a=q` is "transmit + test" — apps probing
+        // for protocol support send a tiny (often 1x1) payload and
+        // expect OK if the terminal understands kitty graphics. A
+        // body-less query (some tools emit this as a bare protocol
+        // probe) also gets OK.
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
         h.process(b"Ga=q,i=42", b"", &mut sink).unwrap();
@@ -723,10 +856,55 @@ mod tests {
             .map(|r| String::from_utf8_lossy(r).into_owned())
             .collect();
         assert!(
-            joined.contains("ENOENT"),
-            "expected ENOENT for unknown image, got {joined:?}",
+            joined.contains(";OK"),
+            "empty-body query should reply OK, got {joined:?}",
         );
-        assert!(!joined.contains(";OK"));
+    }
+
+    #[test]
+    fn query_with_valid_body_replies_ok_without_storing() {
+        // The yazi probe shape: `a=q,s=1,v=1,t=d,f=24;AAAA` — 1x1 RGB
+        // pixel. Decode succeeds → OK. Registry stays empty (Query
+        // must not store).
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        h.process(
+            b"Ga=q,s=1,v=1,t=d,f=24,i=31",
+            b"AAAA",
+            &mut sink,
+        )
+        .unwrap();
+        let joined: String = sink
+            .replies
+            .iter()
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .collect();
+        assert!(joined.contains(";OK"), "got {joined:?}");
+        assert!(
+            sink.registered.is_empty(),
+            "Query must not store the image"
+        );
+    }
+
+    #[test]
+    fn query_with_garbage_body_replies_error() {
+        // Body that is valid base64 of garbage PNG bytes → Ebadf
+        // (PNG decoder rejects). The base64 layer succeeds first.
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        // "garbage!" base64-encoded.
+        h.process(
+            b"Ga=q,f=100,i=99",
+            b"Z2FyYmFnZSE=",
+            &mut sink,
+        )
+        .unwrap();
+        let joined: String = sink
+            .replies
+            .iter()
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .collect();
+        assert!(joined.contains("EBADF"), "got {joined:?}");
     }
 
     #[test]

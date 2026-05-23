@@ -38,6 +38,7 @@ use toastty::mouse::{
     MouseEventKind, classify_button_event, encode_mouse, pixel_to_cell, protocol_wants_event,
 };
 use toastty::paste::wrap_for_paste;
+use toastty::pty_log::{Direction, PtyLogger};
 use toastty::shell::resolve_shell;
 use toastty::theme_bridge::theme_from_config;
 
@@ -129,6 +130,9 @@ struct Toastty {
     /// keeps a connection to the OS clipboard server; constructing it
     /// failed on the user's box is recoverable — we just log + skip.
     clipboard: Option<arboard::Clipboard>,
+    /// Optional bidirectional PTY-byte logger, enabled by
+    /// `TOASTTY_PTY_LOG=<path>`. No-op when the env var is unset.
+    pty_log: PtyLogger,
 }
 
 impl Toastty {
@@ -158,6 +162,7 @@ impl Toastty {
             mouse_pos: (0.0, 0.0),
             mouse_held: None,
             clipboard: None,
+            pty_log: PtyLogger::from_env(),
         }
     }
 
@@ -219,7 +224,8 @@ impl Toastty {
         self.write_pty(&bytes);
     }
 
-    fn write_pty(&self, bytes: &[u8]) {
+    fn write_pty(&mut self, bytes: &[u8]) {
+        self.pty_log.log(Direction::ToApp, bytes);
         if let Some(pty) = self.pty.as_ref()
             && let Err(e) = pty.write(bytes)
         {
@@ -296,6 +302,12 @@ impl Toastty {
         let (px_w, px_h) = self.physical_size;
         let (cols, rows) = grid_dims_from_pixels(px_w, px_h, cell_w, cell_h);
         self.term.resize(rows, cols);
+        // Re-plumb cell pixel size: font swap (M4b reload) can change
+        // it, and CSI 16 t queries arriving post-resize need the
+        // current value.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (cpw, cph) = (cell_w as u16, cell_h as u16);
+        self.term.set_cell_pixel_size(cpw, cph);
         if let Some(pty) = self.pty.as_mut() {
             let pixel_width = u16::try_from(px_w).unwrap_or(u16::MAX);
             let pixel_height = u16::try_from(px_h).unwrap_or(u16::MAX);
@@ -317,6 +329,7 @@ impl Toastty {
     /// during this batch — the caller uses that signal to schedule the
     /// watchdog redraw via `ControlSignal::RedrawIn(BSU_TIMEOUT)`.
     fn handle_pty_bytes(&mut self, bytes: &[u8]) -> bool {
+        self.pty_log.log(Direction::FromApp, bytes);
         let was_paused = self.term.pause_rendering();
         self.parser.advance(&mut self.term, bytes);
         // OSC 0/1/2 may have changed the title — sync to the window
@@ -395,6 +408,21 @@ impl Toastty {
         let (cols, rows) = grid_dims_from_pixels(size.0, size.1, cell_w, cell_h);
         self.term.resize(rows, cols);
 
+        // Plumb the renderer's cell pixel size + theme bg into Term so
+        // CSI 16 t / OSC 11 queries reply with the right values. Apps
+        // like yazi gate kitty-graphics rendering on these answers and
+        // fall back to colored cells when the queries time out.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (cpw, cph) = (cell_w as u16, cell_h as u16);
+        self.term.set_cell_pixel_size(cpw, cph);
+        let theme_bg = renderer.theme().bg;
+        let bg_rgb = [
+            linear_to_srgb_u8(theme_bg[0]),
+            linear_to_srgb_u8(theme_bg[1]),
+            linear_to_srgb_u8(theme_bg[2]),
+        ];
+        self.term.set_default_bg(bg_rgb);
+
         // Spawn the PTY.
         let (program, args) = resolve_shell(&self.config.shell);
         info!(?program, ?args, rows, cols, "spawning shell");
@@ -414,11 +442,36 @@ impl Toastty {
         let spec = PtySpec::program(program)
             .args(args)
             .with_current_env()
+            // Strip multiplexer markers leaked from whatever launched
+            // toastty. The shell running INSIDE toastty isn't inside
+            // tmux / zellij / screen — toastty is the terminal it sees
+            // — and apps that key off these vars degrade badly:
+            // - yazi: `ZELLIJ_SESSION_NAME` is set → retains only
+            //   `Sixel` in the adapter list → empty on macOS → falls
+            //   all the way through to `Chafa` (colored-cell preview).
+            //   Kitty graphics never gets a chance even when we
+            //   correctly advertise support via KITTY_WINDOW_ID.
+            // - many shells: `TMUX` / `TMUX_PANE` change prompt + reset
+            //   wrappers that toastty doesn't speak.
+            .env_remove("ZELLIJ")
+            .env_remove("ZELLIJ_PANE_ID")
+            .env_remove("ZELLIJ_SESSION_NAME")
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .env_remove("STY") // GNU screen
             .env("TERM", "xterm-256color")
             // M10 shell integration: snippets under
             // `share/shell-integration/` gate on this var so they only
             // activate inside a toastty session.
             .env("TOASTTY", "1")
+            // M11a: signal kitty-graphics support to apps that gate on
+            // env-var brand detection rather than probing. yazi's
+            // `Brand::from_env` checks for `KITTY_WINDOW_ID` to route
+            // image rendering through the modern KGP driver instead of
+            // its legacy fallback (which exercises code paths we
+            // haven't validated). The value is informational — apps
+            // generally treat any non-empty string as "we're in kitty".
+            .env("KITTY_WINDOW_ID", "1")
             .size(WinSize {
                 rows,
                 cols,
@@ -715,6 +768,21 @@ impl App for Toastty {
 }
 
 /// True when `(button, modifiers)` is the "open hyperlink under cursor"
+/// Convert a linear-light channel value (0.0..1.0) back to an 8-bit
+/// sRGB byte. Inverse of `srgb_to_linear` in toastty-render. Used to
+/// feed Term's OSC 10/11/12 query handlers a byte triplet apps can
+/// understand.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn linear_to_srgb_u8(x: f32) -> u8 {
+    let clamped = x.clamp(0.0, 1.0);
+    let srgb = if clamped <= 0.003_130_8 {
+        12.92 * clamped
+    } else {
+        1.055 * clamped.powf(1.0 / 2.4) - 0.055
+    };
+    (srgb * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
 /// binding. On macOS it's `Cmd-Left`; on every other platform it's
 /// `Ctrl-Left` (matching iTerm2 / Alacritty conventions).
 fn is_open_link_binding(button: MouseButton, modifiers: Modifiers) -> bool {
