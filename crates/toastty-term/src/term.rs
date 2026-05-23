@@ -2257,6 +2257,24 @@ mod tests {
     }
 
     #[test]
+    fn decset_2027_is_independent_of_other_modes() {
+        // Toggling 2027 must not affect 2026 or 2048 (no cross-mode
+        // bleed). Catches accidental field-confusion regressions.
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?2026h");
+        feed(&mut t, b"\x1b[?2048h");
+        feed(&mut t, b"\x1b[?2027h");
+        assert!(t.grapheme_cluster_mode());
+        assert!(t.pause_rendering());
+        assert!(t.inband_resize_mode());
+        feed(&mut t, b"\x1b[?2027l");
+        assert!(!t.grapheme_cluster_mode());
+        // Other modes unaffected.
+        assert!(t.pause_rendering());
+        assert!(t.inband_resize_mode());
+    }
+
+    #[test]
     fn decset_2048_toggles_inband_resize_mode() {
         let mut t = Term::new(2, 4, 0);
         assert!(!t.inband_resize_mode());
