@@ -82,4 +82,28 @@ mod tests {
         let s = std::str::from_utf8(&out).unwrap();
         assert_eq!(s, "\x1b[48;65535;65535;65535;65535t");
     }
+
+    #[test]
+    fn term_then_encode_round_trip_via_decset() {
+        // End-to-end-ish: feed DECSET 2048 into a Term, then ask the
+        // encoder for a resize report using that Term's
+        // `inband_resize_mode()` flag. The encoder must produce bytes
+        // post-enable and `None` post-disable.
+        use toastty_parser::Parser;
+        use toastty_term::Term;
+
+        let mut t = Term::new(2, 4, 0);
+        let mut p = Parser::new();
+        // Enable.
+        p.advance(&mut t, b"\x1b[?2048h");
+        let report =
+            encode_resize_report(24, 80, 480, 640, t.inband_resize_mode()).expect("Some when on");
+        assert_eq!(
+            std::str::from_utf8(&report).unwrap(),
+            "\x1b[48;24;80;480;640t"
+        );
+        // Disable.
+        p.advance(&mut t, b"\x1b[?2048l");
+        assert!(encode_resize_report(24, 80, 480, 640, t.inband_resize_mode()).is_none());
+    }
 }
