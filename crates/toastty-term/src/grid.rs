@@ -71,7 +71,11 @@ impl Row {
         if start >= end {
             return;
         }
-        let blank = Cell { ch: ' ', style };
+        let blank = Cell {
+            ch: ' ',
+            style,
+            is_continuation: false,
+        };
         for c in &mut self.cells[start..end] {
             *c = blank;
         }
@@ -161,7 +165,11 @@ impl Grid {
             if row.cells.len() != cols as usize {
                 row.resize_cols(cols);
             }
-            row.cells.fill(Cell { ch: ' ', style });
+            row.cells.fill(Cell {
+                ch: ' ',
+                style,
+                is_continuation: false,
+            });
             row.soft_wrap = false;
         }
     }
@@ -223,6 +231,7 @@ mod tests {
         r.cells[0] = Cell {
             ch: 'x',
             style: red_style(),
+            is_continuation: false,
         };
         r.soft_wrap = true;
         r.clear();
@@ -251,6 +260,7 @@ mod tests {
             Cell {
                 ch: 'z',
                 style: Style::RESET,
+                is_continuation: false,
             },
             8,
         );
@@ -270,6 +280,7 @@ mod tests {
             Cell {
                 ch: 'x',
                 style: Style::RESET,
+                is_continuation: false,
             },
             3,
         );
@@ -284,6 +295,7 @@ mod tests {
             *c = Cell {
                 ch: char::from(b'a' + i as u8),
                 style: Style::RESET,
+                is_continuation: false,
             };
         }
         r.erase(1, 3, red_style());
@@ -292,14 +304,16 @@ mod tests {
             r.cells[1],
             Cell {
                 ch: ' ',
-                style: red_style()
+                style: red_style(),
+                is_continuation: false,
             }
         );
         assert_eq!(
             r.cells[2],
             Cell {
                 ch: ' ',
-                style: red_style()
+                style: red_style(),
+                is_continuation: false,
             }
         );
         assert_eq!(r.cells[3].ch, 'd');
@@ -336,6 +350,7 @@ mod tests {
             Cell {
                 ch: 'a',
                 style: Style::RESET,
+                is_continuation: false,
             },
             3,
         );
@@ -344,6 +359,7 @@ mod tests {
             Cell {
                 ch: 'b',
                 style: Style::RESET,
+                is_continuation: false,
             },
             3,
         );
@@ -362,6 +378,7 @@ mod tests {
             Cell {
                 ch: 'x',
                 style: Style::RESET,
+                is_continuation: false,
             },
             3,
         );
@@ -386,6 +403,7 @@ mod tests {
             Cell {
                 ch: 'a',
                 style: Style::RESET,
+                is_continuation: false,
             },
             4,
         );
@@ -403,6 +421,7 @@ mod tests {
             Cell {
                 ch: 'a',
                 style: Style::RESET,
+                is_continuation: false,
             },
             3,
         );
@@ -411,6 +430,7 @@ mod tests {
             Cell {
                 ch: 'b',
                 style: Style::RESET,
+                is_continuation: false,
             },
             3,
         );

@@ -517,6 +517,7 @@ impl Term {
         let cell = Cell {
             ch: c,
             style: self.cursor.style,
+            is_continuation: false,
         };
         let col = self.cursor.col;
         let row = self.cursor.row;
