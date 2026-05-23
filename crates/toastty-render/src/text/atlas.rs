@@ -10,8 +10,16 @@
 //! This module is pure CPU. The wgpu textures themselves live in
 //! `glyph_rasterizer` — this just owns the packing math + a key→slot
 //! cache. That separation keeps the unit tests GPU-free.
+//!
+//! ## Eviction (M11a)
+//!
+//! `reserve` returns `Result<AtlasSlot, AtlasFull>`; callers that hit
+//! [`AtlasFull`] can call [`Atlas::evict_oldest_shelf`] (LRU shelf
+//! invalidation) and retry. Cache entries pointing at the evicted shelf
+//! are dropped so a future `reserve` for those keys re-rasterizes.
 
 use std::collections::HashMap;
+use thiserror::Error;
 
 /// Which of the two virtual atlas layers a slot lives in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -49,6 +57,20 @@ struct Shelf {
     height: u32,
     /// X cursor where the next glyph would land.
     cursor_x: u32,
+    /// Monotonic counter, bumped on every reserve hitting this shelf.
+    /// LRU eviction picks the shelf with the smallest counter.
+    last_used: u64,
+}
+
+/// Reservation failure for a full atlas layer. Returned by
+/// [`Atlas::reserve`]; the caller can recover by calling
+/// [`Atlas::evict_oldest_shelf`] on the same layer and retrying.
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+#[error("atlas layer {layer:?} is full ({w}x{h} request)")]
+pub struct AtlasFull {
+    pub layer: AtlasLayer,
+    pub w: u32,
+    pub h: u32,
 }
 
 /// A bounded shelf-pack allocator. Pure CPU, deterministic.
@@ -59,6 +81,18 @@ pub(crate) struct ShelfPacker {
     shelves: Vec<Shelf>,
     /// Y of the next shelf's top edge if we have to create a new one.
     next_shelf_top: u32,
+    /// Monotonic counter stamped onto a shelf on each successful
+    /// reserve. Used by [`Self::evict_oldest`] to pick the LRU shelf.
+    clock: u64,
+}
+
+/// Outcome of a successful packer reserve.
+struct ShelfReserved {
+    x: u32,
+    y: u32,
+    /// Index of the shelf we placed onto. Returned so the cache can
+    /// associate cache entries with shelves for later eviction.
+    shelf_idx: usize,
 }
 
 impl ShelfPacker {
@@ -68,12 +102,13 @@ impl ShelfPacker {
             height,
             shelves: Vec::new(),
             next_shelf_top: 0,
+            clock: 0,
         }
     }
 
     /// Try to reserve a `(w, h)` rectangle. Returns `None` if no shelf can
     /// fit it and we're out of vertical room for a new shelf.
-    fn reserve(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
+    fn reserve(&mut self, w: u32, h: u32) -> Option<ShelfReserved> {
         if w == 0 || h == 0 || w > self.width {
             return None;
         }
@@ -81,7 +116,7 @@ impl ShelfPacker {
         // First-fit: walk existing shelves looking for one with room.
         // Allow up to 25% slack on the shelf height to avoid creating a
         // tall, near-empty shelf for one outlier.
-        for shelf in &mut self.shelves {
+        for (idx, shelf) in self.shelves.iter_mut().enumerate() {
             let height_ok =
                 h <= shelf.height || (h <= shelf.height + shelf.height / 4 && shelf.cursor_x == 0);
             if !height_ok {
@@ -93,7 +128,13 @@ impl ShelfPacker {
                 if h > shelf.height {
                     shelf.height = h;
                 }
-                return Some((x, shelf.top));
+                self.clock += 1;
+                shelf.last_used = self.clock;
+                return Some(ShelfReserved {
+                    x,
+                    y: shelf.top,
+                    shelf_idx: idx,
+                });
             }
         }
 
@@ -102,14 +143,55 @@ impl ShelfPacker {
             return None;
         }
         let top = self.next_shelf_top;
+        self.clock += 1;
         let new_shelf = Shelf {
             top,
             height: h,
             cursor_x: w,
+            last_used: self.clock,
         };
+        let shelf_idx = self.shelves.len();
         self.shelves.push(new_shelf);
         self.next_shelf_top += h;
-        Some((0, top))
+        Some(ShelfReserved {
+            x: 0,
+            y: top,
+            shelf_idx,
+        })
+    }
+
+    /// Bump the LRU timestamp on `shelf_idx`. Called when an existing
+    /// cache entry is looked up — keeps "in-use" shelves from being
+    /// evicted by [`Self::evict_oldest`].
+    fn touch(&mut self, shelf_idx: usize) {
+        if let Some(s) = self.shelves.get_mut(shelf_idx) {
+            self.clock += 1;
+            s.last_used = self.clock;
+        }
+    }
+
+    /// Reset the shelf with the smallest `last_used` so it can be
+    /// re-packed. Returns the index of the evicted shelf, or `None`
+    /// when there are no shelves to evict.
+    fn evict_oldest(&mut self) -> Option<usize> {
+        if self.shelves.is_empty() {
+            return None;
+        }
+        let mut best = 0usize;
+        let mut best_used = self.shelves[0].last_used;
+        for (i, s) in self.shelves.iter().enumerate() {
+            if s.last_used < best_used {
+                best = i;
+                best_used = s.last_used;
+            }
+        }
+        // "Reset" the shelf: cursor back to 0; height left as-is (the
+        // shelf's vertical extent is fixed once opened).
+        let s = &mut self.shelves[best];
+        s.cursor_x = 0;
+        // Don't bump clock: the shelf is now empty and the LRU pointer
+        // should remain at the bottom. Future reserves will touch it.
+        Some(best)
     }
 }
 
@@ -120,18 +202,28 @@ impl ShelfPacker {
 /// critical because the renderer would otherwise re-rasterize the same
 /// glyph every frame.
 ///
-/// # M4b limitations
+/// # Eviction
 ///
-/// - **Eviction:** none. If a layer fills up, `reserve` returns `None`
-///   and the higher-level caller panics. Allocate generously (e.g.
-///   1024×1024 per layer) and the demo won't hit it.
-///   TODO(atlas-evict): implement LRU shelf reset once we have a real
-///   workload to size against.
+/// When a layer fills, `reserve` returns
+/// `Err(`[`AtlasFull`]`)`. Callers can either:
+/// 1. Degrade gracefully — render an empty fallback for that glyph this
+///    frame.
+/// 2. Recover — call [`Atlas::evict_oldest_shelf`] on the layer and
+///    retry the reserve.
 #[derive(Debug, Clone)]
 pub struct Atlas {
     mask: ShelfPacker,
     color: ShelfPacker,
-    cache: HashMap<GlyphKey, AtlasSlot>,
+    cache: HashMap<GlyphKey, CachedSlot>,
+}
+
+/// Internal cache entry. Tracks the slot plus the shelf it lives on
+/// (so a later [`Atlas::evict_oldest_shelf`] can drop matching cache
+/// entries).
+#[derive(Debug, Clone, Copy)]
+struct CachedSlot {
+    slot: AtlasSlot,
+    shelf_idx: usize,
 }
 
 impl Atlas {
@@ -155,37 +247,79 @@ impl Atlas {
     /// Reserve space for a glyph. Returns the existing slot if the key
     /// has been seen, else packs into `layer` and caches the result.
     ///
-    /// Returns `None` only when the target layer is full.
+    /// Returns `Err(AtlasFull)` only when the target layer is full —
+    /// callers can call [`Atlas::evict_oldest_shelf`] for that layer
+    /// and retry.
     pub fn reserve(
         &mut self,
         key: GlyphKey,
         layer: AtlasLayer,
         w: u32,
         h: u32,
-    ) -> Option<AtlasSlot> {
-        if let Some(slot) = self.cache.get(&key) {
-            return Some(*slot);
+    ) -> Result<AtlasSlot, AtlasFull> {
+        if let Some(cached) = self.cache.get(&key).copied() {
+            // Touch the LRU on the shelf this glyph lives on so it
+            // doesn't get evicted out from under us.
+            let packer = match cached.slot.layer {
+                AtlasLayer::Mask => &mut self.mask,
+                AtlasLayer::Color => &mut self.color,
+            };
+            packer.touch(cached.shelf_idx);
+            return Ok(cached.slot);
         }
         let packer = match layer {
             AtlasLayer::Mask => &mut self.mask,
             AtlasLayer::Color => &mut self.color,
         };
-        let (x, y) = packer.reserve(w, h)?;
-        let slot = AtlasSlot { layer, x, y, w, h };
-        self.cache.insert(key, slot);
-        Some(slot)
+        let res = packer.reserve(w, h).ok_or(AtlasFull { layer, w, h })?;
+        let slot = AtlasSlot {
+            layer,
+            x: res.x,
+            y: res.y,
+            w,
+            h,
+        };
+        self.cache.insert(
+            key,
+            CachedSlot {
+                slot,
+                shelf_idx: res.shelf_idx,
+            },
+        );
+        Ok(slot)
     }
 
     /// Returns the slot for `key` if it has been reserved.
     #[must_use]
     pub fn lookup(&self, key: GlyphKey) -> Option<AtlasSlot> {
-        self.cache.get(&key).copied()
+        self.cache.get(&key).map(|c| c.slot)
     }
 
     /// Number of cached glyph keys (sum across layers).
     #[must_use]
     pub fn cached_glyph_count(&self) -> usize {
         self.cache.len()
+    }
+
+    /// Evict the least-recently-used shelf on `layer`. All cache entries
+    /// pointing at that shelf are dropped; the shelf is reset so it can
+    /// be re-packed. Returns true iff something was evicted.
+    ///
+    /// Cache entries on other shelves (and on the other layer) are
+    /// untouched. Callers re-reserve evicted keys on the next frame and
+    /// the rasterizer re-uploads them.
+    pub fn evict_oldest_shelf(&mut self, layer: AtlasLayer) -> bool {
+        let packer = match layer {
+            AtlasLayer::Mask => &mut self.mask,
+            AtlasLayer::Color => &mut self.color,
+        };
+        let Some(evicted_idx) = packer.evict_oldest() else {
+            return false;
+        };
+        // Drop cache entries that mapped onto the evicted shelf+layer.
+        self.cache
+            .retain(|_, c| !(c.slot.layer == layer && c.shelf_idx == evicted_idx));
+        true
     }
 }
 
@@ -279,28 +413,28 @@ mod tests {
     }
 
     #[test]
-    fn exhaustion_returns_none_no_panic() {
+    fn exhaustion_returns_err_no_panic() {
         // 8x8 atlas can fit at most one 6x6 glyph; the second 6x6 should
         // fail (different key so cache won't hit).
         let mut a = Atlas::new(8, 8);
-        assert!(a.reserve(GlyphKey(1), AtlasLayer::Mask, 6, 6).is_some());
+        assert!(a.reserve(GlyphKey(1), AtlasLayer::Mask, 6, 6).is_ok());
         // Second glyph won't fit in the remaining 2 wide x 8 tall, and
         // there's no vertical room for a new shelf.
-        assert!(a.reserve(GlyphKey(2), AtlasLayer::Mask, 6, 6).is_none());
+        assert!(a.reserve(GlyphKey(2), AtlasLayer::Mask, 6, 6).is_err());
     }
 
     #[test]
     fn rejects_zero_dim_request() {
         let mut a = Atlas::new(64, 64);
-        assert!(a.reserve(GlyphKey(1), AtlasLayer::Mask, 0, 8).is_none());
-        assert!(a.reserve(GlyphKey(2), AtlasLayer::Mask, 8, 0).is_none());
+        assert!(a.reserve(GlyphKey(1), AtlasLayer::Mask, 0, 8).is_err());
+        assert!(a.reserve(GlyphKey(2), AtlasLayer::Mask, 8, 0).is_err());
     }
 
     #[test]
     fn rejects_oversize_request() {
         let mut a = Atlas::new(16, 16);
         // Wider than atlas — must fail without panicking.
-        assert!(a.reserve(GlyphKey(1), AtlasLayer::Mask, 32, 8).is_none());
+        assert!(a.reserve(GlyphKey(1), AtlasLayer::Mask, 32, 8).is_err());
     }
 
     #[test]
@@ -344,8 +478,57 @@ mod tests {
         // Filling the mask layer to capacity must not prevent the color
         // layer from accepting fresh glyphs.
         let mut a = Atlas::new(8, 8);
-        assert!(a.reserve(GlyphKey(1), AtlasLayer::Mask, 6, 6).is_some());
+        assert!(a.reserve(GlyphKey(1), AtlasLayer::Mask, 6, 6).is_ok());
         // Mask layer exhausted (proved by previous test).
-        assert!(a.reserve(GlyphKey(2), AtlasLayer::Color, 6, 6).is_some());
+        assert!(a.reserve(GlyphKey(2), AtlasLayer::Color, 6, 6).is_ok());
+    }
+
+    #[test]
+    fn evict_oldest_shelf_recovers_room() {
+        // 8x16 atlas: fit two 6x8 glyphs (one per shelf) then exhaust.
+        // Evicting the oldest shelf clears space for one more.
+        let mut a = Atlas::new(8, 16);
+        let _s1 = a.reserve(GlyphKey(1), AtlasLayer::Mask, 6, 8).unwrap();
+        let _s2 = a.reserve(GlyphKey(2), AtlasLayer::Mask, 6, 8).unwrap();
+        // Third reservation: layer full.
+        assert!(a.reserve(GlyphKey(3), AtlasLayer::Mask, 6, 8).is_err());
+        assert!(a.evict_oldest_shelf(AtlasLayer::Mask));
+        // Now the third one fits.
+        assert!(a.reserve(GlyphKey(3), AtlasLayer::Mask, 6, 8).is_ok());
+        // The evicted entry should no longer be in the cache.
+        assert!(a.lookup(GlyphKey(1)).is_none());
+    }
+
+    #[test]
+    fn evict_oldest_shelf_no_shelves_returns_false() {
+        let mut a = Atlas::new(8, 8);
+        assert!(!a.evict_oldest_shelf(AtlasLayer::Mask));
+    }
+
+    #[test]
+    fn evict_oldest_shelf_doesnt_evict_recently_used() {
+        // 8x16 atlas: two 6x8 glyphs. Reserve glyph 1, then 2; lookup
+        // glyph 1 again (touching). Eviction should pick shelf 2 (which
+        // was older relative to the touch on shelf 1).
+        let mut a = Atlas::new(8, 16);
+        let _s1 = a.reserve(GlyphKey(1), AtlasLayer::Mask, 6, 8).unwrap();
+        let _s2 = a.reserve(GlyphKey(2), AtlasLayer::Mask, 6, 8).unwrap();
+        // Touch 1 via reserve (cache hit).
+        let _again = a.reserve(GlyphKey(1), AtlasLayer::Mask, 6, 8).unwrap();
+        a.evict_oldest_shelf(AtlasLayer::Mask);
+        // Glyph 1 still in cache, glyph 2 evicted.
+        assert!(a.lookup(GlyphKey(1)).is_some());
+        assert!(a.lookup(GlyphKey(2)).is_none());
+    }
+
+    #[test]
+    fn atlas_full_error_carries_dims() {
+        let mut a = Atlas::new(8, 8);
+        let err = a
+            .reserve(GlyphKey(1), AtlasLayer::Mask, 32, 8)
+            .unwrap_err();
+        assert_eq!(err.layer, AtlasLayer::Mask);
+        assert_eq!(err.w, 32);
+        assert_eq!(err.h, 8);
     }
 }

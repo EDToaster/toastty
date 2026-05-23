@@ -3240,6 +3240,9 @@ dependencies = [
 name = "toastty-graphics"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "flate2",
+ "image",
  "proptest",
  "thiserror 2.0.18",
  "toastty-parser",
@@ -3318,10 +3321,12 @@ dependencies = [
 name = "toastty-term"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "proptest",
  "smallvec",
  "thiserror 2.0.18",
  "toastty-config",
+ "toastty-graphics",
  "toastty-parser",
  "toastty-protocols",
  "toastty-pty",

@@ -11,10 +11,12 @@ thiserror.workspace = true
 unicode-width.workspace = true
 
 toastty-config.workspace = true
+toastty-graphics.workspace = true
 toastty-parser.workspace = true
 toastty-protocols.workspace = true
 
 [dev-dependencies]
+base64 = "0.22"
 proptest.workspace = true
 toastty-pty.workspace = true
 

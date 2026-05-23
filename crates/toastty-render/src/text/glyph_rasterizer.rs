@@ -434,7 +434,7 @@ impl GlyphRasterizer {
         if w == 0 || h == 0 || image.data.is_empty() {
             // Whitespace / zero-extent: cache an empty slot so we don't
             // re-rasterize next time.
-            let slot = self.atlas.reserve(key, AtlasLayer::Mask, 1, 1)?;
+            let slot = self.atlas.reserve(key, AtlasLayer::Mask, 1, 1).ok()?;
             self.placements.insert(key, placement);
             // Don't upload anything.
             return Some(make_glyph_slot(slot, placement));
@@ -447,9 +447,16 @@ impl GlyphRasterizer {
             SwashContent::Mask | SwashContent::SubpixelMask => AtlasLayer::Mask,
         };
 
-        let slot = self.atlas.reserve(key, layer, w, h).expect(
-            "atlas full — M4b's policy is panic; allocate larger atlases or implement eviction",
-        );
+        // Best-effort recovery: if the layer is full, evict the LRU
+        // shelf and retry once. Failing that, degrade by returning
+        // `None` — the renderer falls back to a background-only
+        // instance and the next frame will re-shape the row.
+        let slot = if let Ok(s) = self.atlas.reserve(key, layer, w, h) {
+            s
+        } else {
+            self.atlas.evict_oldest_shelf(layer);
+            self.atlas.reserve(key, layer, w, h).ok()?
+        };
 
         upload_glyph_pixels(queue, self.atlas_texture_for(layer), slot, &image.data);
 

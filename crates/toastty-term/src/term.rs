@@ -13,6 +13,9 @@ use crate::cursor::Cursor;
 use crate::damage::Damage;
 use crate::grid::Grid;
 use toastty_config::CursorShape;
+use toastty_graphics::kitty::handler::{KittyHandler, KittySink};
+use toastty_graphics::kitty::header::DeleteSpec;
+use toastty_graphics::{ImageData, ImageGrid, ImageRegistry, Placement};
 use toastty_parser::{Params, Perform};
 
 /// Width of a hard tab. Eight is the canonical default; once we expose
@@ -207,6 +210,66 @@ pub struct Term {
     clipboard_requests: Vec<ClipboardRequest>,
     /// Security gates from the user's `[security]` config.
     security: SecurityFlags,
+    // ----- M11a: Kitty graphics + image protocols -----
+    /// Buffer of APC payload bytes for the current `APC ... ST` packet.
+    /// Cleared on `apc_start`; appended via `apc_chunk`; consumed by
+    /// `apc_end`.
+    apc_buffer: Vec<u8>,
+    /// Stateful Kitty dispatcher. Owns chunked-upload reassembly.
+    image_handler: KittyHandler,
+    /// Cache of decoded image bytes keyed by Kitty image id.
+    image_registry: ImageRegistry,
+    /// Parallel layer of placements over the cell grid.
+    image_grid: ImageGrid,
+    /// Monotonic counter bumped whenever the registry or grid mutates.
+    /// The renderer compares against its cached value to decide when
+    /// to re-sync GPU textures (and force a full clear of the frame).
+    image_revision: u32,
+    /// SGR 58 underline color. Stored but not yet rendered as an
+    /// underline color; the Unicode placeholder pipeline reads it as
+    /// the *high byte* (bits 8..16) of the image id. The SGR 38
+    /// foreground supplies bits 0..8 (the low byte).
+    ///
+    /// TODO: kitty's full protocol allows image ids up to bits 8..32
+    /// via a third diacritic on the first cell of a run. M11a only
+    /// handles the 16-bit form (bits 0..8 from SGR 38 + bits 8..16
+    /// from SGR 58); the third-diacritic 32-bit extension is rare and
+    /// deferred.
+    cursor_underline_color: Option<Color>,
+    /// Unicode placeholder run-in-progress.
+    placeholder_run: Option<PlaceholderRun>,
+}
+
+/// In-progress run of Kitty Unicode placeholder cells.
+///
+/// Apps emit `<PLACEHOLDER><d_row><d_col>(<d_id_msb>)?` per cell as the
+/// foreground SGR encodes the low byte of the image id. We collect the
+/// run greedily until the next non-placeholder/non-diacritic codepoint
+/// arrives, then materialize placements.
+#[derive(Debug)]
+pub(crate) struct PlaceholderRun {
+    /// Image id whose low byte was taken from the cursor fg color.
+    pub image_id_low: u8,
+    /// Cursor underline color encoded the optional 8-bit MSB extension
+    /// of the image id (kitty supports a 24-bit id via SGR 38;5 + 58;5).
+    pub image_id_high: Option<u8>,
+    /// Cells collected so far: `(row, col, diacritics)`.
+    pub cells: Vec<PlaceholderCell>,
+    /// Starting row (so future extensions can detect newline
+    /// boundaries; not yet consumed in M11a).
+    #[allow(dead_code)]
+    pub start_row: u16,
+}
+
+/// One placeholder cell within a [`PlaceholderRun`].
+#[derive(Debug, Clone)]
+pub(crate) struct PlaceholderCell {
+    pub row: u16,
+    pub col: u16,
+    /// Diacritic indices in emission order. The first encodes the source
+    /// image row, the second the source image column, the third (optional)
+    /// the image id MSB extension.
+    pub diacritics: smallvec::SmallVec<[u16; 3]>,
 }
 
 /// One pending OSC 52 clipboard operation, queued by [`Term`] and
@@ -308,6 +371,15 @@ impl Term {
             current_hyperlink: None,
             clipboard_requests: Vec::new(),
             security: SecurityFlags::default(),
+            apc_buffer: Vec::new(),
+            image_handler: KittyHandler::new(),
+            // Default 256 MiB image cache cap. Generous but bounded; the
+            // binary can shrink via `Term::set_image_cap`.
+            image_registry: ImageRegistry::new(256 * 1024 * 1024),
+            image_grid: ImageGrid::new(),
+            image_revision: 0,
+            cursor_underline_color: None,
+            placeholder_run: None,
         }
     }
 
@@ -342,6 +414,46 @@ impl Term {
     /// asynchronously-produced replies through the same drain.
     pub fn push_pty_reply(&mut self, bytes: &[u8]) {
         self.pty_replies.extend_from_slice(bytes);
+    }
+
+    /// Read-only view of the cached image bytes.
+    #[must_use]
+    pub fn image_registry(&self) -> &ImageRegistry {
+        &self.image_registry
+    }
+
+    /// Read-only view of placements over the cell grid.
+    #[must_use]
+    pub fn image_grid(&self) -> &ImageGrid {
+        &self.image_grid
+    }
+
+    /// Monotonic image-content revision. Bumps when the registry or
+    /// placement grid changes. Renderer compares to its cached value
+    /// to decide when to re-sync GPU textures.
+    #[must_use]
+    pub fn image_revision(&self) -> u32 {
+        self.image_revision
+    }
+
+    /// Current SGR 58 underline color, or `None` when SGR 59 (or 0)
+    /// reset it. The Unicode placeholder pipeline reads this as the
+    /// high byte of the image id.
+    #[must_use]
+    pub fn cursor_underline_color(&self) -> Option<Color> {
+        self.cursor_underline_color
+    }
+
+    /// Override the per-Term image-cache byte budget. May evict.
+    pub fn set_image_cap(&mut self, cap_bytes: u64) {
+        let evicted = self.image_registry.set_cap(cap_bytes);
+        if !evicted.is_empty() {
+            for id in &evicted {
+                self.image_grid.remove_image(*id);
+            }
+            self.image_revision = self.image_revision.wrapping_add(1);
+            self.mark_all_dirty();
+        }
     }
 
     /// Read the override for palette index `idx`. Returns `None` if no
@@ -792,6 +904,12 @@ impl Term {
             // for each row no longer matches its position. Force a
             // re-shape of all rows.
             self.mark_all_dirty();
+            // Slide image placements up by 1 row (alt screen has no
+            // image placements but the call is cheap).
+            let dropped = self.image_grid.shift_rows_up(1, 0);
+            if !dropped.is_empty() {
+                self.image_revision = self.image_revision.wrapping_add(1);
+            }
         } else {
             // Followup C3: a mid-screen LF moves the cursor without
             // touching any cell content. Under partial redraw, the
@@ -836,6 +954,62 @@ impl Term {
     }
 
     fn print_char(&mut self, c: char) {
+        // M11a: Unicode placeholder pipeline.
+        //
+        // Apps emit `<U+10EEEE><diacritic*>` cells where:
+        // - The cursor's SGR fg is Indexed256(N): low byte of image id.
+        // - SGR 58 (cursor_underline_color) Indexed256(M): high byte
+        //   of image id (optional).
+        // - 0..3 diacritics encode source-image row, source-image col,
+        //   and (optionally) the image id MSB extension.
+        //
+        // We collect cells greedily into `placeholder_run` until the
+        // next non-placeholder/non-diacritic codepoint arrives, then
+        // finalize → emit image placements.
+        if toastty_graphics::is_placeholder(c) {
+            if self.placeholder_run.is_none()
+                && let Color::Indexed256(low) = self.cursor.style.fg
+            {
+                let high = match self.cursor_underline_color {
+                    Some(Color::Indexed256(h)) => Some(h),
+                    _ => None,
+                };
+                self.placeholder_run = Some(PlaceholderRun {
+                    image_id_low: low,
+                    image_id_high: high,
+                    cells: Vec::new(),
+                    start_row: self.cursor.row,
+                });
+            }
+            if let Some(run) = self.placeholder_run.as_mut() {
+                run.cells.push(PlaceholderCell {
+                    row: self.cursor.row,
+                    col: self.cursor.col.min(self.cols.saturating_sub(1)),
+                    diacritics: smallvec::SmallVec::new(),
+                });
+            }
+            // Placeholder still occupies a cell in the grid layout, so
+            // fall through and write it as a normal char (cell width 1).
+            // Treating it as cell-width 1 keeps text-layout sane; the
+            // renderer skips drawing it via the image overlay.
+            // (We still write the codepoint so partial-redraw + cursor
+            // motion behaves identically to text.)
+        } else if toastty_graphics::is_diacritic(c)
+            && let Some(run) = self.placeholder_run.as_mut()
+            && let Some(idx) = toastty_graphics::diacritic_to_index(c)
+        {
+            // Diacritic attaches to the most recent placeholder cell.
+            if let Some(last) = run.cells.last_mut() {
+                last.diacritics.push(idx);
+            }
+            // Diacritics are zero-width; don't advance.
+            return;
+        } else if let Some(run) = self.placeholder_run.take() {
+            // Non-placeholder / non-diacritic codepoint: finalize the
+            // run before printing this char.
+            self.finalize_placeholder_run(run);
+        }
+
         let cell_w = Self::char_cell_width(c);
         // Zero-width chars (combining marks, controls) currently fall
         // through as a no-op. A future pass can attach them to the
@@ -898,6 +1072,135 @@ impl Term {
             self.mark_cell(row, col + 1);
         }
         self.cursor.col += cell_w;
+    }
+
+    /// Materialize the accumulated placeholder run into image
+    /// placements over the cells the run touched. Called when the
+    /// stream emits a non-placeholder/non-diacritic codepoint.
+    #[allow(clippy::needless_pass_by_value)] // run is conceptually consumed.
+    fn finalize_placeholder_run(&mut self, run: PlaceholderRun) {
+        if run.cells.is_empty() {
+            return;
+        }
+        // Compute the image id. SGR fg supplies the low byte; SGR 58
+        // (cursor_underline_color) optionally supplies the high byte;
+        // a third diacritic on the first cell supplies a 16-bit
+        // extension. We support the common 8-bit form (fg → id),
+        // optionally promoted to 16-bit via SGR 58. The 32-bit kitty
+        // extension via three diacritics is documented but rare; for
+        // M11a we accept the 16-bit form only.
+        let id = if let Some(high) = run.image_id_high {
+            u32::from(high) << 8 | u32::from(run.image_id_low)
+        } else {
+            u32::from(run.image_id_low)
+        };
+        // The cells in the run form contiguous rectangles (apps emit
+        // them row-by-row). For each contiguous (row, col-range)
+        // segment, emit a placement with a sub-rect derived from the
+        // first/last diacritic pair in that segment.
+        //
+        // For M11a we materialize each cell as a 1x1 placement with
+        // src_rect derived from the diacritic pair. A future
+        // optimization can coalesce adjacent cells into a single
+        // placement.
+        if !self.image_registry.contains(id) {
+            // Image not registered: still occupy the cells as
+            // placeholders so the layout doesn't shift; we just don't
+            // emit visible images.
+            return;
+        }
+        // Look up image dims for the sub-rect calculation.
+        let (img_w, img_h) = {
+            let Some(img) = self.image_registry.get(id) else {
+                return;
+            };
+            (img.width, img.height)
+        };
+        // The diacritic table maps to 0..N where N is the number of
+        // cells along the relevant axis. Apps typically emit the same
+        // row diacritic across one display row, with the column
+        // diacritic varying. We treat the FIRST diacritic as the
+        // image row, the SECOND as the image column. Without
+        // metadata about cell dims we synthesize a uniform tiling: if
+        // an app emits R rows worth of placeholders, the image is
+        // tiled into R rows; same for columns.
+        //
+        // To keep this M11a-minimal, build a single placement per
+        // cell whose src_rect spans (col_diacritic, row_diacritic) on
+        // a uniform grid based on the maximum diacritic seen across
+        // the run.
+        let mut max_row_d = 0u16;
+        let mut max_col_d = 0u16;
+        for cell in &run.cells {
+            if let Some(&r) = cell.diacritics.first() {
+                max_row_d = max_row_d.max(r);
+            }
+            if let Some(&c) = cell.diacritics.get(1) {
+                max_col_d = max_col_d.max(c);
+            }
+        }
+        // Tile dimensions in source pixels. If diacritics are zero
+        // everywhere (single-cell placement covering the full image),
+        // emit a single full-image placement spanning the run's
+        // bounding rect.
+        let single_cell = max_row_d == 0 && max_col_d == 0;
+        let mut placements = Vec::new();
+        if single_cell {
+            // Bounding rect of the run.
+            let mut min_r = u16::MAX;
+            let mut max_r = 0;
+            let mut min_c = u16::MAX;
+            let mut max_c = 0;
+            for cell in &run.cells {
+                min_r = min_r.min(cell.row);
+                max_r = max_r.max(cell.row);
+                min_c = min_c.min(cell.col);
+                max_c = max_c.max(cell.col);
+            }
+            placements.push(Placement {
+                image_id: id,
+                placement_id: 0,
+                row_range: min_r..max_r.saturating_add(1),
+                col_range: min_c..max_c.saturating_add(1),
+                src_rect: toastty_graphics::SrcRect::FULL,
+                z: 0,
+            });
+        } else {
+            let tile_w = if max_col_d == 0 {
+                img_w
+            } else {
+                img_w / u32::from(max_col_d.saturating_add(1)).max(1)
+            };
+            let tile_h = if max_row_d == 0 {
+                img_h
+            } else {
+                img_h / u32::from(max_row_d.saturating_add(1)).max(1)
+            };
+            for cell in &run.cells {
+                let row_d = cell.diacritics.first().copied().unwrap_or(0);
+                let col_d = cell.diacritics.get(1).copied().unwrap_or(0);
+                let sx = u32::from(col_d) * tile_w;
+                let sy = u32::from(row_d) * tile_h;
+                placements.push(Placement {
+                    image_id: id,
+                    placement_id: 0,
+                    row_range: cell.row..cell.row.saturating_add(1),
+                    col_range: cell.col..cell.col.saturating_add(1),
+                    src_rect: toastty_graphics::SrcRect {
+                        x: sx,
+                        y: sy,
+                        w: tile_w,
+                        h: tile_h,
+                    },
+                    z: 0,
+                });
+            }
+        }
+        for placement in placements {
+            mark_placement_dirty(self, &placement);
+            self.image_grid.add(placement);
+        }
+        self.image_revision = self.image_revision.wrapping_add(1);
     }
 
     fn handle_csi(&mut self, params: &Params, intermediates: &[u8], action: char) {
@@ -1198,11 +1501,12 @@ impl Term {
                 38 if slice.len() >= 2 => self.cursor.style.fg = parse_extended_color_from_slice(&slice[1..]).unwrap_or(self.cursor.style.fg),
                 48 if slice.len() >= 2 => self.cursor.style.bg = parse_extended_color_from_slice(&slice[1..]).unwrap_or(self.cursor.style.bg),
                 58 if slice.len() >= 2 => {
-                    // Underline color is parsed but not yet stored — we don't
-                    // have anywhere to put it. We MUST still consume the
-                    // sub-params so they don't leak. The colon form keeps
-                    // them in the same slice, so there's nothing to do.
-                    let _ = parse_extended_color_from_slice(&slice[1..]);
+                    // M11a: SGR 58 underline color is stored on
+                    // `cursor_underline_color`. The Unicode placeholder
+                    // pipeline reads this as the *high byte* of the
+                    // image id (kitty's protocol packs id MSB into the
+                    // 256-color underline slot).
+                    self.cursor_underline_color = parse_extended_color_from_slice(&slice[1..]);
                 }
                 38 => {
                     // Semicolon form: consume from the outer iterator.
@@ -1218,8 +1522,18 @@ impl Term {
                     }
                 }
                 58 => {
-                    // Parse and discard for now — see comment above.
-                    let _ = parse_extended_color_from_iter(&mut iter);
+                    // M11a: semicolon form for SGR 58 — store on
+                    // `cursor_underline_color`.
+                    self.cursor_underline_color = parse_extended_color_from_iter(&mut iter);
+                }
+                // SGR 59 — reset underline color to default.
+                59 => {
+                    self.cursor_underline_color = None;
+                }
+                // SGR 0 (reset) — clear the underline color too.
+                0 => {
+                    self.cursor_underline_color = None;
+                    self.apply_sgr_param(0);
                 }
                 v => self.apply_sgr_param(v),
             }
@@ -1242,8 +1556,11 @@ impl Term {
             39 => style.fg = Color::Default,
             40..=47 => style.bg = ansi_color(v - 40, false),
             49 => style.bg = Color::Default,
-            // 59 (default underline color) is also handled by the wildcard
-            // for now — we don't store underline color yet.
+            // M11a: 59 (default underline color) is handled at the
+            // `apply_sgr` walker level — we clear
+            // `self.cursor_underline_color` there because we don't
+            // have access to `self` from inside `apply_sgr_param`
+            // (only `&mut style`).
             90..=97 => style.fg = ansi_color(v - 90, true),
             100..=107 => style.bg = ansi_color(v - 100, true),
             _ => {}
@@ -1328,6 +1645,12 @@ impl Term {
         self.cursor = Cursor::default();
         // Switching screens invalidates every cached shaped line.
         self.mark_all_dirty();
+        // Alt screen has no image placements in M11a — clear so apps
+        // can't accidentally see stale images from the primary screen.
+        let dropped = self.image_grid.clear();
+        if !dropped.is_empty() {
+            self.image_revision = self.image_revision.wrapping_add(1);
+        }
     }
 
     fn exit_alt_screen(&mut self) {
@@ -1339,6 +1662,13 @@ impl Term {
         self.clamp_cursor();
         // Switching back: re-shape the primary screen contents.
         self.mark_all_dirty();
+        // Same policy on exit: clear image placements (the primary
+        // screen's images were not preserved across the alt-screen
+        // switch in M11a).
+        let dropped = self.image_grid.clear();
+        if !dropped.is_empty() {
+            self.image_revision = self.image_revision.wrapping_add(1);
+        }
     }
 }
 
@@ -1455,6 +1785,10 @@ impl Perform for Term {
     }
 
     fn execute(&mut self, byte: u8) {
+        // Any non-print event terminates an in-flight placeholder run.
+        if let Some(run) = self.placeholder_run.take() {
+            self.finalize_placeholder_run(run);
+        }
         match byte {
             b'\r' => {
                 // CR moves the cursor in-place to column 0. Mark old
@@ -1505,6 +1839,9 @@ impl Perform for Term {
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+        if let Some(run) = self.placeholder_run.take() {
+            self.finalize_placeholder_run(run);
+        }
         self.handle_csi(params, intermediates, action);
     }
 
@@ -1700,6 +2037,207 @@ impl Perform for Term {
 
     // DCS / APC / hyperlinks / kitty keyboard / mode 2026 etc. all
     // deferred. TODOs live in lib-level docs.
+
+    fn apc_start(&mut self) {
+        self.apc_buffer.clear();
+    }
+
+    fn apc_chunk(&mut self, bytes: &[u8]) {
+        // Cap on a single APC packet's buffered bytes — defends against
+        // a hostile stream sending an unbounded APC payload that's
+        // larger than the kitty handler's per-upload cap. 256 MiB
+        // here matches the registry default cap.
+        const APC_BUFFER_CAP: usize = 256 * 1024 * 1024;
+        if self.apc_buffer.len().saturating_add(bytes.len()) > APC_BUFFER_CAP {
+            // Drop further chunks for this packet — `apc_end` will see
+            // a truncated buffer and fail header parsing cleanly.
+            return;
+        }
+        self.apc_buffer.extend_from_slice(bytes);
+    }
+
+    fn apc_end(&mut self) {
+        // Take ownership of the buffered payload so we can borrow
+        // `self` mutably as the sink. Defensive: if the payload doesn't
+        // start with `G`, it's not a Kitty graphics packet — silently
+        // drop. (Other APC users — e.g. tmux passthrough — might pass
+        // through; we ignore them for M11a.)
+        let payload = std::mem::take(&mut self.apc_buffer);
+        if payload.is_empty() || payload[0] != b'G' {
+            return;
+        }
+        // Split on the first `;` into header vs body.
+        let split = payload.iter().position(|&b| b == b';');
+        let (header_bytes, body): (&[u8], &[u8]) = match split {
+            Some(idx) => (&payload[..idx], &payload[idx + 1..]),
+            None => (&payload[..], &[]),
+        };
+        // Pull the handler out so we can pass &mut self as the sink.
+        let mut handler = std::mem::take(&mut self.image_handler);
+        // Swallow the Result — header errors do not reach the sink so
+        // there's no reply to emit. (A future enhancement could push a
+        // synthetic error reply here.)
+        let _ = handler.process(header_bytes, body, self);
+        self.image_handler = handler;
+    }
+}
+
+// ---- M11a: KittySink ----
+
+impl KittySink for Term {
+    fn register_image(&mut self, id_request: u32, data: ImageData) -> Option<u32> {
+        match self.image_registry.insert(id_request, data) {
+            Ok(inserted) => {
+                // Evicted ids no longer exist in the registry; drop their
+                // placements + mark cells dirty.
+                for evicted in &inserted.evicted {
+                    let dropped = self.image_grid.remove_image(*evicted);
+                    for p in dropped {
+                        mark_placement_dirty(self, &p);
+                    }
+                }
+                self.image_revision = self.image_revision.wrapping_add(1);
+                Some(inserted.id)
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn place_image(&mut self, mut placement: Placement) {
+        // The handler emits placements with row/col fields populated
+        // from header.cell_x / cell_y. For a *transmit-and-place*, the
+        // semantic is "place at the current cursor" — translate the
+        // placement against the cursor row/col so the placement lands
+        // where the app expects.
+        //
+        // For a standalone `a=p` (place an already-transmitted image),
+        // the cell_x/cell_y fields are absolute; we leave them alone.
+        // Distinguishing the two paths from inside the sink isn't
+        // possible without extra state — the handler always carries the
+        // header's cell_x/cell_y. For M11a we treat all placements as
+        // relative-to-cursor, which matches the way `tput` / `kitty
+        // +kitten icat` actually drive the protocol.
+        let cur_row = self.cursor.row;
+        let cur_col = self.cursor.col.min(self.cols.saturating_sub(1));
+        let row_span = placement.row_range.end - placement.row_range.start;
+        let col_span = placement.col_range.end - placement.col_range.start;
+        placement.row_range = cur_row..cur_row.saturating_add(row_span);
+        placement.col_range = cur_col..cur_col.saturating_add(col_span);
+        // Clamp to grid.
+        if placement.row_range.end > self.rows {
+            placement.row_range.end = self.rows;
+        }
+        if placement.col_range.end > self.cols {
+            placement.col_range.end = self.cols;
+        }
+        // Mark dirty BEFORE consuming `placement` into the grid.
+        mark_placement_dirty(self, &placement);
+        self.image_grid.add(placement);
+        self.image_revision = self.image_revision.wrapping_add(1);
+    }
+
+    fn delete_image(&mut self, delete: DeleteSpec, header: &toastty_graphics::kitty::header::Header) {
+        // Treat empty / unknown specs the same as `a` (all).
+        let spec_byte = if delete.byte == 0 { b'a' } else { delete.byte };
+        let mut dropped_placements = Vec::new();
+        let drop_bytes = delete.free_bytes();
+        match spec_byte {
+            // `a` / `A` — delete all visible placements (and bytes if
+            // uppercase).
+            b'a' | b'A' => {
+                dropped_placements.extend(self.image_grid.clear());
+                if drop_bytes {
+                    let ids: Vec<u32> = self.image_registry.ids().collect();
+                    for id in ids {
+                        self.image_registry.remove(id);
+                    }
+                }
+            }
+            // `i` / `I` — by image id (provided via `i=`).
+            b'i' | b'I' => {
+                if header.image_id != 0 {
+                    dropped_placements.extend(self.image_grid.remove_image(header.image_id));
+                    if drop_bytes {
+                        self.image_registry.remove(header.image_id);
+                    }
+                }
+            }
+            // `n` / `N` — by image *number* (provided via `I=`). We
+            // don't track image-number→id mapping yet; fall through as
+            // a no-op.
+            // `p` / `P` — by (image id, placement id). The grid filter
+            // matches both fields.
+            b'p' | b'P' => {
+                let img = header.image_id;
+                let pid = header.placement_id;
+                dropped_placements.extend(self.image_grid.remove_where(|p| {
+                    p.image_id == img && p.placement_id == pid
+                }));
+            }
+            // `r` / `R` — by row.
+            b'r' | b'R' => {
+                if header.cell_y < u32::from(self.rows) {
+                    let row = header.cell_y as u16;
+                    dropped_placements.extend(self.image_grid.clear_row(row));
+                }
+            }
+            // Other specs (`c` cell, `x`/`y` columns/rows, `z` by z, `q`
+            // by ranges, ...) are deferred for M11a follow-ups.
+            _ => {}
+        }
+        for p in &dropped_placements {
+            mark_placement_dirty(self, p);
+        }
+        if !dropped_placements.is_empty() || drop_bytes {
+            self.image_revision = self.image_revision.wrapping_add(1);
+        }
+    }
+
+    fn queue_reply(&mut self, bytes: &[u8]) {
+        self.pty_replies.extend_from_slice(bytes);
+    }
+
+    fn pending_budget_remaining(&self) -> u64 {
+        // Take registry budget minus the bytes already buffered in the
+        // APC reassembly buffer.
+        let used_buf = self.apc_buffer.len() as u64;
+        self.image_registry
+            .budget_remaining()
+            .saturating_sub(used_buf)
+    }
+
+    fn advance_cursor_after_placement(&mut self, rows: u16, _cols: u16, start_col: u16) {
+        // Kitty spec: after T, the cursor moves to (start_row + rows,
+        // start_col). M11a-followup.N6: previously this reset col to
+        // 0, which broke apps that placed images mid-line (e.g.
+        // inline icons inside a sentence) — the cursor would jump
+        // back to column 0 and overwrite the leading text.
+        //
+        // If the cursor would land below the visible viewport, we let
+        // `linefeed` scroll the grid (which also shifts image rows up).
+        for _ in 0..rows {
+            self.linefeed();
+        }
+        self.cursor.col = start_col.min(self.cols.saturating_sub(1));
+    }
+
+    fn image_exists(&self, id: u32) -> bool {
+        self.image_registry.contains(id)
+    }
+
+    fn cursor_col(&self) -> u16 {
+        self.cursor.col.min(self.cols.saturating_sub(1))
+    }
+}
+
+fn mark_placement_dirty(t: &mut Term, p: &Placement) {
+    let rows = t.rows;
+    let cols = t.cols;
+    let r_end = p.row_range.end.min(rows);
+    let c_end = p.col_range.end.min(cols);
+    for r in p.row_range.start..r_end {
+        t.mark_cells(r, p.col_range.start, c_end);
+    }
 }
 
 #[cfg(test)]
@@ -3717,5 +4255,278 @@ mod tests {
         });
         feed(&mut t, b"\x1b]52;c;!!\x1b\\");
         assert!(t.drain_clipboard_requests().is_empty());
+    }
+
+    // ----- M11a: kitty APC integration -----
+
+    /// Helper: produce a 1x1 red RGBA pixel base64-encoded.
+    fn b64_red_1x1() -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .encode([255u8, 0, 0, 255])
+            .into_bytes()
+    }
+
+    #[test]
+    fn apc_kitty_transmit_registers_image() {
+        let mut t = Term::new(4, 8, 0);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=t,f=32,s=1,v=1,i=42;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        assert!(t.image_registry().contains(42));
+        // OK reply was queued.
+        let replies = t.drain_pty_replies();
+        assert!(!replies.is_empty());
+        let s = String::from_utf8_lossy(&replies);
+        assert!(s.contains(";OK"), "expected OK reply, got {s:?}");
+    }
+
+    #[test]
+    fn apc_kitty_non_graphics_is_ignored() {
+        // tmux / other APC users — payload doesn't start with 'G'.
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b_tmux passthrough payload\x1b\\");
+        assert_eq!(t.image_registry().len(), 0);
+    }
+
+    #[test]
+    fn apc_kitty_oversized_payload_replies_efbig() {
+        let mut t = Term::new(2, 4, 0);
+        // Shrink the cap so the test isn't sensitive to the default.
+        t.set_image_cap(1024);
+        // Declare a payload bigger than the cap.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=t,f=32,s=8192,v=8192,i=1,S=268435456;\x1b\\");
+        feed(&mut t, &payload);
+        let replies = t.drain_pty_replies();
+        let s = String::from_utf8_lossy(&replies);
+        assert!(s.contains("EFBIG"), "expected EFBIG, got {s:?}");
+    }
+
+    #[test]
+    fn apc_kitty_transmit_and_place_advances_cursor() {
+        let mut t = Term::new(8, 8, 0);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=2,r=2;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        // Image placed.
+        assert!(t.image_registry().contains(1));
+        assert_eq!(t.image_grid().len(), 1);
+        // Cursor advanced by `r=2` rows; column preserved at the
+        // start_col (cursor started at col 0).
+        let cur = t.cursor();
+        assert_eq!(cur.row, 2);
+        assert_eq!(cur.col, 0);
+    }
+
+    #[test]
+    fn apc_kitty_transmit_and_place_lands_cursor_at_start_col() {
+        // M11a-followup.N6: after `a=T`, the cursor must land at
+        // (start_row + r, start_col), NOT (start_row + r, 0). Apps
+        // that place images mid-line (e.g. inline emoji icons inside
+        // a sentence) rely on this.
+        let mut t = Term::new(8, 16, 0);
+        // Move the cursor to (row=1, col=5) — 1-based 2;6.
+        feed(&mut t, b"\x1b[2;6H");
+        assert_eq!(t.cursor().col, 5);
+        assert_eq!(t.cursor().row, 1);
+        // Place a 1x1 red pixel as a 1x2 cell placement spanning 2
+        // rows, default C=0 (cursor MOVES after).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=1,r=2;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        let cur = t.cursor();
+        // Row advanced by 2 (the r= value).
+        assert_eq!(cur.row, 1 + 2, "cursor row should advance by r=2");
+        // Column preserved at start_col=5 — the M11a-followup.N6 fix.
+        assert_eq!(cur.col, 5, "cursor col must preserve start_col=5, not reset to 0");
+    }
+
+    #[test]
+    fn apc_kitty_delete_all_clears_grid() {
+        let mut t = Term::new(8, 8, 0);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=1,r=1;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        assert_eq!(t.image_grid().len(), 1);
+        // Now delete all.
+        feed(&mut t, b"\x1b_Ga=d,d=A\x1b\\");
+        assert_eq!(t.image_grid().len(), 0);
+        // Uppercase 'A' also frees the bytes.
+        assert_eq!(t.image_registry().len(), 0);
+    }
+
+    #[test]
+    fn apc_kitty_animate_replies_enotsup() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b_Ga=a,i=1\x1b\\");
+        let replies = t.drain_pty_replies();
+        let s = String::from_utf8_lossy(&replies);
+        assert!(s.contains("ENOTSUP"), "got {s:?}");
+    }
+
+    #[test]
+    fn linefeed_shifts_image_placements_up_on_scroll() {
+        let mut t = Term::new(2, 4, 0);
+        // Place an image at the cursor (row 0).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=1,r=1;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        // The placement was at row 0..1.
+        let p_before = t.image_grid().iter().next().unwrap().row_range.clone();
+        assert_eq!(p_before, 0..1);
+        // Force a few newlines so the grid scrolls (only 2 rows total).
+        feed(&mut t, b"\n\n\n");
+        // Placement either shifted off-screen (dropped) or moved up.
+        // With 2 rows + 3 newlines, the placement should be dropped.
+        assert!(t.image_grid().is_empty());
+    }
+
+    #[test]
+    fn alt_screen_enter_clears_image_grid() {
+        let mut t = Term::new(4, 8, 0);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=1,r=1;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        assert_eq!(t.image_grid().len(), 1);
+        // Enter alt screen.
+        feed(&mut t, b"\x1b[?1049h");
+        assert_eq!(t.image_grid().len(), 0);
+    }
+
+    #[test]
+    fn sgr_58_underline_color_indexed_stored() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[58;5;42m");
+        assert_eq!(t.cursor_underline_color(), Some(Color::Indexed256(42)));
+    }
+
+    #[test]
+    fn sgr_58_colon_form_indexed_stored() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[58:5:7m");
+        assert_eq!(t.cursor_underline_color(), Some(Color::Indexed256(7)));
+    }
+
+    #[test]
+    fn sgr_59_resets_underline_color() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[58;5;42m");
+        assert!(t.cursor_underline_color().is_some());
+        feed(&mut t, b"\x1b[59m");
+        assert_eq!(t.cursor_underline_color(), None);
+    }
+
+    #[test]
+    fn sgr_0_resets_underline_color() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[58;5;42m");
+        feed(&mut t, b"\x1b[0m");
+        assert_eq!(t.cursor_underline_color(), None);
+    }
+
+    #[test]
+    fn placeholder_run_creates_image_placement() {
+        let mut t = Term::new(4, 8, 0);
+        // First, register image id=42.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=t,f=32,s=2,v=2,i=42;");
+        // 2x2 RGBA all-red, base64-encoded.
+        let raw = vec![255u8, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255];
+        let b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(&raw)
+        };
+        payload.extend_from_slice(b64.as_bytes());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        assert!(t.image_registry().contains(42));
+        // Now emit a placeholder run with fg = Indexed256(42).
+        // SGR 38;5;42 sets fg; then emit placeholder + first diacritic
+        // (image row 0) + second diacritic (image col 0).
+        feed(&mut t, b"\x1b[38;5;42m");
+        // Placeholder char + a non-placeholder to finalize.
+        let mut s = String::new();
+        s.push(toastty_graphics::PLACEHOLDER);
+        s.push(' '); // finalize
+        feed(&mut t, s.as_bytes());
+        // The image grid should have one placement of image 42.
+        assert_eq!(t.image_grid().len(), 1);
+        let p = t.image_grid().iter().next().unwrap();
+        assert_eq!(p.image_id, 42);
+    }
+
+    #[test]
+    fn placeholder_without_indexed_fg_is_inactive() {
+        let mut t = Term::new(4, 8, 0);
+        // No image registered, no SGR fg set.
+        let mut s = String::new();
+        s.push(toastty_graphics::PLACEHOLDER);
+        s.push(' ');
+        feed(&mut t, s.as_bytes());
+        // No placements created.
+        assert_eq!(t.image_grid().len(), 0);
+    }
+
+    #[test]
+    fn image_place_marks_cells_dirty() {
+        let mut t = Term::new(4, 8, 0);
+        t.clear_damage();
+        assert!(t.damage().is_empty());
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=3,r=2;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        // Damage should now cover the cells the placement landed on.
+        assert!(!t.damage().is_empty());
+    }
+
+    #[test]
+    fn placeholder_finalizes_on_csi() {
+        let mut t = Term::new(4, 8, 0);
+        // Register image.
+        let raw = vec![255u8, 0, 0, 255];
+        let b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(&raw)
+        };
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=t,f=32,s=1,v=1,i=7;");
+        payload.extend_from_slice(b64.as_bytes());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        feed(&mut t, b"\x1b[38;5;7m");
+        let mut s = String::new();
+        s.push(toastty_graphics::PLACEHOLDER);
+        feed(&mut t, s.as_bytes());
+        // CSI sequence should finalize the run.
+        feed(&mut t, b"\x1b[H");
+        assert_eq!(t.image_grid().len(), 1);
+    }
+
+    #[test]
+    fn image_revision_bumps_on_register_and_place() {
+        let mut t = Term::new(4, 8, 0);
+        let rev0 = t.image_revision();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=1,r=1;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        let rev1 = t.image_revision();
+        assert_ne!(rev0, rev1);
     }
 }

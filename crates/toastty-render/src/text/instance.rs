@@ -8,7 +8,7 @@
 //! resulting `Vec<CellInstance>` to the vertex buffer.
 
 use bytemuck::{Pod, Zeroable};
-use toastty_term::{Cell, Color as TColor, CursorShape, Damage, Style, Term};
+use toastty_term::{Cell, Color as TColor, CursorShape, Damage, PLACEHOLDER, Style, Term};
 
 /// Flag bit: instance is the text-cursor block (forces inverse rendering,
 /// no glyph sample).
@@ -481,6 +481,16 @@ pub fn build_instances_into<F>(
                 continue;
             }
 
+            // Kitty Unicode placeholder cells (`U+10EEEE`) live in the
+            // grid as cursor-motion shims; the image pipeline draws the
+            // actual pixels. Skip the glyph emission so the rasterizer
+            // doesn't draw `.notdef` tofu where the image will land.
+            // (Keep the bg quad — placeholders still need to overpaint
+            // whatever was there before the image arrived.)
+            if cell.ch == PLACEHOLDER {
+                continue;
+            }
+
             if let Some(slot) = locate_glyph(r, c, cell.ch, &cell.style) {
                 let flags = if slot.is_color { FLAG_COLOR_GLYPH } else { 0 };
                 // Glyph quad: position is cell + glyph bearing; size is
@@ -635,6 +645,14 @@ pub fn build_dirty_instances_into<F>(
             });
 
             if cell.ch.is_whitespace() || cell.ch == '\0' {
+                continue;
+            }
+
+            // Suppress glyph emission for Kitty Unicode placeholder
+            // cells — see the matching note in `build_instances_into`.
+            // The bg quad above is kept so old content stays
+            // overpainted under LoadOp::Load.
+            if cell.ch == PLACEHOLDER {
                 continue;
             }
 
@@ -1173,6 +1191,73 @@ mod tests {
         let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
         let underline_count = v.iter().filter(|i| i.flags & FLAG_UNDERLINE != 0).count();
         assert_eq!(underline_count, 0);
+    }
+
+    #[test]
+    fn kitty_unicode_placeholder_emits_bg_quad_but_no_glyph() {
+        // M11a-followup C2: cells holding the Kitty Unicode placeholder
+        // (`U+10EEEE`) must emit a background quad so old content gets
+        // overpainted, but MUST NOT emit a glyph quad — the image
+        // pipeline draws the real pixels, and a glyph quad would
+        // render `.notdef` tofu through any gap in the image.
+        let mut t = Term::new(1, 4, 0);
+        // SGR Indexed256(1) primes the placeholder run (sets image_id_low
+        // = 1) then the placeholder codepoint lands in cell (0, 0).
+        feed(&mut t, "\x1b[38;5;1m\u{10EEEE}".as_bytes());
+
+        // The locator panics if the renderer asks for a glyph at the
+        // placeholder cell — that's the bug C2 fixes.
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, ch, _| {
+                assert_ne!(ch, PLACEHOLDER, "locator must NOT be called for placeholder");
+                None
+            },
+        );
+        // Exactly one non-cursor instance: the bg quad. No glyph quad,
+        // no underline strip.
+        let non_cursor: Vec<_> = v.iter().filter(|i| i.flags & FLAG_CURSOR == 0).collect();
+        assert_eq!(non_cursor.len(), 1, "expected 1 bg quad, got {non_cursor:?}");
+        assert!(non_cursor[0].flags & FLAG_NO_GLYPH != 0);
+        assert_eq!(non_cursor[0].pos, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn kitty_unicode_placeholder_emits_bg_quad_in_dirty_builder() {
+        // Same as above but exercising the M9 partial-redraw path.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, "\x1b[38;5;1m\u{10EEEE}".as_bytes());
+        let damage = t.damage().clone();
+        let mut out = Vec::new();
+        super::build_dirty_instances_into(
+            &mut out,
+            &t,
+            &damage,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            true,
+            |_, _, ch, _| {
+                assert_ne!(ch, PLACEHOLDER, "locator must NOT be called for placeholder");
+                None
+            },
+        );
+        // One bg quad for the placeholder cell + cursor.
+        let non_cursor: Vec<_> = out.iter().filter(|i| i.flags & FLAG_CURSOR == 0).collect();
+        assert!(
+            non_cursor.iter().any(|i| i.pos == [0.0, 0.0] && i.flags & FLAG_NO_GLYPH != 0),
+            "expected a bg quad at (0,0); got {non_cursor:?}",
+        );
+        // No glyph instance (no FLAG_NO_GLYPH cleared, no FLAG_COLOR_GLYPH).
+        assert!(
+            out.iter()
+                .filter(|i| i.flags & FLAG_CURSOR == 0)
+                .all(|i| i.flags & FLAG_NO_GLYPH != 0),
+            "placeholder must not emit a glyph instance",
+        );
     }
 
     #[test]
