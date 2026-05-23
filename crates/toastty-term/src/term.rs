@@ -2523,8 +2523,8 @@ mod tests {
     /// This test simulates the binary's "skipped frame" branch by
     /// mutating Term state in the exact sequence the binary will use:
     /// force-flush sets the flag and dirties everything; then a
-    /// hypothetical "skipped" frame does NOT call clear_dirty or
-    /// clear_sync_output_force_flushed; the flag and dirty rows must
+    /// hypothetical "skipped" frame does NOT call `clear_dirty` or
+    /// `clear_sync_output_force_flushed`; the flag and dirty rows must
     /// still be set on the next observation.
     #[test]
     fn sync_output_force_flushed_flag_survives_skipped_frame() {
