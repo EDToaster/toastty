@@ -9,9 +9,13 @@
 # Provides:
 #  - OSC 7   — advertise the current working directory.
 #  - OSC 133 — semantic prompt markers (A/B/C/D).
+#
+# NOTE: never use `exit` here — when this file is sourced (rather than
+# executed), `exit` terminates the user's shell session. The early-out
+# below uses `return` so it only unloads this script (M10-followup C2).
 
 if test "$TOASTTY" != "1"
-    exit
+    return
 end
 
 # OSC 7 — emitted on every directory change.

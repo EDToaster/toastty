@@ -63,3 +63,18 @@ end
   drop in your own URL-encoder.
 - These snippets emit ASCII only; non-UTF-8 paths get percent-encoded
   byte by byte (RFC 3986).
+
+## Manual verification
+
+Sourcing a snippet must never kill the host shell. Verify by hand:
+
+```fish
+# In a non-toastty fish session (TOASTTY unset / != "1"):
+source /path/to/toastty/share/shell-integration/fish.fish
+# Shell must still be alive — the snippet `return`s out of itself,
+# rather than `exit`ing the session.
+```
+
+Repeat the same for bash and zsh with `unset TOASTTY` first. The shell
+prompt should reappear; no automated CI coverage because the CI image
+doesn't bundle all three shells.
