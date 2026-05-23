@@ -556,7 +556,22 @@ impl Term {
             // re-shape of all rows.
             self.mark_all_dirty();
         } else {
+            // Followup C3: a mid-screen LF moves the cursor without
+            // touching any cell content. Under partial redraw, the
+            // dirty-instance builder would see an empty damage set
+            // and the renderer would skip the frame, leaving the old
+            // cursor block painted on the original row. Mark both
+            // the cell the cursor leaves and the cell it lands on so
+            // the old block gets overpainted and the new block gets
+            // emitted.
+            let old_row = self.cursor.row;
             self.cursor.row += 1;
+            let new_row = self.cursor.row;
+            // Defend against the pending-wrap sentinel where
+            // cursor.col may equal cols.
+            let col = self.cursor.col.min(self.cols.saturating_sub(1));
+            self.mark_cell(old_row, col);
+            self.mark_cell(new_row, col);
         }
     }
 
@@ -2840,6 +2855,28 @@ mod tests {
         assert!(t.damage().rows[3].all_cols);
         // Row 0: not touched (clear_damage was called).
         assert!(t.damage().rows[0].is_empty());
+    }
+
+    /// Followup C3: a bare LF without scroll (mid-screen) moves the
+    /// cursor down by a row without touching any cell content. The
+    /// dirty-instance builder would see an empty damage set and the
+    /// renderer would skip the frame, leaving the previous cursor
+    /// block painted on the old row. `linefeed` must mark both the
+    /// old and new cursor cell so partial redraw overpaints the old
+    /// block and emits the new one.
+    #[test]
+    fn damage_lf_marks_old_and_new_cell() {
+        let mut t = Term::new(3, 8, 0);
+        // Cursor at row 0, col 0 by default.
+        t.clear_damage();
+        feed(&mut t, b"\n");
+        // Old cell (0, 0) and new cell (1, 0) must both be dirty.
+        assert!(damage_has_cell(&t, 0, 0), "old cursor cell must be dirty");
+        assert!(damage_has_cell(&t, 1, 0), "new cursor cell must be dirty");
+        // No other cells should be dirty.
+        assert_eq!(&t.damage().rows[0].cols[..], &[0]);
+        assert_eq!(&t.damage().rows[1].cols[..], &[0]);
+        assert!(t.damage().rows[2].is_empty());
     }
 
     /// Followup C1: `Term::mark_cell_dirty` is the public hook the
