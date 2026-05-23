@@ -385,6 +385,14 @@ pub fn build_instances_into<F>(
                 continue;
             };
 
+            // Continuation cells are the second half of a width-2
+            // cluster. The cluster's primary cell at `(r, c-1)` will
+            // emit a glyph that spans both columns — drawing anything
+            // here would over-paint the second half with a blank.
+            if cell.is_continuation {
+                continue;
+            }
+
             if is_blank_for_render(cell) {
                 continue;
             }
@@ -856,6 +864,23 @@ mod tests {
             "big cell: width {} should be in [2, 3]",
             cur.size[0],
         );
+    }
+
+    #[test]
+    fn continuation_cell_produces_no_instance() {
+        // Print a CJK ideograph; the renderer should emit a single
+        // background instance + a single glyph slot for the primary
+        // cell, NOT a second instance for the continuation half at
+        // col=1.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, "你".as_bytes());
+        // No glyph slots — locator returns None. We only count
+        // background instances.
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        // Exactly one non-cursor instance (the wide cluster's
+        // background quad), even though the cell grid records two
+        // cells (one primary + one continuation).
+        assert_eq!(count_non_cursor(&v), 1);
     }
 
     #[test]
