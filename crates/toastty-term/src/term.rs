@@ -4,6 +4,8 @@
 //! effect. Implements `toastty_parser::Perform` so the parser can drive it
 //! directly.
 
+use std::time::Instant;
+
 use crate::cell::{Cell, Color, Style};
 use crate::cursor::Cursor;
 use crate::grid::Grid;
@@ -62,6 +64,28 @@ impl MouseMode {
     pub fn report_any_motion(&self) -> bool {
         matches!(self.protocol, MouseProtocol::AnyMotion)
     }
+}
+
+/// Synchronized-output (DECSET 2026) state.
+///
+/// When BSU (`CSI ? 2026 h`) is received, `active` flips to true and
+/// `started_at` records the wall-clock instant. The renderer must skip
+/// frames while `active` is true. If ESU (`CSI ? 2026 l`) doesn't arrive
+/// within the timeout (~1s, matching tmux), the binary's watchdog calls
+/// [`Term::force_flush_sync_output`] which clears `active` and sets
+/// `timeout_force_flushed` so the very next post-flush render performs a
+/// corrective full redraw (decision #7).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SyncOutput {
+    /// BSU received, ESU not yet.
+    pub active: bool,
+    /// Wall-clock instant BSU went high; used by the watchdog timer.
+    pub started_at: Option<Instant>,
+    /// Set when the watchdog force-flushed the pause without an ESU. The
+    /// renderer reads this on the next frame to ensure a full redraw, then
+    /// the binary clears it via
+    /// [`Term::clear_sync_output_force_flushed`].
+    pub timeout_force_flushed: bool,
 }
 
 // ---- Kitty keyboard protocol flag bits ----
@@ -124,6 +148,12 @@ pub struct Term {
     /// behaviour. Capped at 8 entries (more than enough — kitty docs say
     /// "small stack").
     kitty_keyboard_stack: Vec<u8>,
+    /// DECSET 2026 — synchronized output (BSU/ESU) state.
+    sync_output: SyncOutput,
+    /// DECSET 2027 — grapheme cluster processing opt-in.
+    grapheme_cluster_mode: bool,
+    /// DECSET 2048 — in-band resize notifications opt-in.
+    inband_resize_mode: bool,
 }
 
 impl Term {
@@ -159,6 +189,9 @@ impl Term {
             report_focus: false,
             mouse_mode: MouseMode::default(),
             kitty_keyboard_stack: Vec::new(),
+            sync_output: SyncOutput::default(),
+            grapheme_cluster_mode: false,
+            inband_resize_mode: false,
         }
     }
 
@@ -166,6 +199,90 @@ impl Term {
     #[must_use]
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
+    }
+
+    /// True when DECSET 2026 (synchronized output) is active and the
+    /// renderer must skip submitting frames. Cleared on ESU or by the
+    /// watchdog after the timeout.
+    #[must_use]
+    pub fn pause_rendering(&self) -> bool {
+        self.sync_output.active
+    }
+
+    /// True when DECSET 2027 (grapheme cluster processing) is active.
+    #[must_use]
+    pub fn grapheme_cluster_mode(&self) -> bool {
+        self.grapheme_cluster_mode
+    }
+
+    /// True when DECSET 2048 (in-band resize notifications) is active.
+    #[must_use]
+    pub fn inband_resize_mode(&self) -> bool {
+        self.inband_resize_mode
+    }
+
+    /// Wall-clock instant the current BSU went high. `None` if no BSU is
+    /// currently active. Exposed for the binary's watchdog timer.
+    #[must_use]
+    pub fn sync_output_started_at(&self) -> Option<Instant> {
+        self.sync_output.started_at
+    }
+
+    /// True when the BSU watchdog timed out and force-flushed the pause;
+    /// the renderer must emit a corrective full redraw before the binary
+    /// clears the flag via
+    /// [`Term::clear_sync_output_force_flushed`].
+    #[must_use]
+    pub fn sync_output_force_flushed(&self) -> bool {
+        self.sync_output.timeout_force_flushed
+    }
+
+    /// Clear the timeout-force-flushed flag. Called by the binary right
+    /// after the corrective full redraw has been issued.
+    pub fn clear_sync_output_force_flushed(&mut self) {
+        self.sync_output.timeout_force_flushed = false;
+    }
+
+    /// Force-flush the synchronized-output pause: clear `active`, set
+    /// `timeout_force_flushed = true`, and mark every visible row dirty
+    /// so the next frame issues a corrective full redraw (decision #7).
+    ///
+    /// Idempotent: calling twice in a row clears nothing new and leaves
+    /// the flag latched until the renderer consumes it.
+    pub fn force_flush_sync_output(&mut self) {
+        if !self.sync_output.active && !self.sync_output.timeout_force_flushed {
+            // Nothing to do — and we don't want to needlessly mark rows
+            // dirty when no BSU was ever in flight.
+            return;
+        }
+        self.sync_output.active = false;
+        self.sync_output.started_at = None;
+        self.sync_output.timeout_force_flushed = true;
+        self.mark_all_dirty_internal();
+    }
+
+    /// Internal: handle a DECSET 2026 toggle. Enable-side captures the
+    /// wall-clock so the watchdog can compute elapsed time. Disable-side
+    /// clears the pause and marks every row dirty so the post-ESU frame
+    /// is a full redraw — both the watchdog and the normal ESU paths
+    /// share this corrective-redraw behaviour.
+    ///
+    /// Reentrant guard: a second BSU while already active must NOT
+    /// restart the timer (the spec says successive BSUs without an ESU
+    /// in between are a single contiguous batch).
+    fn set_sync_output(&mut self, enable: bool) {
+        if enable {
+            if !self.sync_output.active {
+                self.sync_output.active = true;
+                self.sync_output.started_at = Some(Instant::now());
+            }
+            // Reentrant BSU: leave started_at unchanged.
+        } else {
+            // ESU: clear and force a corrective full redraw.
+            self.sync_output.active = false;
+            self.sync_output.started_at = None;
+            self.mark_all_dirty_internal();
+        }
     }
 
     /// True when DECSET 1004 (focus reporting) is active.
@@ -735,7 +852,19 @@ impl Term {
                 2004 => {
                     self.bracketed_paste = enable;
                 }
-                // TODO(modes): 1, 7, 12, 25, 2026, 2027, 2048, etc.
+                // 2026 — synchronized output (BSU/ESU).
+                2026 => {
+                    self.set_sync_output(enable);
+                }
+                // 2027 — grapheme cluster processing opt-in.
+                2027 => {
+                    self.grapheme_cluster_mode = enable;
+                }
+                // 2048 — in-band resize notifications.
+                2048 => {
+                    self.inband_resize_mode = enable;
+                }
+                // TODO(modes): 1, 7, 12, 25, etc.
                 _ => {}
             }
         }
@@ -2075,6 +2204,102 @@ mod tests {
         t.set_cursor_default(CursorShape::Underline, false);
         assert_eq!(t.cursor_shape(), CursorShape::Underline);
         assert!(!t.cursor_blink());
+    }
+
+    // ---- M8 mode toggle tests --------------------------------------------
+
+    #[test]
+    fn decset_2026_pauses_rendering() {
+        let mut t = Term::new(2, 4, 0);
+        assert!(!t.pause_rendering());
+        feed(&mut t, b"\x1b[?2026h");
+        assert!(t.pause_rendering());
+        assert!(t.sync_output_started_at().is_some());
+    }
+
+    #[test]
+    fn decset_2026_disable_clears_pause_and_marks_dirty() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?2026h");
+        // Clear dirty so we can observe the disable-side effect.
+        t.clear_dirty();
+        feed(&mut t, b"\x1b[?2026l");
+        assert!(!t.pause_rendering());
+        assert!(t.sync_output_started_at().is_none());
+        // Every visible row should now be dirty so the post-ESU frame
+        // does a full redraw.
+        for (i, &d) in t.dirty_rows().iter().enumerate() {
+            assert!(d, "row {i} should be dirty after ESU");
+        }
+    }
+
+    #[test]
+    fn decset_2026_reentrant_bsu_does_not_restart_timer() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?2026h");
+        let first = t.sync_output_started_at().expect("first BSU recorded");
+        // Sleep is allergy-inducing in tests; we just trust the
+        // wall-clock monotonicity here and re-enable. The flag must
+        // NOT bump `started_at` forward.
+        feed(&mut t, b"\x1b[?2026h");
+        let second = t.sync_output_started_at().expect("still active");
+        assert_eq!(first, second, "reentrant BSU must not restart timer");
+    }
+
+    #[test]
+    fn decset_2027_toggles_grapheme_cluster_mode() {
+        let mut t = Term::new(2, 4, 0);
+        assert!(!t.grapheme_cluster_mode());
+        feed(&mut t, b"\x1b[?2027h");
+        assert!(t.grapheme_cluster_mode());
+        feed(&mut t, b"\x1b[?2027l");
+        assert!(!t.grapheme_cluster_mode());
+    }
+
+    #[test]
+    fn decset_2048_toggles_inband_resize_mode() {
+        let mut t = Term::new(2, 4, 0);
+        assert!(!t.inband_resize_mode());
+        feed(&mut t, b"\x1b[?2048h");
+        assert!(t.inband_resize_mode());
+        feed(&mut t, b"\x1b[?2048l");
+        assert!(!t.inband_resize_mode());
+    }
+
+    #[test]
+    fn force_flush_sync_output_sets_timeout_flag_and_dirties_all() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?2026h");
+        assert!(t.pause_rendering());
+        t.clear_dirty();
+        t.force_flush_sync_output();
+        assert!(!t.pause_rendering());
+        assert!(t.sync_output_force_flushed());
+        for (i, &d) in t.dirty_rows().iter().enumerate() {
+            assert!(d, "row {i} should be dirty after timeout flush");
+        }
+    }
+
+    #[test]
+    fn force_flush_sync_output_is_idempotent_when_no_bsu() {
+        let mut t = Term::new(2, 4, 0);
+        t.clear_dirty();
+        // No BSU in flight — flush is a no-op.
+        t.force_flush_sync_output();
+        assert!(!t.sync_output_force_flushed());
+        for &d in t.dirty_rows() {
+            assert!(!d, "no row should be dirty when there was no BSU to flush");
+        }
+    }
+
+    #[test]
+    fn sync_output_force_flushed_is_consumed_by_clear() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?2026h");
+        t.force_flush_sync_output();
+        assert!(t.sync_output_force_flushed());
+        t.clear_sync_output_force_flushed();
+        assert!(!t.sync_output_force_flushed());
     }
 
     #[test]
