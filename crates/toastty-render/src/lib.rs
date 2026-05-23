@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 
 pub mod color;
+pub mod image;
 pub mod surface_format;
 pub mod text;
 
