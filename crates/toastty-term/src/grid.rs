@@ -156,6 +156,30 @@ impl Grid {
         self.head = (self.head + 1) % self.rows.len();
     }
 
+    /// Scroll down by one: a fresh blank row appears at the top, the
+    /// bottom visible row falls off (xterm-style — *not* preserved for a
+    /// later `scroll_up`). Used by RI / DECSTBM-less reverse scrolling.
+    ///
+    /// Symmetric to `scroll_up`: we clear the slot that's leaving the
+    /// visible region (the visible bottom) so it stays blank while
+    /// off-screen — preserving the "off-screen ring slots are blank"
+    /// invariant `scroll_up` relies on.
+    pub fn scroll_down(&mut self) {
+        // Clear the visible-bottom slot *before* moving the head, so the
+        // row that's about to scroll off-screen goes out blank.
+        let bottom_slot = self.slot(self.visible_rows.saturating_sub(1));
+        self.rows[bottom_slot].clear();
+        self.rows[bottom_slot].resize_cols(self.cols);
+        // Decrement head with wrap-around. The slot that was at logical
+        // row `cap - 1` (off-screen, blank by invariant) becomes the new
+        // logical row 0.
+        self.head = if self.head == 0 {
+            self.rows.len() - 1
+        } else {
+            self.head - 1
+        };
+    }
+
     /// Clear every visible row. Scrollback is left untouched (used by the
     /// alt screen flip, which only manages its own visible region).
     pub fn clear_visible(&mut self, style: Style) {
@@ -378,6 +402,62 @@ mod tests {
         assert_eq!(g.row(0).cells[0].ch, 'b');
         // Row 1 is fresh blank.
         assert_eq!(g.row(1).cells[0], Cell::BLANK);
+    }
+
+    #[test]
+    fn grid_scroll_down_rotates_head() {
+        let mut g = Grid::new(2, 3, 2);
+        g.row_mut(0).put(
+            0,
+            Cell {
+                ch: 'a',
+                style: Style::RESET,
+                is_continuation: false,
+                hyperlink_id: None,
+            },
+            3,
+        );
+        g.row_mut(1).put(
+            0,
+            Cell {
+                ch: 'b',
+                style: Style::RESET,
+                is_continuation: false,
+                hyperlink_id: None,
+            },
+            3,
+        );
+        g.scroll_down();
+        // Row 0 is fresh blank (the inserted line at the top).
+        assert_eq!(g.row(0).cells[0], Cell::BLANK);
+        // Row 1 holds what was row 0 ('a' moved down by one).
+        assert_eq!(g.row(1).cells[0].ch, 'a');
+    }
+
+    #[test]
+    fn grid_scroll_down_with_scrollback_blanks_off_screen_slot() {
+        // cap > visible_rows: verify the slot scrolled off the visible
+        // bottom is blanked so it stays clean as it rotates around the
+        // ring (the invariant scroll_up also relies on).
+        let mut g = Grid::new(2, 3, 4);
+        g.row_mut(1).put(
+            0,
+            Cell {
+                ch: 'z',
+                style: Style::RESET,
+                is_continuation: false,
+                hyperlink_id: None,
+            },
+            3,
+        );
+        g.scroll_down();
+        // After scrolling down twice more, the slot that held 'z' rotates
+        // back into the visible region; it must still be blank.
+        g.scroll_down();
+        g.scroll_down();
+        for r in 0..2 {
+            assert_eq!(g.row(r).cells[0], Cell::BLANK);
+        }
     }
 
     #[test]

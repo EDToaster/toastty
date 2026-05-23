@@ -947,6 +947,30 @@ impl Term {
         }
     }
 
+    /// Reverse Index (RI, `ESC M`): symmetric counterpart to `linefeed`.
+    /// Move cursor up one; at the top of the scroll region, scroll the
+    /// screen *down* by one (open a blank row at the top, drop the
+    /// bottom row). Less, vim, fzf and friends rely on this for the
+    /// "paint lines into the top" path (e.g. `b`/`u` paging up).
+    fn reverse_index(&mut self) {
+        if self.cursor.row == 0 {
+            // At top: scroll down by one, cursor stays at row 0.
+            self.active_grid_mut().scroll_down();
+            self.mark_all_dirty();
+            let dropped = self.image_grid.shift_rows_down(1, 0, self.rows);
+            if !dropped.is_empty() {
+                self.image_revision = self.image_revision.wrapping_add(1);
+            }
+        } else {
+            let old_row = self.cursor.row;
+            self.cursor.row -= 1;
+            let new_row = self.cursor.row;
+            let col = self.cursor.col.min(self.cols.saturating_sub(1));
+            self.mark_cell(old_row, col);
+            self.mark_cell(new_row, col);
+        }
+    }
+
     fn linefeed(&mut self) {
         if self.cursor.row + 1 >= self.rows {
             // At bottom: scroll up by one and stay on the last row.
@@ -1915,6 +1939,39 @@ impl Perform for Term {
         self.handle_csi(params, intermediates, action);
     }
 
+    /// ESC + final-byte dispatch. Covers the handful of single-byte
+    /// terminal-control escapes that don't fit the CSI/OSC frames.
+    ///
+    /// Sequences with intermediate bytes (character-set selection like
+    /// `ESC ( B`, etc.) are silently ignored — they're not load-bearing
+    /// for the apps we currently target.
+    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        if let Some(run) = self.placeholder_run.take() {
+            self.finalize_placeholder_run(run);
+        }
+        if !intermediates.is_empty() {
+            return;
+        }
+        match byte {
+            // RI (Reverse Index) — symmetric to LF: cursor up one row,
+            // scroll down at the top of the scroll region.
+            b'M' => self.reverse_index(),
+            // IND (Index) — semantically a linefeed without CR.
+            b'D' => self.linefeed(),
+            // NEL (Next Line) — CR + LF.
+            b'E' => {
+                let row = self.cursor.row;
+                let max_col = self.cols.saturating_sub(1);
+                let old_col = self.cursor.col.min(max_col);
+                self.cursor.col = 0;
+                self.mark_cell(row, old_col);
+                self.mark_cell(row, 0);
+                self.linefeed();
+            }
+            _ => {}
+        }
+    }
+
     /// OSC dispatch. Currently handles the title-setting variants:
     ///
     /// - `OSC 0 ; <title> ST` — set both icon and window title.
@@ -2484,6 +2541,49 @@ mod tests {
         let t = run(3, 8, b"a\r\nb");
         assert_eq!(row_text(&t, 0), "a");
         assert_eq!(row_text(&t, 1), "b");
+    }
+
+    #[test]
+    fn ri_at_top_scrolls_screen_down() {
+        // Fill the screen, home the cursor, then RI: existing rows
+        // should shift down by one, top row should be blank, bottom row
+        // should fall off. This is the load-bearing path for less's
+        // back-up (`b`/`u`) rendering.
+        let mut t = run(3, 8, b"a\r\nb\r\nc");
+        // Home, then RI (`ESC M`).
+        feed(&mut t, b"\x1b[H\x1bM");
+        assert_eq!(row_text(&t, 0), "");
+        assert_eq!(row_text(&t, 1), "a");
+        assert_eq!(row_text(&t, 2), "b");
+        assert_eq!(t.cursor().row, 0);
+        assert_eq!(t.cursor().col, 0);
+    }
+
+    #[test]
+    fn ri_mid_screen_just_moves_cursor_up() {
+        // Cursor not at top: RI is just "cursor up one row", no scroll.
+        let mut t = run(3, 8, b"a\r\nb\r\nc");
+        // Park cursor at row 2, col 0; then RI.
+        feed(&mut t, b"\x1b[3;1H\x1bM");
+        assert_eq!(row_text(&t, 0), "a");
+        assert_eq!(row_text(&t, 1), "b");
+        assert_eq!(row_text(&t, 2), "c");
+        assert_eq!(t.cursor().row, 1);
+    }
+
+    #[test]
+    fn ri_feed_like_less_pages_up() {
+        // Mimic less's "scroll up" emit pattern: per new row, send
+        // CUP-home + RI + content + CRLF. Each iteration pushes prior
+        // writes down by one, so after N iterations the screen reads
+        // top-down as the lines written in *reverse* order.
+        let mut t = run(4, 4, b"P0\r\nP1\r\nP2\r\nP3");
+        // Write three new lines [X2, X1, X0] into the top via RI.
+        feed(&mut t, b"\x1b[H\x1bMX2\r\n\x1b[H\x1bMX1\r\n\x1b[H\x1bMX0\r\n");
+        assert_eq!(row_text(&t, 0), "X0");
+        assert_eq!(row_text(&t, 1), "X1");
+        assert_eq!(row_text(&t, 2), "X2");
+        assert_eq!(row_text(&t, 3), "P0");
     }
 
     #[test]

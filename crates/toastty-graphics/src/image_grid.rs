@@ -156,6 +156,46 @@ impl ImageGrid {
         self.placements.is_empty()
     }
 
+    /// Shift every placement starting at or below `scroll_top` down by
+    /// `n` rows, clamped to `scroll_bottom` (exclusive). Placements
+    /// whose `start` would land at or past `scroll_bottom` are dropped
+    /// and returned so the caller can mark cells dirty.
+    ///
+    /// `n == 0` is a no-op. Symmetric to [`Self::shift_rows_up`]; used
+    /// by RI (Reverse Index) when the grid scrolls down.
+    pub fn shift_rows_down(
+        &mut self,
+        n: u16,
+        scroll_top: u16,
+        scroll_bottom: u16,
+    ) -> Vec<Placement> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut removed = Vec::new();
+        let mut i = 0;
+        while i < self.placements.len() {
+            let p = &mut self.placements[i].1;
+            if p.row_range.start < scroll_top {
+                // Above the scroll region — unaffected.
+                i += 1;
+                continue;
+            }
+            let new_start = p.row_range.start.saturating_add(n);
+            let new_end = p.row_range.end.saturating_add(n);
+            if new_start >= scroll_bottom {
+                // Entire placement scrolled past the bottom — drop.
+                removed.push(self.placements.remove(i).1);
+                continue;
+            }
+            // Clip the bottom edge to the scroll region.
+            let new_end = new_end.min(scroll_bottom);
+            p.row_range = new_start..new_end;
+            i += 1;
+        }
+        removed
+    }
+
     /// Shift every placement starting at or below `scroll_top` up by `n`
     /// rows. Placements whose entire row range scrolls above 0 are
     /// dropped and returned so the caller can mark cells dirty.
