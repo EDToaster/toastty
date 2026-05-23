@@ -867,6 +867,42 @@ mod tests {
     }
 
     #[test]
+    fn mixed_cjk_and_ascii_geometry_aligns_to_cell_boundaries() {
+        // End-to-end geometry check (no GPU): print "a你b" → cells:
+        //   0: 'a' (primary, ascii)
+        //   1: '你' (primary, wide)
+        //   2: continuation
+        //   3: 'b' (primary, ascii)
+        // build_instances must emit three background quads (skipping
+        // the continuation), and each non-cursor instance's x-pos
+        // must be a multiple of cell_w.
+        let mut t = Term::new(1, 8, 0);
+        feed(&mut t, "a你b".as_bytes());
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        let bgs: Vec<_> = v
+            .iter()
+            .filter(|i| i.flags & FLAG_CURSOR == 0)
+            .collect();
+        // Exactly 3 instances — one per non-continuation cell.
+        assert_eq!(bgs.len(), 3);
+        // Each landing on an integer cell boundary.
+        for inst in &bgs {
+            let col_f = inst.pos[0] / 8.0;
+            let col = col_f.round();
+            assert!((col_f - col).abs() < 1e-3, "x={} not on cell grid", inst.pos[0]);
+        }
+        // Columns 0 / 1 / 3 — the continuation column (2) is skipped.
+        let cols: Vec<u16> = bgs
+            .iter()
+            .map(|i| (i.pos[0] / 8.0).round() as u16)
+            .collect();
+        assert!(cols.contains(&0), "'a' at col 0");
+        assert!(cols.contains(&1), "'你' at col 1");
+        assert!(cols.contains(&3), "'b' at col 3 (after continuation)");
+        assert!(!cols.contains(&2), "col 2 (continuation) must be skipped");
+    }
+
+    #[test]
     fn continuation_cell_produces_no_instance() {
         // Print a CJK ideograph; the renderer should emit a single
         // background instance + a single glyph slot for the primary
