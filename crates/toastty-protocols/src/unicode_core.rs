@@ -67,9 +67,8 @@ pub fn char_cell_width(c: char, mode_2027_active: bool) -> u8 {
     let _ = mode_2027_active; // single-char width is the same in both modes
     match UnicodeWidthChar::width(c) {
         Some(0) => 0,
-        Some(1) => 1,
-        Some(_) => 2,
-        None => 1,
+        Some(w) if w >= 2 => 2,
+        _ => 1,
     }
 }
 

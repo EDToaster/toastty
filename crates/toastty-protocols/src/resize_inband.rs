@@ -35,13 +35,7 @@ pub fn encode_resize_report(
     // `CSI 48 ; rows ; cols ; pixel_h ; pixel_w t`. We build the
     // string directly — the format strings are simple enough that the
     // allocator cost is well below the PTY-write cost.
-    let body = format!(
-        "\x1b[48;{rows};{cols};{pixel_height};{pixel_width}t",
-        rows = rows,
-        cols = cols,
-        pixel_height = pixel_height,
-        pixel_width = pixel_width,
-    );
+    let body = format!("\x1b[48;{rows};{cols};{pixel_height};{pixel_width}t");
     Some(body.into_bytes())
 }
 

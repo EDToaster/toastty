@@ -276,14 +276,13 @@ impl Toastty {
         // corrective full redraw. We re-check after the parser advance
         // because the same batch may have contained BSU+ESU in order
         // (in which case `pause_rendering` is already false).
-        if self.term.pause_rendering() {
-            if let Some(started_at) = self.term.sync_output_started_at()
-                && should_force_flush(started_at, Instant::now())
-            {
-                self.term.force_flush_sync_output();
-                if let Some(w) = self.window.as_ref() {
-                    w.request_redraw();
-                }
+        if self.term.pause_rendering()
+            && let Some(started_at) = self.term.sync_output_started_at()
+            && should_force_flush(started_at, Instant::now())
+        {
+            self.term.force_flush_sync_output();
+            if let Some(w) = self.window.as_ref() {
+                w.request_redraw();
             }
         }
 

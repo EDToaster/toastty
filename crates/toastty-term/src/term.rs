@@ -518,9 +518,12 @@ impl Term {
     fn char_cell_width(c: char) -> u16 {
         match UnicodeWidthChar::width(c) {
             Some(0) => 0,
-            Some(1) => 1,
-            Some(_) => 2,
-            None => 1,
+            // Wide (2+) → 2 cells; narrow / unknown → 1. `None`
+            // (unprintable) is treated as 1 so the cursor never gets
+            // stuck on a no-width codepoint that wasn't filtered out
+            // upstream.
+            Some(w) if w >= 2 => 2,
+            _ => 1,
         }
     }
 
@@ -717,8 +720,7 @@ impl Term {
         let cells = &self.active_grid().row(self.cursor.row).cells;
         let is_cont = cells
             .get(col as usize)
-            .map(|c| c.is_continuation)
-            .unwrap_or(false);
+            .is_some_and(|c| c.is_continuation);
         if is_cont { col - 1 } else { col }
     }
 

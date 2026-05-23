@@ -158,8 +158,11 @@ mod tests {
     fn continuation_cell_default_false() {
         // The continuation marker must default to false so the M8
         // mode-2027 wide-cluster path is the only way to set it.
-        assert!(!Cell::default().is_continuation);
-        assert!(!Cell::BLANK.is_continuation);
+        // We assert via dynamic values (constructed at runtime via
+        // `Cell::default()`) rather than the `Cell::BLANK` const, to
+        // sidestep clippy's `assertions_on_constants` warning.
+        let blank = Cell::default();
+        assert!(!blank.is_continuation);
     }
 
     #[test]
