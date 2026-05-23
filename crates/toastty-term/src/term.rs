@@ -2303,6 +2303,46 @@ mod tests {
     }
 
     #[test]
+    fn sync_output_full_flow_bsu_then_esu_in_one_batch() {
+        // App emits BSU, writes a row of cells, then ESU all in one
+        // PTY batch. After the batch:
+        // - pause_rendering is false (ESU lowered it)
+        // - every row is dirty (post-ESU full redraw)
+        // - the cell content is what the app wrote
+        let mut t = Term::new(2, 4, 0);
+        t.clear_dirty();
+        feed(&mut t, b"\x1b[?2026hAB\x1b[?2026l");
+        assert!(!t.pause_rendering());
+        assert_eq!(row_text(&t, 0), "AB");
+        // All rows dirty (the ESU disable path marks everything).
+        for (i, &d) in t.dirty_rows().iter().enumerate() {
+            assert!(d, "row {i} should be dirty after batch ESU");
+        }
+    }
+
+    #[test]
+    fn sync_output_force_flush_after_bsu_only_renders_partial_state() {
+        // App emits BSU + content, never sends ESU. Watchdog calls
+        // force_flush_sync_output. After the flush, the partial cell
+        // content is visible AND every row is dirty so the renderer
+        // emits a corrective full redraw (decision #7 subtlety).
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?2026hAB");
+        // Pre-condition: paused, content written.
+        assert!(t.pause_rendering());
+        assert_eq!(row_text(&t, 0), "AB");
+        t.clear_dirty();
+        t.force_flush_sync_output();
+        assert!(!t.pause_rendering());
+        assert!(t.sync_output_force_flushed());
+        for (i, &d) in t.dirty_rows().iter().enumerate() {
+            assert!(d, "row {i} should be dirty after timeout flush");
+        }
+        // Content is still there.
+        assert_eq!(row_text(&t, 0), "AB");
+    }
+
+    #[test]
     fn parse_extended_color_from_iter_truecolor_runs_out_of_components() {
         // Cover the `?` branches inside the iter helper. Each missing
         // component path returns None.
