@@ -558,6 +558,7 @@ pub fn build_instances_into<F>(
 /// Continuation cells (second half of a width-2 cluster) are skipped:
 /// the cluster's primary cell at `(r, c-1)` is responsible for the full
 /// multi-cell quad.
+#[allow(clippy::too_many_arguments)] // mirrors build_instances_into + adds damage/visibility/ext_palette
 pub fn build_dirty_instances_into<F>(
     out: &mut Vec<CellInstance>,
     term: &Term,
