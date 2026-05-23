@@ -69,7 +69,21 @@ pub trait KittySink {
     /// didn't set `C=1`. The host translates this into actual cursor
     /// motion. Default is a no-op so simple test sinks don't need to
     /// care about cursor state.
-    fn advance_cursor_after_placement(&mut self, _rows: u16, _cols: u16) {}
+    ///
+    /// `start_col` is the column the placement started at — kitty
+    /// spec says the cursor lands at `(start_row + rows, start_col)`,
+    /// NOT at column 0. The handler captures this via
+    /// [`KittySink::cursor_col`] before the placement is consumed.
+    fn advance_cursor_after_placement(&mut self, _rows: u16, _cols: u16, _start_col: u16) {}
+
+    /// Current cursor column. Consulted by the handler so it can
+    /// thread `start_col` into
+    /// [`KittySink::advance_cursor_after_placement`] without taking
+    /// a separate borrow of the sink. Default `0` keeps the trait
+    /// usable from test sinks that don't model a cursor.
+    fn cursor_col(&self) -> u16 {
+        0
+    }
 
     /// True iff the host's image registry holds an entry for `id`.
     ///
@@ -307,12 +321,17 @@ impl KittyHandler {
             let placement = default_placement_from_header(&header, final_id, img_w, img_h);
             let rows_span = placement.row_range.end - placement.row_range.start;
             let cols_span = placement.col_range.end - placement.col_range.start;
+            // M11a-followup.N6: capture the cursor's start_col BEFORE
+            // place_image consumes the placement. Kitty spec says the
+            // cursor lands at (start_row + rows, start_col), not at
+            // column 0.
+            let start_col = sink.cursor_col();
             sink.place_image(placement);
             // Kitty spec: T advances the cursor by the placement size
             // unless `C=1`. We delegate to the host so the cursor
             // motion respects scroll/wrap.
             if !header.cursor_no_move {
-                sink.advance_cursor_after_placement(rows_span, cols_span);
+                sink.advance_cursor_after_placement(rows_span, cols_span, start_col);
             }
         }
 

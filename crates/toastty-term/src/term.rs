@@ -2206,22 +2206,27 @@ impl KittySink for Term {
             .saturating_sub(used_buf)
     }
 
-    fn advance_cursor_after_placement(&mut self, rows: u16, _cols: u16) {
-        // Kitty docs say: after T, the cursor moves to the cell *below*
-        // the bottom-left of the placement. We approximate by moving
-        // down by `rows` and resetting column to 0 — close enough for
-        // common `kitty +kitten icat` usage.
+    fn advance_cursor_after_placement(&mut self, rows: u16, _cols: u16, start_col: u16) {
+        // Kitty spec: after T, the cursor moves to (start_row + rows,
+        // start_col). M11a-followup.N6: previously this reset col to
+        // 0, which broke apps that placed images mid-line (e.g.
+        // inline icons inside a sentence) — the cursor would jump
+        // back to column 0 and overwrite the leading text.
         //
         // If the cursor would land below the visible viewport, we let
         // `linefeed` scroll the grid (which also shifts image rows up).
         for _ in 0..rows {
             self.linefeed();
         }
-        self.cursor.col = 0;
+        self.cursor.col = start_col.min(self.cols.saturating_sub(1));
     }
 
     fn image_exists(&self, id: u32) -> bool {
         self.image_registry.contains(id)
+    }
+
+    fn cursor_col(&self) -> u16 {
+        self.cursor.col.min(self.cols.saturating_sub(1))
     }
 }
 
@@ -4311,10 +4316,36 @@ mod tests {
         // Image placed.
         assert!(t.image_registry().contains(1));
         assert_eq!(t.image_grid().len(), 1);
-        // Cursor advanced by `r=2` rows (column reset to 0).
+        // Cursor advanced by `r=2` rows; column preserved at the
+        // start_col (cursor started at col 0).
         let cur = t.cursor();
         assert_eq!(cur.row, 2);
         assert_eq!(cur.col, 0);
+    }
+
+    #[test]
+    fn apc_kitty_transmit_and_place_lands_cursor_at_start_col() {
+        // M11a-followup.N6: after `a=T`, the cursor must land at
+        // (start_row + r, start_col), NOT (start_row + r, 0). Apps
+        // that place images mid-line (e.g. inline emoji icons inside
+        // a sentence) rely on this.
+        let mut t = Term::new(8, 16, 0);
+        // Move the cursor to (row=1, col=5) — 1-based 2;6.
+        feed(&mut t, b"\x1b[2;6H");
+        assert_eq!(t.cursor().col, 5);
+        assert_eq!(t.cursor().row, 1);
+        // Place a 1x1 red pixel as a 1x2 cell placement spanning 2
+        // rows, default C=0 (cursor MOVES after).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=1,r=2;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        let cur = t.cursor();
+        // Row advanced by 2 (the r= value).
+        assert_eq!(cur.row, 1 + 2, "cursor row should advance by r=2");
+        // Column preserved at start_col=5 — the M11a-followup.N6 fix.
+        assert_eq!(cur.col, 5, "cursor col must preserve start_col=5, not reset to 0");
     }
 
     #[test]
