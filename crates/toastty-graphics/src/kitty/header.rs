@@ -226,6 +226,7 @@ fn parse_i32(key: &str, value: &str) -> Result<i32, KittyHeaderError> {
     })
 }
 
+#[allow(clippy::too_many_lines)] // long match arm — each key is one line.
 fn apply(h: &mut Header, key: &str, value: &str) -> Result<(), KittyHeaderError> {
     match key {
         "a" => {
