@@ -14,7 +14,7 @@ csi="${esc}["
 st="${esc}\\"
 
 cleanup() {
-    # Restore any modes the M7 sections leave dangling if you Ctrl-C
+    # Restore any modes the M7/M8 sections leave dangling if you Ctrl-C
     # out partway through.
     printf '%s?2004l' "$csi"
     printf '%s?1004l' "$csi"
@@ -22,6 +22,9 @@ cleanup() {
     printf '%s?1000l' "$csi"
     printf '%s?1006l' "$csi"
     printf '%s<u' "$csi"
+    printf '%s?2026l' "$csi"
+    printf '%s?2027l' "$csi"
+    printf '%s?2048l' "$csi"
 }
 trap cleanup EXIT
 
@@ -37,8 +40,8 @@ section "1. Plain text + UTF-8"
 echo "ASCII:  The quick brown fox jumps over the lazy dog"
 echo "Latin:  jalapeño, naïve, café, façade"
 echo "Greek:  αβγδεζη θικλμνξ οπρστυ φχψω"
-echo "CJK:    你好世界 (wide chars — likely misaligned for now)"
-note "[partial] wide chars (CJK) should occupy 2 cells but currently take 1"
+echo "CJK:    你好世界 (single-codepoint wide chars — 2 cells each since M8)"
+note "VS16 emoji (❤️) and ZWJ clusters need DECSET 2027 — see M8.2 below"
 
 # ────────────────────────────────────────────────────────────────
 section "2. C0 control characters"
@@ -258,6 +261,66 @@ printf '%s>3u' "$csi"
 sleep 8
 printf '%s<u' "$csi"
 note "Flags popped — Enter is back to \\r."
+
+# ─────────────────────────────────────────────────────────────────
+section "M8.1 — Synchronized output (DECSET 2026)"
+note "BSU/ESU brackets keep the renderer from showing partial frames."
+note "Sending BSU, writing 5 lines with 200ms delays, then ESU."
+note "Lines should appear *atomically* at ESU, not one-by-one."
+sleep 1
+printf '%s?2026h' "$csi"          # BSU
+for i in 1 2 3 4 5; do
+    printf '  line %d (you should NOT see this until ESU)\n' "$i"
+    sleep 0.2
+done
+sleep 0.5
+printf '%s?2026l' "$csi"          # ESU
+note "If you saw 5 lines appear at once after ~1.5s, mode 2026 is working."
+sleep 1
+
+note ""
+note "Watchdog: 1s after BSU with no ESU, the renderer force-flushes"
+note "and the next frame is a corrective full redraw."
+sleep 1
+printf '%s?2026h' "$csi"          # BSU only, no ESU
+printf '  watchdog target: written under BSU, no ESU follows.\n'
+sleep 1.5
+printf '  visible? then the watchdog kicked in.\n'
+printf '%s?2026l' "$csi"          # cleanup
+sleep 1
+
+# ─────────────────────────────────────────────────────────────────
+section "M8.2 — Grapheme cluster widths (DECSET 2027)"
+note "Single-codepoint wide chars (CJK, base emoji) already render at"
+note "width 2 — Term::print uses unicode-width regardless of mode 2027."
+echo '  你好世界    ← 4 CJK ideographs, expect 8 cells wide'
+echo '  |-------|   ← 8-col ruler'
+note ""
+note "Enabling DECSET 2027 — apps signal they want cluster-width honoring"
+note "for VS16 / ZWJ clusters in the renderer's cluster snap."
+printf '%s?2027h' "$csi"
+echo '  你好世界    ← mode 2027 active'
+echo '  |-------|'
+printf '%s?2027l' "$csi"
+note ""
+note "Known limitation (M9): Term::print is still per-codepoint, so"
+note "VS16-presented ❤️ and ZWJ family clusters disagree between the"
+note "cell grid (1 cell) and renderer geometry (2 cells). Cluster-aware"
+note "print() lands in M9."
+sleep 1
+
+# ─────────────────────────────────────────────────────────────────
+section "M8.3 — In-band resize notifications (DECSET 2048)"
+note "Enabling mode 2048. Resize the toastty window — the kernel sends"
+note "SIGWINCH, and toastty emits a CSI 48 ; rows ; cols ; ph ; pw t"
+note "report on the PTY's read side, in order with stdout (no race)."
+note ""
+note "Your shell may show garbage characters as the sequence arrives;"
+note "an app using mode 2048 parses them as a structured resize event."
+note "Press Enter when you're done resizing."
+printf '%s?2048h' "$csi"
+read -r _
+printf '%s?2048l' "$csi"
 
 # ─────────────────────────────────────────────────────────────────
 section "Done"

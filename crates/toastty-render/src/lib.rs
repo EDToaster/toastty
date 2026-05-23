@@ -440,9 +440,17 @@ impl Renderer {
                 // Reuse a per-call String allocation; under release LLVM
                 // hoists the small allocation per row, but a future
                 // optimization could move the buffer into TextState.
+                //
+                // Continuation cells are excluded: they're the second
+                // half of a width-2 cluster whose primary cell already
+                // contributes its full multi-cell glyph to the shaper.
+                // Feeding the continuation in as a space would insert
+                // an extra glyph cosmic-text would shape, shifting every
+                // downstream cluster's snapped column by one.
                 let line_text: String = row
                     .cells
                     .iter()
+                    .filter(|c| !c.is_continuation)
                     .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
                     .collect();
                 let lg = text.rasterizer.shape_line(
