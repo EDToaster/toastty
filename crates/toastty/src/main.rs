@@ -12,12 +12,13 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use pollster::block_on;
 use toastty_config::{Config, ConfigSource};
 use toastty_parser::Parser;
+use toastty_protocols::synchronized::{BSU_TIMEOUT, should_force_flush};
 use toastty_pty::{Pty, PtySpec, WinSize};
 use toastty_render::Renderer;
 use toastty_term::Term;
@@ -257,18 +258,38 @@ impl Toastty {
         }
     }
 
-    fn handle_pty_bytes(&mut self, bytes: &[u8]) {
+    /// Feed a batch of PTY bytes through the parser. Returns whether a
+    /// fresh BSU (mode 2026 begin-synchronized-update) just went high
+    /// during this batch — the caller uses that signal to schedule the
+    /// watchdog redraw via `ControlSignal::RedrawIn(BSU_TIMEOUT)`.
+    fn handle_pty_bytes(&mut self, bytes: &[u8]) -> bool {
+        let was_paused = self.term.pause_rendering();
         self.parser.advance(&mut self.term, bytes);
         // OSC 0/1/2 may have changed the title — sync to the window
         // decoration. `sync_title` is a no-op when the title is
         // unchanged, so calling on every batch is cheap.
         self.sync_title();
-        // Redraw is requested via ControlSignal::RedrawIn(ZERO) from the
-        // PtyBytes handler — that path wakes the event loop reliably on
-        // macOS. Bare `request_redraw()` + ControlSignal::Continue queues
-        // a redraw via setNeedsDisplay but doesn't wake the loop until
-        // the next external event, leaving the window stale until a
-        // keystroke. See `Event::PtyBytes` below.
+
+        // BSU watchdog: if a BSU is currently in flight and its timer
+        // has already elapsed, force-flush so the next frame issues a
+        // corrective full redraw. We re-check after the parser advance
+        // because the same batch may have contained BSU+ESU in order
+        // (in which case `pause_rendering` is already false).
+        if self.term.pause_rendering() {
+            if let Some(started_at) = self.term.sync_output_started_at()
+                && should_force_flush(started_at, Instant::now())
+            {
+                self.term.force_flush_sync_output();
+                if let Some(w) = self.window.as_ref() {
+                    w.request_redraw();
+                }
+            }
+        }
+
+        // A fresh BSU started in this batch — caller will schedule a
+        // wake-up at BSU_TIMEOUT so the watchdog above eventually
+        // fires even if the app sends no more bytes.
+        !was_paused && self.term.pause_rendering()
     }
 }
 
@@ -466,8 +487,11 @@ impl App for Toastty {
                         warn!("render_term error: {e}");
                     }
                     // Consume the per-row damage signal so the next
-                    // render only re-shapes rows that changed.
+                    // render only re-shapes rows that changed. We also
+                    // clear the BSU timeout-flush flag so the renderer
+                    // observes it for exactly one frame.
                     self.term.clear_dirty();
+                    self.term.clear_sync_output_force_flushed();
                 }
                 ControlSignal::Continue
             }
@@ -500,12 +524,25 @@ impl App for Toastty {
             } => self.handle_mouse(button, state, position),
             Event::Scroll { delta_x, delta_y } => self.handle_scroll(delta_x, delta_y),
             Event::PtyBytes(bytes) => {
-                self.handle_pty_bytes(&bytes);
+                let fresh_bsu = self.handle_pty_bytes(&bytes);
+                // If a BSU just went high we still want to wake the
+                // event loop, but at the watchdog deadline rather than
+                // immediately — `render_term` would just skip while the
+                // pause is active. The watchdog inside
+                // `handle_pty_bytes` already fires if the previous BSU
+                // had already expired; this branch covers the
+                // "BSU-then-silence" case where no further bytes
+                // arrive to drive the watchdog.
+                //
                 // RedrawIn(ZERO) — not Continue — to force the event
                 // loop to wake immediately. On macOS, plain
                 // `request_redraw()` doesn't wake from Wait reliably;
                 // RedrawIn sets ControlFlow::WaitUntil(now) which does.
-                ControlSignal::RedrawIn(Duration::ZERO)
+                if fresh_bsu {
+                    ControlSignal::RedrawIn(BSU_TIMEOUT)
+                } else {
+                    ControlSignal::RedrawIn(Duration::ZERO)
+                }
             }
             Event::PtyClosed => {
                 debug!("pty closed; exiting");
