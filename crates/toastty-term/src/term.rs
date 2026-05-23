@@ -248,7 +248,9 @@ pub(crate) struct PlaceholderRun {
     pub image_id_high: Option<u8>,
     /// Cells collected so far: `(row, col, diacritics)`.
     pub cells: Vec<PlaceholderCell>,
-    /// Starting row (so we can detect newline boundaries).
+    /// Starting row (so future extensions can detect newline
+    /// boundaries; not yet consumed in M11a).
+    #[allow(dead_code)]
     pub start_row: u16,
 }
 
@@ -945,6 +947,62 @@ impl Term {
     }
 
     fn print_char(&mut self, c: char) {
+        // M11a: Unicode placeholder pipeline.
+        //
+        // Apps emit `<U+10EEEE><diacritic*>` cells where:
+        // - The cursor's SGR fg is Indexed256(N): low byte of image id.
+        // - SGR 58 (cursor_underline_color) Indexed256(M): high byte
+        //   of image id (optional).
+        // - 0..3 diacritics encode source-image row, source-image col,
+        //   and (optionally) the image id MSB extension.
+        //
+        // We collect cells greedily into `placeholder_run` until the
+        // next non-placeholder/non-diacritic codepoint arrives, then
+        // finalize → emit image placements.
+        if toastty_graphics::is_placeholder(c) {
+            if self.placeholder_run.is_none()
+                && let Color::Indexed256(low) = self.cursor.style.fg
+            {
+                let high = match self.cursor_underline_color {
+                    Some(Color::Indexed256(h)) => Some(h),
+                    _ => None,
+                };
+                self.placeholder_run = Some(PlaceholderRun {
+                    image_id_low: low,
+                    image_id_high: high,
+                    cells: Vec::new(),
+                    start_row: self.cursor.row,
+                });
+            }
+            if let Some(run) = self.placeholder_run.as_mut() {
+                run.cells.push(PlaceholderCell {
+                    row: self.cursor.row,
+                    col: self.cursor.col.min(self.cols.saturating_sub(1)),
+                    diacritics: smallvec::SmallVec::new(),
+                });
+            }
+            // Placeholder still occupies a cell in the grid layout, so
+            // fall through and write it as a normal char (cell width 1).
+            // Treating it as cell-width 1 keeps text-layout sane; the
+            // renderer skips drawing it via the image overlay.
+            // (We still write the codepoint so partial-redraw + cursor
+            // motion behaves identically to text.)
+        } else if toastty_graphics::is_diacritic(c)
+            && let Some(run) = self.placeholder_run.as_mut()
+            && let Some(idx) = toastty_graphics::diacritic_to_index(c)
+        {
+            // Diacritic attaches to the most recent placeholder cell.
+            if let Some(last) = run.cells.last_mut() {
+                last.diacritics.push(idx);
+            }
+            // Diacritics are zero-width; don't advance.
+            return;
+        } else if let Some(run) = self.placeholder_run.take() {
+            // Non-placeholder / non-diacritic codepoint: finalize the
+            // run before printing this char.
+            self.finalize_placeholder_run(run);
+        }
+
         let cell_w = Self::char_cell_width(c);
         // Zero-width chars (combining marks, controls) currently fall
         // through as a no-op. A future pass can attach them to the
@@ -1007,6 +1065,134 @@ impl Term {
             self.mark_cell(row, col + 1);
         }
         self.cursor.col += cell_w;
+    }
+
+    /// Materialize the accumulated placeholder run into image
+    /// placements over the cells the run touched. Called when the
+    /// stream emits a non-placeholder/non-diacritic codepoint.
+    fn finalize_placeholder_run(&mut self, run: PlaceholderRun) {
+        if run.cells.is_empty() {
+            return;
+        }
+        // Compute the image id. SGR fg supplies the low byte; SGR 58
+        // (cursor_underline_color) optionally supplies the high byte;
+        // a third diacritic on the first cell supplies a 16-bit
+        // extension. We support the common 8-bit form (fg → id),
+        // optionally promoted to 16-bit via SGR 58. The 32-bit kitty
+        // extension via three diacritics is documented but rare; for
+        // M11a we accept the 16-bit form only.
+        let id = if let Some(high) = run.image_id_high {
+            u32::from(high) << 8 | u32::from(run.image_id_low)
+        } else {
+            u32::from(run.image_id_low)
+        };
+        // The cells in the run form contiguous rectangles (apps emit
+        // them row-by-row). For each contiguous (row, col-range)
+        // segment, emit a placement with a sub-rect derived from the
+        // first/last diacritic pair in that segment.
+        //
+        // For M11a we materialize each cell as a 1x1 placement with
+        // src_rect derived from the diacritic pair. A future
+        // optimization can coalesce adjacent cells into a single
+        // placement.
+        if !self.image_registry.contains(id) {
+            // Image not registered: still occupy the cells as
+            // placeholders so the layout doesn't shift; we just don't
+            // emit visible images.
+            return;
+        }
+        // Look up image dims for the sub-rect calculation.
+        let (img_w, img_h) = {
+            let Some(img) = self.image_registry.get(id) else {
+                return;
+            };
+            (img.width, img.height)
+        };
+        // The diacritic table maps to 0..N where N is the number of
+        // cells along the relevant axis. Apps typically emit the same
+        // row diacritic across one display row, with the column
+        // diacritic varying. We treat the FIRST diacritic as the
+        // image row, the SECOND as the image column. Without
+        // metadata about cell dims we synthesize a uniform tiling: if
+        // an app emits R rows worth of placeholders, the image is
+        // tiled into R rows; same for columns.
+        //
+        // To keep this M11a-minimal, build a single placement per
+        // cell whose src_rect spans (col_diacritic, row_diacritic) on
+        // a uniform grid based on the maximum diacritic seen across
+        // the run.
+        let mut max_row_d = 0u16;
+        let mut max_col_d = 0u16;
+        for cell in &run.cells {
+            if let Some(&r) = cell.diacritics.first() {
+                max_row_d = max_row_d.max(r);
+            }
+            if let Some(&c) = cell.diacritics.get(1) {
+                max_col_d = max_col_d.max(c);
+            }
+        }
+        // Tile dimensions in source pixels. If diacritics are zero
+        // everywhere (single-cell placement covering the full image),
+        // emit a single full-image placement spanning the run's
+        // bounding rect.
+        let single_cell = max_row_d == 0 && max_col_d == 0;
+        let mut placements = Vec::new();
+        if single_cell {
+            // Bounding rect of the run.
+            let mut min_r = u16::MAX;
+            let mut max_r = 0;
+            let mut min_c = u16::MAX;
+            let mut max_c = 0;
+            for cell in &run.cells {
+                min_r = min_r.min(cell.row);
+                max_r = max_r.max(cell.row);
+                min_c = min_c.min(cell.col);
+                max_c = max_c.max(cell.col);
+            }
+            placements.push(Placement {
+                image_id: id,
+                placement_id: 0,
+                row_range: min_r..max_r.saturating_add(1),
+                col_range: min_c..max_c.saturating_add(1),
+                src_rect: toastty_graphics::SrcRect::FULL,
+                z: 0,
+            });
+        } else {
+            let tile_w = if max_col_d == 0 {
+                img_w
+            } else {
+                img_w / u32::from(max_col_d.saturating_add(1)).max(1)
+            };
+            let tile_h = if max_row_d == 0 {
+                img_h
+            } else {
+                img_h / u32::from(max_row_d.saturating_add(1)).max(1)
+            };
+            for cell in &run.cells {
+                let row_d = cell.diacritics.first().copied().unwrap_or(0);
+                let col_d = cell.diacritics.get(1).copied().unwrap_or(0);
+                let sx = u32::from(col_d) * tile_w;
+                let sy = u32::from(row_d) * tile_h;
+                placements.push(Placement {
+                    image_id: id,
+                    placement_id: 0,
+                    row_range: cell.row..cell.row.saturating_add(1),
+                    col_range: cell.col..cell.col.saturating_add(1),
+                    src_rect: toastty_graphics::SrcRect {
+                        x: sx,
+                        y: sy,
+                        w: tile_w,
+                        h: tile_h,
+                    },
+                    z: 0,
+                });
+            }
+        }
+        for placement in placements {
+            mark_placement_dirty(self, &placement);
+            self.image_grid.add(placement);
+        }
+        self.image_revision = self.image_revision.wrapping_add(1);
     }
 
     fn handle_csi(&mut self, params: &Params, intermediates: &[u8], action: char) {
@@ -1596,6 +1782,10 @@ impl Perform for Term {
     }
 
     fn execute(&mut self, byte: u8) {
+        // Any non-print event terminates an in-flight placeholder run.
+        if let Some(run) = self.placeholder_run.take() {
+            self.finalize_placeholder_run(run);
+        }
         match byte {
             b'\r' => {
                 // CR moves the cursor in-place to column 0. Mark old
@@ -1646,6 +1836,9 @@ impl Perform for Term {
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+        if let Some(run) = self.placeholder_run.take() {
+            self.finalize_placeholder_run(run);
+        }
         self.handle_csi(params, intermediates, action);
     }
 
@@ -4204,6 +4397,72 @@ mod tests {
         feed(&mut t, b"\x1b[58;5;42m");
         feed(&mut t, b"\x1b[0m");
         assert_eq!(t.cursor_underline_color(), None);
+    }
+
+    #[test]
+    fn placeholder_run_creates_image_placement() {
+        let mut t = Term::new(4, 8, 0);
+        // First, register image id=42.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=t,f=32,s=2,v=2,i=42;");
+        // 2x2 RGBA all-red, base64-encoded.
+        let raw = vec![255u8, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255];
+        let b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(&raw)
+        };
+        payload.extend_from_slice(b64.as_bytes());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        assert!(t.image_registry().contains(42));
+        // Now emit a placeholder run with fg = Indexed256(42).
+        // SGR 38;5;42 sets fg; then emit placeholder + first diacritic
+        // (image row 0) + second diacritic (image col 0).
+        feed(&mut t, b"\x1b[38;5;42m");
+        // Placeholder char + a non-placeholder to finalize.
+        let mut s = String::new();
+        s.push(toastty_graphics::PLACEHOLDER);
+        s.push(' '); // finalize
+        feed(&mut t, s.as_bytes());
+        // The image grid should have one placement of image 42.
+        assert_eq!(t.image_grid().len(), 1);
+        let p = t.image_grid().iter().next().unwrap();
+        assert_eq!(p.image_id, 42);
+    }
+
+    #[test]
+    fn placeholder_without_indexed_fg_is_inactive() {
+        let mut t = Term::new(4, 8, 0);
+        // No image registered, no SGR fg set.
+        let mut s = String::new();
+        s.push(toastty_graphics::PLACEHOLDER);
+        s.push(' ');
+        feed(&mut t, s.as_bytes());
+        // No placements created.
+        assert_eq!(t.image_grid().len(), 0);
+    }
+
+    #[test]
+    fn placeholder_finalizes_on_csi() {
+        let mut t = Term::new(4, 8, 0);
+        // Register image.
+        let raw = vec![255u8, 0, 0, 255];
+        let b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(&raw)
+        };
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=t,f=32,s=1,v=1,i=7;");
+        payload.extend_from_slice(b64.as_bytes());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        feed(&mut t, b"\x1b[38;5;7m");
+        let mut s = String::new();
+        s.push(toastty_graphics::PLACEHOLDER);
+        feed(&mut t, s.as_bytes());
+        // CSI sequence should finalize the run.
+        feed(&mut t, b"\x1b[H");
+        assert_eq!(t.image_grid().len(), 1);
     }
 
     #[test]
