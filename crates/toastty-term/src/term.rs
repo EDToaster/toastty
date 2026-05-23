@@ -227,7 +227,14 @@ pub struct Term {
     image_revision: u32,
     /// SGR 58 underline color. Stored but not yet rendered as an
     /// underline color; the Unicode placeholder pipeline reads it as
-    /// the *low byte* of the image id (kitty's protocol).
+    /// the *high byte* (bits 8..16) of the image id. The SGR 38
+    /// foreground supplies bits 0..8 (the low byte).
+    ///
+    /// TODO: kitty's full protocol allows image ids up to bits 8..32
+    /// via a third diacritic on the first cell of a run. M11a only
+    /// handles the 16-bit form (bits 0..8 from SGR 38 + bits 8..16
+    /// from SGR 58); the third-diacritic 32-bit extension is rare and
+    /// deferred.
     cursor_underline_color: Option<Color>,
     /// Unicode placeholder run-in-progress.
     placeholder_run: Option<PlaceholderRun>,
