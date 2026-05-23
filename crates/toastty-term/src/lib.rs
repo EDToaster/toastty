@@ -21,11 +21,13 @@
 
 mod cell;
 mod cursor;
+mod damage;
 mod grid;
 mod term;
 
 pub use cell::{Cell, Color, Style, StyleFlags};
 pub use cursor::Cursor;
+pub use damage::{Damage, RowDamage};
 pub use grid::{Grid, Row};
 pub use term::{
     KITTY_FLAG_DISAMBIGUATE, KITTY_FLAG_REPORT_ALL_AS_ESC, KITTY_FLAG_REPORT_ALTERNATE,

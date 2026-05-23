@@ -144,7 +144,7 @@ impl App for Demo {
             }
             Event::Redraw => {
                 if let Some(r) = self.renderer.as_mut()
-                    && let Err(e) = r.render_term(&self.term)
+                    && let Err(e) = r.render_term(&mut self.term)
                 {
                     tracing::warn!("render_term error: {e}");
                 }

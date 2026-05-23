@@ -8,7 +8,7 @@
 //! resulting `Vec<CellInstance>` to the vertex buffer.
 
 use bytemuck::{Pod, Zeroable};
-use toastty_term::{Cell, Color as TColor, CursorShape, Style, Term};
+use toastty_term::{Cell, Color as TColor, CursorShape, Damage, Style, Term};
 
 /// Flag bit: instance is the text-cursor block (forces inverse rendering,
 /// no glyph sample).
@@ -441,9 +441,10 @@ pub fn build_instances_into<F>(
 
     // Append cursor as the last instance. Clamp position into the grid.
     // Shape comes from `Term::cursor_shape()` (set by config + DECSCUSR).
-    // TODO(M9): respect `Term::cursor_blink()` once the animation tick
-    // lands. For now blink is stored but not rendered — a blinking
-    // cursor is drawn the same as a steady one.
+    // Blink visibility is gated by `build_dirty_instances_into` /
+    // `Renderer::render_term`; the unconditional `build_instances_into`
+    // path always emits the cursor (legacy behavior, used by tests and
+    // the first frame).
     let cur = term.cursor();
     let cur_col = u16::min(cur.col, cols.saturating_sub(1));
     let cur_row = u16::min(cur.row, rows.saturating_sub(1));
@@ -454,6 +455,137 @@ pub fn build_instances_into<F>(
         term.cursor_shape(),
         theme.cursor,
     ));
+}
+
+/// Build instances for only the dirty cells in `damage` against the
+/// active grid, plus the cursor (gated on `cursor_visible`).
+///
+/// This is the M9 partial-redraw counterpart to [`build_instances_into`]:
+/// it emits a background quad **for every dirty cell, including blanks**
+/// so a `LoadOp::Load` pass overpaints whatever was previously there
+/// (without the blank-cell bg quad, the old glyph would ghost through).
+/// Glyph instances are emitted only for non-whitespace cells with an
+/// atlas slot.
+///
+/// If `damage.all` is set, this delegates to [`build_instances_into`] —
+/// the renderer cascades `damage.all` into `needs_full_clear` for the
+/// frame, so emitting every cell is the right thing anyway.
+///
+/// Continuation cells (second half of a width-2 cluster) are skipped:
+/// the cluster's primary cell at `(r, c-1)` is responsible for the full
+/// multi-cell quad.
+pub fn build_dirty_instances_into<F>(
+    out: &mut Vec<CellInstance>,
+    term: &Term,
+    damage: &Damage,
+    cell_size: (f32, f32),
+    theme: &Theme,
+    cursor_visible: bool,
+    mut locate_glyph: F,
+) where
+    F: FnMut(u16, u16, char, &Style) -> Option<GlyphSlot>,
+{
+    // damage.all → fall back to the full-build path. Same instance
+    // count as a full frame, and the renderer's `needs_full_clear` is
+    // already set to true for this frame.
+    if damage.all {
+        build_instances_into(out, term, cell_size, theme, locate_glyph);
+        if !cursor_visible {
+            // Drop the trailing cursor instance the full builder
+            // unconditionally appends.
+            out.pop();
+        }
+        return;
+    }
+
+    out.clear();
+    let (rows, cols) = term.size();
+    // Damage is usually small; reserve based on the dirty-row count.
+    let dirty_row_count = damage.iter_rows().count();
+    if dirty_row_count > 0 && out.capacity() < dirty_row_count {
+        out.reserve(dirty_row_count);
+    }
+
+    let cell_w = cell_size.0;
+    let cell_h = cell_size.1;
+
+    for (r, row_damage) in damage.iter_rows() {
+        let row = term.row(r);
+        // Build the per-cell iteration source. all_cols expands to the
+        // full column range; otherwise iterate the sparse list.
+        let row_cols = cols;
+        let dirty_cells: Box<dyn Iterator<Item = u16>> = if row_damage.all_cols {
+            Box::new(0..row_cols)
+        } else {
+            Box::new(row_damage.cols.iter().copied())
+        };
+
+        for c in dirty_cells {
+            let Some(cell) = row.cells.get(c as usize) else {
+                continue;
+            };
+            // Continuation cells: the cluster's primary at c-1 already
+            // contributes a wide-cell quad. Drawing here would over-paint
+            // the second half with a blank.
+            if cell.is_continuation {
+                continue;
+            }
+
+            let pos = [f32::from(c) * cell_w, f32::from(r) * cell_h];
+            let (fg, bg) = resolve_cell_colors(cell, theme);
+
+            // Always emit a background quad — even for blank cells —
+            // under LoadOp::Load, so old glyphs / cursor blocks get
+            // overpainted.
+            out.push(CellInstance {
+                pos,
+                size: [cell_w, cell_h],
+                uv_min: [0.0, 0.0],
+                uv_max: [0.0, 0.0],
+                fg,
+                bg,
+                flags: FLAG_NO_GLYPH,
+                pad: [0; 3],
+            });
+
+            if cell.ch.is_whitespace() || cell.ch == '\0' {
+                continue;
+            }
+
+            if let Some(slot) = locate_glyph(r, c, cell.ch, &cell.style) {
+                let flags = if slot.is_color {
+                    FLAG_COLOR_GLYPH
+                } else {
+                    0
+                };
+                out.push(CellInstance {
+                    pos: [pos[0] + slot.glyph_offset[0], pos[1] + slot.glyph_offset[1]],
+                    size: slot.glyph_size,
+                    uv_min: slot.uv_min,
+                    uv_max: slot.uv_max,
+                    fg,
+                    bg,
+                    flags,
+                    pad: [0; 3],
+                });
+            }
+        }
+    }
+
+    // Cursor is the last instance — guarantees it renders on top of
+    // any cell at the same coordinates. Gated on visibility (blink).
+    if cursor_visible {
+        let cur = term.cursor();
+        let cur_col = u16::min(cur.col, cols.saturating_sub(1));
+        let cur_row = u16::min(cur.row, rows.saturating_sub(1));
+        let pos = [f32::from(cur_col) * cell_w, f32::from(cur_row) * cell_h];
+        out.push(CellInstance::cursor_for_shape(
+            pos,
+            [cell_w, cell_h],
+            term.cursor_shape(),
+            theme.cursor,
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -942,5 +1074,169 @@ mod tests {
         feed(&mut t, b"\x1b[2 q");
         let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
         assert_eq!(cursor_instance(&v).size, [8.0, 16.0]);
+    }
+
+    // ----- M9 partial-redraw builder ----------------------------------------
+
+    #[test]
+    fn build_dirty_instances_empty_damage_emits_only_cursor() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"AB");
+        t.clear_damage();
+        let mut out = Vec::new();
+        super::build_dirty_instances_into(
+            &mut out,
+            &t,
+            t.damage(),
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            true,
+            |_, _, _, _| None,
+        );
+        // No dirty cells, cursor visible: only the cursor instance.
+        assert_eq!(out.len(), 1);
+        assert!(out[0].flags & FLAG_CURSOR != 0);
+    }
+
+    #[test]
+    fn build_dirty_instances_single_cell_emits_bg_quad_and_cursor() {
+        let mut t = Term::new(2, 8, 0);
+        feed(&mut t, b"A"); // (0, 0) dirty
+        let damage = t.damage().clone();
+        let mut out = Vec::new();
+        super::build_dirty_instances_into(
+            &mut out,
+            &t,
+            &damage,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            true,
+            |_, _, _, _| None,
+        );
+        // 1 bg quad + cursor.
+        assert_eq!(out.len(), 2);
+        assert!(out[1].flags & FLAG_CURSOR != 0);
+        assert_eq!(out[0].pos, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn build_dirty_instances_blank_cell_still_emits_bg_quad() {
+        // Manually mark cell (0, 0) dirty, but leave it blank. Under
+        // LoadOp::Load we MUST emit a bg quad so any prior glyph at
+        // that position is overpainted (the "ghost text" gotcha in
+        // the M9 plan).
+        let t = Term::new(1, 4, 0);
+        // t.damage() starts with `all` flag set; produce a custom damage
+        // with just one dirty cell.
+        let mut damage = Damage::new(1);
+        damage.clear();
+        damage.rows[0].mark(0);
+        let mut out = Vec::new();
+        super::build_dirty_instances_into(
+            &mut out,
+            &t,
+            &damage,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            true,
+            |_, _, _, _| None,
+        );
+        // 1 bg quad (even though the cell is blank) + cursor.
+        let bgs: Vec<_> = out.iter().filter(|i| i.flags & FLAG_CURSOR == 0).collect();
+        assert_eq!(bgs.len(), 1, "blank dirty cell must emit a bg quad");
+        // And it has the no-glyph flag.
+        assert!(bgs[0].flags & FLAG_NO_GLYPH != 0);
+    }
+
+    #[test]
+    fn build_dirty_instances_all_matches_full_build() {
+        // damage.all → delegate to build_instances_into. Output must
+        // match the full builder (sans any cursor visibility gating).
+        let mut t = Term::new(2, 6, 0);
+        feed(&mut t, b"hello"); // some content
+        let mut full = Vec::new();
+        super::build_instances_into(
+            &mut full,
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            |_, _, _, _| None,
+        );
+        let mut dirty = Vec::new();
+        super::build_dirty_instances_into(
+            &mut dirty,
+            &t,
+            t.damage(),
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            true,
+            |_, _, _, _| None,
+        );
+        // Same instance count (cursor + per-cell quads).
+        assert_eq!(full.len(), dirty.len());
+    }
+
+    #[test]
+    fn build_dirty_instances_skips_continuation() {
+        // CJK ideograph at col 0; mark both primary and continuation
+        // dirty. The continuation must be skipped (no per-cell quad).
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, "你".as_bytes());
+        let damage = t.damage().clone();
+        let mut out = Vec::new();
+        super::build_dirty_instances_into(
+            &mut out,
+            &t,
+            &damage,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            true,
+            |_, _, _, _| None,
+        );
+        // Only one non-cursor instance: the primary cell's bg quad
+        // (continuation skipped).
+        let bgs: Vec<_> = out.iter().filter(|i| i.flags & FLAG_CURSOR == 0).collect();
+        assert_eq!(bgs.len(), 1);
+        assert_eq!(bgs[0].pos[0], 0.0);
+    }
+
+    #[test]
+    fn build_dirty_instances_cursor_visibility_gates_cursor_instance() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"A");
+        let mut out = Vec::new();
+        super::build_dirty_instances_into(
+            &mut out,
+            &t,
+            t.damage(),
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            false, // cursor hidden (mid-blink off-phase)
+            |_, _, _, _| None,
+        );
+        // No cursor instance.
+        assert!(out.iter().all(|i| i.flags & FLAG_CURSOR == 0));
+    }
+
+    #[test]
+    fn build_dirty_instances_all_with_invisible_cursor_drops_cursor() {
+        // When damage.all triggers the full-build delegate, the
+        // builder still pops the cursor instance off if cursor_visible
+        // is false. Test the off path.
+        let mut t = Term::new(1, 2, 0);
+        feed(&mut t, b"x");
+        assert!(t.damage().all);
+        let mut out = Vec::new();
+        super::build_dirty_instances_into(
+            &mut out,
+            &t,
+            t.damage(),
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            false,
+            |_, _, _, _| None,
+        );
+        // No cursor instance.
+        assert!(out.iter().all(|i| i.flags & FLAG_CURSOR == 0));
     }
 }

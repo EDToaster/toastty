@@ -27,6 +27,8 @@ pub mod color;
 pub mod surface_format;
 pub mod text;
 
+use std::time::{Duration, Instant};
+
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
 use toastty_term::Term;
@@ -55,6 +57,31 @@ fn build_term_instances_into(
         let lg = row_glyphs.get(row as usize)?.as_ref()?;
         lg.by_column.get(&(col, ch)).copied()
     });
+}
+
+/// Append partial-redraw instances for `term` into `out` using the
+/// per-cell damage signal. Backed by
+/// [`crate::text::instance::build_dirty_instances_into`].
+fn build_term_dirty_instances_into(
+    out: &mut Vec<CellInstance>,
+    term: &Term,
+    cell_size: (f32, f32),
+    theme: &Theme,
+    cursor_visible: bool,
+    row_glyphs: &[Option<LineGlyphs>],
+) {
+    crate::text::instance::build_dirty_instances_into(
+        out,
+        term,
+        term.damage(),
+        cell_size,
+        theme,
+        cursor_visible,
+        |row, col, ch, _style| {
+            let lg = row_glyphs.get(row as usize)?.as_ref()?;
+            lg.by_column.get(&(col, ch)).copied()
+        },
+    );
 }
 
 /// Bundled fallback font: `FiraMono Medium` (OFL).
@@ -155,6 +182,90 @@ pub struct Renderer {
     text: Option<TextState>,
     /// Theme used by `render_term` when emitting instances.
     theme: Theme,
+    /// True when the next frame must use `LoadOp::Clear` instead of
+    /// `LoadOp::Load`. Set on construction (so the very first frame
+    /// fully paints), on resize / theme / font swap, and whenever the
+    /// term reports `damage.all` (M8 corrective-flush path).
+    needs_full_clear: bool,
+    /// Cursor blink state machine.
+    blink: CursorBlink,
+}
+
+/// Default cursor blink half-cycle (matches gnome-terminal / kitty).
+pub const DEFAULT_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+
+/// Standalone cursor-blink state machine. Lives on `Renderer` but is
+/// pulled out so the blink logic can be tested without a GPU.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CursorBlink {
+    pub last_at: Instant,
+    pub visible: bool,
+    pub interval: Duration,
+    /// Last observed value of the term's `cursor_blink` flag.
+    /// Used by [`CursorBlink::sync_enabled`] to detect the false→true
+    /// edge (DECSCUSR Ps=2/4/6 → Ps=1/3/5 / blink restore) and reset
+    /// the phase so the next tick fires `interval` from the
+    /// re-enable, not from a stale `last_at` (followup I1).
+    pub prev_enabled: bool,
+}
+
+impl CursorBlink {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_at: now,
+            visible: true,
+            interval: DEFAULT_CURSOR_BLINK_INTERVAL,
+            prev_enabled: true,
+        }
+    }
+
+    /// True iff a tick is due. Always false when `blink_enabled` is
+    /// false (DECSCUSR Ps=2/4/6 → steady cursor).
+    fn animation_due(&self, blink_enabled: bool, now: Instant) -> bool {
+        if !blink_enabled {
+            return false;
+        }
+        now.saturating_duration_since(self.last_at) >= self.interval
+    }
+
+    /// Time until the next tick. `None` when blink is disabled.
+    fn next_deadline(&self, blink_enabled: bool, now: Instant) -> Option<Duration> {
+        if !blink_enabled {
+            return None;
+        }
+        let next = self.last_at + self.interval;
+        Some(next.saturating_duration_since(now))
+    }
+
+    /// Toggle visibility and stamp `last_at`. Called by `render_term`
+    /// when `animation_due` returns true.
+    fn tick(&mut self, now: Instant) {
+        self.visible = !self.visible;
+        self.last_at = now;
+    }
+
+    /// Force visibility on. Used when the term has blink disabled
+    /// mid-cycle.
+    fn force_visible(&mut self) {
+        self.visible = true;
+    }
+
+    /// Followup I1: observe the term's current `cursor_blink` flag.
+    /// On the false→true edge (steady → blinking), reset the phase by
+    /// stamping `last_at = now` and forcing `visible = true`, so the
+    /// first tick after re-enable fires a full `interval` later — not
+    /// instantly (which would visually flicker the cursor).
+    ///
+    /// Must be called before [`CursorBlink::animation_due`] each
+    /// frame so the edge detection runs at most once per frame.
+    fn sync_enabled(&mut self, enabled: bool, now: Instant) {
+        if enabled && !self.prev_enabled {
+            // false → true: fresh cycle.
+            self.last_at = now;
+            self.visible = true;
+        }
+        self.prev_enabled = enabled;
+    }
 }
 
 struct TextState {
@@ -267,6 +378,10 @@ impl Renderer {
             clear_color: [0.07, 0.07, 0.09, 1.0],
             text: None,
             theme: Theme::default_dark(),
+            // First frame after construction always clears: the
+            // back-buffer's initial contents are undefined.
+            needs_full_clear: true,
+            blink: CursorBlink::new(Instant::now()),
         })
     }
 
@@ -316,6 +431,9 @@ impl Renderer {
             line_cache: Vec::new(),
             instances_scratch: Vec::new(),
         });
+        // Font swap invalidates the cell grid — force the next frame
+        // to clear.
+        self.needs_full_clear = true;
     }
 
     /// Current cell size in pixels (width, height). Returns `(0, 0)` if
@@ -330,9 +448,50 @@ impl Renderer {
     /// Set the theme used by [`Renderer::render_term`]. Also syncs the
     /// clear color to the theme background so cells with the default bg
     /// (which emit no instance) show through with the right color.
+    ///
+    /// Theme changes invalidate the framebuffer (background color, all
+    /// foreground colors); the next frame uses `LoadOp::Clear`.
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
         self.clear_color = theme.bg;
+        self.needs_full_clear = true;
+    }
+
+    /// Force the next frame to use `LoadOp::Clear` instead of
+    /// `LoadOp::Load`. Called by the binary on resize / theme / font
+    /// swap — any event that invalidates the GPU framebuffer's prior
+    /// contents.
+    pub fn invalidate_framebuffer(&mut self) {
+        self.needs_full_clear = true;
+    }
+
+    /// Override the cursor blink half-cycle. Used by the config layer
+    /// to thread the `[cursor]` rate through to the runtime.
+    pub fn set_cursor_blink_interval(&mut self, d: Duration) {
+        self.blink.interval = d;
+    }
+
+    /// Current cursor blink half-cycle.
+    #[must_use]
+    pub fn cursor_blink_interval(&self) -> Duration {
+        self.blink.interval
+    }
+
+    /// True iff the cursor is currently in the "on" phase of the blink
+    /// cycle (or the term has blink disabled, in which case the cursor
+    /// is always visible).
+    #[must_use]
+    pub fn cursor_visible(&self) -> bool {
+        self.blink.visible
+    }
+
+    /// Time until the cursor's next blink toggle, given `term`'s blink
+    /// flag. Returns `None` when the term has blink disabled (DECSCUSR
+    /// Ps=2/4/6 → steady cursor) so the binary doesn't pointlessly
+    /// schedule a wake-up.
+    #[must_use]
+    pub fn next_redraw_deadline(&self, term: &Term) -> Option<Duration> {
+        self.blink.next_deadline(term.cursor_blink(), Instant::now())
     }
 
     /// Current theme.
@@ -342,10 +501,14 @@ impl Renderer {
 
     /// Resize the surface. Width or height of 0 is clamped to 1 (configuring
     /// a zero-sized surface panics in wgpu).
+    ///
+    /// The new surface back-buffer has undefined contents — the next
+    /// frame must use `LoadOp::Clear`.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
         self.surface.configure(&self.device, &self.config);
+        self.needs_full_clear = true;
     }
 
     /// Set the clear color (linear RGBA, `[0, 1]` range).
@@ -376,7 +539,7 @@ impl Renderer {
     /// [`Renderer::with_font`] must be called first; returns
     /// [`RenderError::FontNotConfigured`] otherwise.
     ///
-    /// Honors `term.dirty_rows()` for the row-shape cache (decision §7,
+    /// Honors `term.damage()` for the row-shape cache (decision §7,
     /// minimum-viable subset for M5; full skip-submit / cell-level
     /// damage lands in M9).
     ///
@@ -386,7 +549,7 @@ impl Renderer {
     /// bench under `benches/render_term.rs` runs in release mode; this
     /// env var works in the debug build too).
     #[allow(clippy::too_many_lines)] // optional tracing branches add ~30 LoC
-    pub fn render_term(&mut self, term: &Term) -> Result<RenderOutcome, RenderError> {
+    pub fn render_term(&mut self, term: &mut Term) -> Result<RenderOutcome, RenderError> {
         if self.text.is_none() {
             return Err(RenderError::FontNotConfigured);
         }
@@ -404,6 +567,51 @@ impl Renderer {
         // (followup C2).
         if term.pause_rendering() {
             return Ok(RenderOutcome::Skipped);
+        }
+
+        // M9 skip-submit: if no cells changed AND no animation tick is
+        // due, there's nothing to draw. Skip the surface acquire +
+        // encode + submit entirely. The binary preserves the damage
+        // signal across skipped frames (followup C2).
+        //
+        // Cursor blink animation: when a tick is due AND the term has
+        // blink enabled, force the frame through so the renderer can
+        // toggle `cursor_visible` and emit the updated cursor instance.
+        let now = Instant::now();
+        // Followup I1: detect the steady→blinking edge BEFORE computing
+        // animation_due so the freshly-stamped `last_at` doesn't
+        // immediately fire a tick (which would flash the cursor).
+        self.blink.sync_enabled(term.cursor_blink(), now);
+        let cursor_animation_due = self.blink.animation_due(term.cursor_blink(), now);
+        if term.damage().is_empty() && !cursor_animation_due && !self.needs_full_clear {
+            return Ok(RenderOutcome::Skipped);
+        }
+
+        // If the blink tick fired, flip the visibility flag now —
+        // before instance building reads `cursor_visible`.
+        if cursor_animation_due {
+            self.blink.tick(now);
+            // Followup C1: under partial-redraw (LoadOp::Load) the
+            // dirty-instance builder only emits bg quads for cells in
+            // the damage set. When the blink toggles
+            // visible→invisible, no other code path marks the cursor's
+            // cell dirty, so the previous frame's cursor block ghosts.
+            // Mark the cursor's current cell here so the builder emits
+            // a fresh bg quad (which overpaints the ghost) and, on the
+            // visible→visible→... cycle, re-emits the cursor on top.
+            //
+            // `mark_cell_dirty` handles the width-2 continuation case
+            // (marks col - 1 too so the multi-cell glyph is re-emitted).
+            let cur = term.cursor();
+            term.mark_cell_dirty(cur.row, cur.col);
+        }
+        // If the term has blink disabled, the cursor must always be
+        // visible. We don't update `last_at` because the blink state
+        // is unobservable while disabled, and any future re-enable
+        // should compute the next tick from the moment of re-enable,
+        // not from a stale baseline. Steady cursor:
+        if !term.cursor_blink() && !self.blink.visible {
+            self.blink.force_visible();
         }
 
         let trace = std::env::var_os("TOASTTY_TRACE_RENDER").is_some();
@@ -427,11 +635,15 @@ impl Renderer {
             // Re-shape only dirty rows; reuse cached `LineGlyphs` for
             // the rest. The atlas itself never shrinks, so a clean row's
             // glyph slots stay valid across frames.
-            let dirty = term.dirty_rows();
+            let damage = term.damage();
             let mut shaped = 0u32;
             let t_shape = if trace { Some(std::time::Instant::now()) } else { None };
             for r in 0..rows {
-                let is_dirty = dirty.get(r as usize).copied().unwrap_or(true)
+                let is_dirty = damage.all
+                    || damage
+                        .rows
+                        .get(r as usize)
+                        .is_some_and(|rd| !rd.is_empty())
                     || text.line_cache[r as usize].is_none();
                 if !is_dirty {
                     continue;
@@ -476,13 +688,32 @@ impl Renderer {
         let theme = self.theme;
         // Build instances using the cached row glyphs. Reuse the
         // scratch vec across frames. We have to temporarily extract
-        // the scratch out of TextState because `build_term_instances_into`
-        // needs to read `text.line_cache` immutably while writing to the
-        // scratch; can't hold two borrows of TextState at once.
+        // the scratch out of TextState because the builders need to
+        // read `text.line_cache` immutably while writing to the scratch;
+        // can't hold two borrows of TextState at once.
+        let damage_all = term.damage().all;
+        let cursor_visible = self.blink.visible;
         let text = self.text.as_mut().expect("text init");
         let mut instances = std::mem::take(&mut text.instances_scratch);
         let t_bi = if trace { Some(std::time::Instant::now()) } else { None };
-        build_term_instances_into(&mut instances, term, cell_size, &theme, &text.line_cache);
+        // Pick the builder: full build when the framebuffer is being
+        // cleared (LoadOp::Clear); partial build under LoadOp::Load
+        // so we only emit instances for cells that actually changed.
+        if self.needs_full_clear || damage_all {
+            build_term_instances_into(&mut instances, term, cell_size, &theme, &text.line_cache);
+            if !cursor_visible {
+                instances.pop();
+            }
+        } else {
+            build_term_dirty_instances_into(
+                &mut instances,
+                term,
+                cell_size,
+                &theme,
+                cursor_visible,
+                &text.line_cache,
+            );
+        }
         if let Some(t) = t_bi {
             let ms = t.elapsed().as_secs_f64() * 1000.0;
             tracing::info!(target: "render_trace", "build_instances n={} took={ms:.3}ms", instances.len());
@@ -497,6 +728,12 @@ impl Renderer {
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
+                // Followup C2: the reconfigured back-buffer has
+                // undefined contents (same invariant as `resize`).
+                // Without flagging a full clear here, the next frame
+                // may pick `LoadOp::Load` and read garbage. The cost
+                // is one extra clear on recovery — cheap.
+                self.needs_full_clear = true;
                 // No frame went out — caller must not clear damage / BSU
                 // force-flushed flag, so report Skipped.
                 return Ok(RenderOutcome::Skipped);
@@ -505,6 +742,13 @@ impl Renderer {
                 return Err(RenderError::SurfaceLost);
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                // Followup C2: defensively force the next frame to
+                // clear. Timeout means the driver missed its
+                // deadline; Occluded means the window isn't visible.
+                // In both cases the back-buffer's prior contents may
+                // be stale — flagging a full clear avoids any chance
+                // of a LoadOp::Load reading garbage on recovery.
+                self.needs_full_clear = true;
                 return Ok(RenderOutcome::Skipped);
             }
         };
@@ -534,6 +778,23 @@ impl Renderer {
             ],
         };
 
+        // damage.all is the M8 corrective-flush path: cascade it into
+        // a full clear for this frame.
+        if term.damage().all {
+            self.needs_full_clear = true;
+        }
+
+        let load_op = if self.needs_full_clear {
+            wgpu::LoadOp::Clear(wgpu::Color {
+                r: f64::from(self.theme.bg[0]),
+                g: f64::from(self.theme.bg[1]),
+                b: f64::from(self.theme.bg[2]),
+                a: f64::from(self.theme.bg[3]),
+            })
+        } else {
+            wgpu::LoadOp::Load
+        };
+
         {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("toastty-render term pass"),
@@ -542,12 +803,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: f64::from(self.theme.bg[0]),
-                            g: f64::from(self.theme.bg[1]),
-                            b: f64::from(self.theme.bg[2]),
-                            a: f64::from(self.theme.bg[3]),
-                        }),
+                        load: load_op,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -589,6 +845,10 @@ impl Renderer {
         if let Some(text) = self.text.as_mut() {
             text.instances_scratch = instances;
         }
+        // Successful submit — the framebuffer now holds known contents,
+        // so the next frame can use LoadOp::Load unless someone
+        // explicitly invalidates again.
+        self.needs_full_clear = false;
         Ok(RenderOutcome::Rendered)
     }
 
@@ -686,5 +946,239 @@ mod tests {
         let o = RenderOutcome::Skipped;
         let p = o;
         assert_eq!(o, p);
+    }
+
+    // ----- M9 cursor blink ------------------------------------------------
+
+    #[test]
+    fn cursor_blink_animation_due_after_interval() {
+        let now = Instant::now();
+        let blink = CursorBlink {
+            last_at: now
+                .checked_sub(Duration::from_millis(600))
+                .expect("now is past UNIX epoch"),
+            visible: true,
+            interval: Duration::from_millis(530),
+            prev_enabled: true,
+        };
+        assert!(blink.animation_due(true, now));
+    }
+
+    #[test]
+    fn cursor_blink_animation_not_due_before_interval() {
+        let now = Instant::now();
+        let blink = CursorBlink {
+            last_at: now,
+            visible: true,
+            interval: Duration::from_millis(530),
+            prev_enabled: true,
+        };
+        assert!(!blink.animation_due(true, now));
+    }
+
+    #[test]
+    fn cursor_blink_toggles_after_interval() {
+        let mut blink = CursorBlink::new(Instant::now());
+        let was_visible = blink.visible;
+        blink.tick(Instant::now());
+        assert_ne!(blink.visible, was_visible);
+    }
+
+    #[test]
+    fn cursor_blink_disabled_when_term_blink_off() {
+        let now = Instant::now();
+        let blink = CursorBlink {
+            last_at: now
+                .checked_sub(Duration::from_secs(10))
+                .expect("now is past UNIX epoch"),
+            visible: true,
+            interval: Duration::from_millis(530),
+            prev_enabled: true,
+        };
+        // Term has blink disabled → animation NEVER due.
+        assert!(!blink.animation_due(false, now));
+        // And no deadline scheduled.
+        assert!(blink.next_deadline(false, now).is_none());
+    }
+
+    #[test]
+    fn next_redraw_deadline_is_some_when_blink_on() {
+        let now = Instant::now();
+        let blink = CursorBlink::new(now);
+        let d = blink.next_deadline(true, now);
+        assert!(d.is_some(), "deadline must be Some when blink is on");
+        let d = d.unwrap();
+        // Just after construction, the next toggle is ~`interval` away.
+        assert!(d <= blink.interval);
+    }
+
+    #[test]
+    fn next_redraw_deadline_saturates_at_zero_when_overdue() {
+        let now = Instant::now();
+        let blink = CursorBlink {
+            last_at: now
+                .checked_sub(Duration::from_secs(5))
+                .expect("now is past UNIX epoch"),
+            visible: true,
+            interval: Duration::from_millis(530),
+            prev_enabled: true,
+        };
+        let d = blink.next_deadline(true, now).unwrap();
+        assert_eq!(d, Duration::ZERO, "overdue deadline must saturate to 0");
+    }
+
+    #[test]
+    fn cursor_blink_force_visible_resets_phase() {
+        let mut blink = CursorBlink::new(Instant::now());
+        blink.visible = false;
+        blink.force_visible();
+        assert!(blink.visible);
+    }
+
+    /// Followup I1: on the steady → blinking edge, the previous
+    /// `last_at` is stale (the term was disabled), so `animation_due`
+    /// would return true immediately and the cursor would flicker on
+    /// the very first frame after re-enable. `sync_enabled` must reset
+    /// `last_at` and `visible` on the edge so the next tick is a full
+    /// `interval` away.
+    #[test]
+    fn cursor_blink_re_enable_resets_phase() {
+        // Set up a blink with a tiny interval (1 ms) and an ancient
+        // `last_at`, then mark it as "previously disabled". The
+        // simulated "now" is well past `last_at + interval`, which
+        // without the fix would trigger an instant flash.
+        let then = Instant::now();
+        let mut blink = CursorBlink {
+            last_at: then
+                .checked_sub(Duration::from_secs(5))
+                .expect("now is past UNIX epoch"),
+            visible: false,
+            interval: Duration::from_millis(1),
+            prev_enabled: false,
+        };
+        // Simulate "later" (no real sleep needed — the edge check
+        // operates on the `now` parameter).
+        let later = then;
+        blink.sync_enabled(true, later);
+
+        // After the edge: visible is back ON, and the next deadline
+        // is close to `interval` (not zero / overdue).
+        assert!(blink.visible, "re-enable must force visible ON");
+        let d = blink
+            .next_deadline(true, later)
+            .expect("blink is enabled now");
+        assert_eq!(d, blink.interval, "fresh cycle: deadline == interval");
+        // And no tick should be due right now.
+        assert!(
+            !blink.animation_due(true, later),
+            "no instant flicker — first tick should be a full interval away"
+        );
+    }
+
+    /// Followup I1: `sync_enabled` must be a no-op on the true → true
+    /// edge so it doesn't reset the phase mid-cycle.
+    #[test]
+    fn cursor_blink_sync_enabled_noop_when_already_enabled() {
+        let now = Instant::now();
+        let original_last_at = now
+            .checked_sub(Duration::from_millis(100))
+            .expect("now is past UNIX epoch");
+        let mut blink = CursorBlink {
+            last_at: original_last_at,
+            visible: false,
+            interval: Duration::from_millis(530),
+            prev_enabled: true,
+        };
+        blink.sync_enabled(true, now);
+        // true → true: nothing changed.
+        assert_eq!(blink.last_at, original_last_at);
+        assert!(!blink.visible);
+        assert!(blink.prev_enabled);
+    }
+
+    /// Followup I1: on the true → false edge `sync_enabled` should
+    /// only record `prev_enabled = false`; it must not touch
+    /// `last_at` or `visible` (the steady-cursor force-visible path
+    /// lives elsewhere — `force_visible` — and a stale `last_at`
+    /// while disabled is harmless since `animation_due` short-circuits).
+    #[test]
+    fn cursor_blink_sync_enabled_disable_only_records_edge() {
+        let now = Instant::now();
+        let original_last_at = now
+            .checked_sub(Duration::from_millis(100))
+            .expect("now is past UNIX epoch");
+        let mut blink = CursorBlink {
+            last_at: original_last_at,
+            visible: false,
+            interval: Duration::from_millis(530),
+            prev_enabled: true,
+        };
+        blink.sync_enabled(false, now);
+        assert_eq!(blink.last_at, original_last_at);
+        assert!(!blink.visible);
+        assert!(!blink.prev_enabled);
+    }
+
+    /// Followup C1: when the blink toggles visible→invisible, the
+    /// renderer must mark the cursor's cell dirty so the dirty-instance
+    /// builder emits a fresh bg quad over the previous cursor block.
+    /// Otherwise, under LoadOp::Load, the old cursor ghosts.
+    ///
+    /// This is the integration-level invariant: we simulate the
+    /// `render_term` path's blink tick + `Term::mark_cell_dirty` +
+    /// `build_dirty_instances_into` sequence, then assert the OFF
+    /// frame's instance list contains a bg quad at the cursor cell
+    /// without the cursor flag set.
+    #[test]
+    fn blink_off_emits_bg_quad_at_cursor_cell() {
+        use crate::text::instance::{
+            FLAG_CURSOR, FLAG_NO_GLYPH, Theme, build_dirty_instances_into,
+        };
+        use toastty_term::Term;
+
+        let mut term = Term::new(3, 8, 0);
+        // Cursor at (0, 0) by default. Position it to a distinctive
+        // cell so we can assert position-precisely.
+        let mut parser = toastty_parser::Parser::new();
+        parser.advance(&mut term, b"\x1b[2;4H"); // row 2, col 4 (1-based)
+        let cur = term.cursor();
+        assert_eq!((cur.row, cur.col), (1, 3));
+        term.clear_damage();
+
+        // Simulate first blink tick: ON → OFF. The renderer's path is:
+        //  1) detect animation_due
+        //  2) tick (visible flips false)
+        //  3) mark_cell_dirty at the cursor's current row/col
+        //  4) build_dirty_instances_into with cursor_visible=false
+        let cell_size = (8.0_f32, 16.0_f32);
+        let theme = Theme::default_dark();
+        term.mark_cell_dirty(cur.row, cur.col);
+        let mut instances = Vec::new();
+        build_dirty_instances_into(
+            &mut instances,
+            &term,
+            term.damage(),
+            cell_size,
+            &theme,
+            false, // cursor_visible == OFF frame
+            |_, _, _, _| None,
+        );
+
+        // No cursor instance must be present (visible=false).
+        assert!(
+            instances.iter().all(|i| i.flags & FLAG_CURSOR == 0),
+            "OFF frame must not emit any cursor instance"
+        );
+        // A background-only quad must be present at the cursor's cell.
+        let expected_pos = [f32::from(cur.col) * cell_size.0, f32::from(cur.row) * cell_size.1];
+        let bg_at_cursor = instances.iter().find(|i| {
+            i.flags & FLAG_NO_GLYPH != 0
+                && (i.pos[0] - expected_pos[0]).abs() < 1e-3
+                && (i.pos[1] - expected_pos[1]).abs() < 1e-3
+        });
+        assert!(
+            bg_at_cursor.is_some(),
+            "OFF frame must emit a bg quad at the cursor's cell to overpaint the old cursor block"
+        );
     }
 }

@@ -126,7 +126,7 @@ impl Harness {
     /// encode the text pass, submit. No `present()`. Mirrors
     /// `Renderer::render_term` post-fix.
     ///
-    /// Callers should invoke `term.clear_dirty()` after this returns
+    /// Callers should invoke `term.clear_damage()` after this returns
     /// to consume the damage signal.
     fn render_term(&mut self, term: &Term) {
         let (rows, _cols) = term.size();
@@ -137,9 +137,13 @@ impl Harness {
             self.line_cache.resize(rows as usize, None);
         }
 
-        let dirty = term.dirty_rows();
+        let damage = term.damage();
         for r in 0..rows {
-            let is_dirty = dirty.get(r as usize).copied().unwrap_or(true)
+            let is_dirty = damage.all
+                || damage
+                    .rows
+                    .get(r as usize)
+                    .is_some_and(|rd| !rd.is_empty())
                 || self.line_cache[r as usize].is_none();
             if !is_dirty {
                 continue;
@@ -232,7 +236,7 @@ impl Harness {
     /// Same as `render_term` but prints per-phase wall time. Used by the
     /// one-off `bench_phase_breakdown` to attribute the cost.
     ///
-    /// `force_full` ignores `term.dirty_rows()` and re-shapes every row,
+    /// `force_full` ignores `term.damage()` and re-shapes every row,
     /// simulating the pre-fix code path so the report can show what we
     /// avoided.
     #[allow(clippy::too_many_lines)]
@@ -245,14 +249,18 @@ impl Harness {
         if self.line_cache.len() != rows as usize {
             self.line_cache.resize(rows as usize, None);
         }
-        let dirty = term.dirty_rows();
+        let damage = term.damage();
         let mut shaped = 0usize;
 
         // Phase A: shape (dirty rows only, unless `force_full`).
         let t_shape = Instant::now();
         for r in 0..rows {
             let is_dirty = force_full
-                || dirty.get(r as usize).copied().unwrap_or(true)
+                || damage.all
+                || damage
+                    .rows
+                    .get(r as usize)
+                    .is_some_and(|rd| !rd.is_empty())
                 || self.line_cache[r as usize].is_none();
             if !is_dirty {
                 continue;
@@ -415,14 +423,14 @@ fn bench_fullframe(c: &mut Criterion) {
     // Warm up the atlas so the first measured iteration isn't penalised
     // by glyph uploads.
     harness.render_term(&term);
-    term.clear_dirty();
+    term.clear_damage();
 
     c.bench_function("fullframe_200x60", |b| {
         b.iter(|| {
             // Worst case: every row is dirty (full repaint).
             term.mark_all_dirty();
             harness.render_term(&term);
-            term.clear_dirty();
+            term.clear_damage();
         });
     });
 }
@@ -435,7 +443,7 @@ fn bench_single_cell_change(c: &mut Criterion) {
     parser.advance(&mut term, b"\x1b[31;101H");
 
     harness.render_term(&term);
-    term.clear_dirty();
+    term.clear_damage();
 
     let mut tick: u8 = 0;
     c.bench_function("single_cell_change_200x60", |b| {
@@ -447,7 +455,7 @@ fn bench_single_cell_change(c: &mut Criterion) {
             let ch = b"abcdefghijklmnopqrstuvwxyz"[(tick as usize) % 26];
             parser.advance(&mut term, &[0x1b, b'[', b'3', b'1', b';', b'1', b'0', b'1', b'H', ch]);
             harness.render_term(&term);
-            term.clear_dirty();
+            term.clear_damage();
         });
     });
 }
@@ -463,13 +471,13 @@ fn bench_fullframe_fullscreen(c: &mut Criterion) {
     let mut harness = Harness::new(width, height);
     let mut term = make_term_filled(BIG_ROWS, BIG_COLS);
     harness.render_term(&term);
-    term.clear_dirty();
+    term.clear_damage();
 
     c.bench_function("fullframe_300x120", |b| {
         b.iter(|| {
             term.mark_all_dirty();
             harness.render_term(&term);
-            term.clear_dirty();
+            term.clear_damage();
         });
     });
 }
@@ -482,7 +490,7 @@ fn bench_single_cell_change_fullscreen(c: &mut Criterion) {
     parser.advance(&mut term, b"\x1b[61;101H");
 
     harness.render_term(&term);
-    term.clear_dirty();
+    term.clear_damage();
 
     let mut tick: u8 = 0;
     c.bench_function("single_cell_change_300x120", |b| {
@@ -491,7 +499,7 @@ fn bench_single_cell_change_fullscreen(c: &mut Criterion) {
             let ch = b"abcdefghijklmnopqrstuvwxyz"[(tick as usize) % 26];
             parser.advance(&mut term, &[0x1b, b'[', b'6', b'1', b';', b'1', b'0', b'1', b'H', ch]);
             harness.render_term(&term);
-            term.clear_dirty();
+            term.clear_damage();
         });
     });
 }
@@ -514,7 +522,7 @@ fn bench_phase_breakdown(c: &mut Criterion) {
         for _ in 0..3 {
             h.render_term(&term);
         }
-        term.clear_dirty();
+        term.clear_damage();
 
         println!(
             "\n=== phase breakdown: {label}  grid={rows}x{cols}  px={width}x{height} ===",
@@ -526,13 +534,13 @@ fn bench_phase_breakdown(c: &mut Criterion) {
         parser.advance(&mut term, b"\x1b[1;1Hx");
         println!("[ single-cell change, only dirty row re-shapes ]");
         h.render_term_instrumented(&term, false);
-        term.clear_dirty();
+        term.clear_damage();
 
         // Worst case (full repaint) — emulates the pre-fix code path.
         term.mark_all_dirty();
         println!("[ full repaint, every row re-shapes (pre-fix path) ]");
         h.render_term_instrumented(&term, true);
-        term.clear_dirty();
+        term.clear_damage();
     }
 
     c.bench_function("phase_breakdown_dummy", |b| {
