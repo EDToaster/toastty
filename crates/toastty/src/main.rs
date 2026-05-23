@@ -21,7 +21,7 @@ use toastty_parser::Parser;
 use toastty_protocols::resize_inband::encode_resize_report;
 use toastty_protocols::synchronized::{BSU_TIMEOUT, should_force_flush};
 use toastty_pty::{Pty, PtySpec, WinSize};
-use toastty_render::Renderer;
+use toastty_render::{RenderOutcome, Renderer};
 use toastty_term::Term;
 use toastty_window::{
     App, ControlSignal, Event, KeyState, LogicalKey, Modifiers, MouseButton, ToasttyWindow,
@@ -509,15 +509,25 @@ impl App for Toastty {
                     self.term.force_flush_sync_output();
                 }
                 if let Some(r) = self.renderer.as_mut() {
-                    if let Err(e) = r.render_term(&self.term) {
-                        warn!("render_term error: {e}");
+                    match r.render_term(&self.term) {
+                        Ok(RenderOutcome::Rendered) => {
+                            // Consume the per-row damage signal so the
+                            // next render only re-shapes rows that
+                            // changed. Clear the BSU timeout-flush
+                            // flag too so the renderer observes it for
+                            // exactly one frame.
+                            self.term.clear_dirty();
+                            self.term.clear_sync_output_force_flushed();
+                        }
+                        Ok(RenderOutcome::Skipped) => {
+                            // Frame skipped (pause-gated or surface
+                            // hiccup): leave the dirty bitset and the
+                            // BSU force-flushed flag alone so the next
+                            // non-skipped frame still issues the
+                            // corrective redraw.
+                        }
+                        Err(e) => warn!("render_term error: {e}"),
                     }
-                    // Consume the per-row damage signal so the next
-                    // render only re-shapes rows that changed. We also
-                    // clear the BSU timeout-flush flag so the renderer
-                    // observes it for exactly one frame.
-                    self.term.clear_dirty();
-                    self.term.clear_sync_output_force_flushed();
                 }
                 ControlSignal::Continue
             }

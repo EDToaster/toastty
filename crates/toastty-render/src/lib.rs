@@ -71,6 +71,27 @@ pub const DEFAULT_FONT_SIZE_PX: f32 = 16.0;
 /// `text` submodule directly.
 pub use crate::text::glyph_rasterizer::DEFAULT_LINE_HEIGHT_RATIO as DEFAULT_LINE_HEIGHT;
 
+/// Outcome of a [`Renderer::render_term`] call.
+///
+/// The pause gate for DECSET 2026 returns [`RenderOutcome::Skipped`]; a
+/// frame that actually went through encoder + submit returns
+/// [`RenderOutcome::Rendered`]. Callers use this to gate the "clear
+/// dirty bitset + clear BSU force-flushed flag" cleanup so the signals
+/// survive across a skipped frame (followup C2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum RenderOutcome {
+    /// Renderer emitted a frame: the dirty list and any
+    /// `sync_output_force_flushed` flag were consumed and should be
+    /// cleared by the caller.
+    Rendered,
+    /// Renderer skipped this frame (currently: DECSET 2026 paused). The
+    /// caller must NOT clear the dirty list or the BSU force-flushed
+    /// flag — both must persist so the next non-skipped frame still
+    /// performs the corrective full redraw.
+    Skipped,
+}
+
 /// Errors from [`Renderer`] construction or rendering.
 #[derive(Debug, Error)]
 pub enum RenderError {
@@ -365,7 +386,7 @@ impl Renderer {
     /// bench under `benches/render_term.rs` runs in release mode; this
     /// env var works in the debug build too).
     #[allow(clippy::too_many_lines)] // optional tracing branches add ~30 LoC
-    pub fn render_term(&mut self, term: &Term) -> Result<(), RenderError> {
+    pub fn render_term(&mut self, term: &Term) -> Result<RenderOutcome, RenderError> {
         if self.text.is_none() {
             return Err(RenderError::FontNotConfigured);
         }
@@ -374,12 +395,15 @@ impl Renderer {
         // `pause_rendering` on BSU; until ESU (or the watchdog
         // timeout), we skip the frame entirely — no shaping, no submit,
         // no surface acquire. The watchdog lives in the binary
-        // (`Toastty::handle_pty_bytes`) and calls
+        // (`Toastty::handle_pty_bytes` and `Event::Redraw`) and calls
         // `Term::force_flush_sync_output` after 1 s, which both clears
         // the pause and marks every row dirty so the next frame is a
-        // corrective full redraw.
+        // corrective full redraw. Returning `Skipped` here is how the
+        // binary knows NOT to clear the dirty bitset or the BSU
+        // force-flushed flag — both must survive across the skip
+        // (followup C2).
         if term.pause_rendering() {
-            return Ok(());
+            return Ok(RenderOutcome::Skipped);
         }
 
         let trace = std::env::var_os("TOASTTY_TRACE_RENDER").is_some();
@@ -465,13 +489,15 @@ impl Renderer {
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
-                return Ok(());
+                // No frame went out — caller must not clear damage / BSU
+                // force-flushed flag, so report Skipped.
+                return Ok(RenderOutcome::Skipped);
             }
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Validation => {
                 return Err(RenderError::SurfaceLost);
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(());
+                return Ok(RenderOutcome::Skipped);
             }
         };
         if let Some(t) = t_acq {
@@ -555,7 +581,7 @@ impl Renderer {
         if let Some(text) = self.text.as_mut() {
             text.instances_scratch = instances;
         }
-        Ok(())
+        Ok(RenderOutcome::Rendered)
     }
 
     /// Render one frame. M4a: just a clear-color pass.
