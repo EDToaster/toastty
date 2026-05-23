@@ -12,6 +12,7 @@ use cosmic_text::{
     SwashContent,
 };
 use std::collections::HashMap;
+use unicode_width::UnicodeWidthChar;
 use wgpu::{Device, Extent3d, Queue, Texture, TextureFormat};
 
 use crate::text::atlas::{Atlas, AtlasLayer, AtlasSlot, GlyphKey};
@@ -80,18 +81,30 @@ pub struct GlyphRasterizer {
     cell_size: (f32, f32),
     /// Configured font family, kept around for `Attrs`.
     family_name: String,
-    /// Per-character glyph slot fast path. Populated as `shape_line`
-    /// resolves each character through cosmic-text the first time;
-    /// subsequent lines containing only cached characters skip the
-    /// (expensive) cosmic-text layout call entirely.
+    /// Per-character glyph cache. Keyed on `char` alone, which is **only
+    /// correct under three invariants**:
+    ///   1. Single-weight font (no bold/italic switching). Bold/italic
+    ///      glyphs are different shapes; adding font-weight selection
+    ///      requires re-keying as `(char, style_fingerprint)`.
+    ///   2. No NFD combining marks. `é` as `e + U+0301` would render as
+    ///      `e` and a separately-cached `U+0301` placed in the next
+    ///      column — visually wrong. Pre-composed `é` (U+00E9) is fine.
+    ///   3. Cell width == 1. Wide chars (CJK, fullwidth) and zero-width
+    ///      chars (control, combining) must not be cached at all.
+    ///      Enforced by the `unicode_width::UnicodeWidthChar::width(c)
+    ///      != Some(1)` bail in the fast path.
     ///
-    /// Safe because in our monospace rendering each glyph slot
-    /// (`uv_min` / `uv_max` / `glyph_offset` / `glyph_size` /
-    /// `is_color`) is column-independent: `cell_w`-based placement
-    /// happens in `build_instances`. The bypass is keyed by `char` so
-    /// it does not handle complex shaping (ligatures, combining marks,
-    /// `BiDi`). When any character in a line is missing from the
-    /// cache, we fall back to the full cosmic-text path.
+    /// M6+ font-weight switching will require lifting invariant #1
+    /// by re-keying the cache. NFD inputs (#2) and complex shaping
+    /// require dropping the fast path entirely and going through
+    /// cosmic-text + the cluster-width snap.
+    ///
+    /// Populated as `shape_line` resolves each character through
+    /// cosmic-text the first time; subsequent lines containing only
+    /// cached single-column characters skip the (expensive)
+    /// cosmic-text layout call entirely. The per-line layout cost
+    /// dominates the renderer's per-frame budget at fullscreen
+    /// (~110 µs / row of ASCII on M4 Pro).
     char_cache: HashMap<char, GlyphSlot>,
     /// Characters known to be uncacheable (cosmic-text returned no
     /// glyph for them — e.g., zero-width spaces). Recording them stops
@@ -208,8 +221,8 @@ impl GlyphRasterizer {
     /// Fast path: per-character lookups against `char_cache`. Returns
     /// `None` if any character in `text` would require cosmic-text
     /// (cache miss for a character that has not been marked
-    /// uncacheable). When it returns `Some`, no cosmic-text work was
-    /// done.
+    /// uncacheable, or any non-single-column character). When it
+    /// returns `Some`, no cosmic-text work was done.
     fn try_shape_line_fast(&self, text: &str) -> Option<LineGlyphs> {
         let mut out = LineGlyphs::default();
         let cell_w = self.cell_size.0;
@@ -219,16 +232,21 @@ impl GlyphRasterizer {
         // Each character in a monospace terminal grid occupies one
         // cell. We assign columns by index in the iteration order; the
         // term's row text is fed cell-by-cell, so the i'th char is
-        // column i for ASCII. (Wide characters would break this — we
-        // bail to the slow path for any non-cached glyph, which
-        // includes anything that's not a single-column ASCII letter
-        // after the first few frames.)
+        // column i. This breaks for wide / zero-width characters
+        // (CJK ideographs, combining marks, controls): a wide char
+        // would span two columns, and a combining mark would consume a
+        // column index without advancing the cell. Bail to the slow
+        // path on any char whose `unicode_width` is not exactly 1.
         for (col, ch) in text.chars().enumerate() {
             if col > u16::MAX as usize {
                 return None;
             }
             if ch == ' ' || ch == '\0' {
                 continue;
+            }
+            // Width-1 invariant — see `char_cache` doc comment.
+            if ch.width() != Some(1) {
+                return None;
             }
             // Already-known miss: skip the cell, but keep going on
             // the fast path. This stops e.g. control characters from
@@ -307,8 +325,14 @@ impl GlyphRasterizer {
                 // Populate the per-character fast-path cache. A single
                 // monospace glyph's slot is column-independent (see
                 // `build_instances`), so reusing it for the next line
-                // is correct.
-                self.char_cache.entry(p.ch).or_insert(slot);
+                // is correct — but ONLY for width-1 chars. Wide and
+                // zero-width chars (CJK, combining marks, controls)
+                // must never enter the cache: their `(col, ch)` keys
+                // wouldn't survive the fast path's column-by-iteration
+                // assumption (invariant #3 on `char_cache`).
+                if p.ch.width() == Some(1) {
+                    self.char_cache.entry(p.ch).or_insert(slot);
+                }
                 produced_chars.insert(p.ch);
             }
         }
@@ -524,4 +548,100 @@ fn upload_glyph_pixels(queue: &Queue, texture: &Texture, slot: AtlasSlot, data: 
             depth_or_array_layers: 1,
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{instance_descriptor, instance_flags_for_tests};
+    use pollster::block_on;
+    use wgpu::{DeviceDescriptor, PowerPreference, RequestAdapterOptions};
+
+    const TEST_FONT: &[u8] = include_bytes!("../../fonts/FiraMono-Medium.ttf");
+
+    fn make_rasterizer() -> (Device, Queue, GlyphRasterizer) {
+        let instance = wgpu::Instance::new(instance_descriptor(instance_flags_for_tests()));
+        let adapter = block_on(instance.request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::LowPower,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))
+        .expect("no GPU adapter for test");
+        let (device, queue) = block_on(adapter.request_device(&DeviceDescriptor {
+            label: Some("char_cache test device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            trace: wgpu::Trace::Off,
+        }))
+        .expect("device request failed");
+        let rasterizer = GlyphRasterizer::new(
+            &device,
+            16.0,
+            DEFAULT_LINE_HEIGHT_RATIO,
+            Some("Fira Mono"),
+            Some(TEST_FONT),
+        );
+        (device, queue, rasterizer)
+    }
+
+    /// Wide / zero-width characters must not enter `char_cache`: their
+    /// cell-width != 1 violates invariant #3, so the fast path bails
+    /// before consulting the cache and the slow path skips insertion.
+    /// Without this guard, a CJK ideograph could be cached and later
+    /// silently misaligned in a single-column slot.
+    #[test]
+    fn cjk_does_not_enter_char_cache() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+
+        // ASCII-only line: every glyph is width-1 and should land in
+        // the cache via the slow path's `char_cache.entry(...)` call.
+        rasterizer.shape_line(&queue, "hello");
+        let ascii_cache_size = rasterizer.char_cache.len();
+        assert!(
+            ascii_cache_size >= "hello".chars().filter(|c| *c != 'l').count(),
+            "ASCII chars should populate char_cache; got {ascii_cache_size}"
+        );
+        let cache_before = rasterizer.char_cache.clone();
+
+        // Now shape a line containing a CJK ideograph. `你` has
+        // unicode_width 2; the fast path must bail (so the slow path
+        // runs), and the slow path must NOT insert `你` into the
+        // per-char cache.
+        rasterizer.shape_line(&queue, "你");
+
+        // The CJK char itself must not be in the cache.
+        assert!(
+            !rasterizer.char_cache.contains_key(&'你'),
+            "wide char `你` must not be inserted into char_cache"
+        );
+
+        // No previously-cached entries should have been disturbed.
+        for (k, v) in &cache_before {
+            assert_eq!(
+                rasterizer.char_cache.get(k),
+                Some(v),
+                "existing char_cache entry for {k:?} changed"
+            );
+        }
+    }
+
+    /// The fast path must refuse a line containing any non-width-1
+    /// character, even if the ASCII parts would otherwise hit the
+    /// cache.
+    #[test]
+    fn fast_path_bails_on_wide_char() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        // Warm the cache for ASCII letters.
+        rasterizer.shape_line(&queue, "ab");
+        assert!(rasterizer.char_cache.contains_key(&'a'));
+        assert!(rasterizer.char_cache.contains_key(&'b'));
+
+        // A line mixing ASCII + a wide char: fast path must return
+        // None even though `a`/`b` are cached.
+        assert!(rasterizer.try_shape_line_fast("a你b").is_none());
+        // Pure ASCII still takes the fast path.
+        assert!(rasterizer.try_shape_line_fast("ab").is_some());
+    }
 }

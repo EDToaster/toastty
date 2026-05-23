@@ -13,6 +13,7 @@ naga.workspace = true
 raw-window-handle.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+unicode-width = "0.2"
 wgpu.workspace = true
 
 toastty-term.workspace = true
