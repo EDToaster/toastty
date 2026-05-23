@@ -27,4 +27,7 @@ mod term;
 pub use cell::{Cell, Color, Style, StyleFlags};
 pub use cursor::Cursor;
 pub use grid::{Grid, Row};
-pub use term::Term;
+pub use term::{
+    KITTY_FLAG_DISAMBIGUATE, KITTY_FLAG_REPORT_ALL_AS_ESC, KITTY_FLAG_REPORT_ALTERNATE,
+    KITTY_FLAG_REPORT_EVENTS, KITTY_FLAG_REPORT_TEXT, MouseMode, MouseProtocol, Term,
+};

@@ -13,6 +13,70 @@ use toastty_parser::{Params, Perform};
 /// tab-stop manipulation (HTS/TBC) this becomes per-column state.
 const TAB_WIDTH: u16 = 8;
 
+/// Mouse reporting protocol selected via DECSET 1000/1002/1003.
+///
+/// Apps opt in via the matching DECSET; the binary uses
+/// [`Term::mouse_mode`] to decide which events to forward as CSI sequences.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MouseProtocol {
+    /// Mouse reporting off (default).
+    #[default]
+    Off,
+    /// DECSET 1000 — report button presses + releases only.
+    X10,
+    /// DECSET 1002 — report button presses + releases + motion while a
+    /// button is held (drag).
+    ButtonMotion,
+    /// DECSET 1003 — report all motion (rarely needed, but cheap).
+    AnyMotion,
+}
+
+/// Combined mouse mode state — protocol + whether SGR (1006) encoding is
+/// active. `sgr_encoding` doesn't change which events fire, just how they
+/// are serialised.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MouseMode {
+    pub protocol: MouseProtocol,
+    pub sgr_encoding: bool,
+}
+
+impl MouseMode {
+    /// True when *any* event reporting is on (protocol != Off).
+    #[must_use]
+    pub fn is_on(&self) -> bool {
+        !matches!(self.protocol, MouseProtocol::Off)
+    }
+
+    /// True when motion-while-button-held events should be reported.
+    #[must_use]
+    pub fn report_drag(&self) -> bool {
+        matches!(
+            self.protocol,
+            MouseProtocol::ButtonMotion | MouseProtocol::AnyMotion
+        )
+    }
+
+    /// True when *any* motion (regardless of button state) is reported.
+    #[must_use]
+    pub fn report_any_motion(&self) -> bool {
+        matches!(self.protocol, MouseProtocol::AnyMotion)
+    }
+}
+
+// ---- Kitty keyboard protocol flag bits ----
+// See <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>.
+
+/// Disambiguate escape codes (bit 1).
+pub const KITTY_FLAG_DISAMBIGUATE: u8 = 0b0_0001;
+/// Report event types — press / repeat / release (bit 2).
+pub const KITTY_FLAG_REPORT_EVENTS: u8 = 0b0_0010;
+/// Report alternate keys (bit 4) — TODO(kitty-keyboard).
+pub const KITTY_FLAG_REPORT_ALTERNATE: u8 = 0b0_0100;
+/// Report all keys as escape codes (bit 8) — TODO(kitty-keyboard).
+pub const KITTY_FLAG_REPORT_ALL_AS_ESC: u8 = 0b0_1000;
+/// Report associated text (bit 16) — TODO(kitty-keyboard).
+pub const KITTY_FLAG_REPORT_TEXT: u8 = 0b1_0000;
+
 /// Top-level terminal state object.
 #[derive(Debug)]
 pub struct Term {
@@ -27,6 +91,18 @@ pub struct Term {
     cols: u16,
     /// Primary-grid scrollback capacity (visible rows + history).
     scrollback: u16,
+    /// DECSET 2004 — wrap pastes in `\x1b[200~ ... \x1b[201~`.
+    bracketed_paste: bool,
+    /// DECSET 1004 — emit `\x1b[I` / `\x1b[O` on focus change.
+    report_focus: bool,
+    /// Current mouse reporting mode (DECSET 1000 / 1002 / 1003 / 1006).
+    mouse_mode: MouseMode,
+    /// Kitty keyboard progressive-enhancement flag stack.
+    ///
+    /// The active flags are the top of the stack; empty stack == legacy
+    /// behaviour. Capped at 8 entries (more than enough — kitty docs say
+    /// "small stack").
+    kitty_keyboard_stack: Vec<u8>,
 }
 
 impl Term {
@@ -49,6 +125,83 @@ impl Term {
             rows,
             cols,
             scrollback,
+            bracketed_paste: false,
+            report_focus: false,
+            mouse_mode: MouseMode::default(),
+            kitty_keyboard_stack: Vec::new(),
+        }
+    }
+
+    /// True when DECSET 2004 (bracketed paste) is active.
+    #[must_use]
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    /// True when DECSET 1004 (focus reporting) is active.
+    #[must_use]
+    pub fn report_focus(&self) -> bool {
+        self.report_focus
+    }
+
+    /// Current mouse reporting mode (DECSET 1000/1002/1003/1006).
+    #[must_use]
+    pub fn mouse_mode(&self) -> MouseMode {
+        self.mouse_mode
+    }
+
+    /// Active kitty keyboard progressive-enhancement flags (top of stack).
+    /// Zero == legacy behaviour.
+    #[must_use]
+    pub fn kitty_flags(&self) -> u8 {
+        self.kitty_keyboard_stack.last().copied().unwrap_or(0)
+    }
+
+    /// Read-only view of the kitty flag stack; useful for tests.
+    #[must_use]
+    pub fn kitty_stack(&self) -> &[u8] {
+        &self.kitty_keyboard_stack
+    }
+
+    /// Push `flags` onto the kitty progressive-enhancement stack.
+    ///
+    /// Caps the stack at 8 entries (rotates oldest out when full).
+    pub fn kitty_push(&mut self, flags: u8) {
+        if self.kitty_keyboard_stack.len() >= 8 {
+            self.kitty_keyboard_stack.remove(0);
+        }
+        self.kitty_keyboard_stack.push(flags);
+    }
+
+    /// Pop `n` entries from the kitty flag stack. Saturates at zero.
+    pub fn kitty_pop(&mut self, n: usize) {
+        let new_len = self.kitty_keyboard_stack.len().saturating_sub(n);
+        self.kitty_keyboard_stack.truncate(new_len);
+    }
+
+    /// Mutate active kitty flags without push/pop. `mode` selects the
+    /// operation:
+    /// - 1 — set bits to exactly `flags` (replace).
+    /// - 2 — OR `flags` into the top.
+    /// - 3 — clear (AND NOT) `flags` from the top.
+    ///
+    /// If the stack is empty, this implicitly pushes `flags` (for mode 1
+    /// or 2) or is a no-op (mode 3).
+    pub fn kitty_set(&mut self, flags: u8, mode: u8) {
+        if self.kitty_keyboard_stack.is_empty() {
+            match mode {
+                1 | 2 => self.kitty_keyboard_stack.push(flags),
+                _ => {}
+            }
+            return;
+        }
+        // Safe: just checked non-empty.
+        let top = self.kitty_keyboard_stack.last_mut().unwrap();
+        match mode {
+            1 => *top = flags,
+            2 => *top |= flags,
+            3 => *top &= !flags,
+            _ => {}
         }
     }
 
@@ -162,6 +315,28 @@ impl Term {
             'm' => self.apply_sgr(params),
             'h' if priv_marker == Some(b'?') => self.apply_decset(params, true),
             'l' if priv_marker == Some(b'?') => self.apply_decset(params, false),
+            // Kitty keyboard protocol stack manipulation:
+            //   CSI > flags u   — push
+            //   CSI < n u       — pop n (default 1)
+            //   CSI = flags ; mode u — set/clear without push
+            //   CSI ? u         — query (handled by the binary; no state
+            //                     change here, just observable via
+            //                     `Term::kitty_flags()`).
+            'u' if priv_marker == Some(b'>') => {
+                let f = first_param(params, 0);
+                self.kitty_push((f & 0xff) as u8);
+            }
+            'u' if priv_marker == Some(b'<') => {
+                let n = first_param(params, 1).max(1) as usize;
+                self.kitty_pop(n);
+            }
+            'u' if priv_marker == Some(b'=') => {
+                let f = first_param(params, 0);
+                let mode = nth_param(params, 1, 1);
+                self.kitty_set((f & 0xff) as u8, (mode & 0xff) as u8);
+            }
+            // `CSI ? u` (query) is handled at the binary level: it needs
+            // to write the reply back to the PTY.
             _ => {}
         }
     }
@@ -275,17 +450,56 @@ impl Term {
 
     fn apply_decset(&mut self, params: &Params, enable: bool) {
         for sub in params {
-            if let Some(&code) = sub.first()
-                && code == 1049
-            {
-                if enable {
-                    self.enter_alt_screen();
-                } else {
-                    self.exit_alt_screen();
+            let Some(&code) = sub.first() else {
+                continue;
+            };
+            match code {
+                1049 => {
+                    if enable {
+                        self.enter_alt_screen();
+                    } else {
+                        self.exit_alt_screen();
+                    }
                 }
+                // 1000 — X10 / VT200 button reporting (press + release).
+                1000 => {
+                    self.mouse_mode.protocol = if enable {
+                        MouseProtocol::X10
+                    } else {
+                        MouseProtocol::Off
+                    };
+                }
+                // 1002 — button-event tracking (press/release + drag).
+                1002 => {
+                    self.mouse_mode.protocol = if enable {
+                        MouseProtocol::ButtonMotion
+                    } else {
+                        MouseProtocol::Off
+                    };
+                }
+                // 1003 — any-event tracking (all motion regardless of buttons).
+                1003 => {
+                    self.mouse_mode.protocol = if enable {
+                        MouseProtocol::AnyMotion
+                    } else {
+                        MouseProtocol::Off
+                    };
+                }
+                // 1004 — focus events.
+                1004 => {
+                    self.report_focus = enable;
+                }
+                // 1006 — SGR extended mouse encoding.
+                1006 => {
+                    self.mouse_mode.sgr_encoding = enable;
+                }
+                // 2004 — bracketed paste.
+                2004 => {
+                    self.bracketed_paste = enable;
+                }
+                // TODO(modes): 1, 7, 12, 25, 2026, 2027, 2048, etc.
+                _ => {}
             }
-            // TODO(modes): 1, 7, 12, 25, 1000-series mouse, 2004, 2026,
-            // 2027, 2048, etc. live in toastty-protocols.
         }
     }
 
@@ -847,6 +1061,150 @@ mod tests {
         // exercise it here since callers normally bound the index 0..=7.
         assert_eq!(super::ansi_color(99, false), Color::Default);
         assert_eq!(super::ansi_color(99, true), Color::Default);
+    }
+
+    // ---- mode toggle tests (M7) ---------------------------------------------
+
+    #[test]
+    fn bracketed_paste_toggles_via_decset_2004() {
+        let mut t = Term::new(2, 4, 0);
+        assert!(!t.bracketed_paste());
+        feed(&mut t, b"\x1b[?2004h");
+        assert!(t.bracketed_paste());
+        feed(&mut t, b"\x1b[?2004l");
+        assert!(!t.bracketed_paste());
+    }
+
+    #[test]
+    fn report_focus_toggles_via_decset_1004() {
+        let mut t = Term::new(2, 4, 0);
+        assert!(!t.report_focus());
+        feed(&mut t, b"\x1b[?1004h");
+        assert!(t.report_focus());
+        feed(&mut t, b"\x1b[?1004l");
+        assert!(!t.report_focus());
+    }
+
+    #[test]
+    fn mouse_mode_1000_x10() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?1000h");
+        assert_eq!(t.mouse_mode().protocol, MouseProtocol::X10);
+        assert!(t.mouse_mode().is_on());
+        assert!(!t.mouse_mode().report_drag());
+        feed(&mut t, b"\x1b[?1000l");
+        assert_eq!(t.mouse_mode().protocol, MouseProtocol::Off);
+    }
+
+    #[test]
+    fn mouse_mode_1002_button_motion() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?1002h");
+        assert_eq!(t.mouse_mode().protocol, MouseProtocol::ButtonMotion);
+        assert!(t.mouse_mode().report_drag());
+        assert!(!t.mouse_mode().report_any_motion());
+    }
+
+    #[test]
+    fn mouse_mode_1003_any_motion() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?1003h");
+        assert!(t.mouse_mode().report_any_motion());
+        assert!(t.mouse_mode().report_drag());
+    }
+
+    #[test]
+    fn mouse_mode_1006_sgr_encoding() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?1006h");
+        assert!(t.mouse_mode().sgr_encoding);
+        feed(&mut t, b"\x1b[?1006l");
+        assert!(!t.mouse_mode().sgr_encoding);
+    }
+
+    #[test]
+    fn mouse_mode_combined_1006_1002() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?1002h\x1b[?1006h");
+        assert!(t.mouse_mode().sgr_encoding);
+        assert_eq!(t.mouse_mode().protocol, MouseProtocol::ButtonMotion);
+    }
+
+    #[test]
+    fn kitty_push_pop_round_trip() {
+        let mut t = Term::new(2, 4, 0);
+        assert_eq!(t.kitty_flags(), 0);
+        feed(&mut t, b"\x1b[>1u");
+        assert_eq!(t.kitty_flags(), 1);
+        assert_eq!(t.kitty_stack(), &[1]);
+        feed(&mut t, b"\x1b[>3u");
+        assert_eq!(t.kitty_flags(), 3);
+        assert_eq!(t.kitty_stack(), &[1, 3]);
+        feed(&mut t, b"\x1b[<1u");
+        assert_eq!(t.kitty_flags(), 1);
+        feed(&mut t, b"\x1b[<u");
+        // CSI < u with no param defaults to 1.
+        assert_eq!(t.kitty_flags(), 0);
+        assert!(t.kitty_stack().is_empty());
+    }
+
+    #[test]
+    fn kitty_pop_more_than_stack_does_not_underflow() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[>5u");
+        feed(&mut t, b"\x1b[<99u");
+        assert_eq!(t.kitty_flags(), 0);
+        assert!(t.kitty_stack().is_empty());
+    }
+
+    #[test]
+    fn kitty_set_mode_1_replaces_top() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[>1u");
+        feed(&mut t, b"\x1b[=15;1u");
+        assert_eq!(t.kitty_flags(), 15);
+    }
+
+    #[test]
+    fn kitty_set_mode_2_ors_bits() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[>1u");
+        feed(&mut t, b"\x1b[=2;2u");
+        assert_eq!(t.kitty_flags(), 3);
+    }
+
+    #[test]
+    fn kitty_set_mode_3_clears_bits() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[>3u");
+        feed(&mut t, b"\x1b[=2;3u");
+        assert_eq!(t.kitty_flags(), 1);
+    }
+
+    #[test]
+    fn kitty_set_with_empty_stack_pushes() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[=5;1u");
+        assert_eq!(t.kitty_flags(), 5);
+        assert_eq!(t.kitty_stack(), &[5]);
+    }
+
+    #[test]
+    fn kitty_set_mode_3_on_empty_is_noop() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[=5;3u");
+        assert!(t.kitty_stack().is_empty());
+    }
+
+    #[test]
+    fn kitty_stack_caps_at_eight() {
+        let mut t = Term::new(2, 4, 0);
+        for n in 0..10u8 {
+            t.kitty_push(n);
+        }
+        assert_eq!(t.kitty_stack().len(), 8);
+        // Oldest values rotated out — top is the last value pushed.
+        assert_eq!(t.kitty_flags(), 9);
     }
 
     #[test]

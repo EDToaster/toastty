@@ -9,7 +9,10 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod focus;
 pub mod geometry;
 pub mod keyboard;
+pub mod mouse;
+pub mod paste;
 pub mod shell;
 pub mod theme_bridge;
