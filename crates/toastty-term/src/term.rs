@@ -6,6 +6,8 @@
 
 use std::time::Instant;
 
+use unicode_width::UnicodeWidthChar;
+
 use crate::cell::{Cell, Color, Style};
 use crate::cursor::Cursor;
 use crate::grid::Grid;
@@ -504,9 +506,40 @@ impl Term {
         }
     }
 
+    /// Cell width of `c` per `unicode-width` (legacy `wcwidth` table).
+    ///
+    /// Returns `1` for ordinary text / unknown chars, `2` for CJK
+    /// ideographs / emoji / fullwidth forms, `0` for combining marks
+    /// and other zero-width controls. Mode 2027 (
+    /// [`Term::grapheme_cluster_mode`]) only re-shapes the renderer's
+    /// width snap — `Term::print` operates per-char and trusts the
+    /// `unicode-width` table either way (matching xterm / kitty
+    /// behaviour for the legacy stream-of-chars `print` path).
+    fn char_cell_width(c: char) -> u16 {
+        match UnicodeWidthChar::width(c) {
+            Some(0) => 0,
+            Some(1) => 1,
+            Some(_) => 2,
+            None => 1,
+        }
+    }
+
     fn print_char(&mut self, c: char) {
-        // Wrap before printing if the cursor is past the last column.
-        if self.cursor.col >= self.cols {
+        let cell_w = Self::char_cell_width(c);
+        // Zero-width chars (combining marks, controls) currently fall
+        // through as a no-op. A future pass can attach them to the
+        // previous cell's grapheme; for M8 we just drop them so the
+        // cursor doesn't advance into a dead cell.
+        if cell_w == 0 {
+            return;
+        }
+
+        // Wrap before printing if the cursor is past the last column
+        // OR — for a width-2 char — there's only 1 column left. The
+        // width-2 wrap case matches xterm: a wide char never splits.
+        let needs_wrap = self.cursor.col >= self.cols
+            || (cell_w == 2 && self.cursor.col + 1 >= self.cols);
+        if needs_wrap {
             // Mark the row we're leaving as soft-wrapped (decision #6).
             let leaving = self.cursor.row;
             self.active_grid_mut().row_mut(leaving).soft_wrap = true;
@@ -514,7 +547,7 @@ impl Term {
             self.cursor.col = 0;
             self.linefeed();
         }
-        let cell = Cell {
+        let primary = Cell {
             ch: c,
             style: self.cursor.style,
             is_continuation: false,
@@ -522,9 +555,20 @@ impl Term {
         let col = self.cursor.col;
         let row = self.cursor.row;
         let max_cols = self.cols;
-        self.active_grid_mut().row_mut(row).put(col, cell, max_cols);
+        self.active_grid_mut().row_mut(row).put(col, primary, max_cols);
+        if cell_w == 2 {
+            // Continuation marker: '\0' with the same style.
+            let cont = Cell {
+                ch: '\0',
+                style: self.cursor.style,
+                is_continuation: true,
+            };
+            self.active_grid_mut()
+                .row_mut(row)
+                .put(col + 1, cont, max_cols);
+        }
         self.mark_dirty(row);
-        self.cursor.col += 1;
+        self.cursor.col += cell_w;
     }
 
     fn handle_csi(&mut self, params: &Params, intermediates: &[u8], action: char) {
@@ -653,8 +697,29 @@ impl Term {
     }
 
     fn cursor_back(&mut self, n: u16) {
-        let new_col = self.cursor.col.saturating_sub(n);
+        let mut new_col = self.cursor.col.saturating_sub(n);
+        // Snap onto the start of a width-2 cluster: if the landing
+        // column is a continuation cell, step one more column left so
+        // the cursor lands on the cluster's primary cell. Bounds-
+        // checked so we don't underflow at column 0.
+        new_col = self.snap_back_off_continuation(new_col);
         self.move_cursor(self.cursor.row, new_col);
+    }
+
+    /// If `col` points at a continuation cell, return `col - 1`
+    /// (the cluster's primary). Otherwise return `col` unchanged.
+    /// Bounds-checked: column 0 cannot be a valid continuation, so the
+    /// answer is always in-range.
+    fn snap_back_off_continuation(&self, col: u16) -> u16 {
+        if col == 0 || col >= self.cols {
+            return col;
+        }
+        let cells = &self.active_grid().row(self.cursor.row).cells;
+        let is_cont = cells
+            .get(col as usize)
+            .map(|c| c.is_continuation)
+            .unwrap_or(false);
+        if is_cont { col - 1 } else { col }
     }
 
     fn cursor_position(&mut self, row_1based: u16, col_1based: u16) {
@@ -1013,9 +1078,13 @@ impl Perform for Term {
             b'\r' => self.cursor.col = 0,
             b'\n' | 0x0B | 0x0C => self.linefeed(),
             0x08 => {
-                // BS: move cursor left one, no wrap.
+                // BS: move cursor left one, no wrap. Snap off the
+                // continuation half of a wide cluster so two BSes
+                // in a row don't strand the cursor inside a CJK
+                // ideograph.
                 if self.cursor.col > 0 {
                     self.cursor.col -= 1;
+                    self.cursor.col = self.snap_back_off_continuation(self.cursor.col);
                 }
             }
             b'\t' => {
@@ -2319,6 +2388,80 @@ mod tests {
         assert!(t.sync_output_force_flushed());
         t.clear_sync_output_force_flushed();
         assert!(!t.sync_output_force_flushed());
+    }
+
+    #[test]
+    fn print_wide_cluster_writes_continuation_cell() {
+        // Print a CJK ideograph at column 0. The primary cell holds
+        // the character; the next cell is a continuation marker.
+        // Cursor advances by 2 columns.
+        let mut t = Term::new(2, 8, 0);
+        feed(&mut t, "你".as_bytes());
+        let row = t.row(0);
+        assert_eq!(row.cells[0].ch, '你');
+        assert!(!row.cells[0].is_continuation);
+        assert!(row.cells[1].is_continuation);
+        assert_eq!(row.cells[1].ch, '\0');
+        // Continuation inherits the style of the cluster's primary.
+        assert_eq!(row.cells[1].style, row.cells[0].style);
+        assert_eq!(t.cursor().col, 2);
+    }
+
+    #[test]
+    fn print_wide_cluster_wraps_when_only_one_column_left() {
+        // Grid is 3 cols wide. Print "ab" → cursor at col 2. Next
+        // print of "你" should wrap to the next row instead of
+        // splitting the cluster.
+        let mut t = Term::new(3, 3, 0);
+        feed(&mut t, b"ab");
+        assert_eq!(t.cursor().col, 2);
+        feed(&mut t, "你".as_bytes());
+        // Wrap took effect: the wide cluster lands on row 1.
+        assert_eq!(t.row(1).cells[0].ch, '你');
+        assert!(t.row(1).cells[1].is_continuation);
+        // Row 0 marked soft-wrap.
+        assert!(t.row(0).soft_wrap);
+    }
+
+    #[test]
+    fn print_two_wide_clusters_fill_grid() {
+        // 4-column row, two CJK ideographs.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, "你好".as_bytes());
+        let row = t.row(0);
+        assert_eq!(row.cells[0].ch, '你');
+        assert!(row.cells[1].is_continuation);
+        assert_eq!(row.cells[2].ch, '好');
+        assert!(row.cells[3].is_continuation);
+        // Cursor sits one past the last column (pending-wrap).
+        assert_eq!(t.cursor().col, 4);
+    }
+
+    #[test]
+    fn backspace_skips_continuation_cell() {
+        // After printing one wide cluster, cursor is at col 2.
+        // BS should land on col 1? No — the continuation cell should
+        // be skipped, so cursor lands on col 0 (the cluster's
+        // primary). Two BSes after a single wide cluster shouldn't
+        // strand the cursor on a continuation half.
+        let mut t = Term::new(1, 8, 0);
+        feed(&mut t, "你".as_bytes());
+        assert_eq!(t.cursor().col, 2);
+        feed(&mut t, b"\x08");
+        // After one BS, cursor steps off the continuation: lands at
+        // col 0 (the cluster's primary).
+        assert_eq!(t.cursor().col, 0);
+    }
+
+    #[test]
+    fn cursor_back_skips_continuation_cell() {
+        // CUB n by 1 from col 2 should land on col 0 (jumping over
+        // the continuation cell at col 1).
+        let mut t = Term::new(1, 8, 0);
+        feed(&mut t, "你".as_bytes());
+        assert_eq!(t.cursor().col, 2);
+        feed(&mut t, b"\x1b[1D");
+        assert_eq!(t.cursor().col, 0);
     }
 
     #[test]
