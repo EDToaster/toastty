@@ -31,18 +31,11 @@ pub fn cluster_cell_width(cluster: &str, mode_2027_active: bool) -> u8 {
         return 0;
     }
     if mode_2027_active {
-        // `UnicodeWidthStr` is grapheme-aware: ZWJ sequences and VS16
-        // count as width 2 because the underlying tables consider the
-        // composition. ASCII = 1, CJK = 2, etc. We cap at 2 because a
-        // single cluster shouldn't exceed two cells in a terminal grid
-        // — anything pathologically wider gets clamped to keep the
-        // grid layout stable.
+        // UnicodeWidthStr already returns 2 for CJK ideographs, VS16-presented
+        // emoji, ZWJ-joined sequences, and regional-indicator flag pairs. We
+        // cap at 2 to defend against pathological inputs (e.g. clusters with
+        // declared widths > 2 from a future spec extension).
         let w = UnicodeWidthStr::width(cluster);
-        // Per text-stack.md a combining-mark-on-base cluster is width
-        // 1 (base contributes, mark is zero-width). VS15 emoji on a
-        // chevron base = 1. ZWJ family = 1 from the table, but in
-        // practice 2 — we ship the conservative answer here so emoji
-        // get two cells.
         return u8::try_from(w.min(2)).unwrap_or(1);
     }
     // Mode 2027 off: legacy wcwidth behaviour — width of the first
