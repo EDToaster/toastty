@@ -271,6 +271,15 @@ impl Toastty {
         // unchanged, so calling on every batch is cheap.
         self.sync_title();
 
+        // Drain any OSC replies the parsed batch wants written back to
+        // the PTY (OSC 4 palette query, OSC 52 clipboard read). The
+        // queue is unconditional — handlers that need no reply just
+        // don't enqueue. See `Term::drain_pty_replies`.
+        let replies = self.term.drain_pty_replies();
+        if !replies.is_empty() {
+            self.write_pty(&replies);
+        }
+
         // BSU watchdog: if a BSU is currently in flight and its timer
         // has already elapsed, force-flush so the next frame issues a
         // corrective full redraw. We re-check after the parser advance

@@ -166,6 +166,15 @@ pub struct Term {
     /// marks rotate out when the cap is hit so the buffer can't bloat
     /// on a long-running session.
     prompt_marks: Vec<PromptMark>,
+    /// FIFO of bytes that need to be written back to the PTY after the
+    /// current `parser.advance` call completes. Populated by OSC handlers
+    /// that need to reply to a query (OSC 4 query, OSC 52 read). Drained
+    /// by the binary via [`Term::drain_pty_replies`].
+    ///
+    /// Keeping replies in a queue (rather than synchronously writing to
+    /// the PTY from inside a `Perform` callback) lets the parsing layer
+    /// stay free of I/O concerns and keeps `Term` reentrancy-safe.
+    pty_replies: Vec<u8>,
 }
 
 /// One semantic prompt marker recorded from OSC 133.
@@ -237,7 +246,23 @@ impl Term {
             inband_resize_mode: false,
             cwd: String::new(),
             prompt_marks: Vec::new(),
+            pty_replies: Vec::new(),
         }
+    }
+
+    /// Drain bytes queued for the PTY back-channel and return them. The
+    /// binary calls this after every `parser.advance` and writes the
+    /// returned bytes to the PTY master. Returns an empty `Vec` when
+    /// nothing was queued.
+    pub fn drain_pty_replies(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pty_replies)
+    }
+
+    /// Append `bytes` to the PTY back-channel. Public so cooperating
+    /// layers (the binary's OSC 52 clipboard read path) can queue
+    /// asynchronously-produced replies through the same drain.
+    pub fn push_pty_reply(&mut self, bytes: &[u8]) {
+        self.pty_replies.extend_from_slice(bytes);
     }
 
     /// Most recent cwd advertised via OSC 7. Empty when the shell hasn't
@@ -3147,5 +3172,24 @@ mod tests {
             feed(&mut t, b"\x1b]133;A\x1b\\");
         }
         assert_eq!(t.prompt_marks().len(), 4096);
+    }
+
+    // ----- PTY reply queue --------------------------------------------------
+
+    #[test]
+    fn pty_reply_queue_drains_in_order() {
+        let mut t = Term::new(2, 4, 0);
+        t.push_pty_reply(b"hello");
+        t.push_pty_reply(b" world");
+        let drained = t.drain_pty_replies();
+        assert_eq!(drained, b"hello world");
+        // Second drain returns empty — drain consumes.
+        assert!(t.drain_pty_replies().is_empty());
+    }
+
+    #[test]
+    fn pty_reply_queue_starts_empty() {
+        let mut t = Term::new(2, 4, 0);
+        assert!(t.drain_pty_replies().is_empty());
     }
 }
