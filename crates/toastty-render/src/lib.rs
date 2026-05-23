@@ -370,6 +370,18 @@ impl Renderer {
             return Err(RenderError::FontNotConfigured);
         }
 
+        // DECSET 2026 (synchronized output) gate. The dispatcher flips
+        // `pause_rendering` on BSU; until ESU (or the watchdog
+        // timeout), we skip the frame entirely — no shaping, no submit,
+        // no surface acquire. The watchdog lives in the binary
+        // (`Toastty::handle_pty_bytes`) and calls
+        // `Term::force_flush_sync_output` after 1 s, which both clears
+        // the pause and marks every row dirty so the next frame is a
+        // corrective full redraw.
+        if term.pause_rendering() {
+            return Ok(());
+        }
+
         let trace = std::env::var_os("TOASTTY_TRACE_RENDER").is_some();
         let t_total = if trace { Some(std::time::Instant::now()) } else { None };
 
