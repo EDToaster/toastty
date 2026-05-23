@@ -237,16 +237,63 @@ impl Term {
     }
 
     fn apply_sgr(&mut self, params: &Params) {
-        // `CSI m` (no params) and `CSI 0 m` both reset; `vte 0.15.0` always
-        // pushes at least one numeric param even when none was written, so
-        // either path lands in the `apply_sgr_param(0)` branch below.
+        // `CSI m` (no params) and `CSI 0 m` both reset. `vte 0.15.0` always
+        // pushes at least one numeric param even when none was written, but
+        // we keep the defensive empty-params branch for direct callers.
         if params.is_empty() {
             self.cursor.style = Style::RESET;
             return;
         }
-        for sub in params {
-            let v = sub.first().copied().unwrap_or(0);
-            self.apply_sgr_param(v);
+
+        // Walk the top-level params one slice at a time. The multi-param
+        // SGR introducers (38/48/58) consume one or more *following*
+        // top-level params on the legacy semicolon form
+        // (`CSI 38;5;N m` → slices `[[38],[5],[N]]`), but read their
+        // sub-params from the same slice on the ITU-T T.416 colon form
+        // (`CSI 38:5:N m` → slice `[[38,5,N]]`). Both must be supported —
+        // virtually every modern app uses the semicolon form, but some
+        // (especially with underline color, mode 58) emit the colon form.
+        //
+        // Critical: the consumed params must NOT also be re-interpreted as
+        // standalone SGR codes. The old implementation iterated each
+        // top-level slice and called `apply_sgr_param(slice[0])`, which
+        // meant a truecolor `\x1b[38;2;200;32;100m` sequence accidentally
+        // ran `apply_sgr_param(32)` and set fg green. That's the leak this
+        // function exists to fix.
+        let mut iter = params.iter();
+        while let Some(slice) = iter.next() {
+            // Empty top-level params shouldn't occur from vte but treat them
+            // as the implicit 0 (reset) the spec requires.
+            let head = slice.first().copied().unwrap_or(0);
+            match head {
+                38 if slice.len() >= 2 => self.cursor.style.fg = parse_extended_color_from_slice(&slice[1..]).unwrap_or(self.cursor.style.fg),
+                48 if slice.len() >= 2 => self.cursor.style.bg = parse_extended_color_from_slice(&slice[1..]).unwrap_or(self.cursor.style.bg),
+                58 if slice.len() >= 2 => {
+                    // Underline color is parsed but not yet stored — we don't
+                    // have anywhere to put it. We MUST still consume the
+                    // sub-params so they don't leak. The colon form keeps
+                    // them in the same slice, so there's nothing to do.
+                    let _ = parse_extended_color_from_slice(&slice[1..]);
+                }
+                38 => {
+                    // Semicolon form: consume from the outer iterator.
+                    let color = parse_extended_color_from_iter(&mut iter);
+                    if let Some(c) = color {
+                        self.cursor.style.fg = c;
+                    }
+                }
+                48 => {
+                    let color = parse_extended_color_from_iter(&mut iter);
+                    if let Some(c) = color {
+                        self.cursor.style.bg = c;
+                    }
+                }
+                58 => {
+                    // Parse and discard for now — see comment above.
+                    let _ = parse_extended_color_from_iter(&mut iter);
+                }
+                v => self.apply_sgr_param(v),
+            }
         }
     }
 
@@ -266,9 +313,10 @@ impl Term {
             39 => style.fg = Color::Default,
             40..=47 => style.bg = ansi_color(v - 40, false),
             49 => style.bg = Color::Default,
+            // 59 (default underline color) is also handled by the wildcard
+            // for now — we don't store underline color yet.
             90..=97 => style.fg = ansi_color(v - 90, true),
             100..=107 => style.bg = ansi_color(v - 100, true),
-            // 38/48 (256/truecolor) deliberately skipped for M3.
             _ => {}
         }
     }
@@ -321,6 +369,78 @@ fn nth_param(params: &Params, n: usize, default: u16) -> u16 {
         .and_then(|sub| sub.first().copied())
         .filter(|&v| v != 0)
         .unwrap_or(default)
+}
+
+/// Parse a `38/48/58` extended-color introducer's sub-parameters from a
+/// single sub-param slice — i.e. the ITU-T T.416 colon form like
+/// `CSI 38:5:42m` (which `vte 0.15` exposes as one slice `[38, 5, 42]`).
+/// Caller passes the slice *after* the leading 38/48/58, i.e. `[5, 42]`
+/// or `[2, R, G, B]` (or the 5-element `[2, Pi, R, G, B]` with the T.416
+/// color-space identifier we ignore).
+///
+/// Returns `None` for malformed input (insufficient sub-params, unknown
+/// kind). The caller has already consumed the sub-params either way, so
+/// nothing leaks back into the SGR stream.
+fn parse_extended_color_from_slice(rest: &[u16]) -> Option<Color> {
+    match rest.first().copied()? {
+        // Indexed: next sub-param is the 0..256 palette index.
+        5 => rest.get(1).map(|n| Color::Indexed256(clamp_u8(*n))),
+        // Truecolor. The canonical T.416 form is `[2, Pi, R, G, B]` with a
+        // color-space identifier; the widely-deployed shortcut form omits
+        // it (`[2, R, G, B]`). xterm and alacritty both accept both. We
+        // mirror that: 5+ sub-params → skip the identifier; 4 sub-params →
+        // treat the first as R.
+        2 => {
+            // `rest.len() >= N` below guarantees the indexing is in-bounds,
+            // so we use direct slice access — `rest.get(..).copied()?`
+            // would produce unreachable short-circuit branches that clippy
+            // and coverage both flag.
+            let (r, g, b) = if rest.len() >= 5 {
+                (rest[2], rest[3], rest[4])
+            } else if rest.len() >= 4 {
+                (rest[1], rest[2], rest[3])
+            } else {
+                return None;
+            };
+            Some(Color::Rgb(clamp_u8(r), clamp_u8(g), clamp_u8(b)))
+        }
+        _ => None,
+    }
+}
+
+/// Parse a `38/48/58` extended-color from the legacy semicolon form
+/// (`CSI 38;5;42m` → slices `[[38],[5],[42]]`). The caller has already
+/// consumed the leading `38/48/58` slice from `iter`. We read the kind
+/// (5 or 2) and the appropriate number of *following* top-level params,
+/// returning `None` on malformed input. Crucially, **we always consume
+/// the expected number of params** so they cannot leak back into the
+/// outer SGR walker.
+fn parse_extended_color_from_iter<'a, I>(iter: &mut I) -> Option<Color>
+where
+    I: Iterator<Item = &'a [u16]>,
+{
+    let kind = iter.next().and_then(|s| s.first().copied())?;
+    match kind {
+        5 => {
+            let idx = iter.next().and_then(|s| s.first().copied())?;
+            Some(Color::Indexed256(clamp_u8(idx)))
+        }
+        2 => {
+            // Semicolon form is always 3-component RGB. The T.416
+            // color-space identifier is only meaningful in the colon
+            // form and not transmitted via `;`-separated params.
+            let r = iter.next().and_then(|s| s.first().copied())?;
+            let g = iter.next().and_then(|s| s.first().copied())?;
+            let b = iter.next().and_then(|s| s.first().copied())?;
+            Some(Color::Rgb(clamp_u8(r), clamp_u8(g), clamp_u8(b)))
+        }
+        _ => None,
+    }
+}
+
+/// Saturating cast — SGR params arrive as `u16`; valid values are 0..256.
+fn clamp_u8(v: u16) -> u8 {
+    u8::try_from(v).unwrap_or(u8::MAX)
 }
 
 fn ansi_color(idx: u16, bright: bool) -> Color {
@@ -856,5 +976,350 @@ mod tests {
         feed(&mut t, b"\x1b[;5H");
         assert_eq!(t.cursor().row, 0);
         assert_eq!(t.cursor().col, 4);
+    }
+
+    // ----- Extended-color SGR (38/48 + 5/2) leak-fix tests ---------------
+    //
+    // These cover the bug where the old SGR walker re-interpreted the
+    // sub-params of a truecolor / 256-color introducer as standalone SGR
+    // codes — e.g. `CSI 38;2;200;32;100m` accidentally setting fg green
+    // because 32 lands in the 30..=37 named-foreground range.
+
+    #[test]
+    fn sgr_256_fg_does_not_leak_into_bg_for_index_in_named_range() {
+        // `42` is a 256-color index but ALSO the value of `bg=Green` in the
+        // legacy SGR table. The fix must not re-apply `42` as a standalone
+        // SGR after consuming it as the palette index.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[38;5;42mX");
+        let s = t.row(0).cells[0].style;
+        assert_eq!(s.fg, Color::Indexed256(42));
+        // Critical: bg must still be Default. Under the broken parser bg
+        // would be `Color::Green` because `42 - 40 = 2` triggers the 40..=47
+        // arm.
+        assert_eq!(s.bg, Color::Default);
+        assert_eq!(s.flags, StyleFlags::default());
+    }
+
+    #[test]
+    fn sgr_truecolor_fg_does_not_leak_inner_byte_as_fg() {
+        // `\x1b[38;2;200;32;100m` sets fg to RGB(200, 32, 100). The middle
+        // byte (G=32) lies in 30..=37 and would set fg=Green under the
+        // broken parser; the third byte (B=100) lies in 100..=107 and
+        // would also set bg=BrightBlack. Neither must happen.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[38;2;200;32;100mX");
+        let s = t.row(0).cells[0].style;
+        assert_eq!(s.fg, Color::Rgb(200, 32, 100));
+        assert_eq!(s.bg, Color::Default);
+        // Sanity: even if a future bug made these flags persist, this
+        // asserts no flag side effect.
+        assert_eq!(s.flags, StyleFlags::default());
+    }
+
+    #[test]
+    fn sgr_256_bg_basic() {
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[48;5;1mX");
+        let s = t.row(0).cells[0].style;
+        assert_eq!(s.bg, Color::Indexed256(1));
+        assert_eq!(s.fg, Color::Default);
+    }
+
+    #[test]
+    fn sgr_truecolor_bg_basic() {
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[48;2;10;20;30mX");
+        let s = t.row(0).cells[0].style;
+        assert_eq!(s.bg, Color::Rgb(10, 20, 30));
+        assert_eq!(s.fg, Color::Default);
+    }
+
+    #[test]
+    fn sgr_256_incomplete_is_ignored_cleanly() {
+        // `\x1b[38;5m` is missing the index — the parser must consume the
+        // `5` so it can't leak as a standalone SGR, and must NOT change
+        // the fg.
+        let mut t = Term::new(1, 4, 0);
+        // Start with a known fg so we can detect an accidental change.
+        feed(&mut t, b"\x1b[31m\x1b[38;5mX");
+        let s = t.row(0).cells[0].style;
+        // fg is whatever the introducer left it as — either kept Red (good)
+        // or reset to Default. Under the broken parser, `5` would land in
+        // `apply_sgr_param(5)` (a no-op currently) but a future bug could
+        // map 5 to BlinkSlow. We assert the introducer was at least
+        // consumed: fg should be Red (untouched), NOT something else.
+        assert_eq!(s.fg, Color::Red);
+        // And no flag side effects from consuming `5`.
+        assert!(!s.flags.bold);
+    }
+
+    #[test]
+    fn sgr_truecolor_incomplete_does_not_leak_components() {
+        // Missing one component: `\x1b[38;2;200;32m` (only R and G). The
+        // 32 must NOT leak as a standalone SGR setting fg=Green.
+        let mut t = Term::new(1, 4, 0);
+        // Establish a baseline: bold + red.
+        feed(&mut t, b"\x1b[1;31m");
+        feed(&mut t, b"\x1b[38;2;200;32mX");
+        let s = t.row(0).cells[0].style;
+        // Fg was Red; the truecolor sequence is incomplete — fg either
+        // stays Red or becomes whatever the partial parse returned. In
+        // our implementation it stays Red (Option::unwrap_or current fg).
+        // The CRITICAL assertion: fg is NOT Green (which would be set by
+        // `32` leaking through).
+        assert_ne!(s.fg, Color::Green);
+        // And bold must still be on (we didn't accidentally consume the 1).
+        assert!(s.flags.bold);
+    }
+
+    #[test]
+    fn sgr_mixed_named_then_extended_then_attr() {
+        // Real-world style sequence: red fg, override with 256-color fg,
+        // turn on bold. Final state: fg = Indexed256(42), bold = true,
+        // bg = Default.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[31;38;5;42;1mX");
+        let s = t.row(0).cells[0].style;
+        assert_eq!(s.fg, Color::Indexed256(42));
+        assert_eq!(s.bg, Color::Default);
+        assert!(s.flags.bold);
+    }
+
+    #[test]
+    fn sgr_colon_form_256_color() {
+        // ITU-T T.416 colon form. `vte 0.15` reports this as one slice
+        // `[38, 5, 42]` rather than three slices `[[38],[5],[42]]`. The
+        // parser must handle both.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[38:5:42mX");
+        let s = t.row(0).cells[0].style;
+        assert_eq!(s.fg, Color::Indexed256(42));
+        assert_eq!(s.bg, Color::Default);
+    }
+
+    #[test]
+    fn sgr_colon_form_truecolor_short() {
+        // Colon-form 4-arg truecolor: `[38, 2, R, G, B]`. The G byte (32)
+        // must not leak.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[38:2:200:32:100mX");
+        let s = t.row(0).cells[0].style;
+        assert_eq!(s.fg, Color::Rgb(200, 32, 100));
+        assert_eq!(s.bg, Color::Default);
+    }
+
+    #[test]
+    fn sgr_colon_form_truecolor_with_color_space_id() {
+        // Canonical T.416 truecolor: `[38, 2, Pi, R, G, B]`. The Pi
+        // color-space identifier (here `1` — sRGB) must be skipped.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[38:2:1:200:32:100mX");
+        let s = t.row(0).cells[0].style;
+        assert_eq!(s.fg, Color::Rgb(200, 32, 100));
+        assert_eq!(s.bg, Color::Default);
+    }
+
+    #[test]
+    fn sgr_unknown_extended_kind_is_consumed_without_leak() {
+        // 38 followed by neither 5 nor 2: malformed. The introducer must
+        // still consume the `9` so it doesn't reapply as a standalone
+        // SGR. Currently 9 is unhandled but we test the principle.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[1;38;9;31mX");
+        let s = t.row(0).cells[0].style;
+        // Bold from before the introducer should stick.
+        assert!(s.flags.bold);
+        // The trailing `31` (red fg) must apply — the parser must have
+        // bailed cleanly out of the malformed 38;9 sequence.
+        assert_eq!(s.fg, Color::Red);
+    }
+
+    #[test]
+    fn sgr_default_fg_only_clears_fg() {
+        // `\x1b[39m` resets fg but leaves bg/flags alone.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[1;31;44mA\x1b[39mB");
+        let s = t.row(0).cells[1].style;
+        assert_eq!(s.fg, Color::Default);
+        assert_eq!(s.bg, Color::Blue);
+        assert!(s.flags.bold);
+    }
+
+    #[test]
+    fn sgr_underline_color_is_consumed_and_ignored() {
+        // We don't store underline color yet, but the introducer must
+        // consume its sub-params so nothing leaks. Mode 58 with 256-color
+        // index 42 should NOT end up setting bg=Green or anything else.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[58;5;42mX");
+        let s = t.row(0).cells[0].style;
+        assert_eq!(s.fg, Color::Default);
+        assert_eq!(s.bg, Color::Default);
+        assert_eq!(s.flags, StyleFlags::default());
+    }
+
+    #[test]
+    fn sgr_underline_color_truecolor_is_consumed_and_ignored() {
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[58;2;200;32;100mX");
+        let s = t.row(0).cells[0].style;
+        assert_eq!(s.fg, Color::Default);
+        assert_eq!(s.bg, Color::Default);
+        assert_eq!(s.flags, StyleFlags::default());
+    }
+
+    #[test]
+    fn sgr_underline_color_default_is_a_noop() {
+        // Mode 59 = default underline color. Must not panic / leak.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[31;59mX");
+        let s = t.row(0).cells[0].style;
+        assert_eq!(s.fg, Color::Red);
+    }
+
+    #[test]
+    fn sgr_helix_simulated_sidebar_does_not_leak_past_reset() {
+        // Reproduces the helix sidebar leak shape: paint a few cells with
+        // a 256-color fg, then reset, then paint plain text. The plain
+        // text cells must come out with default fg — no green leak.
+        let mut t = Term::new(1, 16, 0);
+        feed(&mut t, b"\x1b[38;5;42m 1 \x1b[0m text");
+        // Cells 0..3 (the painted " 1 ") have fg=Indexed256(42); cells
+        // 3..8 (the " text" after reset) have fg=Default.
+        for (i, want_fg) in [
+            (0, Color::Indexed256(42)),
+            (1, Color::Indexed256(42)),
+            (2, Color::Indexed256(42)),
+            (3, Color::Default),
+            (4, Color::Default),
+            (5, Color::Default),
+            (6, Color::Default),
+            (7, Color::Default),
+        ] {
+            assert_eq!(
+                t.row(0).cells[i].style.fg,
+                want_fg,
+                "cell {i} fg differs (helix leak regression)",
+            );
+            // bg must always be Default in this scenario.
+            assert_eq!(
+                t.row(0).cells[i].style.bg,
+                Color::Default,
+                "cell {i} bg accidentally non-default",
+            );
+        }
+    }
+
+    #[test]
+    fn sgr_truecolor_then_named_fg_overrides_correctly() {
+        // After truecolor, a plain named SGR must still work (no stale
+        // state in the iterator).
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[38;2;1;2;3m\x1b[33mX");
+        let s = t.row(0).cells[0].style;
+        assert_eq!(s.fg, Color::Yellow);
+    }
+
+    #[test]
+    fn parse_extended_color_from_slice_rejects_unknown_kind() {
+        // Direct unit-test of the slice helper — input `[9, ...]` is
+        // neither 5 nor 2 so must return None.
+        assert!(super::parse_extended_color_from_slice(&[9, 1, 2, 3]).is_none());
+        // Empty slice → None.
+        assert!(super::parse_extended_color_from_slice(&[]).is_none());
+        // 5 with no index → None.
+        assert!(super::parse_extended_color_from_slice(&[5]).is_none());
+        // 2 with fewer than 3 RGB components → None.
+        assert!(super::parse_extended_color_from_slice(&[2, 1, 2]).is_none());
+    }
+
+    #[test]
+    fn parse_extended_color_from_iter_returns_none_for_unknown_kind() {
+        // Direct unit-test of the iterator helper.
+        let slices: Vec<&[u16]> = vec![&[9], &[1], &[2]];
+        let mut it = slices.into_iter();
+        assert!(super::parse_extended_color_from_iter(&mut it).is_none());
+    }
+
+    #[test]
+    fn clamp_u8_saturates_values_above_255() {
+        assert_eq!(super::clamp_u8(0), 0);
+        assert_eq!(super::clamp_u8(255), 255);
+        assert_eq!(super::clamp_u8(256), 255);
+        assert_eq!(super::clamp_u8(u16::MAX), 255);
+    }
+
+    #[test]
+    fn sgr_colon_form_bg_256_color() {
+        // Cover the colon-form `48` branch (top-level `bg = ...`).
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[48:5:1mX");
+        let s = t.row(0).cells[0].style;
+        assert_eq!(s.bg, Color::Indexed256(1));
+        assert_eq!(s.fg, Color::Default);
+    }
+
+    #[test]
+    fn sgr_colon_form_underline_color_consumed_and_ignored() {
+        // Cover the colon-form `58` branch (top-level discard).
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[58:5:42mX");
+        let s = t.row(0).cells[0].style;
+        assert_eq!(s.fg, Color::Default);
+        assert_eq!(s.bg, Color::Default);
+    }
+
+    #[test]
+    fn sgr_semicolon_form_bg_incomplete_leaves_bg_alone() {
+        // Cover the `None` branch of the bg `if let Some(c)` in the
+        // semicolon-form 48 handler. We pre-set a known bg (Blue), then
+        // feed a malformed `\x1b[48;9m` (unknown kind 9). The bg must
+        // stay Blue — the partial parse must NOT leak any of those
+        // codes back into the SGR walker.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[44m\x1b[48;9mX");
+        let s = t.row(0).cells[0].style;
+        assert_eq!(s.bg, Color::Blue);
+    }
+
+    #[test]
+    fn parse_extended_color_from_slice_truecolor_with_color_space_id_form() {
+        // Cover the rest.len() >= 5 branch directly.
+        let c = super::parse_extended_color_from_slice(&[2, 1, 100, 150, 200]);
+        assert_eq!(c, Some(Color::Rgb(100, 150, 200)));
+    }
+
+    #[test]
+    fn parse_extended_color_from_slice_truecolor_short_form() {
+        // Cover the 4-arg shortcut.
+        let c = super::parse_extended_color_from_slice(&[2, 100, 150, 200]);
+        assert_eq!(c, Some(Color::Rgb(100, 150, 200)));
+    }
+
+    #[test]
+    fn parse_extended_color_from_iter_truecolor_runs_out_of_components() {
+        // Cover the `?` branches inside the iter helper. Each missing
+        // component path returns None.
+        // Missing G.
+        let slices: Vec<&[u16]> = vec![&[2], &[100]];
+        let mut it = slices.into_iter();
+        assert!(super::parse_extended_color_from_iter(&mut it).is_none());
+        // Missing B.
+        let slices: Vec<&[u16]> = vec![&[2], &[100], &[150]];
+        let mut it = slices.into_iter();
+        assert!(super::parse_extended_color_from_iter(&mut it).is_none());
+        // Missing R.
+        let slices: Vec<&[u16]> = vec![&[2]];
+        let mut it = slices.into_iter();
+        assert!(super::parse_extended_color_from_iter(&mut it).is_none());
+        // Missing 256 index.
+        let slices: Vec<&[u16]> = vec![&[5]];
+        let mut it = slices.into_iter();
+        assert!(super::parse_extended_color_from_iter(&mut it).is_none());
+        // Empty iterator -> None on first read.
+        let slices: Vec<&[u16]> = vec![];
+        let mut it = slices.into_iter();
+        assert!(super::parse_extended_color_from_iter(&mut it).is_none());
     }
 }
