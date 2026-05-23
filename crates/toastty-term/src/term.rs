@@ -464,6 +464,26 @@ impl Term {
         }
     }
 
+    /// Public counterpart of [`Term::mark_cell`] for cooperating layers
+    /// (e.g. the renderer's cursor-blink tick) to mark a single cell
+    /// dirty without going through a full-screen redraw. Bounds-checked.
+    ///
+    /// If the cell at `(r, c)` is a width-2 continuation, the primary
+    /// cell at `(r, c - 1)` is marked as well so the multi-cell glyph
+    /// gets re-emitted (the renderer skips continuation cells, so
+    /// marking only `(r, c)` would emit no instance at all).
+    pub fn mark_cell_dirty(&mut self, r: u16, c: u16) {
+        let is_continuation = self
+            .row(r)
+            .cells
+            .get(c as usize)
+            .is_some_and(|cell| cell.is_continuation);
+        if is_continuation && c > 0 {
+            self.mark_cell(r, c - 1);
+        }
+        self.mark_cell(r, c);
+    }
+
     /// Mark cells `[start, end)` on row `r` dirty. Saturates at the
     /// row's column count and is a no-op if `r` is out of range.
     fn mark_cells(&mut self, r: u16, start: u16, end: u16) {
@@ -2820,5 +2840,51 @@ mod tests {
         assert!(t.damage().rows[3].all_cols);
         // Row 0: not touched (clear_damage was called).
         assert!(t.damage().rows[0].is_empty());
+    }
+
+    /// Followup C1: `Term::mark_cell_dirty` is the public hook the
+    /// renderer uses to mark the cursor's cell dirty when the blink
+    /// flips visible→invisible (so the dirty-instance builder emits a
+    /// fresh bg quad that overpaints the previous cursor block).
+    #[test]
+    fn mark_cell_dirty_marks_single_cell() {
+        let mut t = Term::new(3, 8, 0);
+        t.clear_damage();
+        t.mark_cell_dirty(1, 4);
+        let row1 = &t.damage().rows[1];
+        assert!(!row1.all_cols);
+        assert_eq!(&row1.cols[..], &[4]);
+        // Other rows untouched.
+        assert!(t.damage().rows[0].is_empty());
+        assert!(t.damage().rows[2].is_empty());
+    }
+
+    /// Followup C1: when the targeted cell is a width-2 continuation
+    /// (second half of a wide-char cluster), `mark_cell_dirty` must
+    /// also mark `col - 1` so the primary cell's multi-cell glyph gets
+    /// re-emitted under partial redraw (the dirty-instance builder
+    /// skips continuation cells).
+    #[test]
+    fn mark_cell_dirty_marks_continuation_partner() {
+        // Wide char (CJK) at col 0; continuation at col 1.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, "你".as_bytes());
+        t.clear_damage();
+        // Asking for the continuation cell at (0, 1) must also dirty
+        // the primary at (0, 0).
+        t.mark_cell_dirty(0, 1);
+        let row0 = &t.damage().rows[0];
+        assert!(!row0.all_cols);
+        assert_eq!(&row0.cols[..], &[0, 1]);
+    }
+
+    /// Followup C1: out-of-range row is a no-op (mirrors the private
+    /// `mark_cell` helper, which guards `damage.rows.get_mut`).
+    #[test]
+    fn mark_cell_dirty_out_of_range_row_is_noop() {
+        let mut t = Term::new(2, 4, 0);
+        t.clear_damage();
+        t.mark_cell_dirty(99, 0);
+        assert!(t.damage().is_empty());
     }
 }

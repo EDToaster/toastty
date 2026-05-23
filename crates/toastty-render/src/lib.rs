@@ -525,7 +525,7 @@ impl Renderer {
     /// bench under `benches/render_term.rs` runs in release mode; this
     /// env var works in the debug build too).
     #[allow(clippy::too_many_lines)] // optional tracing branches add ~30 LoC
-    pub fn render_term(&mut self, term: &Term) -> Result<RenderOutcome, RenderError> {
+    pub fn render_term(&mut self, term: &mut Term) -> Result<RenderOutcome, RenderError> {
         if self.text.is_none() {
             return Err(RenderError::FontNotConfigured);
         }
@@ -563,6 +563,19 @@ impl Renderer {
         // before instance building reads `cursor_visible`.
         if cursor_animation_due {
             self.blink.tick(now);
+            // Followup C1: under partial-redraw (LoadOp::Load) the
+            // dirty-instance builder only emits bg quads for cells in
+            // the damage set. When the blink toggles
+            // visible→invisible, no other code path marks the cursor's
+            // cell dirty, so the previous frame's cursor block ghosts.
+            // Mark the cursor's current cell here so the builder emits
+            // a fresh bg quad (which overpaints the ghost) and, on the
+            // visible→visible→... cycle, re-emits the cursor on top.
+            //
+            // `mark_cell_dirty` handles the width-2 continuation case
+            // (marks col - 1 too so the multi-cell glyph is re-emitted).
+            let cur = term.cursor();
+            term.mark_cell_dirty(cur.row, cur.col);
         }
         // If the term has blink disabled, the cursor must always be
         // visible. We don't update `last_at` because the blink state
@@ -975,5 +988,68 @@ mod tests {
         blink.visible = false;
         blink.force_visible();
         assert!(blink.visible);
+    }
+
+    /// Followup C1: when the blink toggles visible→invisible, the
+    /// renderer must mark the cursor's cell dirty so the dirty-instance
+    /// builder emits a fresh bg quad over the previous cursor block.
+    /// Otherwise, under LoadOp::Load, the old cursor ghosts.
+    ///
+    /// This is the integration-level invariant: we simulate the
+    /// `render_term` path's blink tick + `Term::mark_cell_dirty` +
+    /// `build_dirty_instances_into` sequence, then assert the OFF
+    /// frame's instance list contains a bg quad at the cursor cell
+    /// without the cursor flag set.
+    #[test]
+    fn blink_off_emits_bg_quad_at_cursor_cell() {
+        use crate::text::instance::{
+            FLAG_CURSOR, FLAG_NO_GLYPH, Theme, build_dirty_instances_into,
+        };
+        use toastty_term::Term;
+
+        let mut term = Term::new(3, 8, 0);
+        // Cursor at (0, 0) by default. Position it to a distinctive
+        // cell so we can assert position-precisely.
+        let mut parser = toastty_parser::Parser::new();
+        parser.advance(&mut term, b"\x1b[2;4H"); // row 2, col 4 (1-based)
+        let cur = term.cursor();
+        assert_eq!((cur.row, cur.col), (1, 3));
+        term.clear_damage();
+
+        // Simulate first blink tick: ON → OFF. The renderer's path is:
+        //  1) detect animation_due
+        //  2) tick (visible flips false)
+        //  3) mark_cell_dirty at the cursor's current row/col
+        //  4) build_dirty_instances_into with cursor_visible=false
+        let cell_size = (8.0_f32, 16.0_f32);
+        let theme = Theme::default_dark();
+        term.mark_cell_dirty(cur.row, cur.col);
+        let mut instances = Vec::new();
+        build_dirty_instances_into(
+            &mut instances,
+            &term,
+            term.damage(),
+            cell_size,
+            &theme,
+            false, // cursor_visible == OFF frame
+            |_, _, _, _| None,
+        );
+
+        // No cursor instance must be present (visible=false).
+        assert!(
+            instances.iter().all(|i| i.flags & FLAG_CURSOR == 0),
+            "OFF frame must not emit any cursor instance"
+        );
+        // A background-only quad must be present at the cursor's cell.
+        let expected_pos = [f32::from(cur.col) * cell_size.0, f32::from(cur.row) * cell_size.1];
+        let bg_at_cursor = instances.iter().find(|i| {
+            i.flags & FLAG_NO_GLYPH != 0
+                && (i.pos[0] - expected_pos[0]).abs() < 1e-3
+                && (i.pos[1] - expected_pos[1]).abs() < 1e-3
+        });
+        assert!(
+            bg_at_cursor.is_some(),
+            "OFF frame must emit a bg quad at the cursor's cell to overpaint the old cursor block"
+        );
     }
 }

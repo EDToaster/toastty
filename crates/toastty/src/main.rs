@@ -516,7 +516,7 @@ impl App for Toastty {
                 }
                 let mut next_blink: Option<Duration> = None;
                 if let Some(r) = self.renderer.as_mut() {
-                    match r.render_term(&self.term) {
+                    match r.render_term(&mut self.term) {
                         Ok(RenderOutcome::Rendered) => {
                             // Consume the per-cell damage signal so the
                             // next render only re-emits cells that
