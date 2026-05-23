@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use pollster::block_on;
 use toastty_config::{Config, ConfigSource};
 use toastty_parser::Parser;
+use toastty_protocols::resize_inband::encode_resize_report;
 use toastty_protocols::synchronized::{BSU_TIMEOUT, should_force_flush};
 use toastty_pty::{Pty, PtySpec, WinSize};
 use toastty_render::Renderer;
@@ -479,6 +480,19 @@ impl App for Toastty {
                     r.resize(width, height);
                 }
                 self.resync_grid();
+                // DECSET 2048 — emit an in-band resize report so apps
+                // that opted in see the new geometry in order with
+                // everything else on the PTY (no SIGWINCH race). The
+                // encoder returns None when 2048 is off, so we don't
+                // touch the PTY in the default case.
+                let (rows, cols) = self.term.size();
+                let pixel_w = u16::try_from(width).unwrap_or(u16::MAX);
+                let pixel_h = u16::try_from(height).unwrap_or(u16::MAX);
+                if let Some(bytes) =
+                    encode_resize_report(rows, cols, pixel_h, pixel_w, self.term.inband_resize_mode())
+                {
+                    self.write_pty(&bytes);
+                }
                 ControlSignal::RedrawIn(Duration::ZERO)
             }
             Event::Redraw => {
