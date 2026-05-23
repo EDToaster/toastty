@@ -7,6 +7,7 @@
 use crate::cell::{Cell, Color, Style};
 use crate::cursor::Cursor;
 use crate::grid::Grid;
+use toastty_config::CursorShape;
 use toastty_parser::{Params, Perform};
 
 /// Width of a hard tab. Eight is the canonical default; once we expose
@@ -37,6 +38,16 @@ pub struct Term {
     /// the cursor block repaints correctly under `hjkl`-style navigation.
     /// See [`Term::move_cursor`].
     dirty: Vec<bool>,
+    /// Window title, last set via OSC 0 or OSC 2. Empty when the app has
+    /// not set one (the binary picks a default at startup). Title updates
+    /// do NOT mark any row dirty — the title doesn't live in the grid.
+    title: String,
+    /// Cursor block shape. Set at startup from config; runtime overrides
+    /// arrive via DECSCUSR (`CSI N SP q`).
+    cursor_shape: CursorShape,
+    /// Cursor blink flag. Stored for completeness but not yet rendered —
+    /// the animation tick lands with M9.
+    cursor_blink: bool,
 }
 
 impl Term {
@@ -62,7 +73,43 @@ impl Term {
             // Start with everything dirty so the first render shapes
             // every row.
             dirty: vec![true; rows as usize],
+            title: String::new(),
+            // Defaults match `toastty_config::CursorConfig::defaults`.
+            // Callers can override via `set_cursor_default` at init time;
+            // the PTY can override at runtime via DECSCUSR.
+            cursor_shape: CursorShape::Block,
+            cursor_blink: true,
         }
+    }
+
+    /// Set the default cursor shape and blink flag. Intended for the
+    /// binary to call right after `Term::new` so the runtime cursor
+    /// state matches the user's `[cursor]` config table. Runtime
+    /// overrides (DECSCUSR) still win after this is called.
+    pub fn set_cursor_default(&mut self, shape: CursorShape, blink: bool) {
+        self.cursor_shape = shape;
+        self.cursor_blink = blink;
+    }
+
+    /// Current window title — last value set via OSC 0 / OSC 2. Empty if
+    /// the PTY never set one.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Current cursor block shape. Reflects either the startup default
+    /// or the most recent DECSCUSR override.
+    #[must_use]
+    pub fn cursor_shape(&self) -> CursorShape {
+        self.cursor_shape
+    }
+
+    /// Current cursor blink flag. Stored but not yet rendered — see
+    /// M9 / animation tick.
+    #[must_use]
+    pub fn cursor_blink(&self) -> bool {
+        self.cursor_blink
     }
 
     /// Visible (rows, cols).
@@ -226,6 +273,53 @@ impl Term {
             'm' => self.apply_sgr(params),
             'h' if priv_marker == Some(b'?') => self.apply_decset(params, true),
             'l' if priv_marker == Some(b'?') => self.apply_decset(params, false),
+            // DECSCUSR: `CSI Ps SP q` — runtime cursor shape + blink.
+            // vte exposes the SP intermediate as `intermediates = b" "`.
+            'q' if intermediates == b" " => self.apply_decscusr(first_param(params, 0)),
+            _ => {}
+        }
+    }
+
+    /// Apply DECSCUSR (`CSI Ps SP q`). Mapping per xterm:
+    ///
+    /// | Ps     | Shape     | Blink |
+    /// | ------ | --------- | ----- |
+    /// | 0 / 1  | Block     | yes   |
+    /// | 2      | Block     | no    |
+    /// | 3      | Underline | yes   |
+    /// | 4      | Underline | no    |
+    /// | 5      | Bar       | yes   |
+    /// | 6      | Bar       | no    |
+    ///
+    /// Unknown values are ignored (current xterm behavior). No row is
+    /// marked dirty — the cursor instance is rebuilt every frame
+    /// regardless, and the cell grid isn't touched.
+    fn apply_decscusr(&mut self, ps: u16) {
+        match ps {
+            0 | 1 => {
+                self.cursor_shape = CursorShape::Block;
+                self.cursor_blink = true;
+            }
+            2 => {
+                self.cursor_shape = CursorShape::Block;
+                self.cursor_blink = false;
+            }
+            3 => {
+                self.cursor_shape = CursorShape::Underline;
+                self.cursor_blink = true;
+            }
+            4 => {
+                self.cursor_shape = CursorShape::Underline;
+                self.cursor_blink = false;
+            }
+            5 => {
+                self.cursor_shape = CursorShape::Bar;
+                self.cursor_blink = true;
+            }
+            6 => {
+                self.cursor_shape = CursorShape::Bar;
+                self.cursor_blink = false;
+            }
             _ => {}
         }
     }
@@ -594,7 +688,56 @@ impl Perform for Term {
         self.handle_csi(params, intermediates, action);
     }
 
-    // OSC / DCS / APC / hyperlinks / kitty keyboard / mode 2026 etc. all
+    /// OSC dispatch. Currently handles the title-setting variants:
+    ///
+    /// - `OSC 0 ; <title> ST` — set both icon and window title.
+    /// - `OSC 1 ; <title> ST` — set the icon title only. We have no
+    ///   tray icon, so this is parsed but not acted on. (We could
+    ///   stash it on `self` for future use; for v0.1 we just ignore.)
+    /// - `OSC 2 ; <title> ST` — set the window title only.
+    ///
+    /// The payload bytes are not guaranteed to be UTF-8 by the spec,
+    /// but in practice nearly every emitter is. We lossy-decode so a
+    /// rogue byte can't crash the terminal.
+    ///
+    /// All other OSC codes (4 palette, 8 hyperlinks, 10/11 fg/bg query,
+    /// 52 clipboard, ...) are deferred to later milestones — silently
+    /// ignored here so they don't trip on stale payloads.
+    ///
+    /// Note: title changes do **not** mark any row dirty. The renderer's
+    /// per-frame cursor pass already runs every frame; the title lives
+    /// outside the grid entirely.
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        // OSC must have at least one param: the code.
+        let Some(code_bytes) = params.first() else {
+            return;
+        };
+        // Parse the code as ASCII digits. Non-numeric → unknown OSC.
+        let Ok(code_str) = std::str::from_utf8(code_bytes) else {
+            return;
+        };
+        let Ok(code) = code_str.parse::<u32>() else {
+            return;
+        };
+        match code {
+            // 0 = set icon + window title; 2 = set window title.
+            // 1 is icon-only — we have no tray icon so don't change
+            // anything, but accept the sequence cleanly.
+            0 | 2 => {
+                let payload = params.get(1).copied().unwrap_or(b"");
+                let title = String::from_utf8_lossy(payload).into_owned();
+                self.title = title;
+            }
+            // 1 = icon-title only — accepted but not acted on (we have
+            // no tray icon). Folded into the wildcard arm: same body
+            // either way.
+            _ => {
+                // 1 + unknown OSC: silently ignored. M10 will add 4 / 8 / 52 etc.
+            }
+        }
+    }
+
+    // DCS / APC / hyperlinks / kitty keyboard / mode 2026 etc. all
     // deferred. TODOs live in lib-level docs.
 }
 
@@ -1425,6 +1568,155 @@ mod tests {
         // Cover the 4-arg shortcut.
         let c = super::parse_extended_color_from_slice(&[2, 100, 150, 200]);
         assert_eq!(c, Some(Color::Rgb(100, 150, 200)));
+    }
+
+    // ----- OSC title + DECSCUSR cursor shape (M6) -------------------------
+
+    #[test]
+    fn osc_2_sets_window_title() {
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b]2;hello world\x1b\\");
+        assert_eq!(t.title(), "hello world");
+    }
+
+    #[test]
+    fn osc_0_sets_window_title() {
+        // OSC 0 also covers the window title (and the icon title, which
+        // we don't model).
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b]0;banner\x1b\\");
+        assert_eq!(t.title(), "banner");
+    }
+
+    #[test]
+    fn osc_0_bel_terminated_also_works() {
+        // BEL-terminated OSC is the older variant still in active use by
+        // most shells (bash PROMPT_COMMAND, zsh print -P).
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b]0;via-bel\x07");
+        assert_eq!(t.title(), "via-bel");
+    }
+
+    #[test]
+    fn osc_1_icon_title_does_not_change_window_title() {
+        // OSC 1 is icon-only. We don't have a tray icon, so it must not
+        // overwrite the window title set by OSC 0 or 2.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b]2;window-title\x1b\\");
+        feed(&mut t, b"\x1b]1;icon-title\x1b\\");
+        assert_eq!(t.title(), "window-title");
+    }
+
+    #[test]
+    fn unknown_osc_is_silently_ignored() {
+        // OSC 99999 — not implemented. Must not panic; must not affect title.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b]2;keep-me\x1b\\");
+        feed(&mut t, b"\x1b]99999;noise\x1b\\");
+        assert_eq!(t.title(), "keep-me");
+    }
+
+    #[test]
+    fn osc_without_payload_is_safe() {
+        // `OSC 2 ST` with no semicolon / payload at all — must not panic.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b]2\x1b\\");
+        // Title left empty (or unchanged). Either is acceptable; we
+        // just need to not crash.
+        assert_eq!(t.title(), "");
+    }
+
+    #[test]
+    fn osc_with_non_utf8_title_is_lossy_decoded() {
+        // Title payload with invalid UTF-8: we lossy-decode rather than
+        // dropping the title. Each invalid byte becomes U+FFFD.
+        let mut t = Term::new(1, 4, 0);
+        // 0xff is invalid UTF-8.
+        feed(&mut t, b"\x1b]2;A\xffB\x1b\\");
+        // Don't assert exact content — just that we didn't crash and the
+        // title is non-empty (since the bytes lossy-decode to something).
+        assert!(!t.title().is_empty());
+    }
+
+    #[test]
+    fn osc_does_not_mark_rows_dirty() {
+        // Title-setting must not pollute the dirty bitset — the title
+        // lives outside the grid.
+        let mut t = Term::new(2, 4, 0);
+        t.clear_dirty();
+        feed(&mut t, b"\x1b]2;quiet\x1b\\");
+        for (i, &d) in t.dirty_rows().iter().enumerate() {
+            assert!(!d, "row {i} should not be dirty after OSC title set");
+        }
+    }
+
+    #[test]
+    fn decscusr_default_is_block_blinking() {
+        // Brand-new Term should match CursorConfig::defaults().
+        let t = Term::new(1, 4, 0);
+        assert_eq!(t.cursor_shape(), CursorShape::Block);
+        assert!(t.cursor_blink());
+    }
+
+    #[test]
+    fn decscusr_full_table() {
+        // (Ps, expected_shape, expected_blink)
+        let cases: &[(u16, CursorShape, bool)] = &[
+            (0, CursorShape::Block, true),
+            (1, CursorShape::Block, true),
+            (2, CursorShape::Block, false),
+            (3, CursorShape::Underline, true),
+            (4, CursorShape::Underline, false),
+            (5, CursorShape::Bar, true),
+            (6, CursorShape::Bar, false),
+        ];
+        for &(ps, want_shape, want_blink) in cases {
+            let mut t = Term::new(1, 4, 0);
+            let seq = format!("\x1b[{ps} q");
+            feed(&mut t, seq.as_bytes());
+            assert_eq!(
+                t.cursor_shape(),
+                want_shape,
+                "Ps={ps}: wrong cursor shape",
+            );
+            assert_eq!(t.cursor_blink(), want_blink, "Ps={ps}: wrong blink");
+        }
+    }
+
+    #[test]
+    fn decscusr_unknown_ps_is_ignored() {
+        // Unknown Ps (here 7+) must not panic or change anything. We
+        // verify by setting a known state, sending the bad code, and
+        // checking the state is unchanged.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[5 q"); // Bar, blinking
+        assert_eq!(t.cursor_shape(), CursorShape::Bar);
+        assert!(t.cursor_blink());
+        feed(&mut t, b"\x1b[42 q"); // unknown
+        assert_eq!(t.cursor_shape(), CursorShape::Bar);
+        assert!(t.cursor_blink());
+    }
+
+    #[test]
+    fn decscusr_without_space_intermediate_is_not_handled_here() {
+        // `CSI N q` (no space) is *not* DECSCUSR — it's a different
+        // sequence we don't currently support. Must not change the
+        // cursor shape. (vte routes the space intermediate as
+        // `intermediates = b" "`.)
+        let mut t = Term::new(1, 4, 0);
+        let initial = (t.cursor_shape(), t.cursor_blink());
+        feed(&mut t, b"\x1b[5q"); // no space — different action
+        assert_eq!((t.cursor_shape(), t.cursor_blink()), initial);
+    }
+
+    #[test]
+    fn set_cursor_default_overrides_init_values() {
+        // The binary calls this once during init() to thread the
+        // `[cursor]` config table through to the runtime state.
+        let mut t = Term::new(1, 4, 0);
+        t.set_cursor_default(CursorShape::Underline, false);
+        assert_eq!(t.cursor_shape(), CursorShape::Underline);
+        assert!(!t.cursor_blink());
     }
 
     #[test]

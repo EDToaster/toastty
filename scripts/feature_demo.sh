@@ -157,32 +157,50 @@ printf '%s?1049l' "$csi"           # leave alt
 echo "(back to primary screen — previous output should still be here)"
 
 # ────────────────────────────────────────────────────────────────
-section "11. Known broken (the bugs we know about)"
-note "[BROKEN] 256-color (CSI 38;5;N) — SGR multi-param parsing leak"
+section "11. 256-color + truecolor (M6)"
+note "256-color (CSI 38;5;N)"
 printf '  256-color: '
 for n in 1 9 17 25 196 220 51; do
     printf '%s38;5;%dmcolor-%d%s0m  ' "$csi" "$n" "$n" "$csi"
 done
 echo
 
-note "[BROKEN] truecolor (CSI 38;2;R;G;B) — same bug as above"
+note "truecolor (CSI 38;2;R;G;B)"
 printf '  truecolor: '
 for spec in "255;0;0" "0;255;0" "0;0;255" "200;100;50" "180;32;100"; do
     printf '%s38;2;%smcolor%s0m  ' "$csi" "$spec" "$csi"
 done
 echo
 note "the last one (180;32;100) is the canonical leak case — the 32"
-note "should be interpreted as a B value, not as 'fg green'"
+note "must be the B value, NOT 'fg green'"
 
-note "[NOT SUPPORTED] OSC 0/1/2 window title (M6)"
+# ────────────────────────────────────────────────────────────────
+section "12. Window title (OSC 0/2) — M6"
 printf '%s]0;hello from toastty demo%s' "$esc" "$st"
-note "  ^ if window title changed to 'hello from toastty demo', M6 is done"
+note "  ^ window title should now read 'hello from toastty demo'"
+sleep 1
+printf '%s]2;toastty M6 demo%s' "$esc" "$st"
+note "  ^ now retitled to 'toastty M6 demo' via OSC 2 (window-only)"
+sleep 1
 
-note "[NOT SUPPORTED] DECSCUSR cursor shape (M6)"
-printf '%s5 q' "$csi"    # blinking bar
-note "  cursor should be a blinking bar above; M6 wires it"
-printf '%s0 q' "$csi"    # reset cursor shape
+# ────────────────────────────────────────────────────────────────
+section "13. Cursor shape (DECSCUSR) — M6"
+note "switching cursor through all 6 DECSCUSR shapes (Ps=1..6)"
+note "Ps=1 → block blinking, Ps=2 → block steady"
+note "Ps=3 → underline blinking, Ps=4 → underline steady"
+note "Ps=5 → bar blinking, Ps=6 → bar steady"
+note "blink doesn't animate yet (M9); shape change is visible"
+for ps in 1 2 3 4 5 6; do
+    printf '%s%d q' "$csi" "$ps"
+    printf '   Ps=%d (watch the cursor)\n' "$ps"
+    sleep 0.6
+done
+# Restore default block.
+printf '%s0 q' "$csi"
+note "  cursor restored to default (block blinking, Ps=0)"
 
+# ────────────────────────────────────────────────────────────────
+section "14. Not supported yet"
 note "[NOT SUPPORTED] OSC 8 hyperlinks (M10)"
 printf '%s]8;;https://example.com%sclick me%s]8;;%s\n' "$esc" "$st" "$esc" "$st"
 note "  ^ should be underlined + clickable in M10"

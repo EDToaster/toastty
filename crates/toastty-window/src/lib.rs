@@ -187,6 +187,15 @@ impl ToasttyWindow {
     pub fn request_redraw(&self) {
         self.inner.request_redraw();
     }
+
+    /// Set the window title (OSC 0 / 2 target).
+    ///
+    /// `winit::Window::set_title` is moderately expensive on some
+    /// backends (it round-trips through the compositor). Callers should
+    /// only invoke this when the title actually changed.
+    pub fn set_title(&self, title: &str) {
+        self.inner.set_title(title);
+    }
 }
 
 impl HasWindowHandle for ToasttyWindow {

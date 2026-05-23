@@ -28,3 +28,8 @@ pub use cell::{Cell, Color, Style, StyleFlags};
 pub use cursor::Cursor;
 pub use grid::{Grid, Row};
 pub use term::Term;
+
+/// Re-export so the renderer / window crates can refer to the runtime
+/// cursor shape via `toastty_term` instead of taking a direct dep on
+/// `toastty-config`.
+pub use toastty_config::CursorShape;
