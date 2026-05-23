@@ -57,6 +57,31 @@ fn build_term_instances_into(
     });
 }
 
+/// Append partial-redraw instances for `term` into `out` using the
+/// per-cell damage signal. Backed by
+/// [`crate::text::instance::build_dirty_instances_into`].
+fn build_term_dirty_instances_into(
+    out: &mut Vec<CellInstance>,
+    term: &Term,
+    cell_size: (f32, f32),
+    theme: &Theme,
+    cursor_visible: bool,
+    row_glyphs: &[Option<LineGlyphs>],
+) {
+    crate::text::instance::build_dirty_instances_into(
+        out,
+        term,
+        term.damage(),
+        cell_size,
+        theme,
+        cursor_visible,
+        |row, col, ch, _style| {
+            let lg = row_glyphs.get(row as usize)?.as_ref()?;
+            lg.by_column.get(&(col, ch)).copied()
+        },
+    );
+}
+
 /// Bundled fallback font: `FiraMono Medium` (OFL).
 ///
 /// Even when the host has system monospace fonts, embedding one makes
@@ -520,13 +545,32 @@ impl Renderer {
         let theme = self.theme;
         // Build instances using the cached row glyphs. Reuse the
         // scratch vec across frames. We have to temporarily extract
-        // the scratch out of TextState because `build_term_instances_into`
-        // needs to read `text.line_cache` immutably while writing to the
-        // scratch; can't hold two borrows of TextState at once.
+        // the scratch out of TextState because the builders need to
+        // read `text.line_cache` immutably while writing to the scratch;
+        // can't hold two borrows of TextState at once.
+        let damage_all = term.damage().all;
+        let cursor_visible = true; // wired to blink state in M9.9
         let text = self.text.as_mut().expect("text init");
         let mut instances = std::mem::take(&mut text.instances_scratch);
         let t_bi = if trace { Some(std::time::Instant::now()) } else { None };
-        build_term_instances_into(&mut instances, term, cell_size, &theme, &text.line_cache);
+        // Pick the builder: full build when the framebuffer is being
+        // cleared (LoadOp::Clear); partial build under LoadOp::Load
+        // so we only emit instances for cells that actually changed.
+        if self.needs_full_clear || damage_all {
+            build_term_instances_into(&mut instances, term, cell_size, &theme, &text.line_cache);
+            if !cursor_visible {
+                instances.pop();
+            }
+        } else {
+            build_term_dirty_instances_into(
+                &mut instances,
+                term,
+                cell_size,
+                &theme,
+                cursor_visible,
+                &text.line_cache,
+            );
+        }
         if let Some(t) = t_bi {
             let ms = t.elapsed().as_secs_f64() * 1000.0;
             tracing::info!(target: "render_trace", "build_instances n={} took={ms:.3}ms", instances.len());
