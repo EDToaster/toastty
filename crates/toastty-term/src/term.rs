@@ -1136,22 +1136,48 @@ impl Perform for Term {
 
     fn execute(&mut self, byte: u8) {
         match byte {
-            b'\r' => self.cursor.col = 0,
+            b'\r' => {
+                // CR moves the cursor in-place to column 0. Mark old
+                // and new cells so the cursor block at the old column
+                // gets overpainted and the new one shows up.
+                let row = self.cursor.row;
+                let max_col = self.cols.saturating_sub(1);
+                let old_col = self.cursor.col.min(max_col);
+                self.cursor.col = 0;
+                self.mark_cell(row, old_col);
+                self.mark_cell(row, 0);
+            }
             b'\n' | 0x0B | 0x0C => self.linefeed(),
             0x08 => {
                 // BS: move cursor left one, no wrap. Snap off the
                 // continuation half of a wide cluster so two BSes
                 // in a row don't strand the cursor inside a CJK
                 // ideograph.
+                //
+                // Mark the old and new cells so the cursor block at
+                // the old column gets overpainted and the new one
+                // shows up under partial redraw (latent damage gap
+                // fix in M9.4).
                 if self.cursor.col > 0 {
+                    let row = self.cursor.row;
+                    let max_col = self.cols.saturating_sub(1);
+                    let old_col = self.cursor.col.min(max_col);
                     self.cursor.col -= 1;
                     self.cursor.col = self.snap_back_off_continuation(self.cursor.col);
+                    self.mark_cell(row, old_col);
+                    self.mark_cell(row, self.cursor.col);
                 }
             }
             b'\t' => {
                 // HT: advance to next multiple of TAB_WIDTH, clamped.
+                // Same damage-gap fix as BS.
+                let row = self.cursor.row;
+                let max_col = self.cols.saturating_sub(1);
+                let old_col = self.cursor.col.min(max_col);
                 let next = (self.cursor.col / TAB_WIDTH + 1) * TAB_WIDTH;
-                self.cursor.col = next.min(self.cols.saturating_sub(1));
+                self.cursor.col = next.min(max_col);
+                self.mark_cell(row, old_col);
+                self.mark_cell(row, self.cursor.col);
             }
             // BEL and everything else are no-ops for M3.
             _ => {}
@@ -2745,6 +2771,39 @@ mod tests {
         assert!(!t.damage().is_empty());
         t.clear_damage();
         assert!(t.damage().is_empty());
+    }
+
+    #[test]
+    fn damage_bs_marks_old_and_new_cell() {
+        let mut t = Term::new(2, 8, 0);
+        feed(&mut t, b"abc"); // cursor at (0, 3)
+        t.clear_damage();
+        feed(&mut t, b"\x08"); // BS — cursor moves to (0, 2)
+        assert_eq!(t.cursor().col, 2);
+        // Old col (3) and new col (2) must be dirty.
+        assert!(damage_has_cell(&t, 0, 3), "old cursor col 3 dirty");
+        assert!(damage_has_cell(&t, 0, 2), "new cursor col 2 dirty");
+    }
+
+    #[test]
+    fn damage_ht_marks_old_and_new_cell() {
+        let mut t = Term::new(2, 32, 0);
+        // Cursor at col 0, HT → col 8.
+        t.clear_damage();
+        feed(&mut t, b"\t");
+        assert_eq!(t.cursor().col, 8);
+        assert!(damage_has_cell(&t, 0, 0), "old col 0 dirty");
+        assert!(damage_has_cell(&t, 0, 8), "new col 8 dirty");
+    }
+
+    #[test]
+    fn damage_wide_cluster_marks_continuation_cell() {
+        let mut t = Term::new(2, 8, 0);
+        t.clear_damage();
+        feed(&mut t, "你".as_bytes()); // wide cluster at col 0
+        // Both the primary (0) and continuation (1) cells are marked.
+        assert!(damage_has_cell(&t, 0, 0), "primary cell dirty");
+        assert!(damage_has_cell(&t, 0, 1), "continuation cell dirty");
     }
 
     #[test]
