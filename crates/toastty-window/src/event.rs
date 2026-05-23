@@ -121,6 +121,7 @@ pub enum Event {
         button: MouseButton,
         state: KeyState,
         position: (f64, f64),
+        modifiers: Modifiers,
     },
     /// Scroll wheel / trackpad scroll. Values are in pixels for
     /// `PixelDelta`-style input and in "lines" for notched wheels.

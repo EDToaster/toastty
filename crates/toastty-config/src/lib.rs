@@ -26,6 +26,7 @@ mod cursor;
 mod error;
 mod font;
 mod scrollback;
+mod security;
 mod shell;
 mod theme;
 mod xdg;
@@ -37,6 +38,7 @@ pub use cursor::{CursorConfig, CursorShape};
 pub use error::ConfigError;
 pub use font::FontConfig;
 pub use scrollback::ScrollbackConfig;
+pub use security::SecurityConfig;
 pub use shell::ShellConfig;
 pub use theme::ThemeConfig;
 
@@ -55,6 +57,7 @@ pub struct Config {
     pub cursor: CursorConfig,
     pub shell: ShellConfig,
     pub scrollback: ScrollbackConfig,
+    pub security: SecurityConfig,
 }
 
 impl Default for Config {
@@ -76,6 +79,7 @@ impl Config {
             cursor: CursorConfig::defaults(),
             shell: ShellConfig::defaults(),
             scrollback: ScrollbackConfig::defaults(),
+            security: SecurityConfig::defaults(),
         }
     }
 

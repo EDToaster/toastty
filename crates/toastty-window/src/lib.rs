@@ -368,11 +368,14 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<'_, A> {
                 self.dispatch(translated, event_loop);
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                let leds = led::read_led_state();
+                let modifiers = translate_modifiers_with_leds(self.modifiers, leds);
                 self.dispatch(
                     Event::Mouse {
                         button: translate_mouse_button(button),
                         state: translate_state(state),
                         position: self.mouse_pos,
+                        modifiers,
                     },
                     event_loop,
                 );

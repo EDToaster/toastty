@@ -22,7 +22,7 @@ use toastty_protocols::resize_inband::encode_resize_report;
 use toastty_protocols::synchronized::{BSU_TIMEOUT, should_force_flush};
 use toastty_pty::{Pty, PtySpec, WinSize};
 use toastty_render::{RenderOutcome, Renderer};
-use toastty_term::Term;
+use toastty_term::{ClipboardRequest, SecurityFlags, Term};
 use toastty_window::{
     App, ControlSignal, Event, KeyState, LogicalKey, Modifiers, MouseButton, ToasttyWindow,
     WindowHandle, WindowOptions, run,
@@ -139,6 +139,12 @@ impl Toastty {
         // Thread the `[cursor]` config table through to the runtime —
         // DECSCUSR can still override at runtime per app.
         term.set_cursor_default(config.cursor.shape, config.cursor.blink);
+        // Thread the `[security]` flags through so OSC 52 dispatch can
+        // gate before queueing a clipboard request.
+        term.set_security(SecurityFlags {
+            osc_52_read: config.security.osc_52_read,
+            osc_52_write: config.security.osc_52_write,
+        });
         Self {
             config,
             window: None,
@@ -221,6 +227,53 @@ impl Toastty {
         }
     }
 
+    /// Service one OSC 52 clipboard request.
+    ///
+    /// `arboard` is synchronous; on Wayland in particular the read
+    /// path can briefly stall while the data device negotiates. We
+    /// accept that — clipboard requests are user-initiated by the app
+    /// they're rare enough that a millisecond-scale stall on the
+    /// render thread is invisible. (TODO if real workloads disagree:
+    /// move clipboard I/O onto a dedicated worker thread.)
+    fn service_clipboard_request(&mut self, req: &ClipboardRequest) {
+        if self.clipboard.is_none() {
+            match arboard::Clipboard::new() {
+                Ok(c) => self.clipboard = Some(c),
+                Err(e) => {
+                    warn!("clipboard init failed: {e}");
+                    return;
+                }
+            }
+        }
+        let Some(clipboard) = self.clipboard.as_mut() else {
+            return;
+        };
+        match req {
+            ClipboardRequest::Set { data } => {
+                // OSC 52 set must be UTF-8 text to round-trip through
+                // arboard's typed API; lossy-decode if the app sent
+                // garbage bytes.
+                let text = String::from_utf8_lossy(data);
+                if let Err(e) = clipboard.set_text(text.into_owned()) {
+                    warn!("clipboard write failed: {e}");
+                }
+            }
+            ClipboardRequest::Query { selection } => {
+                let bytes = match clipboard.get_text() {
+                    Ok(s) => s.into_bytes(),
+                    Err(e) => {
+                        debug!("clipboard read failed: {e}");
+                        return;
+                    }
+                };
+                let sel =
+                    toastty_protocols::clipboard::SelectionChars(selection.clone());
+                let reply = toastty_protocols::clipboard::encode_reply(&sel, &bytes);
+                self.term.push_pty_reply(&reply);
+            }
+        }
+    }
+
     fn current_cell(&self) -> (u16, u16) {
         let cell_size = self
             .renderer
@@ -270,6 +323,24 @@ impl Toastty {
         // decoration. `sync_title` is a no-op when the title is
         // unchanged, so calling on every batch is cheap.
         self.sync_title();
+
+        // Service any OSC 52 clipboard requests. We have to do this
+        // BEFORE draining `pty_replies` because the read path
+        // (`ClipboardRequest::Query`) populates `pty_replies` with the
+        // encoded reply via `push_pty_reply`.
+        let requests = self.term.drain_clipboard_requests();
+        for req in requests {
+            self.service_clipboard_request(&req);
+        }
+
+        // Drain any OSC replies the parsed batch wants written back to
+        // the PTY (OSC 4 palette query, OSC 52 clipboard read). The
+        // queue is unconditional — handlers that need no reply just
+        // don't enqueue. See `Term::drain_pty_replies`.
+        let replies = self.term.drain_pty_replies();
+        if !replies.is_empty() {
+            self.write_pty(&replies);
+        }
 
         // BSU watchdog: if a BSU is currently in flight and its timer
         // has already elapsed, force-flush so the next frame issues a
@@ -344,6 +415,10 @@ impl Toastty {
             .args(args)
             .with_current_env()
             .env("TERM", "xterm-256color")
+            // M10 shell integration: snippets under
+            // `share/shell-integration/` gate on this var so they only
+            // activate inside a toastty session.
+            .env("TOASTTY", "1")
             .size(WinSize {
                 rows,
                 cols,
@@ -422,6 +497,7 @@ impl Toastty {
         button: MouseButton,
         state: KeyState,
         position: (f64, f64),
+        modifiers: Modifiers,
     ) -> ControlSignal {
         self.mouse_pos = position;
         match state {
@@ -432,15 +508,42 @@ impl Toastty {
                 }
             }
         }
+        // OSC 8 click-to-open: Cmd-Left on macOS / Ctrl-Left elsewhere
+        // on press only. Consume the event so the mouse encoder doesn't
+        // also forward it to the foreground app.
+        if state == KeyState::Pressed && is_open_link_binding(button, modifiers) {
+            if let Some(url) = self.hyperlink_under_cursor(position)
+                && let Err(e) = webbrowser::open(&url)
+            {
+                warn!("open URL failed: {e}");
+            }
+            return ControlSignal::Continue;
+        }
         let kind = classify_button_event(button, state);
         let mode = self.term.mouse_mode();
         if protocol_wants_event(mode, &kind) {
             let cell = self.current_cell();
-            if let Some(bytes) = encode_mouse(kind, cell, Modifiers::empty(), mode) {
+            if let Some(bytes) = encode_mouse(kind, cell, modifiers, mode) {
                 self.write_pty(&bytes);
             }
         }
         ControlSignal::Continue
+    }
+
+    /// Look up the OSC 8 hyperlink URL at pixel `(x, y)`, if any.
+    fn hyperlink_under_cursor(&self, position: (f64, f64)) -> Option<String> {
+        let cell_size = self.renderer.as_ref()?.cell_size();
+        let (rows, cols) = self.term.size();
+        // `pixel_to_cell` returns 1-based (col, row). Convert to
+        // 0-based with a saturating sub so column 1 / row 1 map to
+        // (0, 0) instead of underflowing.
+        let (col_1based, row_1based) = pixel_to_cell(position, cell_size, (rows, cols));
+        let col = col_1based.checked_sub(1)?;
+        let row = row_1based.checked_sub(1)?;
+        let row_ref = self.term.row(row);
+        let cell = row_ref.cells.get(col as usize)?;
+        let id = cell.hyperlink_id?;
+        self.term.hyperlink_url(id).map(str::to_string)
     }
 
     fn handle_scroll(&mut self, delta_x: f64, delta_y: f64) -> ControlSignal {
@@ -574,7 +677,8 @@ impl App for Toastty {
                 button,
                 state,
                 position,
-            } => self.handle_mouse(button, state, position),
+                modifiers,
+            } => self.handle_mouse(button, state, position, modifiers),
             Event::Scroll { delta_x, delta_y } => self.handle_scroll(delta_x, delta_y),
             Event::PtyBytes(bytes) => {
                 let fresh_bsu = self.handle_pty_bytes(&bytes);
@@ -607,6 +711,26 @@ impl App for Toastty {
             // Unhandled variants (e.g. Event::User, synthetic wakeups).
             Event::User => ControlSignal::Continue,
         }
+    }
+}
+
+/// True when `(button, modifiers)` is the "open hyperlink under cursor"
+/// binding. On macOS it's `Cmd-Left`; on every other platform it's
+/// `Ctrl-Left` (matching iTerm2 / Alacritty conventions).
+fn is_open_link_binding(button: MouseButton, modifiers: Modifiers) -> bool {
+    if button != MouseButton::Left {
+        return false;
+    }
+    // M10-followup I2: require EXACT modifier set. `contains(SUPER)` was
+    // true for `Cmd+Shift+Left`, `Cmd+Alt+Left`, etc., so hyperlink open
+    // hijacked any combo that happened to include the platform's
+    // primary modifier. Tighten to equality so only the bare combo
+    // qualifies; users keep `Cmd+Shift+Left` / `Ctrl+Alt+Left` free for
+    // selection-extend, window manager shortcuts, etc.
+    if cfg!(target_os = "macos") {
+        modifiers == Modifiers::SUPER
+    } else {
+        modifiers == Modifiers::CONTROL
     }
 }
 
@@ -679,6 +803,92 @@ mod tests {
         assert!(!is_paste_binding(
             &LogicalKey::Named(toastty_window::NamedKey::Enter),
             Modifiers::SUPER
+        ));
+    }
+
+    // ----- is_open_link_binding truth table (M10.5) -----------------------
+
+    #[test]
+    fn left_click_without_modifier_is_not_open_link() {
+        assert!(!is_open_link_binding(MouseButton::Left, Modifiers::empty()));
+    }
+
+    #[test]
+    fn right_click_is_never_open_link() {
+        assert!(!is_open_link_binding(MouseButton::Right, Modifiers::SUPER));
+        assert!(!is_open_link_binding(
+            MouseButton::Right,
+            Modifiers::CONTROL
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cmd_left_is_open_link_on_macos() {
+        assert!(is_open_link_binding(MouseButton::Left, Modifiers::SUPER));
+        // Ctrl-Left is NOT open-link on macOS.
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::CONTROL
+        ));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn ctrl_left_is_open_link_on_non_macos() {
+        assert!(is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::CONTROL
+        ));
+        assert!(!is_open_link_binding(MouseButton::Left, Modifiers::SUPER));
+    }
+
+    /// M10-followup I2: the exact-match guard must reject combos that
+    /// happen to include the platform's primary modifier. Before the
+    /// fix, `Cmd+Shift+Left` (selection-extend on macOS), `Cmd+Alt+Left`
+    /// (word-jump), and so on, were all hijacked into hyperlink-open
+    /// because `contains(SUPER)` is true for any superset.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cmd_with_extra_modifiers_is_not_open_link_on_macos() {
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::SUPER | Modifiers::SHIFT
+        ));
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::SUPER | Modifiers::ALT
+        ));
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::SUPER | Modifiers::CONTROL
+        ));
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::SUPER | Modifiers::SHIFT | Modifiers::ALT
+        ));
+    }
+
+    /// M10-followup I2: same as above, but for the non-macOS path —
+    /// `Ctrl+Alt+Left`, `Ctrl+Shift+Left`, etc., must all reject.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn ctrl_with_extra_modifiers_is_not_open_link_on_non_macos() {
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::CONTROL | Modifiers::SHIFT
+        ));
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::CONTROL | Modifiers::ALT
+        ));
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::CONTROL | Modifiers::SUPER
+        ));
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::CONTROL | Modifiers::SHIFT | Modifiers::ALT
         ));
     }
 }

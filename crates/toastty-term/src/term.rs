@@ -106,7 +106,14 @@ pub const KITTY_FLAG_REPORT_ALL_AS_ESC: u8 = 0b0_1000;
 pub const KITTY_FLAG_REPORT_TEXT: u8 = 0b1_0000;
 
 /// Top-level terminal state object.
+///
+/// `clippy::struct_excessive_bools` is suppressed: the boolean fields
+/// here track orthogonal DECSET modes (bracketed paste / focus report /
+/// grapheme cluster / inband resize / OSC 52 read+write security) plus
+/// the cursor-blink + alt-screen flags. Each is independent state, not
+/// a 7-bit state machine.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Term {
     primary: Grid,
     alt: Grid,
@@ -158,7 +165,103 @@ pub struct Term {
     grapheme_cluster_mode: bool,
     /// DECSET 2048 — in-band resize notifications opt-in.
     inband_resize_mode: bool,
+    /// Last cwd advertised via `OSC 7 ; file://<host>/<path> ST`. Empty
+    /// when the shell hasn't sent one yet. Not validated against the
+    /// host — we accept whatever the shell told us.
+    cwd: String,
+    /// Semantic prompt markers (OSC 133). FIFO bounded at 4096 — old
+    /// marks rotate out when the cap is hit so the buffer can't bloat
+    /// on a long-running session.
+    prompt_marks: std::collections::VecDeque<PromptMark>,
+    /// FIFO of bytes that need to be written back to the PTY after the
+    /// current `parser.advance` call completes. Populated by OSC handlers
+    /// that need to reply to a query (OSC 4 query, OSC 52 read). Drained
+    /// by the binary via [`Term::drain_pty_replies`].
+    ///
+    /// Keeping replies in a queue (rather than synchronously writing to
+    /// the PTY from inside a `Perform` callback) lets the parsing layer
+    /// stay free of I/O concerns and keeps `Term` reentrancy-safe.
+    pty_replies: Vec<u8>,
+    /// OSC 4 palette overrides. `None` at an index means "fall through to
+    /// the renderer's built-in xterm 256-color table"; `Some([r, g, b])`
+    /// is the app-supplied sRGB triple. Boxed because a flat
+    /// `[Option<[u8; 3]>; 256]` is 1 KB; keeping it on the heap avoids
+    /// inflating `Term` itself.
+    palette_overrides: Box<[Option<[u8; 3]>; 256]>,
+    /// Bump-counter incremented every time an OSC 4 set lands. The
+    /// renderer keeps a cached linear-light palette and compares
+    /// revisions to decide when to rebuild.
+    palette_revision: u32,
+    /// Intern table for OSC 8 hyperlink URLs. The cell stores a
+    /// `NonZeroU16` index into this `Vec`; closing the hyperlink
+    /// (`OSC 8 ; ; ST`) clears `current_hyperlink` without touching
+    /// previously-stamped cells. Bounded at 65535 distinct URLs per
+    /// session — well above anything reasonable.
+    hyperlinks: Vec<String>,
+    /// Currently active hyperlink id stamped onto every cell written by
+    /// [`Term::print_char`] until the next `OSC 8 ; ; ST` (closer) or
+    /// a new `OSC 8 ; ... ; url` (which switches to a fresh id).
+    current_hyperlink: Option<crate::cell::HyperlinkId>,
+    /// FIFO of OSC 52 clipboard requests waiting on the binary to
+    /// service through `arboard`. Drained by [`Term::drain_clipboard_requests`].
+    clipboard_requests: Vec<ClipboardRequest>,
+    /// Security gates from the user's `[security]` config.
+    security: SecurityFlags,
 }
+
+/// One pending OSC 52 clipboard operation, queued by [`Term`] and
+/// serviced by the binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardRequest {
+    /// Replace the system clipboard with `data`.
+    Set { data: Vec<u8> },
+    /// Read the system clipboard and reply via
+    /// [`Term::push_pty_reply`] with a `selection`-tagged OSC 52
+    /// response.
+    Query { selection: Vec<u8> },
+}
+
+/// Security flags mirrored on `Term` from
+/// [`toastty_config::SecurityConfig`]. Kept separate from the config
+/// struct so the term crate doesn't depend on config wire types.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SecurityFlags {
+    /// Allow OSC 52 clipboard reads. Off by default.
+    pub osc_52_read: bool,
+    /// Allow OSC 52 clipboard writes. Off by default.
+    pub osc_52_write: bool,
+}
+
+/// One semantic prompt marker recorded from OSC 133.
+///
+/// `(row, kind)` lets a future command-navigation feature jump between
+/// prompt-start / command-start / command-finished markers without
+/// re-scanning the grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptMark {
+    /// Visible row the marker was recorded on. Note that scrollback can
+    /// push the underlying row off the top of the visible viewport; we
+    /// don't currently rebase the row index in that case.
+    pub row: u16,
+    /// What kind of marker this is.
+    pub kind: PromptMarkKind,
+}
+
+/// Kind of a [`PromptMark`] recorded from OSC 133.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptMarkKind {
+    /// `OSC 133 ; A` — start of prompt.
+    PromptStart,
+    /// `OSC 133 ; B` — end of prompt / start of user input.
+    PromptEnd,
+    /// `OSC 133 ; C` — start of command output (after Enter).
+    CommandStart,
+    /// `OSC 133 ; D ; [exit_code]` — command finished.
+    CommandFinished(Option<i32>),
+}
+
+/// Cap on the number of OSC-133 prompt marks we retain.
+const PROMPT_MARK_CAP: usize = 4096;
 
 impl Term {
     /// Construct a fresh terminal `rows` rows by `cols` cols, with
@@ -196,7 +299,141 @@ impl Term {
             sync_output: SyncOutput::default(),
             grapheme_cluster_mode: false,
             inband_resize_mode: false,
+            cwd: String::new(),
+            prompt_marks: std::collections::VecDeque::new(),
+            pty_replies: Vec::new(),
+            palette_overrides: Box::new([None; 256]),
+            palette_revision: 0,
+            hyperlinks: Vec::new(),
+            current_hyperlink: None,
+            clipboard_requests: Vec::new(),
+            security: SecurityFlags::default(),
         }
+    }
+
+    /// Set the security flags. Called by the binary right after
+    /// `Term::new` to thread the user's `[security]` config through.
+    pub fn set_security(&mut self, flags: SecurityFlags) {
+        self.security = flags;
+    }
+
+    /// Current security flags (read-only).
+    #[must_use]
+    pub fn security(&self) -> SecurityFlags {
+        self.security
+    }
+
+    /// Drain queued OSC 52 clipboard requests. Called by the binary
+    /// after every `parser.advance` and serviced via `arboard`.
+    pub fn drain_clipboard_requests(&mut self) -> Vec<ClipboardRequest> {
+        std::mem::take(&mut self.clipboard_requests)
+    }
+
+    /// Drain bytes queued for the PTY back-channel and return them. The
+    /// binary calls this after every `parser.advance` and writes the
+    /// returned bytes to the PTY master. Returns an empty `Vec` when
+    /// nothing was queued.
+    pub fn drain_pty_replies(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pty_replies)
+    }
+
+    /// Append `bytes` to the PTY back-channel. Public so cooperating
+    /// layers (the binary's OSC 52 clipboard read path) can queue
+    /// asynchronously-produced replies through the same drain.
+    pub fn push_pty_reply(&mut self, bytes: &[u8]) {
+        self.pty_replies.extend_from_slice(bytes);
+    }
+
+    /// Read the override for palette index `idx`. Returns `None` if no
+    /// override is active for that slot (the renderer should fall back
+    /// to its built-in 256-color table).
+    #[must_use]
+    pub fn palette_override(&self, idx: u8) -> Option<[u8; 3]> {
+        self.palette_overrides[idx as usize]
+    }
+
+    /// Monotonic revision counter. Bumps on every successful OSC 4 set.
+    /// The renderer reads this once per frame and rebuilds its cached
+    /// linear-light extended palette on change.
+    #[must_use]
+    pub fn palette_revision(&self) -> u32 {
+        self.palette_revision
+    }
+
+    /// Set palette override for `idx` and bump the revision. Marks every
+    /// row dirty so the new color shows immediately under partial
+    /// redraw (since the resolved color of any existing cell drawn at
+    /// `idx` has changed out from under it).
+    fn set_palette_override(&mut self, idx: u8, rgb: [u8; 3]) {
+        self.palette_overrides[idx as usize] = Some(rgb);
+        self.palette_revision = self.palette_revision.wrapping_add(1);
+        self.mark_all_dirty();
+    }
+
+    /// Resolve a hyperlink id (as stamped on a [`Cell`]) back to its URL.
+    /// Returns `None` if the id is out of range — defensive against
+    /// future bugs since ids are minted by [`Term::intern_hyperlink`]
+    /// and stored as `NonZeroU16`.
+    #[must_use]
+    pub fn hyperlink_url(&self, id: crate::cell::HyperlinkId) -> Option<&str> {
+        // Ids are 1-based: `NonZeroU16::new(1)` indexes `hyperlinks[0]`.
+        let idx = id.get() as usize - 1;
+        self.hyperlinks.get(idx).map(String::as_str)
+    }
+
+    /// Intern `url` into the hyperlink table and return its id. Dedups
+    /// against existing entries so the same URL across many cells
+    /// shares one id. Returns `None` if the table is full (65535
+    /// distinct URLs in one session — practically unreachable).
+    fn intern_hyperlink(&mut self, url: &str) -> Option<crate::cell::HyperlinkId> {
+        if let Some(pos) = self.hyperlinks.iter().position(|u| u == url) {
+            // Convert position (0-based) to 1-based NonZero id.
+            return crate::cell::HyperlinkId::new((pos + 1) as u16);
+        }
+        // Cap at u16::MAX - 1 (since ids start at 1).
+        if self.hyperlinks.len() >= (u16::MAX as usize) {
+            return None;
+        }
+        self.hyperlinks.push(url.to_string());
+        let id = u16::try_from(self.hyperlinks.len()).ok()?;
+        crate::cell::HyperlinkId::new(id)
+    }
+
+    /// Most recent cwd advertised via OSC 7. Empty when the shell hasn't
+    /// emitted one yet.
+    #[must_use]
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
+    /// Read-only view of the OSC 133 prompt marks recorded so far, in
+    /// emission order. Capped at 4096 entries; oldest entries roll off
+    /// the front when the cap is hit.
+    ///
+    /// Returns a contiguous slice. The backing store is a `VecDeque`
+    /// for O(1) FIFO eviction (M10-followup I3), so this method calls
+    /// `make_contiguous` to expose the entries as a slice. The mutation
+    /// happens against `&mut self` internally; the public signature
+    /// stays `&self`-returning-`&[…]` so callers continue to index /
+    /// slice without API churn.
+    #[must_use]
+    pub fn prompt_marks(&mut self) -> &[PromptMark] {
+        self.prompt_marks.make_contiguous()
+    }
+
+    /// Append a prompt mark at the current cursor row, evicting the
+    /// oldest entry when the cap is hit.
+    ///
+    /// Uses `VecDeque::pop_front` so eviction is O(1) instead of the
+    /// O(n) `Vec::remove(0)` shift (M10-followup I3): a hot loop of
+    /// rapid prompts no longer pays an N²/2 cost once the cap is
+    /// reached.
+    fn push_prompt_mark(&mut self, kind: PromptMarkKind) {
+        let row = self.cursor.row;
+        if self.prompt_marks.len() >= PROMPT_MARK_CAP {
+            self.prompt_marks.pop_front();
+        }
+        self.prompt_marks.push_back(PromptMark { row, kind });
     }
 
     /// True when DECSET 2004 (bracketed paste) is active.
@@ -635,6 +872,7 @@ impl Term {
             ch: c,
             style: self.cursor.style,
             is_continuation: false,
+            hyperlink_id: self.current_hyperlink,
         };
         let col = self.cursor.col;
         let row = self.cursor.row;
@@ -646,6 +884,7 @@ impl Term {
                 ch: '\0',
                 style: self.cursor.style,
                 is_continuation: true,
+                hyperlink_id: self.current_hyperlink,
             };
             self.active_grid_mut()
                 .row_mut(row)
@@ -1242,6 +1481,7 @@ impl Perform for Term {
     /// Note: title changes do **not** mark any row dirty. The renderer's
     /// per-frame cursor pass already runs every frame; the title lives
     /// outside the grid entirely.
+    #[allow(clippy::too_many_lines)] // each OSC arm is small but the table is wide.
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         // OSC must have at least one param: the code.
         let Some(code_bytes) = params.first() else {
@@ -1263,11 +1503,151 @@ impl Perform for Term {
                 let title = String::from_utf8_lossy(payload).into_owned();
                 self.title = title;
             }
+            // OSC 4 — extended palette query / set.
+            //
+            // Payload is a sequence of `(idx, spec)` pairs. vte splits
+            // on `;`, so `OSC 4 ; 1 ; rgb:ab/cd/ef ; 2 ; ?` arrives as
+            // `params = [b"4", b"1", b"rgb:ab/cd/ef", b"2", b"?"]`. Walk
+            // pairs in steps of two starting at index 1.
+            4 => {
+                let rest = &params[1..];
+                let mut i = 0;
+                while i + 1 < rest.len() {
+                    if let Some(op) =
+                        toastty_protocols::palette::parse_pair(rest[i], rest[i + 1])
+                    {
+                        match op {
+                            toastty_protocols::palette::Osc4Op::Query { idx } => {
+                                let rgb = self.palette_override(idx).unwrap_or_else(|| {
+                                    toastty_protocols::palette::default_xterm_256(idx)
+                                });
+                                let reply =
+                                    toastty_protocols::palette::encode_query_reply(idx, rgb);
+                                self.pty_replies.extend_from_slice(&reply);
+                            }
+                            toastty_protocols::palette::Osc4Op::Set { idx, rgb } => {
+                                self.set_palette_override(idx, rgb);
+                            }
+                        }
+                    }
+                    i += 2;
+                }
+            }
+            // OSC 52 — clipboard. Gated by `security.osc_52_read /
+            // osc_52_write`. Both gates default to off (silently drop)
+            // so a casual escape sequence in a less(1) output can't
+            // hijack the clipboard.
+            //
+            // vte splits the payload on `;`, so an emitted
+            // `OSC 52 ; c ; aGVsbG8=` arrives as
+            // `params = [b"52", b"c", b"aGVsbG8="]`. Rejoin past the
+            // leading code.
+            52 => {
+                let mut joined = Vec::new();
+                for (i, p) in params.iter().enumerate().skip(1) {
+                    if i > 1 {
+                        joined.push(b';');
+                    }
+                    joined.extend_from_slice(p);
+                }
+                if let Some(op) = toastty_protocols::clipboard::parse(&joined) {
+                    match op {
+                        toastty_protocols::clipboard::Osc52Op::Set { payload, .. } => {
+                            if self.security.osc_52_write {
+                                self.clipboard_requests
+                                    .push(ClipboardRequest::Set { data: payload });
+                            }
+                        }
+                        toastty_protocols::clipboard::Osc52Op::Query { selection } => {
+                            if self.security.osc_52_read {
+                                self.clipboard_requests
+                                    .push(ClipboardRequest::Query { selection: selection.0 });
+                            }
+                        }
+                    }
+                }
+            }
+            // OSC 8 — hyperlinks.
+            //
+            // Payload format past `8;` is `<params>;<url>`. vte splits
+            // on `;`, so an emitted `OSC 8 ; id=foo ; https://x` arrives
+            // as `params = [b"8", b"id=foo", b"https://x"]`. Rejoin past
+            // the leading code so the parser sees one byte string.
+            //
+            // `OSC 8 ; ; ST` (empty URL) closes the active hyperlink —
+            // future printed cells are stamped with `None`.
+            8 => {
+                let mut joined = Vec::new();
+                for (i, p) in params.iter().enumerate().skip(1) {
+                    if i > 1 {
+                        joined.push(b';');
+                    }
+                    joined.extend_from_slice(p);
+                }
+                if let Some(parsed) = toastty_protocols::hyperlink::parse(&joined) {
+                    if parsed.url.is_empty() {
+                        self.current_hyperlink = None;
+                    } else {
+                        self.current_hyperlink = self.intern_hyperlink(parsed.url);
+                    }
+                }
+            }
+            // OSC 7 — current working directory (`file://<host>/<path>`).
+            //
+            // The URL itself shouldn't contain semicolons, but `;` is a
+            // valid byte inside a percent-decoded path (RFC 3986 reserves
+            // it). vte will have split on it already, so rejoin params
+            // past the code so we don't drop trailing segments.
+            7 => {
+                let mut joined = Vec::new();
+                for (i, p) in params.iter().enumerate().skip(1) {
+                    if i > 1 {
+                        joined.push(b';');
+                    }
+                    joined.extend_from_slice(p);
+                }
+                if let Some(path) = toastty_protocols::osc_cwd::parse_file_url(&joined) {
+                    self.cwd = path;
+                }
+            }
+            // OSC 133 — semantic prompt markers (Final Term protocol).
+            //
+            // vte splits the OSC params on `;`, so an emitted
+            // `OSC 133 ; D ; 0` arrives as
+            // `params = [b"133", b"D", b"0"]`. We rejoin everything past
+            // the leading code byte before handing off to the parser.
+            133 => {
+                let mut joined = Vec::new();
+                for (i, p) in params.iter().enumerate().skip(1) {
+                    if i > 1 {
+                        joined.push(b';');
+                    }
+                    joined.extend_from_slice(p);
+                }
+                if let Some(kind) = toastty_protocols::semantic_prompt::parse(&joined) {
+                    let mapped = match kind {
+                        toastty_protocols::semantic_prompt::PromptKind::PromptStart => {
+                            PromptMarkKind::PromptStart
+                        }
+                        toastty_protocols::semantic_prompt::PromptKind::PromptEnd => {
+                            PromptMarkKind::PromptEnd
+                        }
+                        toastty_protocols::semantic_prompt::PromptKind::CommandStart => {
+                            PromptMarkKind::CommandStart
+                        }
+                        toastty_protocols::semantic_prompt::PromptKind::CommandFinished(c) => {
+                            PromptMarkKind::CommandFinished(c)
+                        }
+                    };
+                    self.push_prompt_mark(mapped);
+                }
+            }
             // 1 = icon-title only — accepted but not acted on (we have
             // no tray icon). Folded into the wildcard arm: same body
             // either way.
             _ => {
-                // 1 + unknown OSC: silently ignored. M10 will add 4 / 8 / 52 etc.
+                // 1 + unknown OSC: silently ignored. M10 adds 4 / 8 / 52
+                // in later steps.
             }
         }
     }
@@ -2923,5 +3303,327 @@ mod tests {
         t.clear_damage();
         t.mark_cell_dirty(99, 0);
         assert!(t.damage().is_empty());
+    }
+
+    // ----- OSC 7 (cwd) ------------------------------------------------------
+
+    #[test]
+    fn osc7_sets_cwd_from_file_url() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]7;file://host/home/user\x1b\\");
+        assert_eq!(t.cwd(), "/home/user");
+    }
+
+    #[test]
+    fn osc7_handles_hostless_form() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]7;file:///srv/data\x1b\\");
+        assert_eq!(t.cwd(), "/srv/data");
+    }
+
+    #[test]
+    fn osc7_percent_decodes_spaces() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]7;file:///tmp/space%20dir\x1b\\");
+        assert_eq!(t.cwd(), "/tmp/space dir");
+    }
+
+    #[test]
+    fn osc7_non_file_scheme_is_ignored() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]7;http://example.com/\x1b\\");
+        assert_eq!(t.cwd(), "");
+    }
+
+    #[test]
+    fn osc7_bel_terminator_works_too() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]7;file:///home\x07");
+        assert_eq!(t.cwd(), "/home");
+    }
+
+    // ----- OSC 133 (semantic prompts) --------------------------------------
+
+    #[test]
+    fn osc133_a_records_prompt_start() {
+        let mut t = Term::new(3, 8, 0);
+        feed(&mut t, b"\x1b]133;A\x1b\\");
+        let marks = t.prompt_marks();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].kind, PromptMarkKind::PromptStart);
+        assert_eq!(marks[0].row, 0);
+    }
+
+    #[test]
+    fn osc133_b_records_prompt_end_at_current_row() {
+        let mut t = Term::new(3, 8, 0);
+        feed(&mut t, b"\r\n\x1b]133;B\x1b\\");
+        let marks = t.prompt_marks();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].kind, PromptMarkKind::PromptEnd);
+        assert_eq!(marks[0].row, 1);
+    }
+
+    #[test]
+    fn osc133_c_records_command_start() {
+        let mut t = Term::new(3, 8, 0);
+        feed(&mut t, b"\x1b]133;C\x1b\\");
+        assert_eq!(t.prompt_marks()[0].kind, PromptMarkKind::CommandStart);
+    }
+
+    #[test]
+    fn osc133_d_with_exit_code() {
+        let mut t = Term::new(3, 8, 0);
+        feed(&mut t, b"\x1b]133;D;0\x1b\\");
+        assert_eq!(
+            t.prompt_marks()[0].kind,
+            PromptMarkKind::CommandFinished(Some(0))
+        );
+        feed(&mut t, b"\x1b]133;D;127\x1b\\");
+        assert_eq!(
+            t.prompt_marks()[1].kind,
+            PromptMarkKind::CommandFinished(Some(127))
+        );
+    }
+
+    #[test]
+    fn osc133_d_without_exit_code() {
+        let mut t = Term::new(3, 8, 0);
+        feed(&mut t, b"\x1b]133;D\x1b\\");
+        assert_eq!(
+            t.prompt_marks()[0].kind,
+            PromptMarkKind::CommandFinished(None)
+        );
+    }
+
+    #[test]
+    fn osc133_unknown_kind_ignored() {
+        let mut t = Term::new(3, 8, 0);
+        feed(&mut t, b"\x1b]133;Z\x1b\\");
+        assert!(t.prompt_marks().is_empty());
+    }
+
+    #[test]
+    fn osc133_marks_cap_at_4096_with_fifo_eviction() {
+        let mut t = Term::new(3, 8, 0);
+        for _ in 0..4100 {
+            feed(&mut t, b"\x1b]133;A\x1b\\");
+        }
+        assert_eq!(t.prompt_marks().len(), 4096);
+    }
+
+    /// M10-followup I3: push 5000 marks (well past the 4096 cap) and
+    /// confirm the cap is honored without quadratic blowup. We don't
+    /// measure wall time — the test just exercises the eviction path
+    /// at scale, which on the old `Vec::remove(0)` implementation was
+    /// O(n) per eviction; on the new `VecDeque::pop_front` path it's
+    /// O(1). If the runtime regresses to quadratic, this test will
+    /// hang in CI long before it asserts.
+    #[test]
+    fn osc133_marks_fifo_eviction_is_not_quadratic() {
+        let mut t = Term::new(3, 8, 0);
+        for _ in 0..5000 {
+            feed(&mut t, b"\x1b]133;A\x1b\\");
+        }
+        // Cap is enforced.
+        assert_eq!(t.prompt_marks().len(), PROMPT_MARK_CAP);
+        // FIFO semantics: the oldest entries dropped off the front;
+        // everything we see is still PromptStart (we only ever pushed
+        // PromptStart).
+        for m in t.prompt_marks() {
+            assert_eq!(m.kind, PromptMarkKind::PromptStart);
+        }
+    }
+
+    // ----- PTY reply queue --------------------------------------------------
+
+    #[test]
+    fn pty_reply_queue_drains_in_order() {
+        let mut t = Term::new(2, 4, 0);
+        t.push_pty_reply(b"hello");
+        t.push_pty_reply(b" world");
+        let drained = t.drain_pty_replies();
+        assert_eq!(drained, b"hello world");
+        // Second drain returns empty — drain consumes.
+        assert!(t.drain_pty_replies().is_empty());
+    }
+
+    #[test]
+    fn pty_reply_queue_starts_empty() {
+        let mut t = Term::new(2, 4, 0);
+        assert!(t.drain_pty_replies().is_empty());
+    }
+
+    // ----- OSC 4 (palette) -------------------------------------------------
+
+    #[test]
+    fn osc4_set_records_override_and_bumps_revision() {
+        let mut t = Term::new(2, 4, 0);
+        let r0 = t.palette_revision();
+        feed(&mut t, b"\x1b]4;1;rgb:ab/cd/ef\x1b\\");
+        assert_eq!(t.palette_override(1), Some([0xab, 0xcd, 0xef]));
+        assert_ne!(t.palette_revision(), r0);
+    }
+
+    #[test]
+    fn osc4_set_marks_all_dirty() {
+        let mut t = Term::new(2, 4, 0);
+        t.clear_damage();
+        feed(&mut t, b"\x1b]4;5;rgb:00/00/00\x1b\\");
+        assert!(t.damage().all, "palette change must invalidate every row");
+    }
+
+    #[test]
+    fn osc4_query_enqueues_reply() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]4;1;?\x1b\\");
+        let bytes = t.drain_pty_replies();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        // Default xterm-256 red is 0x800000 → "8080/0000/0000".
+        assert_eq!(s, "\x1b]4;1;rgb:8080/0000/0000\x1b\\");
+    }
+
+    #[test]
+    fn osc4_query_returns_override_when_set() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]4;1;rgb:ab/cd/ef\x1b\\");
+        let _ = t.drain_pty_replies();
+        feed(&mut t, b"\x1b]4;1;?\x1b\\");
+        let bytes = t.drain_pty_replies();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(s, "\x1b]4;1;rgb:abab/cdcd/efef\x1b\\");
+    }
+
+    #[test]
+    fn osc4_multi_pair_handled() {
+        let mut t = Term::new(2, 4, 0);
+        feed(
+            &mut t,
+            b"\x1b]4;1;rgb:11/22/33;2;rgb:44/55/66\x1b\\",
+        );
+        assert_eq!(t.palette_override(1), Some([0x11, 0x22, 0x33]));
+        assert_eq!(t.palette_override(2), Some([0x44, 0x55, 0x66]));
+    }
+
+    #[test]
+    fn osc4_malformed_pair_does_not_panic() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]4;notanumber;rgb:ab/cd/ef\x1b\\");
+        // No override applied, no panic.
+        assert!(t.palette_overrides.iter().all(Option::is_none));
+    }
+
+    // ----- OSC 8 (hyperlinks) ----------------------------------------------
+
+    #[test]
+    fn osc8_stamps_hyperlink_id_on_printed_cells() {
+        let mut t = Term::new(2, 16, 0);
+        feed(&mut t, b"\x1b]8;;https://example.com\x1b\\link");
+        // First 4 cells must share the same non-None hyperlink id.
+        let id0 = t.row(0).cells[0].hyperlink_id;
+        assert!(id0.is_some());
+        for c in 0..4 {
+            assert_eq!(t.row(0).cells[c].hyperlink_id, id0);
+        }
+        // Resolves back to the URL.
+        let url = t.hyperlink_url(id0.unwrap()).unwrap();
+        assert_eq!(url, "https://example.com");
+    }
+
+    #[test]
+    fn osc8_closer_clears_subsequent_cells() {
+        let mut t = Term::new(2, 16, 0);
+        feed(
+            &mut t,
+            b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\after",
+        );
+        assert!(t.row(0).cells[0].hyperlink_id.is_some());
+        assert!(t.row(0).cells[4].hyperlink_id.is_none(), "after closer");
+    }
+
+    #[test]
+    fn osc8_dedupes_same_url() {
+        let mut t = Term::new(2, 16, 0);
+        feed(&mut t, b"\x1b]8;;https://example.com\x1b\\a\x1b]8;;\x1b\\");
+        feed(&mut t, b"\x1b]8;;https://example.com\x1b\\b\x1b]8;;\x1b\\");
+        // Both cells reference the same intern id (interning dedupes).
+        assert_eq!(
+            t.row(0).cells[0].hyperlink_id,
+            t.row(0).cells[1].hyperlink_id,
+        );
+    }
+
+    #[test]
+    fn osc8_id_param_parsed_but_unused_for_dedup() {
+        // id= is parsed but not used as the dedup key (URL is). Two
+        // sequences with the same URL but different `id=` still share
+        // the same hyperlink id.
+        let mut t = Term::new(2, 16, 0);
+        feed(&mut t, b"\x1b]8;id=a;https://x.com\x1b\\X\x1b]8;;\x1b\\");
+        feed(&mut t, b"\x1b]8;id=b;https://x.com\x1b\\Y\x1b]8;;\x1b\\");
+        assert_eq!(
+            t.row(0).cells[0].hyperlink_id,
+            t.row(0).cells[1].hyperlink_id,
+        );
+    }
+
+    // ----- OSC 52 (clipboard) ----------------------------------------------
+
+    #[test]
+    fn osc52_set_with_write_disabled_is_dropped() {
+        let mut t = Term::new(2, 4, 0);
+        // Default security = both gates closed.
+        feed(&mut t, b"\x1b]52;c;aGVsbG8=\x1b\\");
+        assert!(t.drain_clipboard_requests().is_empty());
+    }
+
+    #[test]
+    fn osc52_set_with_write_enabled_queues_request() {
+        let mut t = Term::new(2, 4, 0);
+        t.set_security(SecurityFlags {
+            osc_52_read: false,
+            osc_52_write: true,
+        });
+        feed(&mut t, b"\x1b]52;c;aGVsbG8=\x1b\\");
+        let reqs = t.drain_clipboard_requests();
+        assert_eq!(reqs.len(), 1);
+        match &reqs[0] {
+            ClipboardRequest::Set { data } => assert_eq!(data, b"hello"),
+            ClipboardRequest::Query { .. } => panic!("expected Set"),
+        }
+    }
+
+    #[test]
+    fn osc52_query_with_read_disabled_is_dropped() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]52;c;?\x1b\\");
+        assert!(t.drain_clipboard_requests().is_empty());
+    }
+
+    #[test]
+    fn osc52_query_with_read_enabled_queues_request() {
+        let mut t = Term::new(2, 4, 0);
+        t.set_security(SecurityFlags {
+            osc_52_read: true,
+            osc_52_write: false,
+        });
+        feed(&mut t, b"\x1b]52;c;?\x1b\\");
+        let reqs = t.drain_clipboard_requests();
+        assert_eq!(reqs.len(), 1);
+        match &reqs[0] {
+            ClipboardRequest::Query { selection } => assert_eq!(selection, b"c"),
+            ClipboardRequest::Set { .. } => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn osc52_malformed_does_not_panic() {
+        let mut t = Term::new(2, 4, 0);
+        t.set_security(SecurityFlags {
+            osc_52_read: true,
+            osc_52_write: true,
+        });
+        feed(&mut t, b"\x1b]52;c;!!\x1b\\");
+        assert!(t.drain_clipboard_requests().is_empty());
     }
 }

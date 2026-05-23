@@ -24,3 +24,7 @@ args    = []
 
 [scrollback]
 lines = 10000
+
+[security]
+osc_52_read  = false
+osc_52_write = false

@@ -21,6 +21,13 @@ pub const FLAG_COLOR_GLYPH: u32 = 1 << 1;
 /// Flag bit: this instance has no glyph at all (background-only fill).
 pub const FLAG_NO_GLYPH: u32 = 1 << 2;
 
+/// Flag bit: this instance is the underline strip for a cell flagged
+/// with SGR underline or an active OSC 8 hyperlink. The shader doesn't
+/// branch on this bit (current shader treats it the same as
+/// `FLAG_NO_GLYPH`); we still flag it so future shader work can pick
+/// it out without re-scanning the instance buffer.
+pub const FLAG_UNDERLINE: u32 = 1 << 3;
+
 /// GPU-side instance layout. `repr(C)` + `Pod + Zeroable` so it round-trips
 /// through `bytemuck::cast_slice` cleanly.
 ///
@@ -189,20 +196,20 @@ impl Theme {
     }
 
     #[must_use]
-    pub fn resolve_fg(&self, c: TColor) -> [f32; 4] {
+    pub fn resolve_fg(&self, c: TColor, ext_palette: Option<&[[f32; 4]; 256]>) -> [f32; 4] {
         match c {
             TColor::Default => self.fg,
-            TColor::Indexed256(idx) => self.resolve_indexed256(idx),
+            TColor::Indexed256(idx) => self.resolve_indexed256(idx, ext_palette),
             TColor::Rgb(r, g, b) => srgb_to_linear_rgba(r, g, b),
             named => self.palette[palette_index(named)],
         }
     }
 
     #[must_use]
-    pub fn resolve_bg(&self, c: TColor) -> [f32; 4] {
+    pub fn resolve_bg(&self, c: TColor, ext_palette: Option<&[[f32; 4]; 256]>) -> [f32; 4] {
         match c {
             TColor::Default => self.bg,
-            TColor::Indexed256(idx) => self.resolve_indexed256(idx),
+            TColor::Indexed256(idx) => self.resolve_indexed256(idx, ext_palette),
             TColor::Rgb(r, g, b) => srgb_to_linear_rgba(r, g, b),
             named => self.palette[palette_index(named)],
         }
@@ -212,13 +219,29 @@ impl Theme {
     ///
     /// - `0..16` aliases the 16-entry palette (so the user's theme colors apply).
     /// - `16..232` is the 6×6×6 RGB cube using the canonical xterm levels
-    ///   `[0, 95, 135, 175, 215, 255]` (sRGB).
+    ///   `[0, 95, 135, 175, 215, 255]` (sRGB), unless an OSC 4 override is in
+    ///   effect (provided via `ext_palette`).
     /// - `232..256` is the 24-step grayscale ramp at sRGB values
-    ///   `8 + 10*step` (8, 18, …, 238).
+    ///   `8 + 10*step` (8, 18, …, 238), again subject to override.
+    ///
+    /// `ext_palette`, when `Some`, is the renderer's cached linear-light
+    /// 256-entry table built from the term's OSC 4 overrides (with the
+    /// xterm defaults filled in for non-overridden indices). The theme's
+    /// 16-entry `palette` still wins for `idx < 16` so a user theme
+    /// keeps full control of the base ANSI colors. Pass `None` from
+    /// pure-CPU code paths (snapshot tests, benches) that don't care
+    /// about OSC 4 — the function then falls back to the xterm formulas.
     #[must_use]
-    pub fn resolve_indexed256(&self, idx: u8) -> [f32; 4] {
+    pub fn resolve_indexed256(
+        &self,
+        idx: u8,
+        ext_palette: Option<&[[f32; 4]; 256]>,
+    ) -> [f32; 4] {
         if idx < 16 {
             return self.palette[idx as usize];
+        }
+        if let Some(ext) = ext_palette {
+            return ext[idx as usize];
         }
         if idx < 232 {
             let n = idx - 16;
@@ -237,7 +260,7 @@ impl Theme {
 const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
 /// Convert one sRGB byte channel to linear-light float.
-fn srgb_channel_to_linear(v: u8) -> f32 {
+pub(crate) fn srgb_channel_to_linear(v: u8) -> f32 {
     let c = f32::from(v) / 255.0;
     if c <= 0.040_45 {
         c / 12.92
@@ -246,7 +269,7 @@ fn srgb_channel_to_linear(v: u8) -> f32 {
     }
 }
 
-fn srgb_to_linear_rgba(r: u8, g: u8, b: u8) -> [f32; 4] {
+pub(crate) fn srgb_to_linear_rgba(r: u8, g: u8, b: u8) -> [f32; 4] {
     [
         srgb_channel_to_linear(r),
         srgb_channel_to_linear(g),
@@ -314,13 +337,44 @@ pub fn is_blank_for_render(cell: &Cell) -> bool {
         && cell.style.fg == TColor::Default
         && !cell.style.flags.reverse
         && !cell.style.flags.underline
+        // A hyperlinked cell needs the underline strip even when its
+        // text is empty / styled the same as the surroundings.
+        && cell.hyperlink_id.is_none()
+}
+
+/// Build an underline-strip instance for a cell. 2 px thick, flush with
+/// the bottom of the cell, using `fg` as the color (same as the glyph).
+/// Called for cells with SGR underline or an active OSC 8 hyperlink.
+fn underline_instance(pos: [f32; 2], cell_size: [f32; 2], fg: [f32; 4]) -> CellInstance {
+    let thickness = 2.0_f32.min(cell_size[1]);
+    let y = pos[1] + cell_size[1] - thickness;
+    CellInstance {
+        pos: [pos[0], y],
+        size: [cell_size[0], thickness],
+        uv_min: [0.0, 0.0],
+        uv_max: [0.0, 0.0],
+        // Render as `bg = fg` so the underline shows up regardless of
+        // whether the shader currently routes through the FLAG_UNDERLINE
+        // branch — it'll fall through `FLAG_NO_GLYPH` and emit `bg`.
+        fg,
+        bg: fg,
+        flags: FLAG_NO_GLYPH | FLAG_UNDERLINE,
+        pad: [0; 3],
+    }
 }
 
 /// Effective fg/bg for a cell after applying SGR `reverse` (mode 7).
+///
+/// `ext_palette` (when `Some`) is consulted for `Color::Indexed256` lookups
+/// at `idx >= 16` — see [`Theme::resolve_indexed256`] for the OSC 4 path.
 #[must_use]
-pub fn resolve_cell_colors(cell: &Cell, theme: &Theme) -> ([f32; 4], [f32; 4]) {
-    let fg = theme.resolve_fg(cell.style.fg);
-    let bg = theme.resolve_bg(cell.style.bg);
+pub fn resolve_cell_colors(
+    cell: &Cell,
+    theme: &Theme,
+    ext_palette: Option<&[[f32; 4]; 256]>,
+) -> ([f32; 4], [f32; 4]) {
+    let fg = theme.resolve_fg(cell.style.fg, ext_palette);
+    let bg = theme.resolve_bg(cell.style.bg, ext_palette);
     if cell.style.flags.reverse {
         (bg, fg)
     } else {
@@ -332,6 +386,12 @@ pub fn resolve_cell_colors(cell: &Cell, theme: &Theme) -> ([f32; 4], [f32; 4]) {
 ///
 /// - `cell_size` — `(width, height)` in pixels.
 /// - `theme` — palette + cursor color.
+/// - `ext_palette` — optional renderer-cached linear-light 256-entry
+///   table (built from OSC 4 overrides + xterm defaults). When `Some`,
+///   `Color::Indexed256(idx)` with `idx >= 16` resolves through this
+///   table so palette overrides actually reach the rendered pixels
+///   (M10-followup C1). Pure CPU paths (tests, benches) may pass `None`
+///   to fall back to the built-in xterm cube/grayscale math.
 /// - `locate_glyph` — closure called for each non-blank cell to look up
 ///   the cell's primary glyph in the atlas. Receives `(row, col, char,
 ///   style)`. Returns `None` if the glyph isn't atlassed yet (which the
@@ -345,6 +405,7 @@ pub fn build_instances<F>(
     term: &Term,
     cell_size: (f32, f32),
     theme: &Theme,
+    ext_palette: Option<&[[f32; 4]; 256]>,
     locate_glyph: F,
 ) -> Vec<CellInstance>
 where
@@ -352,7 +413,7 @@ where
 {
     let (rows, cols) = term.size();
     let mut out: Vec<CellInstance> = Vec::with_capacity(usize::from(rows) * usize::from(cols));
-    build_instances_into(&mut out, term, cell_size, theme, locate_glyph);
+    build_instances_into(&mut out, term, cell_size, theme, ext_palette, locate_glyph);
     out
 }
 
@@ -364,6 +425,7 @@ pub fn build_instances_into<F>(
     term: &Term,
     cell_size: (f32, f32),
     theme: &Theme,
+    ext_palette: Option<&[[f32; 4]; 256]>,
     mut locate_glyph: F,
 ) where
     F: FnMut(u16, u16, char, &Style) -> Option<GlyphSlot>,
@@ -398,7 +460,7 @@ pub fn build_instances_into<F>(
             }
 
             let pos = [f32::from(c) * cell_w, f32::from(r) * cell_h];
-            let (fg, bg) = resolve_cell_colors(cell, theme);
+            let (fg, bg) = resolve_cell_colors(cell, theme, ext_palette);
 
             // Always emit a cell-sized background quad. The glyph (if
             // present) is rendered as a separate, glyph-sized quad on
@@ -435,6 +497,28 @@ pub fn build_instances_into<F>(
                     flags,
                     pad: [0; 3],
                 });
+            }
+
+            // Underline strip for SGR underline or OSC 8 hyperlink.
+            // M10-followup I6: peek the next cell — width-2 (CJK)
+            // primaries underline the FULL cluster (both columns), not
+            // just the primary column. Without this, hyperlinked CJK
+            // text underlined only the leading half of every wide
+            // glyph. (We do the same in `build_dirty_instances_into`;
+            // the bg quad path stays single-column for now, matching
+            // the existing pre-fix behavior the reviewer called out as
+            // out of scope.)
+            if cell.style.flags.underline || cell.hyperlink_id.is_some() {
+                let strip_w = if row
+                    .cells
+                    .get(c as usize + 1)
+                    .is_some_and(|next| next.is_continuation)
+                {
+                    2.0 * cell_w
+                } else {
+                    cell_w
+                };
+                out.push(underline_instance(pos, [strip_w, cell_h], fg));
             }
         }
     }
@@ -474,12 +558,14 @@ pub fn build_instances_into<F>(
 /// Continuation cells (second half of a width-2 cluster) are skipped:
 /// the cluster's primary cell at `(r, c-1)` is responsible for the full
 /// multi-cell quad.
+#[allow(clippy::too_many_arguments)] // mirrors build_instances_into + adds damage/visibility/ext_palette
 pub fn build_dirty_instances_into<F>(
     out: &mut Vec<CellInstance>,
     term: &Term,
     damage: &Damage,
     cell_size: (f32, f32),
     theme: &Theme,
+    ext_palette: Option<&[[f32; 4]; 256]>,
     cursor_visible: bool,
     mut locate_glyph: F,
 ) where
@@ -489,7 +575,7 @@ pub fn build_dirty_instances_into<F>(
     // count as a full frame, and the renderer's `needs_full_clear` is
     // already set to true for this frame.
     if damage.all {
-        build_instances_into(out, term, cell_size, theme, locate_glyph);
+        build_instances_into(out, term, cell_size, theme, ext_palette, locate_glyph);
         if !cursor_visible {
             // Drop the trailing cursor instance the full builder
             // unconditionally appends.
@@ -532,7 +618,7 @@ pub fn build_dirty_instances_into<F>(
             }
 
             let pos = [f32::from(c) * cell_w, f32::from(r) * cell_h];
-            let (fg, bg) = resolve_cell_colors(cell, theme);
+            let (fg, bg) = resolve_cell_colors(cell, theme, ext_palette);
 
             // Always emit a background quad — even for blank cells —
             // under LoadOp::Load, so old glyphs / cursor blocks get
@@ -568,6 +654,23 @@ pub fn build_dirty_instances_into<F>(
                     flags,
                     pad: [0; 3],
                 });
+            }
+
+            // Underline strip for SGR underline or OSC 8 hyperlink. Emit
+            // *after* the glyph so it draws on top of any descender
+            // (matches xterm). M10-followup I6: same width-2 widening
+            // as the full builder above.
+            if cell.style.flags.underline || cell.hyperlink_id.is_some() {
+                let strip_w = if row
+                    .cells
+                    .get(c as usize + 1)
+                    .is_some_and(|next| next.is_continuation)
+                {
+                    2.0 * cell_w
+                } else {
+                    cell_w
+                };
+                out.push(underline_instance(pos, [strip_w, cell_h], fg));
             }
         }
     }
@@ -618,7 +721,7 @@ mod tests {
     fn empty_term_emits_only_cursor() {
         let t = Term::new(3, 5, 0);
         let theme = Theme::default_dark();
-        let v = build_instances(&t, (8.0, 16.0), &theme, |_, _, _, _| None);
+        let v = build_instances(&t, (8.0, 16.0), &theme, None, |_, _, _, _| None);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].flags & FLAG_CURSOR, FLAG_CURSOR);
     }
@@ -628,7 +731,7 @@ mod tests {
         let mut t = Term::new(2, 8, 0);
         feed(&mut t, b"hello");
         let theme = Theme::default_dark();
-        let v = build_instances(&t, (8.0, 16.0), &theme, |_, _, _, _| None);
+        let v = build_instances(&t, (8.0, 16.0), &theme, None, |_, _, _, _| None);
         // 5 character cells + cursor.
         assert_eq!(v.len(), 6);
         assert_eq!(count_non_cursor(&v), 5);
@@ -639,7 +742,7 @@ mod tests {
         // Empty grid: cells are spaces with default style; nothing should
         // be emitted apart from the cursor.
         let t = Term::new(2, 8, 0);
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
         assert_eq!(count_non_cursor(&v), 0);
     }
 
@@ -648,7 +751,7 @@ mod tests {
         let mut t = Term::new(1, 4, 0);
         // Set bg to red, then write a space.
         feed(&mut t, b"\x1b[41m ");
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
         // 1 background-colored cell + cursor.
         assert_eq!(count_non_cursor(&v), 1);
     }
@@ -657,7 +760,7 @@ mod tests {
     fn cursor_position_follows_csi_h() {
         let mut t = Term::new(10, 10, 0);
         feed(&mut t, b"\x1b[5;10H"); // row 5 col 10 (1-based)
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
         let cur = cursor_instance(&v);
         // 5,10 1-based → row 4, col 9 0-based.
         assert!((cur.pos[0] - 9.0 * 8.0).abs() < 1e-3);
@@ -667,7 +770,7 @@ mod tests {
     #[test]
     fn cursor_clamped_into_grid() {
         let t = Term::new(2, 3, 0);
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
         let cur = cursor_instance(&v);
         assert!(cur.pos[0] < 3.0 * 8.0);
         assert!(cur.pos[1] < 2.0 * 16.0);
@@ -679,7 +782,7 @@ mod tests {
         let mut t = Term::new(1, 4, 0);
         // Non-reverse: red fg.
         feed(&mut t, b"\x1b[31mA");
-        let v = build_instances(&t, (8.0, 16.0), &theme, |_, _, _, _| None);
+        let v = build_instances(&t, (8.0, 16.0), &theme, None, |_, _, _, _| None);
         let normal = v
             .iter()
             .find(|i| i.flags & FLAG_CURSOR == 0)
@@ -690,7 +793,7 @@ mod tests {
         // Reverse: same red, but inverted onto bg.
         let mut t2 = Term::new(1, 4, 0);
         feed(&mut t2, b"\x1b[7;31mA");
-        let v2 = build_instances(&t2, (8.0, 16.0), &theme, |_, _, _, _| None);
+        let v2 = build_instances(&t2, (8.0, 16.0), &theme, None, |_, _, _, _| None);
         let rev = v2
             .iter()
             .find(|i| i.flags & FLAG_CURSOR == 0)
@@ -705,7 +808,7 @@ mod tests {
         let mut t = Term::new(1, 8, 0);
         feed(&mut t, b"a b"); // "a", " ", "b" — space should not call the locator
         let mut seen = Vec::new();
-        let _ = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, ch, _| {
+        let _ = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, ch, _| {
             seen.push(ch);
             None
         });
@@ -718,7 +821,7 @@ mod tests {
     fn color_glyph_flag_is_set_when_slot_is_color() {
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"X");
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| {
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| {
             Some(GlyphSlot {
                 uv_min: [0.0, 0.0],
                 uv_max: [8.0, 16.0],
@@ -737,27 +840,27 @@ mod tests {
     #[test]
     fn theme_resolves_default_colors_to_theme_values() {
         let theme = Theme::default_dark();
-        assert_eq!(theme.resolve_fg(TColor::Default), theme.fg);
-        assert_eq!(theme.resolve_bg(TColor::Default), theme.bg);
+        assert_eq!(theme.resolve_fg(TColor::Default, None), theme.fg);
+        assert_eq!(theme.resolve_bg(TColor::Default, None), theme.bg);
     }
 
     #[test]
     fn theme_resolves_palette_indexed_colors() {
         let theme = Theme::default_dark();
-        let red = theme.resolve_fg(TColor::Red);
-        let bright_red = theme.resolve_fg(TColor::BrightRed);
+        let red = theme.resolve_fg(TColor::Red, None);
+        let bright_red = theme.resolve_fg(TColor::BrightRed, None);
         assert_ne!(red, theme.fg);
         assert_ne!(red, bright_red);
         assert_ne!(
-            theme.resolve_fg(TColor::Green),
-            theme.resolve_fg(TColor::Red)
+            theme.resolve_fg(TColor::Green, None),
+            theme.resolve_fg(TColor::Red, None)
         );
     }
 
     #[test]
     fn cursor_instance_has_no_glyph_flag() {
         let t = Term::new(2, 2, 0);
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
         let cur = cursor_instance(&v);
         assert!(cur.flags & FLAG_NO_GLYPH != 0);
         assert!(cur.flags & FLAG_CURSOR != 0);
@@ -778,6 +881,11 @@ mod tests {
         let mut c = Cell::BLANK;
         c.ch = 'a';
         assert!(!is_blank_for_render(&c));
+        // M10.5: a hyperlinked cell must NOT be considered blank — the
+        // underline strip must still emit.
+        let mut c = Cell::BLANK;
+        c.hyperlink_id = std::num::NonZeroU16::new(1);
+        assert!(!is_blank_for_render(&c));
     }
 
     #[test]
@@ -797,7 +905,7 @@ mod tests {
         // in on a later frame.
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"a");
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
         assert_eq!(count_non_cursor(&v), 1);
         let bg_inst = v.iter().find(|i| i.flags & FLAG_CURSOR == 0).unwrap();
         assert!(bg_inst.flags & FLAG_NO_GLYPH != 0);
@@ -810,9 +918,9 @@ mod tests {
         c.style.fg = TColor::Red;
         c.style.bg = TColor::Default;
         c.style.flags.reverse = true;
-        let (fg, bg) = resolve_cell_colors(&c, &theme);
+        let (fg, bg) = resolve_cell_colors(&c, &theme, None);
         assert_eq!(fg, theme.bg);
-        assert_eq!(bg, theme.resolve_fg(TColor::Red));
+        assert_eq!(bg, theme.resolve_fg(TColor::Red, None));
     }
 
     #[test]
@@ -840,7 +948,7 @@ mod tests {
             TColor::BrightWhite,
         ];
         for c in vs {
-            let v = theme.resolve_fg(c);
+            let v = theme.resolve_fg(c, None);
             assert!(v[3] > 0.99);
         }
     }
@@ -852,7 +960,7 @@ mod tests {
         let theme = Theme::default_dark();
         for i in 0u8..16 {
             assert_eq!(
-                theme.resolve_indexed256(i),
+                theme.resolve_indexed256(i, None),
                 theme.palette[i as usize],
                 "indexed256({i}) should alias palette[{i}]"
             );
@@ -863,12 +971,12 @@ mod tests {
     fn resolve_indexed256_cube_corners_match_xterm_levels() {
         // Cube index 16 = (0,0,0) → black.
         let theme = Theme::default_dark();
-        let black = theme.resolve_indexed256(16);
+        let black = theme.resolve_indexed256(16, None);
         assert!(black[0] < 1e-6);
         assert!(black[1] < 1e-6);
         assert!(black[2] < 1e-6);
         // Cube index 231 = (255,255,255) → white.
-        let white = theme.resolve_indexed256(231);
+        let white = theme.resolve_indexed256(231, None);
         assert!((white[0] - 1.0).abs() < 1e-6);
         assert!((white[1] - 1.0).abs() < 1e-6);
         assert!((white[2] - 1.0).abs() < 1e-6);
@@ -879,7 +987,7 @@ mod tests {
         let theme = Theme::default_dark();
         let mut last = -1.0_f32;
         for i in 232u8..=255 {
-            let g = theme.resolve_indexed256(i);
+            let g = theme.resolve_indexed256(i, None);
             // R == G == B for grayscale.
             assert!((g[0] - g[1]).abs() < 1e-6);
             assert!((g[1] - g[2]).abs() < 1e-6);
@@ -891,9 +999,9 @@ mod tests {
     #[test]
     fn resolve_rgb_round_trips_pure_white_and_black() {
         let theme = Theme::default_dark();
-        let white = theme.resolve_fg(TColor::Rgb(255, 255, 255));
+        let white = theme.resolve_fg(TColor::Rgb(255, 255, 255), None);
         assert!((white[0] - 1.0).abs() < 1e-6);
-        let black = theme.resolve_bg(TColor::Rgb(0, 0, 0));
+        let black = theme.resolve_bg(TColor::Rgb(0, 0, 0), None);
         assert!(black[0] < 1e-6);
     }
 
@@ -901,7 +1009,7 @@ mod tests {
     fn resolve_rgb_uses_srgb_to_linear() {
         let theme = Theme::default_dark();
         // 128 in sRGB → ~0.2159 linear (not 0.5).
-        let mid = theme.resolve_fg(TColor::Rgb(128, 128, 128));
+        let mid = theme.resolve_fg(TColor::Rgb(128, 128, 128), None);
         assert!(mid[0] > 0.2 && mid[0] < 0.23, "linearised mid = {}", mid[0]);
     }
 
@@ -921,7 +1029,7 @@ mod tests {
     fn cursor_for(shape: CursorShape, cell_size: (f32, f32)) -> CellInstance {
         let mut t = Term::new(1, 4, 0);
         t.set_cursor_default(shape, false);
-        let v = build_instances(&t, cell_size, &Theme::default_dark(), |_, _, _, _| None);
+        let v = build_instances(&t, cell_size, &Theme::default_dark(), None, |_, _, _, _| None);
         *cursor_instance(&v)
     }
 
@@ -1010,7 +1118,7 @@ mod tests {
         // must be a multiple of cell_w.
         let mut t = Term::new(1, 8, 0);
         feed(&mut t, "a你b".as_bytes());
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
         let bgs: Vec<_> = v
             .iter()
             .filter(|i| i.flags & FLAG_CURSOR == 0)
@@ -1034,6 +1142,39 @@ mod tests {
         assert!(!cols.contains(&2), "col 2 (continuation) must be skipped");
     }
 
+    // ----- OSC 8 hyperlink underline emission -----------------------------
+
+    #[test]
+    fn hyperlinked_cell_emits_underline_instance() {
+        // A printed cell with an active OSC 8 hyperlink must produce
+        // an underline strip in the instance buffer regardless of SGR
+        // underline state.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b]8;;https://example.com\x1b\\X");
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let underline_count = v.iter().filter(|i| i.flags & FLAG_UNDERLINE != 0).count();
+        assert_eq!(underline_count, 1, "hyperlinked cell must emit one underline strip");
+    }
+
+    #[test]
+    fn sgr_underline_cell_emits_underline_instance() {
+        // Same as above but via SGR mode 4 (\\x1b[4mX).
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[4mX");
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let underline_count = v.iter().filter(|i| i.flags & FLAG_UNDERLINE != 0).count();
+        assert_eq!(underline_count, 1);
+    }
+
+    #[test]
+    fn no_underline_when_neither_sgr_nor_hyperlink_set() {
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"X");
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let underline_count = v.iter().filter(|i| i.flags & FLAG_UNDERLINE != 0).count();
+        assert_eq!(underline_count, 0);
+    }
+
     #[test]
     fn continuation_cell_produces_no_instance() {
         // Print a CJK ideograph; the renderer should emit a single
@@ -1044,7 +1185,7 @@ mod tests {
         feed(&mut t, "你".as_bytes());
         // No glyph slots — locator returns None. We only count
         // background instances.
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
         // Exactly one non-cursor instance (the wide cluster's
         // background quad), even though the cell grid records two
         // cells (one primary + one continuation).
@@ -1057,22 +1198,22 @@ mod tests {
         // emits the right shape.
         let mut t = Term::new(1, 4, 0);
         // Default = block.
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
         assert_eq!(cursor_instance(&v).size, [8.0, 16.0]);
         // Switch to bar (Ps=5 → bar, blinking).
         feed(&mut t, b"\x1b[5 q");
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
         assert!(cursor_instance(&v).size[0] < 8.0, "bar after Ps=5");
         // Switch to underline (Ps=4).
         feed(&mut t, b"\x1b[4 q");
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
         assert!(
             cursor_instance(&v).size[1] < 16.0,
             "underline after Ps=4",
         );
         // Back to block (Ps=2).
         feed(&mut t, b"\x1b[2 q");
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
         assert_eq!(cursor_instance(&v).size, [8.0, 16.0]);
     }
 
@@ -1090,6 +1231,7 @@ mod tests {
             t.damage(),
             (8.0, 16.0),
             &Theme::default_dark(),
+            None,
             true,
             |_, _, _, _| None,
         );
@@ -1110,6 +1252,7 @@ mod tests {
             &damage,
             (8.0, 16.0),
             &Theme::default_dark(),
+            None,
             true,
             |_, _, _, _| None,
         );
@@ -1138,6 +1281,7 @@ mod tests {
             &damage,
             (8.0, 16.0),
             &Theme::default_dark(),
+            None,
             true,
             |_, _, _, _| None,
         );
@@ -1160,6 +1304,7 @@ mod tests {
             &t,
             (8.0, 16.0),
             &Theme::default_dark(),
+            None,
             |_, _, _, _| None,
         );
         let mut dirty = Vec::new();
@@ -1169,6 +1314,7 @@ mod tests {
             t.damage(),
             (8.0, 16.0),
             &Theme::default_dark(),
+            None,
             true,
             |_, _, _, _| None,
         );
@@ -1190,6 +1336,7 @@ mod tests {
             &damage,
             (8.0, 16.0),
             &Theme::default_dark(),
+            None,
             true,
             |_, _, _, _| None,
         );
@@ -1211,6 +1358,7 @@ mod tests {
             t.damage(),
             (8.0, 16.0),
             &Theme::default_dark(),
+            None,
             false, // cursor hidden (mid-blink off-phase)
             |_, _, _, _| None,
         );
@@ -1233,10 +1381,199 @@ mod tests {
             t.damage(),
             (8.0, 16.0),
             &Theme::default_dark(),
+            None,
             false,
             |_, _, _, _| None,
         );
         // No cursor instance.
         assert!(out.iter().all(|i| i.flags & FLAG_CURSOR == 0));
+    }
+
+    // ----- M10-followup C1: OSC 4 ext_palette threads to rendered pixels --
+
+    /// Build a renderer-style `ext_palette` mirroring the term's
+    /// `palette_overrides + xterm defaults`, linearised. Mirrors
+    /// `Renderer::rebuild_ext_palette`.
+    fn rebuild_ext_palette_for_test(term: &Term) -> Box<[[f32; 4]; 256]> {
+        let mut out: Box<[[f32; 4]; 256]> = Box::new([[0.0; 4]; 256]);
+        for idx in 0u16..=255 {
+            let idx_u8 = idx as u8;
+            let rgb = term
+                .palette_override(idx_u8)
+                .unwrap_or_else(|| toastty_protocols::palette::default_xterm_256(idx_u8));
+            out[idx as usize] = srgb_to_linear_rgba(rgb[0], rgb[1], rgb[2]);
+        }
+        out
+    }
+
+    /// Followup C1: OSC 4 palette overrides must reach the GPU. Without
+    /// the fix, the instance builder consulted hard-coded xterm cube
+    /// math and never looked at `palette_overrides`, so the override
+    /// rebuilt into `ext_palette` was rendered-irrelevant. After the
+    /// fix, the same color index resolves through `ext_palette` and the
+    /// CellInstance's fg reflects the override.
+    #[test]
+    fn osc4_palette_override_reaches_cell_instance() {
+        let theme = Theme::default_dark();
+
+        // Print one cell using xterm index 50 (cube color: roughly cyan).
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b[38;5;50mX");
+
+        // Default build (no override yet). Snapshot the fg color of the
+        // glyph instance for index 50. We pull the bg quad (FLAG_NO_GLYPH
+        // set, not the underline strip) — its fg encodes the SGR foreground.
+        let default_ext = rebuild_ext_palette_for_test(&t);
+        let v_default = build_instances(
+            &t,
+            (8.0, 16.0),
+            &theme,
+            Some(&default_ext),
+            |_, _, _, _| None,
+        );
+        let default_fg = v_default
+            .iter()
+            .find(|i| i.flags & FLAG_CURSOR == 0 && i.flags & FLAG_NO_GLYPH != 0)
+            .expect("bg quad for printed cell")
+            .fg;
+
+        // Now drive an OSC 4 override that pins index 50 → pure red.
+        // The term increments palette_revision and marks all dirty.
+        feed(&mut t, b"\x1b]4;50;rgb:ff/00/00\x1b\\");
+        let override_rgb = t.palette_override(50).expect("override set");
+        assert_eq!(override_rgb, [0xff, 0x00, 0x00]);
+
+        // Rebuild the cached ext_palette to mirror what the renderer
+        // would do on `palette_revision` change, then re-emit instances.
+        let after_ext = rebuild_ext_palette_for_test(&t);
+        let v_after = build_instances(
+            &t,
+            (8.0, 16.0),
+            &theme,
+            Some(&after_ext),
+            |_, _, _, _| None,
+        );
+        let after_fg = v_after
+            .iter()
+            .find(|i| i.flags & FLAG_CURSOR == 0 && i.flags & FLAG_NO_GLYPH != 0)
+            .expect("bg quad for printed cell")
+            .fg;
+
+        // The fg must have changed — proving the override actually
+        // reached the instance buffer.
+        assert_ne!(default_fg, after_fg, "OSC 4 override must change rendered color");
+
+        // And it must equal the linearised override (red).
+        let expected = srgb_to_linear_rgba(0xff, 0x00, 0x00);
+        for (i, (a, b)) in after_fg.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "channel {i}: got {a}, expected {b} (override → linearised red)"
+            );
+        }
+    }
+
+    /// Followup C1: the theme's 16-entry `palette` continues to win for
+    /// indices 0..16 even when `ext_palette` is supplied — so a user
+    /// theme keeps full control of base ANSI colors.
+    #[test]
+    fn ext_palette_does_not_override_base_16_palette() {
+        let theme = Theme::default_dark();
+        // Build an ext_palette that's nonsense for idx 0..16 (all white).
+        let mut ext: Box<[[f32; 4]; 256]> = Box::new([[1.0, 1.0, 1.0, 1.0]; 256]);
+        // Index 1 (Red) — copy what the theme expects so the assertion
+        // below is clearly anchored to the theme path, not ext_palette.
+        ext[1] = [1.0, 1.0, 1.0, 1.0];
+        // resolve_indexed256(1, Some(&ext)) must return theme.palette[1],
+        // NOT ext[1].
+        let v = theme.resolve_indexed256(1, Some(&ext));
+        assert_eq!(v, theme.palette[1]);
+        assert_ne!(v, ext[1], "base 16 must come from theme, not ext_palette");
+    }
+
+    // ----- M10-followup I6: width-2 hyperlink underline spans both columns -
+
+    /// Followup I6: a width-2 (CJK) primary with an active OSC 8
+    /// hyperlink must produce an underline strip spanning the FULL
+    /// cluster — two columns — not just the primary column.
+    #[test]
+    fn width2_hyperlinked_cluster_underline_spans_two_columns() {
+        // OSC 8 open + width-2 CJK char + OSC 8 close.
+        let mut t = Term::new(1, 6, 0);
+        feed(
+            &mut t,
+            "\x1b]8;;https://example.com\x1b\\你\x1b]8;;\x1b\\".as_bytes(),
+        );
+        let cell_w = 8.0_f32;
+        let v = build_instances(&t, (cell_w, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let underline = v
+            .iter()
+            .find(|i| i.flags & FLAG_UNDERLINE != 0)
+            .expect("hyperlinked width-2 cluster must emit one underline strip");
+        // Width must be exactly 2 * cell_w — covers both the primary
+        // column AND the continuation column.
+        assert!(
+            (underline.size[0] - 2.0 * cell_w).abs() < 1e-3,
+            "width-2 underline strip width = {} (expected {})",
+            underline.size[0],
+            2.0 * cell_w,
+        );
+    }
+
+    /// Followup I6: a width-1 (ASCII) hyperlinked cell underlines just
+    /// its own column — the width-doubling logic must NOT misfire when
+    /// the next cell isn't a continuation.
+    #[test]
+    fn width1_hyperlinked_cell_underline_is_one_column() {
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"\x1b]8;;https://example.com\x1b\\X");
+        let cell_w = 8.0_f32;
+        let v = build_instances(&t, (cell_w, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let underline = v
+            .iter()
+            .find(|i| i.flags & FLAG_UNDERLINE != 0)
+            .expect("underline strip");
+        assert!(
+            (underline.size[0] - cell_w).abs() < 1e-3,
+            "width-1 underline strip width = {} (expected {})",
+            underline.size[0],
+            cell_w,
+        );
+    }
+
+    /// Followup I6: same widening must apply to the partial-redraw
+    /// builder. Mark the width-2 primary dirty (continuation skipped),
+    /// run the dirty builder, and assert the underline spans both
+    /// columns.
+    #[test]
+    fn width2_hyperlinked_cluster_underline_in_dirty_builder() {
+        let mut t = Term::new(1, 6, 0);
+        feed(
+            &mut t,
+            "\x1b]8;;https://example.com\x1b\\你\x1b]8;;\x1b\\".as_bytes(),
+        );
+        let cell_w = 8.0_f32;
+        let damage = t.damage().clone();
+        let mut out = Vec::new();
+        super::build_dirty_instances_into(
+            &mut out,
+            &t,
+            &damage,
+            (cell_w, 16.0),
+            &Theme::default_dark(),
+            None,
+            true,
+            |_, _, _, _| None,
+        );
+        let underline = out
+            .iter()
+            .find(|i| i.flags & FLAG_UNDERLINE != 0)
+            .expect("dirty builder must emit underline strip for width-2 hyperlink");
+        assert!(
+            (underline.size[0] - 2.0 * cell_w).abs() < 1e-3,
+            "dirty width-2 underline strip width = {} (expected {})",
+            underline.size[0],
+            2.0 * cell_w,
+        );
     }
 }

@@ -12,6 +12,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod clipboard;
+pub mod hyperlink;
+pub mod osc_cwd;
+pub mod palette;
 pub mod resize_inband;
+pub mod semantic_prompt;
 pub mod synchronized;
 pub mod unicode_core;
