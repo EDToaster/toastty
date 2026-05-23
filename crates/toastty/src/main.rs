@@ -721,10 +721,16 @@ fn is_open_link_binding(button: MouseButton, modifiers: Modifiers) -> bool {
     if button != MouseButton::Left {
         return false;
     }
+    // M10-followup I2: require EXACT modifier set. `contains(SUPER)` was
+    // true for `Cmd+Shift+Left`, `Cmd+Alt+Left`, etc., so hyperlink open
+    // hijacked any combo that happened to include the platform's
+    // primary modifier. Tighten to equality so only the bare combo
+    // qualifies; users keep `Cmd+Shift+Left` / `Ctrl+Alt+Left` free for
+    // selection-extend, window manager shortcuts, etc.
     if cfg!(target_os = "macos") {
-        modifiers.contains(Modifiers::SUPER)
+        modifiers == Modifiers::SUPER
     } else {
-        modifiers.contains(Modifiers::CONTROL)
+        modifiers == Modifiers::CONTROL
     }
 }
 
@@ -835,5 +841,54 @@ mod tests {
             Modifiers::CONTROL
         ));
         assert!(!is_open_link_binding(MouseButton::Left, Modifiers::SUPER));
+    }
+
+    /// M10-followup I2: the exact-match guard must reject combos that
+    /// happen to include the platform's primary modifier. Before the
+    /// fix, `Cmd+Shift+Left` (selection-extend on macOS), `Cmd+Alt+Left`
+    /// (word-jump), and so on, were all hijacked into hyperlink-open
+    /// because `contains(SUPER)` is true for any superset.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cmd_with_extra_modifiers_is_not_open_link_on_macos() {
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::SUPER | Modifiers::SHIFT
+        ));
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::SUPER | Modifiers::ALT
+        ));
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::SUPER | Modifiers::CONTROL
+        ));
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::SUPER | Modifiers::SHIFT | Modifiers::ALT
+        ));
+    }
+
+    /// M10-followup I2: same as above, but for the non-macOS path —
+    /// `Ctrl+Alt+Left`, `Ctrl+Shift+Left`, etc., must all reject.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn ctrl_with_extra_modifiers_is_not_open_link_on_non_macos() {
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::CONTROL | Modifiers::SHIFT
+        ));
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::CONTROL | Modifiers::ALT
+        ));
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::CONTROL | Modifiers::SUPER
+        ));
+        assert!(!is_open_link_binding(
+            MouseButton::Left,
+            Modifiers::CONTROL | Modifiers::SHIFT | Modifiers::ALT
+        ));
     }
 }
