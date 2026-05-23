@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use wgpu::{Device, Extent3d, Queue, Texture, TextureFormat};
 
 use crate::text::atlas::{Atlas, AtlasLayer, AtlasSlot, GlyphKey};
-use crate::text::cluster_width::{snap_cluster_widths, GlyphPos};
+use crate::text::cluster_width::{GlyphPos, snap_cluster_widths};
 use crate::text::instance::GlyphSlot;
 
 /// Mask atlas dims (R8) and color atlas dims (BGRA8) — generously sized
@@ -125,7 +125,8 @@ impl GlyphRasterizer {
 
         let swash_cache = SwashCache::new();
         let atlas = Atlas::new(ATLAS_W, ATLAS_H);
-        let mask_texture = create_atlas_texture(device, TextureFormat::R8Unorm, "toastty-mask-atlas");
+        let mask_texture =
+            create_atlas_texture(device, TextureFormat::R8Unorm, "toastty-mask-atlas");
         let color_texture =
             create_atlas_texture(device, TextureFormat::Bgra8Unorm, "toastty-color-atlas");
 
@@ -239,10 +240,14 @@ impl GlyphRasterizer {
 
         // Atlas slot already? Fast path. Placement was cached alongside.
         if let Some(existing) = self.atlas.lookup(key) {
-            let placement = self.placements.get(&key).copied().unwrap_or(GlyphPlacement {
-                offset: [0.0, 0.0],
-                size: [0.0, 0.0],
-            });
+            let placement = self
+                .placements
+                .get(&key)
+                .copied()
+                .unwrap_or(GlyphPlacement {
+                    offset: [0.0, 0.0],
+                    size: [0.0, 0.0],
+                });
             return Some(make_glyph_slot(existing, placement));
         }
 
@@ -327,7 +332,11 @@ fn make_glyph_slot(slot: AtlasSlot, placement: GlyphPlacement) -> GlyphSlot {
     }
 }
 
-fn measure_cell(font_system: &mut FontSystem, metrics: Metrics, family: Option<&str>) -> (f32, f32) {
+fn measure_cell(
+    font_system: &mut FontSystem,
+    metrics: Metrics,
+    family: Option<&str>,
+) -> (f32, f32) {
     let mut probe = Buffer::new(font_system, metrics);
     probe.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
     let fam = family.unwrap_or("monospace");

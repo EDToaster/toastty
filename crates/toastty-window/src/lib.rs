@@ -74,10 +74,29 @@ pub enum WindowError {
 
 /// Custom user-event payload — sent via [`WindowHandle::wake`] from
 /// background threads (e.g. the mio PTY thread).
-#[derive(Debug, Clone, Copy)]
+///
+/// `PtyBytes` and `PtyClosed` correspond 1:1 to
+/// [`toastty_io::UserEvent`]; the `From` impl below makes the
+/// `spawn_pty_reader<EventLoopProxy<UserEvent>>` call site work
+/// without any per-call conversion.
+#[derive(Debug)]
 pub enum UserEvent {
     /// Wake the event loop. Surfaces as [`Event::User`].
     Wake,
+    /// PTY bytes ready, from `toastty-io::spawn_pty_reader`. Surfaces as
+    /// [`Event::PtyBytes`].
+    PtyBytes(Vec<u8>),
+    /// PTY closed (child exited / EIO). Surfaces as [`Event::PtyClosed`].
+    PtyClosed,
+}
+
+impl From<toastty_io::UserEvent> for UserEvent {
+    fn from(ev: toastty_io::UserEvent) -> Self {
+        match ev {
+            toastty_io::UserEvent::PtyBytes(b) => UserEvent::PtyBytes(b),
+            toastty_io::UserEvent::PtyClosed => UserEvent::PtyClosed,
+        }
+    }
 }
 
 /// Cloneable handle to the running event loop. Send across threads to wake
@@ -103,6 +122,14 @@ impl WindowHandle {
         self.proxy
             .send_event(UserEvent::Wake)
             .map_err(|_| EventLoopClosed)
+    }
+
+    /// Borrow the underlying winit `EventLoopProxy<UserEvent>`. Pass
+    /// this directly to `toastty_io::spawn_pty_reader` — the
+    /// `From<toastty_io::UserEvent> for UserEvent` impl above satisfies
+    /// the bound.
+    pub fn event_loop_proxy(&self) -> EventLoopProxy<UserEvent> {
+        self.proxy.clone()
     }
 }
 
@@ -359,8 +386,13 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<'_, A> {
         }
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, _ev: UserEvent) {
-        self.dispatch(Event::User, event_loop);
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, ev: UserEvent) {
+        let mapped = match ev {
+            UserEvent::Wake => Event::User,
+            UserEvent::PtyBytes(b) => Event::PtyBytes(b),
+            UserEvent::PtyClosed => Event::PtyClosed,
+        };
+        self.dispatch(mapped, event_loop);
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {

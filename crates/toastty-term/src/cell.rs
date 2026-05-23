@@ -133,7 +133,12 @@ mod tests {
 
     #[test]
     fn style_flags_are_copy_and_eq() {
-        let a = StyleFlags { bold: true, italic: false, underline: true, reverse: false };
+        let a = StyleFlags {
+            bold: true,
+            italic: false,
+            underline: true,
+            reverse: false,
+        };
         let b = a;
         assert_eq!(a, b);
     }

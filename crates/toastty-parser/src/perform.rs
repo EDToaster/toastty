@@ -100,14 +100,9 @@ impl<H: BufferedApc> Perform for BufferingApcHandler<H> {
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         self.inner.osc_dispatch(params, bell_terminated);
     }
-    fn csi_dispatch(
-        &mut self,
-        params: &Params,
-        intermediates: &[u8],
-        ignore: bool,
-        action: char,
-    ) {
-        self.inner.csi_dispatch(params, intermediates, ignore, action);
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        self.inner
+            .csi_dispatch(params, intermediates, ignore, action);
     }
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
         self.inner.esc_dispatch(intermediates, ignore, byte);
@@ -151,14 +146,9 @@ impl<P: Perform + ?Sized> vte::Perform for VteAdapter<'_, P> {
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         self.inner.osc_dispatch(params, bell_terminated);
     }
-    fn csi_dispatch(
-        &mut self,
-        params: &Params,
-        intermediates: &[u8],
-        ignore: bool,
-        action: char,
-    ) {
-        self.inner.csi_dispatch(params, intermediates, ignore, action);
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        self.inner
+            .csi_dispatch(params, intermediates, ignore, action);
     }
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
         self.inner.esc_dispatch(intermediates, ignore, byte);
@@ -208,7 +198,10 @@ mod tests {
         h.apc_start();
         h.apc_chunk(b"world");
         h.apc_end();
-        assert_eq!(h.inner().apc_payloads, vec![b"hello".to_vec(), b"world".to_vec()]);
+        assert_eq!(
+            h.inner().apc_payloads,
+            vec![b"hello".to_vec(), b"world".to_vec()]
+        );
     }
 
     #[test]
@@ -264,7 +257,9 @@ mod tests {
         h.unhook();
         let c = h.into_inner();
         assert_eq!(
-            (c.prints, c.execs, c.csis, c.oscs, c.escs, c.hooks, c.puts, c.unhooks),
+            (
+                c.prints, c.execs, c.csis, c.oscs, c.escs, c.hooks, c.puts, c.unhooks
+            ),
             (1, 1, 1, 1, 1, 1, 1, 1)
         );
     }

@@ -82,8 +82,8 @@ impl ShelfPacker {
         // Allow up to 25% slack on the shelf height to avoid creating a
         // tall, near-empty shelf for one outlier.
         for shelf in &mut self.shelves {
-            let height_ok = h <= shelf.height
-                || (h <= shelf.height + shelf.height / 4 && shelf.cursor_x == 0);
+            let height_ok =
+                h <= shelf.height || (h <= shelf.height + shelf.height / 4 && shelf.cursor_x == 0);
             if !height_ok {
                 continue;
             }

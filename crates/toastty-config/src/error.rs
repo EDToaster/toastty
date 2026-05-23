@@ -16,10 +16,7 @@ pub enum ConfigError {
 
     /// Color hex string didn't validate (length, charset, `#` prefix).
     #[error("invalid color {input:?}: {reason}")]
-    InvalidColor {
-        input: String,
-        reason: &'static str,
-    },
+    InvalidColor { input: String, reason: &'static str },
 
     /// `theme.palette` must contain exactly 16 entries.
     #[error("theme.palette must contain exactly 16 colors, got {0}")]

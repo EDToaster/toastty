@@ -28,10 +28,7 @@ pub(crate) fn default_config_path() -> Option<PathBuf> {
 /// from poisoning the real process environment (which is racy under
 /// the multi-threaded test harness).
 #[must_use]
-pub fn resolve_with_env(
-    xdg_config_home: Option<&Path>,
-    home: Option<&Path>,
-) -> Option<PathBuf> {
+pub fn resolve_with_env(xdg_config_home: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
     if let Some(x) = xdg_config_home
         && !x.as_os_str().is_empty()
     {

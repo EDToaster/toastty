@@ -9,12 +9,12 @@ use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, BlendComponent, BlendFactor,
     BlendOperation, BlendState, Buffer, BufferAddress, BufferBindingType, BufferDescriptor,
-    BufferUsages, ColorTargetState, ColorWrites, Device, FragmentState, FrontFace, MultisampleState,
-    PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState, PrimitiveTopology, Queue,
-    RenderPipeline, RenderPipelineDescriptor, SamplerBindingType, SamplerDescriptor, ShaderModule,
-    ShaderModuleDescriptor, ShaderSource, ShaderStages, TextureFormat, TextureSampleType,
-    TextureView, TextureViewDescriptor, TextureViewDimension, VertexAttribute, VertexBufferLayout,
-    VertexFormat, VertexState, VertexStepMode,
+    BufferUsages, ColorTargetState, ColorWrites, Device, FragmentState, FrontFace,
+    MultisampleState, PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState,
+    PrimitiveTopology, Queue, RenderPipeline, RenderPipelineDescriptor, SamplerBindingType,
+    SamplerDescriptor, ShaderModule, ShaderModuleDescriptor, ShaderSource, ShaderStages,
+    TextureFormat, TextureSampleType, TextureView, TextureViewDescriptor, TextureViewDimension,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexState, VertexStepMode,
 };
 
 use crate::text::instance::CellInstance;

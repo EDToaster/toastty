@@ -255,12 +255,9 @@ pub(crate) fn assert_matches_golden(name: &str, img: &RgbaImage) {
         candidate.dimensions()
     );
 
-    let similarity = image_compare::rgb_similarity_structure(
-        &Algorithm::MSSIMSimple,
-        &golden,
-        &candidate,
-    )
-    .expect("rgb similarity");
+    let similarity =
+        image_compare::rgb_similarity_structure(&Algorithm::MSSIMSimple, &golden, &candidate)
+            .expect("rgb similarity");
 
     let score = similarity.score;
     eprintln!("snapshot {name}: SSIM = {score:.6}");

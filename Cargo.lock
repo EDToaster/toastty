@@ -2782,6 +2782,7 @@ name = "toastty"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "pollster",
  "toastty-config",
  "toastty-io",
  "toastty-parser",
@@ -2816,8 +2817,8 @@ dependencies = [
 name = "toastty-io"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "mio",
- "thiserror 2.0.18",
  "toastty-pty",
  "tracing",
  "winit",
@@ -2894,6 +2895,7 @@ dependencies = [
  "bitflags 2.11.1",
  "raw-window-handle",
  "thiserror 2.0.18",
+ "toastty-io",
  "tracing",
  "winit",
 ]

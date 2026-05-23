@@ -124,7 +124,10 @@ mod tests {
     #[test]
     fn shape_round_trip_via_toml() {
         for shape in [CursorShape::Block, CursorShape::Bar, CursorShape::Underline] {
-            let c = CursorConfig { shape, blink: false };
+            let c = CursorConfig {
+                shape,
+                blink: false,
+            };
             let s = toml::to_string(&c).unwrap();
             let p: CursorConfig = toml::from_str(&s).unwrap();
             assert_eq!(p, c);
@@ -139,8 +142,10 @@ mod tests {
 
     #[test]
     fn unknown_key_rejected() {
-        let res: Result<CursorConfig, _> = toml::from_str(r#"shape = "bar"
-extra = 1"#);
+        let res: Result<CursorConfig, _> = toml::from_str(
+            r#"shape = "bar"
+extra = 1"#,
+        );
         assert!(res.is_err());
     }
 

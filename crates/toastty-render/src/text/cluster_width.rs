@@ -132,7 +132,12 @@ mod tests {
     #[test]
     fn single_already_snapped_glyph_unchanged_position() {
         // ASCII "A": cluster has one glyph already at width ~ cell.
-        let glyphs = [GlyphPos { start: 0, end: 1, x: 0.0, w: 8.0 }];
+        let glyphs = [GlyphPos {
+            start: 0,
+            end: 1,
+            x: 0.0,
+            w: 8.0,
+        }];
         let out = snap_cluster_widths(&glyphs, 8.0, 1);
         assert_eq!(out.len(), 1);
         assert!(approx(out[0].x, 0.0));
@@ -142,7 +147,12 @@ mod tests {
     #[test]
     fn single_glyph_oversnap_is_corrected() {
         // shaper produced 8.57 px for a 1-cell-wide cluster — snap to 8.
-        let glyphs = [GlyphPos { start: 0, end: 1, x: 0.0, w: 8.57 }];
+        let glyphs = [GlyphPos {
+            start: 0,
+            end: 1,
+            x: 0.0,
+            w: 8.57,
+        }];
         let out = snap_cluster_widths(&glyphs, 8.0, 1);
         assert_eq!(out.len(), 1);
         assert!(approx(out[0].w, 8.0));
@@ -154,8 +164,18 @@ mod tests {
         // Natural widths 3.0 and 5.0 (ratio 3:5). Target is 1 cell = 8 px.
         // After snap, glyph widths should still be 3 and 5.
         let glyphs = [
-            GlyphPos { start: 0, end: 3, x: 0.0, w: 3.0 },
-            GlyphPos { start: 0, end: 3, x: 3.0, w: 5.0 },
+            GlyphPos {
+                start: 0,
+                end: 3,
+                x: 0.0,
+                w: 3.0,
+            },
+            GlyphPos {
+                start: 0,
+                end: 3,
+                x: 3.0,
+                w: 5.0,
+            },
         ];
         let out = snap_cluster_widths(&glyphs, 8.0, 1);
         assert_eq!(out.len(), 2);
@@ -170,8 +190,18 @@ mod tests {
         // Two single-glyph clusters back-to-back. After snap, the second
         // starts exactly one cell to the right of the first.
         let glyphs = [
-            GlyphPos { start: 0, end: 1, x: 0.0, w: 7.4 },
-            GlyphPos { start: 1, end: 2, x: 7.4, w: 8.6 },
+            GlyphPos {
+                start: 0,
+                end: 1,
+                x: 0.0,
+                w: 7.4,
+            },
+            GlyphPos {
+                start: 1,
+                end: 2,
+                x: 7.4,
+                w: 8.6,
+            },
         ];
         let out = snap_cluster_widths(&glyphs, 8.0, 1);
         assert_eq!(out.len(), 2);
@@ -186,8 +216,18 @@ mod tests {
         // Degenerate: shaping returned all zero advances for the cluster.
         // We must not produce NaN; equal split is the fallback.
         let glyphs = [
-            GlyphPos { start: 0, end: 1, x: 0.0, w: 0.0 },
-            GlyphPos { start: 0, end: 1, x: 0.0, w: 0.0 },
+            GlyphPos {
+                start: 0,
+                end: 1,
+                x: 0.0,
+                w: 0.0,
+            },
+            GlyphPos {
+                start: 0,
+                end: 1,
+                x: 0.0,
+                w: 0.0,
+            },
         ];
         let out = snap_cluster_widths(&glyphs, 8.0, 1);
         assert_eq!(out.len(), 2);
@@ -202,7 +242,12 @@ mod tests {
         // The input's first x is the run's starting position. The snap
         // should not pull glyphs back to x=0 if the shaper already
         // positioned them past it (e.g. left margin).
-        let glyphs = [GlyphPos { start: 0, end: 1, x: 24.0, w: 8.1 }];
+        let glyphs = [GlyphPos {
+            start: 0,
+            end: 1,
+            x: 24.0,
+            w: 8.1,
+        }];
         let out = snap_cluster_widths(&glyphs, 8.0, 1);
         assert!(approx(out[0].x, 24.0));
         assert!(approx(out[0].w, 8.0));
@@ -212,7 +257,12 @@ mod tests {
     fn cluster_cells_greater_than_one_is_pass_through() {
         // M4b: we only honor the 1-cell case; wider clusters keep natural
         // widths. The TODO in the module covers this.
-        let glyphs = [GlyphPos { start: 0, end: 4, x: 0.0, w: 13.71 }];
+        let glyphs = [GlyphPos {
+            start: 0,
+            end: 4,
+            x: 0.0,
+            w: 13.71,
+        }];
         let out = snap_cluster_widths(&glyphs, 8.0, 2);
         assert_eq!(out.len(), 1);
         assert!(approx(out[0].w, 13.71));
@@ -220,7 +270,12 @@ mod tests {
 
     #[test]
     fn cluster_cells_zero_is_pass_through() {
-        let glyphs = [GlyphPos { start: 0, end: 1, x: 0.0, w: 8.0 }];
+        let glyphs = [GlyphPos {
+            start: 0,
+            end: 1,
+            x: 0.0,
+            w: 8.0,
+        }];
         let out = snap_cluster_widths(&glyphs, 8.0, 0);
         assert_eq!(out.len(), 1);
         assert!(approx(out[0].w, 8.0));
@@ -230,9 +285,24 @@ mod tests {
     fn mixed_run_three_clusters_each_one_cell() {
         // Three single-glyph clusters: "abc".
         let glyphs = [
-            GlyphPos { start: 0, end: 1, x: 0.0, w: 8.7 },
-            GlyphPos { start: 1, end: 2, x: 8.7, w: 7.3 },
-            GlyphPos { start: 2, end: 3, x: 16.0, w: 8.2 },
+            GlyphPos {
+                start: 0,
+                end: 1,
+                x: 0.0,
+                w: 8.7,
+            },
+            GlyphPos {
+                start: 1,
+                end: 2,
+                x: 8.7,
+                w: 7.3,
+            },
+            GlyphPos {
+                start: 2,
+                end: 3,
+                x: 16.0,
+                w: 8.2,
+            },
         ];
         let out = snap_cluster_widths(&glyphs, 8.0, 1);
         assert_eq!(out.len(), 3);

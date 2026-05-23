@@ -24,9 +24,7 @@ fn run_and_drain(pty: &mut Pty, max_ms: u64) -> Vec<u8> {
         match pty.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => all.extend_from_slice(&buf[..n]),
-            Err(toastty_pty::PtyError::Io(e))
-                if e.kind() == std::io::ErrorKind::WouldBlock =>
-            {
+            Err(toastty_pty::PtyError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if child_exited {
                     break;
                 }
@@ -57,9 +55,7 @@ fn drain_now(pty: &Pty, max_ms: u64) -> Vec<u8> {
         match pty.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => all.extend_from_slice(&buf[..n]),
-            Err(toastty_pty::PtyError::Io(e))
-                if e.kind() == std::io::ErrorKind::WouldBlock =>
-            {
+            Err(toastty_pty::PtyError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(5));
             }
             Err(_) => break,
