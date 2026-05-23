@@ -75,6 +75,16 @@ impl PtySpec {
         self
     }
 
+    /// Drop any inherited entry whose key matches `key`. Used to
+    /// strip leaked multiplexer (Zellij, Tmux) markers so the spawned
+    /// shell doesn't think it's running inside the multiplexer that
+    /// happened to launch toastty.
+    pub fn env_remove(mut self, key: impl Into<OsString>) -> Self {
+        let target = key.into();
+        self.env.retain(|(k, _)| *k != target);
+        self
+    }
+
     pub fn working_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.working_dir = Some(dir.into());
         self
