@@ -226,13 +226,35 @@ pub fn build_instances<F>(
     term: &Term,
     cell_size: (f32, f32),
     theme: &Theme,
-    mut locate_glyph: F,
+    locate_glyph: F,
 ) -> Vec<CellInstance>
 where
     F: FnMut(u16, u16, char, &Style) -> Option<GlyphSlot>,
 {
     let (rows, cols) = term.size();
     let mut out: Vec<CellInstance> = Vec::with_capacity(usize::from(rows) * usize::from(cols));
+    build_instances_into(&mut out, term, cell_size, theme, locate_glyph);
+    out
+}
+
+/// Same as [`build_instances`] but appends into a caller-provided
+/// `Vec` (which is `clear()`ed first). Reusing the buffer across frames
+/// avoids per-frame allocations on the hot render path.
+pub fn build_instances_into<F>(
+    out: &mut Vec<CellInstance>,
+    term: &Term,
+    cell_size: (f32, f32),
+    theme: &Theme,
+    mut locate_glyph: F,
+) where
+    F: FnMut(u16, u16, char, &Style) -> Option<GlyphSlot>,
+{
+    out.clear();
+    let (rows, cols) = term.size();
+    let needed = usize::from(rows) * usize::from(cols);
+    if out.capacity() < needed {
+        out.reserve(needed - out.capacity());
+    }
 
     let cell_w = cell_size.0;
     let cell_h = cell_size.1;
@@ -296,8 +318,6 @@ where
     let cur_row = u16::min(cur.row, rows.saturating_sub(1));
     let pos = [f32::from(cur_col) * cell_w, f32::from(cur_row) * cell_h];
     out.push(CellInstance::cursor(pos, [cell_w, cell_h], theme.cursor));
-
-    out
 }
 
 #[cfg(test)]

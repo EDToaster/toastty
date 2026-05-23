@@ -80,6 +80,23 @@ pub struct GlyphRasterizer {
     cell_size: (f32, f32),
     /// Configured font family, kept around for `Attrs`.
     family_name: String,
+    /// Per-character glyph slot fast path. Populated as `shape_line`
+    /// resolves each character through cosmic-text the first time;
+    /// subsequent lines containing only cached characters skip the
+    /// (expensive) cosmic-text layout call entirely.
+    ///
+    /// Safe because in our monospace rendering each glyph slot
+    /// (`uv_min` / `uv_max` / `glyph_offset` / `glyph_size` /
+    /// `is_color`) is column-independent: `cell_w`-based placement
+    /// happens in `build_instances`. The bypass is keyed by `char` so
+    /// it does not handle complex shaping (ligatures, combining marks,
+    /// `BiDi`). When any character in a line is missing from the
+    /// cache, we fall back to the full cosmic-text path.
+    char_cache: HashMap<char, GlyphSlot>,
+    /// Characters known to be uncacheable (cosmic-text returned no
+    /// glyph for them — e.g., zero-width spaces). Recording them stops
+    /// repeated misses from triggering the slow path forever.
+    char_cache_misses: std::collections::HashSet<char>,
 }
 
 impl GlyphRasterizer {
@@ -143,6 +160,8 @@ impl GlyphRasterizer {
             metrics,
             cell_size,
             family_name,
+            char_cache: HashMap::new(),
+            char_cache_misses: std::collections::HashSet::new(),
         }
     }
 
@@ -167,7 +186,71 @@ impl GlyphRasterizer {
 
     /// Shape `text` as one line and ensure every glyph is in the atlas.
     /// Returns per-column glyph slots keyed by `(column, char)`.
+    ///
+    /// Fast path: if every non-space character is already in
+    /// [`char_cache`](Self::char_cache), we skip cosmic-text entirely
+    /// and just pack the cached slots by column. Spaces are skipped (no
+    /// glyph). This avoids the per-line layout cost — measured at ~110
+    /// µs per row of ASCII on M4 Pro — which dominates the renderer's
+    /// per-frame budget at fullscreen.
+    ///
+    /// Slow path: full cosmic-text shaping. Used the first time a
+    /// character is seen and any time a line contains an
+    /// uncached-and-non-miss character. Populates the cache so future
+    /// lines hit the fast path.
     pub fn shape_line(&mut self, queue: &Queue, text: &str) -> LineGlyphs {
+        if let Some(line) = self.try_shape_line_fast(text) {
+            return line;
+        }
+        self.shape_line_slow(queue, text)
+    }
+
+    /// Fast path: per-character lookups against `char_cache`. Returns
+    /// `None` if any character in `text` would require cosmic-text
+    /// (cache miss for a character that has not been marked
+    /// uncacheable). When it returns `Some`, no cosmic-text work was
+    /// done.
+    fn try_shape_line_fast(&self, text: &str) -> Option<LineGlyphs> {
+        let mut out = LineGlyphs::default();
+        let cell_w = self.cell_size.0;
+        if cell_w <= 0.0 {
+            return None;
+        }
+        // Each character in a monospace terminal grid occupies one
+        // cell. We assign columns by index in the iteration order; the
+        // term's row text is fed cell-by-cell, so the i'th char is
+        // column i for ASCII. (Wide characters would break this — we
+        // bail to the slow path for any non-cached glyph, which
+        // includes anything that's not a single-column ASCII letter
+        // after the first few frames.)
+        for (col, ch) in text.chars().enumerate() {
+            if col > u16::MAX as usize {
+                return None;
+            }
+            if ch == ' ' || ch == '\0' {
+                continue;
+            }
+            // Already-known miss: skip the cell, but keep going on
+            // the fast path. This stops e.g. control characters from
+            // forcing every line through cosmic-text forever.
+            if self.char_cache_misses.contains(&ch) {
+                continue;
+            }
+            match self.char_cache.get(&ch) {
+                Some(slot) => {
+                    #[allow(clippy::cast_possible_truncation)]
+                    out.by_column.insert((col as u16, ch), *slot);
+                }
+                None => return None,
+            }
+        }
+        Some(out)
+    }
+
+    /// Slow path: cosmic-text shaping. Populates `char_cache` /
+    /// `char_cache_misses` with whatever cosmic-text resolves so that
+    /// future calls with the same characters can take the fast path.
+    fn shape_line_slow(&mut self, queue: &Queue, text: &str) -> LineGlyphs {
         let family_name = self.family_name.clone();
         let attrs = Attrs::new().family(Family::Name(&family_name));
         self.buffer.set_text(text, &attrs, Shaping::Advanced, None);
@@ -209,10 +292,34 @@ impl GlyphRasterizer {
             }
         }
 
+        // Track which characters in the input source line had a glyph
+        // produced. Anything *not* in this set is a cosmic-text miss
+        // (e.g. zero-width spaces, control chars, characters mapped to
+        // the .notdef glyph) and we record it as a miss so the fast
+        // path stops trying.
+        let mut produced_chars: std::collections::HashSet<char> =
+            std::collections::HashSet::new();
+
         let mut out = LineGlyphs::default();
         for (p, baseline_y) in &pending {
             if let Some(slot) = self.ensure_atlas_slot(queue, &p.glyph, *baseline_y) {
                 out.by_column.insert((p.col, p.ch), slot);
+                // Populate the per-character fast-path cache. A single
+                // monospace glyph's slot is column-independent (see
+                // `build_instances`), so reusing it for the next line
+                // is correct.
+                self.char_cache.entry(p.ch).or_insert(slot);
+                produced_chars.insert(p.ch);
+            }
+        }
+
+        // Anything in the input that didn't produce a glyph is a miss.
+        for ch in text.chars() {
+            if ch == ' ' || ch == '\0' {
+                continue;
+            }
+            if !produced_chars.contains(&ch) {
+                self.char_cache_misses.insert(ch);
             }
         }
 

@@ -27,6 +27,16 @@ pub struct Term {
     cols: u16,
     /// Primary-grid scrollback capacity (visible rows + history).
     scrollback: u16,
+    /// Per-row dirty bitset (visible rows only). Set by every mutation
+    /// that touches a row; consumed by the renderer's row-shape cache so
+    /// clean rows skip re-shaping. Minimum-viable damage signal — the
+    /// rest of decision #7 (skip-submit, cell-level damage) lands in M9.
+    dirty: Vec<bool>,
+    /// Last-known cursor position, retained across frames so the renderer
+    /// can mark the row the cursor was on (and the row it moves to) when
+    /// the bare cursor moves with no cell write — otherwise a cursor blink
+    /// won't repaint.
+    last_cursor_row: u16,
 }
 
 impl Term {
@@ -49,6 +59,10 @@ impl Term {
             rows,
             cols,
             scrollback,
+            // Start with everything dirty so the first render shapes
+            // every row.
+            dirty: vec![true; rows as usize],
+            last_cursor_row: 0,
         }
     }
 
@@ -72,6 +86,49 @@ impl Term {
         self.alt_active
     }
 
+    /// Borrow the per-row dirty bitset (visible rows only). The renderer
+    /// reads this to decide which rows to re-shape and which to reuse
+    /// from cache. Length equals `self.size().0`.
+    ///
+    /// Call [`Term::clear_dirty`] after consuming. Decision #7 / M9.
+    #[must_use]
+    pub fn dirty_rows(&self) -> &[bool] {
+        &self.dirty
+    }
+
+    /// Reset the per-row dirty bitset. Renderer calls this once a frame
+    /// has consumed the damage signal.
+    pub fn clear_dirty(&mut self) {
+        for d in &mut self.dirty {
+            *d = false;
+        }
+    }
+
+    /// Force every visible row to be reported dirty on the next read.
+    /// Used by the renderer when its row-shape cache is invalidated
+    /// (resize, font change, etc.) to force a re-shape.
+    pub fn mark_all_dirty(&mut self) {
+        for d in &mut self.dirty {
+            *d = true;
+        }
+    }
+
+    /// Mark row `r` dirty. Bounds-checked; out-of-range writes are a
+    /// no-op so callers don't have to guard.
+    fn mark_dirty(&mut self, r: u16) {
+        if let Some(slot) = self.dirty.get_mut(r as usize) {
+            *slot = true;
+        }
+    }
+
+    /// Mark every visible row dirty without going through the public
+    /// API. Used for scrollback motion and screen clears.
+    fn mark_all_dirty_internal(&mut self) {
+        for d in &mut self.dirty {
+            *d = true;
+        }
+    }
+
     /// Resize the visible viewport. **Does not reflow** — that's a
     /// decision #6 / scrollback.md follow-up. The cursor is clamped to the
     /// new dimensions.
@@ -86,6 +143,11 @@ impl Term {
         self.rows = rows;
         self.cols = cols;
         self.clamp_cursor();
+        // Resize invalidates every cached shaped line — re-shape all.
+        self.dirty = vec![true; rows as usize];
+        if self.last_cursor_row >= rows {
+            self.last_cursor_row = rows - 1;
+        }
     }
 
     fn active_grid(&self) -> &Grid {
@@ -120,6 +182,10 @@ impl Term {
         if self.cursor.row + 1 >= self.rows {
             // At bottom: scroll up by one and stay on the last row.
             self.active_grid_mut().scroll_up();
+            // Every visible row's content shifted up; the cached shape
+            // for each row no longer matches its position. Force a
+            // re-shape of all rows.
+            self.mark_all_dirty_internal();
         } else {
             self.cursor.row += 1;
         }
@@ -131,6 +197,7 @@ impl Term {
             // Mark the row we're leaving as soft-wrapped (decision #6).
             let leaving = self.cursor.row;
             self.active_grid_mut().row_mut(leaving).soft_wrap = true;
+            self.mark_dirty(leaving);
             self.cursor.col = 0;
             self.linefeed();
         }
@@ -142,6 +209,7 @@ impl Term {
         let row = self.cursor.row;
         let max_cols = self.cols;
         self.active_grid_mut().row_mut(row).put(col, cell, max_cols);
+        self.mark_dirty(row);
         self.cursor.col += 1;
     }
 
@@ -205,6 +273,10 @@ impl Term {
                     row.erase(0, cols, style);
                     row.soft_wrap = false;
                 }
+                // Dirty: cur_row .. rows.
+                for r in cur_row..rows {
+                    self.mark_dirty(r);
+                }
             }
             // 1: beginning of screen to cursor (inclusive).
             1 => {
@@ -215,10 +287,14 @@ impl Term {
                 }
                 grid.row_mut(cur_row)
                     .erase(0, cur_col.saturating_add(1), style);
+                for r in 0..=cur_row {
+                    self.mark_dirty(r);
+                }
             }
             // 2/3: entire screen (3 = also scrollback, which we treat the same in M3).
             _ => {
                 grid.clear_visible(style);
+                self.mark_all_dirty_internal();
             }
         }
     }
@@ -234,6 +310,7 @@ impl Term {
             1 => row.erase(0, cur_col.saturating_add(1), style),
             _ => row.erase(0, cols, style),
         }
+        self.mark_dirty(cur_row);
     }
 
     fn apply_sgr(&mut self, params: &Params) {
@@ -298,6 +375,8 @@ impl Term {
         self.alt.clear_visible(Style::RESET);
         // Reset cursor to home and clear style for the alt screen.
         self.cursor = Cursor::default();
+        // Switching screens invalidates every cached shaped line.
+        self.mark_all_dirty_internal();
     }
 
     fn exit_alt_screen(&mut self) {
@@ -307,6 +386,8 @@ impl Term {
         self.alt_active = false;
         self.cursor = self.saved_cursor;
         self.clamp_cursor();
+        // Switching back: re-shape the primary screen contents.
+        self.mark_all_dirty_internal();
     }
 }
 

@@ -18,6 +18,7 @@ wgpu.workspace = true
 toastty-term.workspace = true
 
 [dev-dependencies]
+criterion = "0.5"
 image.workspace = true
 image-compare.workspace = true
 insta.workspace = true
@@ -30,6 +31,10 @@ tracing-subscriber.workspace = true
 
 [build-dependencies]
 naga.workspace = true
+
+[[bench]]
+name = "render_term"
+harness = false
 
 [lints]
 workspace = true
