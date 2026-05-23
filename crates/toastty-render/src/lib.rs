@@ -39,6 +39,9 @@ use wgpu::{
     RequestAdapterOptions, Surface, SurfaceConfiguration, TextureFormat, TextureUsages,
 };
 
+use crate::image::atlas::ImageTextureCache;
+use crate::image::instance::{ImageInstance, build_image_instances, split_below_above};
+use crate::image::pipeline::ImagePipeline;
 use crate::text::glyph_rasterizer::{DEFAULT_LINE_HEIGHT_RATIO, GlyphRasterizer, LineGlyphs};
 use crate::text::instance::{CellInstance, Theme};
 use crate::text::pipeline::{GlobalsUbo, TextPipeline};
@@ -219,6 +222,18 @@ pub struct Renderer {
     /// Cached view of [`Self::scratch_texture`], the actual render-pass
     /// color attachment.
     scratch_view: wgpu::TextureView,
+    /// M11a: image-drawing pipeline. Lazy-initialized in
+    /// [`Renderer::with_font_ex`] so headless tests that don't touch
+    /// images can construct a `Renderer` without paying the cost.
+    image_pipeline: Option<ImagePipeline>,
+    /// CPU-side mirror of the texture cache.
+    image_tex_cache: ImageTextureCache,
+    /// Last `Term::image_revision` we synced.
+    image_revision_seen: u32,
+    /// Reusable storage for the below-text / above-text instance
+    /// vectors. Cleared every frame; allocation survives across frames.
+    image_instances_below: Vec<ImageInstance>,
+    image_instances_above: Vec<ImageInstance>,
 }
 
 /// Build the scratch render target. Same dims/format as the surface;
@@ -453,6 +468,11 @@ impl Renderer {
             palette_revision_seen: u32::MAX,
             scratch_texture,
             scratch_view,
+            image_pipeline: None,
+            image_tex_cache: ImageTextureCache::new(ImageTextureCache::DEFAULT_MAX_ACTIVE),
+            image_revision_seen: u32::MAX,
+            image_instances_below: Vec::new(),
+            image_instances_above: Vec::new(),
         })
     }
 
@@ -526,6 +546,12 @@ impl Renderer {
             line_cache: Vec::new(),
             instances_scratch: Vec::new(),
         });
+        // Lazy-init the image pipeline alongside the text pipeline so
+        // both are ready before the first `render_term`. The image
+        // pipeline shares the swapchain format.
+        if self.image_pipeline.is_none() {
+            self.image_pipeline = Some(ImagePipeline::new(&self.device, self.config.format));
+        }
         // Font swap invalidates the cell grid — force the next frame
         // to clear.
         self.needs_full_clear = true;
@@ -676,6 +702,28 @@ impl Renderer {
         // every cell on the very next frame.
         if term.palette_revision() != self.palette_revision_seen {
             self.rebuild_ext_palette(term);
+        }
+
+        // M11a: image-content sync. If the term's image revision has
+        // advanced, re-sync GPU textures and force a full clear for
+        // this frame (the pragmatic shortcut from the milestone plan —
+        // partial redraw with images is not supported in M11a).
+        if term.image_revision() != self.image_revision_seen
+            && let Some(image_pipeline) = self.image_pipeline.as_mut()
+        {
+            image_pipeline.sync_registry(
+                &self.device,
+                &self.queue,
+                term.image_registry(),
+                &mut self.image_tex_cache,
+            );
+            self.image_revision_seen = term.image_revision();
+            self.needs_full_clear = true;
+            // Mark every row dirty so the partial-redraw path falls back
+            // to a full re-emission. The full-clear flag alone is enough
+            // for the bg pass, but the M9 dirty-instance builder gates
+            // on per-row damage too.
+            term.mark_all_dirty();
         }
 
         // M9 skip-submit: if no cells changed AND no animation tick is
@@ -843,6 +891,25 @@ impl Renderer {
             tracing::info!(target: "render_trace", "build_instances n={} took={ms:.3}ms", instances.len());
         }
 
+        // M11a: build image instances split by z sign. We clear the
+        // existing vecs and rebuild every frame — the count of images
+        // is small (<= 14) so this is cheap.
+        self.image_instances_below.clear();
+        self.image_instances_above.clear();
+        if !term.image_grid().is_empty() {
+            let mut tmp: Vec<ImageInstance> = Vec::new();
+            build_image_instances(
+                &mut tmp,
+                term.image_grid(),
+                term.image_registry(),
+                &self.image_tex_cache,
+                cell_size,
+            );
+            let (below, above) = split_below_above(&tmp);
+            self.image_instances_below.extend_from_slice(below);
+            self.image_instances_above.extend_from_slice(above);
+        }
+
         // Acquire surface frame. This is where `Fifo` present mode
         // blocks waiting for vsync; if any prior frame is still queued,
         // we sit here for ~16.7ms.
@@ -942,6 +1009,21 @@ impl Renderer {
                 multiview_mask: None,
             });
 
+            // M11a draw order: below-text images → text → above-text
+            // images. All target `scratch_view`.
+            let viewport = (self.config.width as f32, self.config.height as f32);
+            if let Some(img_pipe) = self.image_pipeline.as_mut()
+                && !self.image_instances_below.is_empty()
+            {
+                img_pipe.render(
+                    &self.device,
+                    &self.queue,
+                    &mut rp,
+                    &self.image_instances_below,
+                    viewport,
+                );
+            }
+
             let text = self.text.as_mut().expect("text init checked above");
             text.pipeline.render(
                 &self.device,
@@ -951,6 +1033,18 @@ impl Renderer {
                 globals,
                 &instances,
             );
+
+            if let Some(img_pipe) = self.image_pipeline.as_mut()
+                && !self.image_instances_above.is_empty()
+            {
+                img_pipe.render(
+                    &self.device,
+                    &self.queue,
+                    &mut rp,
+                    &self.image_instances_above,
+                    viewport,
+                );
+            }
         }
 
         // Blit the scratch texture into the swapchain back-buffer so the
