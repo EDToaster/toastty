@@ -208,6 +208,43 @@ pub struct Renderer {
     /// `ext_palette`. `u32::MAX` marks "never seen" so the first frame
     /// always rebuilds.
     palette_revision_seen: u32,
+    /// Renderer-owned offscreen "framebuffer" we render every frame into.
+    /// Same format and size as the swapchain back-buffer. The damage-
+    /// tracked partial-redraw path requires a stable previous-frame
+    /// target; the swapchain rotates buffers under us, so this texture
+    /// is the persistent target. After each render pass we
+    /// `copy_texture_to_texture` from this into the swapchain frame.
+    scratch_texture: wgpu::Texture,
+    /// Cached view of [`Self::scratch_texture`], the actual render-pass
+    /// color attachment.
+    scratch_view: wgpu::TextureView,
+}
+
+/// Build the scratch render target. Same dims/format as the surface;
+/// `RENDER_ATTACHMENT` so we can draw into it, `COPY_SRC` so we can
+/// blit it to the swapchain back-buffer.
+fn create_scratch(
+    device: &Device,
+    width: u32,
+    height: u32,
+    format: TextureFormat,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("toastty-render scratch framebuffer"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
 }
 
 /// Default cursor blink half-cycle (matches gnome-terminal / kitty).
@@ -369,7 +406,14 @@ impl Renderer {
         let format = surface_format::pick(&caps.formats).ok_or(RenderError::NoSurfaceFormat)?;
 
         let config = SurfaceConfiguration {
-            usage: TextureUsages::RENDER_ATTACHMENT,
+            // COPY_DST: per-frame we copy from the renderer-owned scratch
+            // texture into the swapchain back-buffer. Damage tracking
+            // needs a stable previous-frame target, but the swapchain
+            // rotates buffers (Fifo with 2-frame latency) so any given
+            // back-buffer is 1–2 frames stale and `LoadOp::Load` reads
+            // garbage. The scratch texture is stable; the copy bridges
+            // it to whichever back-buffer the swapchain hands us.
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_DST,
             format,
             width: size.0.max(1),
             height: size.1.max(1),
@@ -389,6 +433,9 @@ impl Renderer {
 
         surface.configure(&device, &config);
 
+        let (scratch_texture, scratch_view) =
+            create_scratch(&device, config.width, config.height, format);
+
         Ok(Self {
             device,
             queue,
@@ -397,12 +444,14 @@ impl Renderer {
             clear_color: [0.07, 0.07, 0.09, 1.0],
             text: None,
             theme: Theme::default_dark(),
-            // First frame after construction always clears: the
-            // back-buffer's initial contents are undefined.
+            // First frame after construction always clears: the scratch
+            // texture's initial contents are undefined.
             needs_full_clear: true,
             blink: CursorBlink::new(Instant::now()),
             ext_palette: Box::new([[0.0, 0.0, 0.0, 1.0]; 256]),
             palette_revision_seen: u32::MAX,
+            scratch_texture,
+            scratch_view,
         })
     }
 
@@ -553,6 +602,12 @@ impl Renderer {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
         self.surface.configure(&self.device, &self.config);
+        // Scratch must match the swapchain dims; recreate. Its contents
+        // become undefined → force a full clear on the next frame.
+        let (tex, view) =
+            create_scratch(&self.device, self.config.width, self.config.height, self.config.format);
+        self.scratch_texture = tex;
+        self.scratch_view = view;
         self.needs_full_clear = true;
     }
 
@@ -825,10 +880,9 @@ impl Renderer {
             tracing::info!(target: "render_trace", "surface_acquire took={ms:.3}ms (blocks on vsync under Fifo)");
         }
 
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
+        // We render into `self.scratch_view`, not into the swapchain
+        // frame, so no need to create a view for `frame.texture` — the
+        // copy_texture_to_texture below takes the texture directly.
         let t_enc = if trace { Some(std::time::Instant::now()) } else { None };
         let mut encoder = self
             .device
@@ -867,7 +921,13 @@ impl Renderer {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("toastty-render term pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    // Render into the renderer-owned scratch texture, not
+                    // the swapchain frame. Its contents persist across
+                    // frames, so `LoadOp::Load` correctly reads the
+                    // previous frame's pixels for damage-tracked partial
+                    // redraw. The swapchain back-buffer rotation would
+                    // otherwise hand us a 1–2 frame stale buffer.
+                    view: &self.scratch_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -891,6 +951,29 @@ impl Renderer {
                 &instances,
             );
         }
+
+        // Blit the scratch texture into the swapchain back-buffer so the
+        // present shows our pixels. The surface config carries COPY_DST.
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.scratch_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &frame.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
 
         if let Some(t) = t_enc {
             let ms = t.elapsed().as_secs_f64() * 1000.0;
