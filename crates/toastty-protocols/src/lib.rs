@@ -14,5 +14,6 @@
 
 pub mod osc_cwd;
 pub mod resize_inband;
+pub mod semantic_prompt;
 pub mod synchronized;
 pub mod unicode_core;

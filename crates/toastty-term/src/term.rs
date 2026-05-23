@@ -162,7 +162,42 @@ pub struct Term {
     /// when the shell hasn't sent one yet. Not validated against the
     /// host — we accept whatever the shell told us.
     cwd: String,
+    /// Semantic prompt markers (OSC 133). FIFO bounded at 4096 — old
+    /// marks rotate out when the cap is hit so the buffer can't bloat
+    /// on a long-running session.
+    prompt_marks: Vec<PromptMark>,
 }
+
+/// One semantic prompt marker recorded from OSC 133.
+///
+/// `(row, kind)` lets a future command-navigation feature jump between
+/// prompt-start / command-start / command-finished markers without
+/// re-scanning the grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptMark {
+    /// Visible row the marker was recorded on. Note that scrollback can
+    /// push the underlying row off the top of the visible viewport; we
+    /// don't currently rebase the row index in that case.
+    pub row: u16,
+    /// What kind of marker this is.
+    pub kind: PromptMarkKind,
+}
+
+/// Kind of a [`PromptMark`] recorded from OSC 133.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptMarkKind {
+    /// `OSC 133 ; A` — start of prompt.
+    PromptStart,
+    /// `OSC 133 ; B` — end of prompt / start of user input.
+    PromptEnd,
+    /// `OSC 133 ; C` — start of command output (after Enter).
+    CommandStart,
+    /// `OSC 133 ; D ; [exit_code]` — command finished.
+    CommandFinished(Option<i32>),
+}
+
+/// Cap on the number of OSC-133 prompt marks we retain.
+const PROMPT_MARK_CAP: usize = 4096;
 
 impl Term {
     /// Construct a fresh terminal `rows` rows by `cols` cols, with
@@ -201,6 +236,7 @@ impl Term {
             grapheme_cluster_mode: false,
             inband_resize_mode: false,
             cwd: String::new(),
+            prompt_marks: Vec::new(),
         }
     }
 
@@ -209,6 +245,24 @@ impl Term {
     #[must_use]
     pub fn cwd(&self) -> &str {
         &self.cwd
+    }
+
+    /// Read-only view of the OSC 133 prompt marks recorded so far, in
+    /// emission order. Capped at 4096 entries; oldest entries roll off
+    /// the front when the cap is hit.
+    #[must_use]
+    pub fn prompt_marks(&self) -> &[PromptMark] {
+        &self.prompt_marks
+    }
+
+    /// Append a prompt mark at the current cursor row, evicting the
+    /// oldest entry when the cap is hit.
+    fn push_prompt_mark(&mut self, kind: PromptMarkKind) {
+        let row = self.cursor.row;
+        if self.prompt_marks.len() >= PROMPT_MARK_CAP {
+            self.prompt_marks.remove(0);
+        }
+        self.prompt_marks.push(PromptMark { row, kind });
     }
 
     /// True when DECSET 2004 (bracketed paste) is active.
@@ -1291,6 +1345,38 @@ impl Perform for Term {
                 }
                 if let Some(path) = toastty_protocols::osc_cwd::parse_file_url(&joined) {
                     self.cwd = path;
+                }
+            }
+            // OSC 133 — semantic prompt markers (Final Term protocol).
+            //
+            // vte splits the OSC params on `;`, so an emitted
+            // `OSC 133 ; D ; 0` arrives as
+            // `params = [b"133", b"D", b"0"]`. We rejoin everything past
+            // the leading code byte before handing off to the parser.
+            133 => {
+                let mut joined = Vec::new();
+                for (i, p) in params.iter().enumerate().skip(1) {
+                    if i > 1 {
+                        joined.push(b';');
+                    }
+                    joined.extend_from_slice(p);
+                }
+                if let Some(kind) = toastty_protocols::semantic_prompt::parse(&joined) {
+                    let mapped = match kind {
+                        toastty_protocols::semantic_prompt::PromptKind::PromptStart => {
+                            PromptMarkKind::PromptStart
+                        }
+                        toastty_protocols::semantic_prompt::PromptKind::PromptEnd => {
+                            PromptMarkKind::PromptEnd
+                        }
+                        toastty_protocols::semantic_prompt::PromptKind::CommandStart => {
+                            PromptMarkKind::CommandStart
+                        }
+                        toastty_protocols::semantic_prompt::PromptKind::CommandFinished(c) => {
+                            PromptMarkKind::CommandFinished(c)
+                        }
+                    };
+                    self.push_prompt_mark(mapped);
                 }
             }
             // 1 = icon-title only — accepted but not acted on (we have
@@ -2993,4 +3079,73 @@ mod tests {
         assert_eq!(t.cwd(), "/home");
     }
 
+    // ----- OSC 133 (semantic prompts) --------------------------------------
+
+    #[test]
+    fn osc133_a_records_prompt_start() {
+        let mut t = Term::new(3, 8, 0);
+        feed(&mut t, b"\x1b]133;A\x1b\\");
+        let marks = t.prompt_marks();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].kind, PromptMarkKind::PromptStart);
+        assert_eq!(marks[0].row, 0);
+    }
+
+    #[test]
+    fn osc133_b_records_prompt_end_at_current_row() {
+        let mut t = Term::new(3, 8, 0);
+        feed(&mut t, b"\r\n\x1b]133;B\x1b\\");
+        let marks = t.prompt_marks();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].kind, PromptMarkKind::PromptEnd);
+        assert_eq!(marks[0].row, 1);
+    }
+
+    #[test]
+    fn osc133_c_records_command_start() {
+        let mut t = Term::new(3, 8, 0);
+        feed(&mut t, b"\x1b]133;C\x1b\\");
+        assert_eq!(t.prompt_marks()[0].kind, PromptMarkKind::CommandStart);
+    }
+
+    #[test]
+    fn osc133_d_with_exit_code() {
+        let mut t = Term::new(3, 8, 0);
+        feed(&mut t, b"\x1b]133;D;0\x1b\\");
+        assert_eq!(
+            t.prompt_marks()[0].kind,
+            PromptMarkKind::CommandFinished(Some(0))
+        );
+        feed(&mut t, b"\x1b]133;D;127\x1b\\");
+        assert_eq!(
+            t.prompt_marks()[1].kind,
+            PromptMarkKind::CommandFinished(Some(127))
+        );
+    }
+
+    #[test]
+    fn osc133_d_without_exit_code() {
+        let mut t = Term::new(3, 8, 0);
+        feed(&mut t, b"\x1b]133;D\x1b\\");
+        assert_eq!(
+            t.prompt_marks()[0].kind,
+            PromptMarkKind::CommandFinished(None)
+        );
+    }
+
+    #[test]
+    fn osc133_unknown_kind_ignored() {
+        let mut t = Term::new(3, 8, 0);
+        feed(&mut t, b"\x1b]133;Z\x1b\\");
+        assert!(t.prompt_marks().is_empty());
+    }
+
+    #[test]
+    fn osc133_marks_cap_at_4096_with_fifo_eviction() {
+        let mut t = Term::new(3, 8, 0);
+        for _ in 0..4100 {
+            feed(&mut t, b"\x1b]133;A\x1b\\");
+        }
+        assert_eq!(t.prompt_marks().len(), 4096);
+    }
 }
