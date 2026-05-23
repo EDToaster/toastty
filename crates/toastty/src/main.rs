@@ -415,6 +415,10 @@ impl Toastty {
             .args(args)
             .with_current_env()
             .env("TERM", "xterm-256color")
+            // M10 shell integration: snippets under
+            // `share/shell-integration/` gate on this var so they only
+            // activate inside a toastty session.
+            .env("TOASTTY", "1")
             .size(WinSize {
                 rows,
                 cols,
