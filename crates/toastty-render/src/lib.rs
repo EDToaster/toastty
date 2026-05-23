@@ -700,6 +700,12 @@ impl Renderer {
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
+                // Followup C2: the reconfigured back-buffer has
+                // undefined contents (same invariant as `resize`).
+                // Without flagging a full clear here, the next frame
+                // may pick `LoadOp::Load` and read garbage. The cost
+                // is one extra clear on recovery — cheap.
+                self.needs_full_clear = true;
                 // No frame went out — caller must not clear damage / BSU
                 // force-flushed flag, so report Skipped.
                 return Ok(RenderOutcome::Skipped);
@@ -708,6 +714,13 @@ impl Renderer {
                 return Err(RenderError::SurfaceLost);
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                // Followup C2: defensively force the next frame to
+                // clear. Timeout means the driver missed its
+                // deadline; Occluded means the window isn't visible.
+                // In both cases the back-buffer's prior contents may
+                // be stale — flagging a full clear avoids any chance
+                // of a LoadOp::Load reading garbage on recovery.
+                self.needs_full_clear = true;
                 return Ok(RenderOutcome::Skipped);
             }
         };
