@@ -11,6 +11,11 @@
 //! flag and its wall-clock timestamp live on `toastty_term::Term`; the
 //! helpers here just answer "did the timer expire?" and "what bytes do
 //! we send as a DECRPM ($p) reply for mode 2026?".
+//!
+//! TODO(M9): wire `encode_decrpm_reply` into the CSI dispatcher's
+//! DECRQM (`CSI ? Pm $ p`) query handler. It's tested locally here
+//! (so it doesn't trip dead-code warnings), but no parser path
+//! consumes the result yet.
 
 use std::time::{Duration, Instant};
 
