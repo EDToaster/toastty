@@ -1,12 +1,14 @@
 //! Benchmark for the `render_term` hot path.
 //!
 //! Builds a headless wgpu device + the same shape/build/encode chain
-//! `Renderer::render_term` uses (no surface — present() is excluded).
-//! Two scenarios:
+//! `Renderer::render_term` uses (no surface — `present()` is excluded).
+//! Scenarios:
 //!
 //! - `fullframe_200x60`: render a fully-populated 200×60 grid.
 //! - `single_cell_change_200x60`: same grid, mutate one cell between
-//!    iterations (the realistic keystroke case).
+//!   iterations (the realistic keystroke case).
+//! - `fullframe_300x120` / `single_cell_change_300x120`: the same two
+//!   cases at twice the row count, to show how shaping cost scales.
 //!
 //! Run with `cargo bench -p toastty-render --bench render_term -- --quick`.
 
@@ -19,7 +21,7 @@ use pollster::block_on;
 use toastty_parser::Parser;
 use toastty_render::DEFAULT_LINE_HEIGHT;
 use toastty_render::text::glyph_rasterizer::{GlyphRasterizer, LineGlyphs};
-use toastty_render::text::instance::{Theme, build_instances};
+use toastty_render::text::instance::{CellInstance, Theme, build_instances_into};
 use toastty_render::text::pipeline::{self, GlobalsUbo, TextPipeline};
 use toastty_render::{instance_descriptor, instance_flags_for_release};
 use toastty_term::Term;
@@ -47,6 +49,10 @@ struct Harness {
     width: u32,
     height: u32,
     theme: Theme,
+    /// Mirrors `TextState::line_cache` in `Renderer`.
+    line_cache: Vec<Option<LineGlyphs>>,
+    /// Mirrors `TextState::instances_scratch` in `Renderer`.
+    instances: Vec<CellInstance>,
 }
 
 impl Harness {
@@ -110,41 +116,56 @@ impl Harness {
             width,
             height,
             theme: Theme::default_dark(),
+            line_cache: Vec::new(),
+            instances: Vec::new(),
         }
     }
 
-    /// One full render: shape every row, build instances, encode the
-    /// text pass, submit. No `present()`. Mirrors `Renderer::render_term`.
+    /// One full render: shape only dirty rows (re-using `line_cache`
+    /// for clean ones), build instances into the reusable scratch vec,
+    /// encode the text pass, submit. No `present()`. Mirrors
+    /// `Renderer::render_term` post-fix.
+    ///
+    /// Callers should invoke `term.clear_dirty()` after this returns
+    /// to consume the damage signal.
     fn render_term(&mut self, term: &Term) {
         let (rows, _cols) = term.size();
         let cell_size = self.rasterizer.cell_size();
         let atlas_dims = self.rasterizer.atlas_dims();
 
-        let mut row_glyphs: Vec<LineGlyphs> = Vec::with_capacity(rows as usize);
+        if self.line_cache.len() != rows as usize {
+            self.line_cache.resize(rows as usize, None);
+        }
+
+        let dirty = term.dirty_rows();
         for r in 0..rows {
+            let is_dirty = dirty.get(r as usize).copied().unwrap_or(true)
+                || self.line_cache[r as usize].is_none();
+            if !is_dirty {
+                continue;
+            }
             let row = term.row(r);
             let line_text: String = row
                 .cells
                 .iter()
                 .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
                 .collect();
-            row_glyphs.push(self.rasterizer.shape_line(&self.queue, &line_text));
+            self.line_cache[r as usize] = Some(self.rasterizer.shape_line(&self.queue, &line_text));
         }
 
-        // Mirror render_term: rebuild bind group each frame.
-        let mask_view = pipeline::default_view(self.rasterizer.mask_texture());
-        let color_view = pipeline::default_view(self.rasterizer.color_texture());
-        self.bind_group = self
-            .pipeline
-            .make_bind_group(&self.device, &mask_view, &color_view);
-
         let theme = self.theme;
-        let row_glyphs_ref = &row_glyphs;
-        let instances =
-            build_instances(term, cell_size, &theme, |row, col, ch, _style| {
-                let lg = row_glyphs_ref.get(row as usize)?;
+        let line_cache_ref = &self.line_cache;
+        build_instances_into(
+            &mut self.instances,
+            term,
+            cell_size,
+            &theme,
+            |row, col, ch, _style| {
+                let lg = line_cache_ref.get(row as usize)?.as_ref()?;
                 lg.by_column.get(&(col, ch)).copied()
-            });
+            },
+        );
+        let instances = &self.instances;
 
         let mut encoder = self
             .device
@@ -190,7 +211,7 @@ impl Harness {
                 &mut rp,
                 &self.bind_group,
                 globals,
-                &instances,
+                instances,
             );
         }
 
@@ -206,47 +227,72 @@ impl Harness {
 
     /// Same as `render_term` but prints per-phase wall time. Used by the
     /// one-off `bench_phase_breakdown` to attribute the cost.
+    ///
+    /// `force_full` ignores `term.dirty_rows()` and re-shapes every row,
+    /// simulating the pre-fix code path so the report can show what we
+    /// avoided.
     #[allow(clippy::too_many_lines)]
-    fn render_term_instrumented(&mut self, term: &Term) {
+    fn render_term_instrumented(&mut self, term: &Term, force_full: bool) {
         let t_total = Instant::now();
-        let (rows, _cols) = term.size();
+        let (rows, cols) = term.size();
         let cell_size = self.rasterizer.cell_size();
         let atlas_dims = self.rasterizer.atlas_dims();
 
-        // Phase A: shape lines.
+        if self.line_cache.len() != rows as usize {
+            self.line_cache.resize(rows as usize, None);
+        }
+        let dirty = term.dirty_rows();
+        let mut shaped = 0usize;
+
+        // Phase A: shape (dirty rows only, unless `force_full`).
         let t_shape = Instant::now();
-        let mut row_glyphs: Vec<LineGlyphs> = Vec::with_capacity(rows as usize);
         for r in 0..rows {
+            let is_dirty = force_full
+                || dirty.get(r as usize).copied().unwrap_or(true)
+                || self.line_cache[r as usize].is_none();
+            if !is_dirty {
+                continue;
+            }
             let row = term.row(r);
             let line_text: String = row
                 .cells
                 .iter()
                 .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
                 .collect();
-            row_glyphs.push(self.rasterizer.shape_line(&self.queue, &line_text));
+            self.line_cache[r as usize] = Some(self.rasterizer.shape_line(&self.queue, &line_text));
+            shaped += 1;
         }
         let shape_ms = t_shape.elapsed().as_secs_f64() * 1000.0;
 
-        // Phase B: bind group.
+        // Phase B: bind group (post-fix this is a no-op; left here for
+        // direct comparison with the pre-fix breakdown).
         let t_bg = Instant::now();
-        let mask_view = pipeline::default_view(self.rasterizer.mask_texture());
-        let color_view = pipeline::default_view(self.rasterizer.color_texture());
-        self.bind_group = self
-            .pipeline
-            .make_bind_group(&self.device, &mask_view, &color_view);
+        if force_full {
+            let mask_view = pipeline::default_view(self.rasterizer.mask_texture());
+            let color_view = pipeline::default_view(self.rasterizer.color_texture());
+            self.bind_group = self
+                .pipeline
+                .make_bind_group(&self.device, &mask_view, &color_view);
+        }
         let bg_ms = t_bg.elapsed().as_secs_f64() * 1000.0;
 
         // Phase C: build_instances.
-        let t_bi = Instant::now();
+        let t_build = Instant::now();
         let theme = self.theme;
-        let row_glyphs_ref = &row_glyphs;
-        let instances =
-            build_instances(term, cell_size, &theme, |row, col, ch, _style| {
-                let lg = row_glyphs_ref.get(row as usize)?;
+        let line_cache_ref = &self.line_cache;
+        build_instances_into(
+            &mut self.instances,
+            term,
+            cell_size,
+            &theme,
+            |row, col, ch, _style| {
+                let lg = line_cache_ref.get(row as usize)?.as_ref()?;
                 lg.by_column.get(&(col, ch)).copied()
-            });
-        let bi_ms = t_bi.elapsed().as_secs_f64() * 1000.0;
-        let n_instances = instances.len();
+            },
+        );
+        let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
+        let n_instances = self.instances.len();
+        let instances = &self.instances;
 
         // Phase D: encode the render pass.
         let t_enc = Instant::now();
@@ -293,7 +339,7 @@ impl Harness {
                 &mut rp,
                 &self.bind_group,
                 globals,
-                &instances,
+                instances,
             );
         }
         let enc_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
@@ -305,10 +351,10 @@ impl Harness {
         let sub_ms = t_sub.elapsed().as_secs_f64() * 1000.0;
 
         let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
-        println!("  instances                  = {n_instances}");
-        println!("  shape_lines (×{rows})         = {shape_ms:>8.3} ms");
+        println!("  rows={rows} cols={cols} instances={n_instances} shaped={shaped}");
+        println!("  shape_lines (×{shaped})         = {shape_ms:>8.3} ms");
         println!("  make_bind_group            = {bg_ms:>8.3} ms");
-        println!("  build_instances            = {bi_ms:>8.3} ms");
+        println!("  build_instances            = {build_ms:>8.3} ms");
         println!("  encode pass                = {enc_ms:>8.3} ms");
         println!("  submit + device.poll(wait) = {sub_ms:>8.3} ms");
         println!("  TOTAL                      = {total_ms:>8.3} ms");
@@ -339,98 +385,159 @@ fn make_term_filled(rows: u16, cols: u16) -> Term {
     term
 }
 
-fn bench_fullframe(c: &mut Criterion) {
-    // Compute the pixel size from the rasterizer's cell metrics so the
-    // viewport matches the grid. We need the rasterizer just to read
-    // cell size — borrow Harness for the rest.
-    let harness = Harness::new(1, 1);
-    let (cw, ch) = harness.rasterizer.cell_size();
+/// Compute the pixel viewport for a `rows × cols` grid using the
+/// rasterizer's cell metrics. Drops the harness; callers build a fresh
+/// one at the right size.
+fn viewport_pixels(rows: u16, cols: u16) -> (u32, u32) {
+    let h = Harness::new(1, 1);
+    let (cw, ch) = h.rasterizer.cell_size();
+    drop(h);
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let width = (cw * f32::from(COLS)).ceil() as u32;
+    let w = (cw * f32::from(cols)).ceil() as u32;
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let height = (ch * f32::from(ROWS)).ceil() as u32;
-    drop(harness);
-    let mut harness = Harness::new(width, height);
+    let hpx = (ch * f32::from(rows)).ceil() as u32;
+    (w, hpx)
+}
 
-    let term = make_term_filled(ROWS, COLS);
+fn bench_fullframe(c: &mut Criterion) {
+    let (width, height) = viewport_pixels(ROWS, COLS);
+    let mut harness = Harness::new(width, height);
+    let mut term = make_term_filled(ROWS, COLS);
 
     // Warm up the atlas so the first measured iteration isn't penalised
     // by glyph uploads.
     harness.render_term(&term);
+    term.clear_dirty();
 
     c.bench_function("fullframe_200x60", |b| {
         b.iter(|| {
+            // Worst case: every row is dirty (full repaint).
+            term.mark_all_dirty();
             harness.render_term(&term);
+            term.clear_dirty();
         });
     });
 }
 
 fn bench_single_cell_change(c: &mut Criterion) {
-    let harness = Harness::new(1, 1);
-    let (cw, ch) = harness.rasterizer.cell_size();
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let width = (cw * f32::from(COLS)).ceil() as u32;
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let height = (ch * f32::from(ROWS)).ceil() as u32;
-    drop(harness);
+    let (width, height) = viewport_pixels(ROWS, COLS);
     let mut harness = Harness::new(width, height);
-
     let mut term = make_term_filled(ROWS, COLS);
     let mut parser = Parser::new();
-    // Park the cursor at row 30 col 100 so each iteration just toggles
-    // one cell.
     parser.advance(&mut term, b"\x1b[31;101H");
 
     harness.render_term(&term);
+    term.clear_dirty();
 
     let mut tick: u8 = 0;
     c.bench_function("single_cell_change_200x60", |b| {
         b.iter(|| {
             tick = tick.wrapping_add(1);
-            // Move to row 30 col 100, write one printable character,
-            // come back. Just two CSI moves + 1 byte ~= what a keystroke
-            // echo from the shell looks like.
+            // Move to row 30 col 100, write one printable character —
+            // exactly what a keystroke echo from the shell looks like.
+            // Only row 30 gets marked dirty.
             let ch = b"abcdefghijklmnopqrstuvwxyz"[(tick as usize) % 26];
             parser.advance(&mut term, &[0x1b, b'[', b'3', b'1', b';', b'1', b'0', b'1', b'H', ch]);
             harness.render_term(&term);
+            term.clear_dirty();
+        });
+    });
+}
+
+/// Bigger "fullscreen at 5K" scenario — twice the rows of the 200×60
+/// case to confirm scaling with row count. The pre-fix code shaped
+/// every row every frame, so this is where the lag was the worst.
+const BIG_COLS: u16 = 300;
+const BIG_ROWS: u16 = 120;
+
+fn bench_fullframe_fullscreen(c: &mut Criterion) {
+    let (width, height) = viewport_pixels(BIG_ROWS, BIG_COLS);
+    let mut harness = Harness::new(width, height);
+    let mut term = make_term_filled(BIG_ROWS, BIG_COLS);
+    harness.render_term(&term);
+    term.clear_dirty();
+
+    c.bench_function("fullframe_300x120", |b| {
+        b.iter(|| {
+            term.mark_all_dirty();
+            harness.render_term(&term);
+            term.clear_dirty();
+        });
+    });
+}
+
+fn bench_single_cell_change_fullscreen(c: &mut Criterion) {
+    let (width, height) = viewport_pixels(BIG_ROWS, BIG_COLS);
+    let mut harness = Harness::new(width, height);
+    let mut term = make_term_filled(BIG_ROWS, BIG_COLS);
+    let mut parser = Parser::new();
+    parser.advance(&mut term, b"\x1b[61;101H");
+
+    harness.render_term(&term);
+    term.clear_dirty();
+
+    let mut tick: u8 = 0;
+    c.bench_function("single_cell_change_300x120", |b| {
+        b.iter(|| {
+            tick = tick.wrapping_add(1);
+            let ch = b"abcdefghijklmnopqrstuvwxyz"[(tick as usize) % 26];
+            parser.advance(&mut term, &[0x1b, b'[', b'6', b'1', b';', b'1', b'0', b'1', b'H', ch]);
+            harness.render_term(&term);
+            term.clear_dirty();
         });
     });
 }
 
 /// Phase breakdown — runs once when `TOASTTY_BENCH_BREAKDOWN=1` is set,
 /// otherwise registered as a no-op criterion bench. Prints per-section
-/// wall time for one warm `render_term` at fullscreen.
+/// wall time for both the cached single-cell case and the worst-case
+/// full repaint, at both window sizes.
 fn bench_phase_breakdown(c: &mut Criterion) {
     if std::env::var_os("TOASTTY_BENCH_BREAKDOWN").is_none() {
         return;
     }
 
-    let mut term = make_term_filled(ROWS, COLS);
-    let harness = Harness::new(1, 1);
-    let (cw, ch) = harness.rasterizer.cell_size();
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let width = (cw * f32::from(COLS)).ceil() as u32;
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let height = (ch * f32::from(ROWS)).ceil() as u32;
-    drop(harness);
-    let mut h = Harness::new(width, height);
+    for (label, rows, cols) in [("200x60", ROWS, COLS), ("300x120", BIG_ROWS, BIG_COLS)] {
+        let (width, height) = viewport_pixels(rows, cols);
+        let mut h = Harness::new(width, height);
+        let mut term = make_term_filled(rows, cols);
 
-    // Warm
-    for _ in 0..3 {
-        h.render_term(&term);
+        // Warm up so atlas uploads aren't in the timing.
+        for _ in 0..3 {
+            h.render_term(&term);
+        }
+        term.clear_dirty();
+
+        println!(
+            "\n=== phase breakdown: {label}  grid={rows}x{cols}  px={width}x{height} ===",
+        );
+
+        // Single-cell change (the realistic keystroke case): mark only
+        // one row dirty.
+        let mut parser = Parser::new();
+        parser.advance(&mut term, b"\x1b[1;1Hx");
+        println!("[ single-cell change, only dirty row re-shapes ]");
+        h.render_term_instrumented(&term, false);
+        term.clear_dirty();
+
+        // Worst case (full repaint) — emulates the pre-fix code path.
+        term.mark_all_dirty();
+        println!("[ full repaint, every row re-shapes (pre-fix path) ]");
+        h.render_term_instrumented(&term, true);
+        term.clear_dirty();
     }
 
-    let mut parser = Parser::new();
-    parser.advance(&mut term, b"\x1b[31;101Hx");
-
-    println!("\n=== phase breakdown: fullscreen {}x{} ({} px × {} px) ===", COLS, ROWS, width, height);
-    h.render_term_instrumented(&term);
-
-    // Register a dummy bench so criterion is happy.
     c.bench_function("phase_breakdown_dummy", |b| {
         b.iter(|| {});
     });
 }
 
-criterion_group!(benches, bench_fullframe, bench_single_cell_change, bench_phase_breakdown);
+criterion_group!(
+    benches,
+    bench_fullframe,
+    bench_single_cell_change,
+    bench_fullframe_fullscreen,
+    bench_single_cell_change_fullscreen,
+    bench_phase_breakdown,
+);
 criterion_main!(benches);
