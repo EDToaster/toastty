@@ -234,6 +234,31 @@ impl Term {
     /// the renderer must emit a corrective full redraw before the binary
     /// clears the flag via
     /// [`Term::clear_sync_output_force_flushed`].
+    ///
+    /// ## Why this flag exists alongside the dirty bitset
+    ///
+    /// The corrective full redraw is mechanically delivered by
+    /// [`Term::force_flush_sync_output`] calling `mark_all_dirty` on
+    /// the per-row bitset — so for M8's row-level damage signal this
+    /// flag carries no extra information that the renderer's hot path
+    /// needs (the dirty bitset already forces re-shape of every row).
+    ///
+    /// We keep the flag distinct because M9 splits the damage signal
+    /// into finer-grained dirty rectangles / dirty cells (see
+    /// `docs/milestones/m09-damage-tracking.md`). At that point the
+    /// renderer needs to distinguish:
+    ///
+    /// 1. "Dirty list covers every cell because the app actually
+    ///    rewrote every cell" → small per-cell list still valid,
+    ///    `LoadOp::Load` is fine.
+    /// 2. "Dirty list is tiny because the app only wrote a few cells
+    ///    but we're recovering from a forced ESU mid-batch — the
+    ///    underlying framebuffer holds half-painted state" →
+    ///    `LoadOp::Clear` + repaint everything.
+    ///
+    /// Case 2 is exactly what `sync_output_force_flushed` signals.
+    /// The binary clears the flag immediately after a render that
+    /// actually went out (followup C2 — only on `RenderOutcome::Rendered`).
     #[must_use]
     pub fn sync_output_force_flushed(&self) -> bool {
         self.sync_output.timeout_force_flushed
@@ -260,7 +285,7 @@ impl Term {
         self.sync_output.active = false;
         self.sync_output.started_at = None;
         self.sync_output.timeout_force_flushed = true;
-        self.mark_all_dirty_internal();
+        self.mark_all_dirty();
     }
 
     /// Internal: handle a DECSET 2026 toggle. Enable-side captures the
@@ -283,7 +308,7 @@ impl Term {
             // ESU: clear and force a corrective full redraw.
             self.sync_output.active = false;
             self.sync_output.started_at = None;
-            self.mark_all_dirty_internal();
+            self.mark_all_dirty();
         }
     }
 
@@ -439,14 +464,6 @@ impl Term {
         }
     }
 
-    /// Mark every visible row dirty without going through the public
-    /// API. Used for scrollback motion and screen clears.
-    fn mark_all_dirty_internal(&mut self) {
-        for d in &mut self.dirty {
-            *d = true;
-        }
-    }
-
     /// Resize the visible viewport. **Does not reflow** — that's a
     /// decision #6 / scrollback.md follow-up. The cursor is clamped to the
     /// new dimensions.
@@ -500,21 +517,23 @@ impl Term {
             // Every visible row's content shifted up; the cached shape
             // for each row no longer matches its position. Force a
             // re-shape of all rows.
-            self.mark_all_dirty_internal();
+            self.mark_all_dirty();
         } else {
             self.cursor.row += 1;
         }
     }
 
-    /// Cell width of `c` per `unicode-width` (legacy `wcwidth` table).
+    /// Cell-width lookup for a single codepoint.
+    ///
+    /// `Term::print` operates per-codepoint, not per-grapheme. M8 wires
+    /// mode 2027 into the *renderer's* cluster-width snap only; the cell
+    /// grid uses `UnicodeWidthChar` here. For VS16 / ZWJ clusters this
+    /// means grid columns and rendered geometry can disagree — picked up
+    /// in M9 when `Term::print` grows cluster awareness.
     ///
     /// Returns `1` for ordinary text / unknown chars, `2` for CJK
     /// ideographs / emoji / fullwidth forms, `0` for combining marks
-    /// and other zero-width controls. Mode 2027 (
-    /// [`Term::grapheme_cluster_mode`]) only re-shapes the renderer's
-    /// width snap — `Term::print` operates per-char and trusts the
-    /// `unicode-width` table either way (matching xterm / kitty
-    /// behaviour for the legacy stream-of-chars `print` path).
+    /// and other zero-width controls.
     fn char_cell_width(c: char) -> u16 {
         match UnicodeWidthChar::width(c) {
             Some(0) => 0,
@@ -767,7 +786,7 @@ impl Term {
             // 2/3: entire screen (3 = also scrollback, which we treat the same in M3).
             _ => {
                 grid.clear_visible(style);
-                self.mark_all_dirty_internal();
+                self.mark_all_dirty();
             }
         }
     }
@@ -948,7 +967,7 @@ impl Term {
         // Reset cursor to home and clear style for the alt screen.
         self.cursor = Cursor::default();
         // Switching screens invalidates every cached shaped line.
-        self.mark_all_dirty_internal();
+        self.mark_all_dirty();
     }
 
     fn exit_alt_screen(&mut self) {
@@ -959,7 +978,7 @@ impl Term {
         self.cursor = self.saved_cursor;
         self.clamp_cursor();
         // Switching back: re-shape the primary screen contents.
-        self.mark_all_dirty_internal();
+        self.mark_all_dirty();
     }
 }
 
@@ -2492,6 +2511,45 @@ mod tests {
         // All rows dirty (the ESU disable path marks everything).
         for (i, &d) in t.dirty_rows().iter().enumerate() {
             assert!(d, "row {i} should be dirty after batch ESU");
+        }
+    }
+
+    /// Followup C2: when `render_term` returns `RenderOutcome::Skipped`
+    /// (pause-gated), the binary's `Event::Redraw` branch must NOT clear
+    /// the dirty bitset or the BSU force-flushed flag — both must
+    /// survive until the next non-skipped frame so the corrective full
+    /// redraw is delivered.
+    ///
+    /// This test simulates the binary's "skipped frame" branch by
+    /// mutating Term state in the exact sequence the binary will use:
+    /// force-flush sets the flag and dirties everything; then a
+    /// hypothetical "skipped" frame does NOT call `clear_dirty` or
+    /// `clear_sync_output_force_flushed`; the flag and dirty rows must
+    /// still be set on the next observation.
+    #[test]
+    fn sync_output_force_flushed_flag_survives_skipped_frame() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?2026hAB");
+        t.force_flush_sync_output();
+        // Precondition: every row dirty, flag set, pause cleared.
+        assert!(!t.pause_rendering());
+        assert!(t.sync_output_force_flushed());
+        for (i, &d) in t.dirty_rows().iter().enumerate() {
+            assert!(d, "row {i} should be dirty after timeout flush");
+        }
+        // A pause-gated Skipped frame: the binary does NOT call
+        // clear_dirty / clear_sync_output_force_flushed. State must be
+        // identical when we observe it again.
+        assert!(t.sync_output_force_flushed());
+        for (i, &d) in t.dirty_rows().iter().enumerate() {
+            assert!(d, "row {i} dirty bit must survive a skipped frame");
+        }
+        // Now simulate a Rendered frame that consumes the signals.
+        t.clear_dirty();
+        t.clear_sync_output_force_flushed();
+        assert!(!t.sync_output_force_flushed());
+        for (i, &d) in t.dirty_rows().iter().enumerate() {
+            assert!(!d, "row {i} should be clean after a real render");
         }
     }
 

@@ -11,6 +11,11 @@
 //! flag and its wall-clock timestamp live on `toastty_term::Term`; the
 //! helpers here just answer "did the timer expire?" and "what bytes do
 //! we send as a DECRPM ($p) reply for mode 2026?".
+//!
+//! TODO(M9): wire `encode_decrpm_reply` into the CSI dispatcher's
+//! DECRQM (`CSI ? Pm $ p`) query handler. It's tested locally here
+//! (so it doesn't trip dead-code warnings), but no parser path
+//! consumes the result yet.
 
 use std::time::{Duration, Instant};
 
@@ -79,5 +84,33 @@ mod tests {
     fn encode_decrpm_set_or_reset() {
         assert_eq!(encode_decrpm_reply(true), b"1");
         assert_eq!(encode_decrpm_reply(false), b"2");
+    }
+
+    /// Stuck-BSU regression (followup C1): when BSU goes high and then
+    /// the app emits nothing for >= [`BSU_TIMEOUT`], the watchdog
+    /// predicate must report "force flush" so the idle-side caller
+    /// (`Toastty::event`'s `Event::Redraw` arm, fired by the
+    /// `ControlSignal::RedrawIn(BSU_TIMEOUT)` wake-up) flips the pause.
+    /// Pre-C1, the only callsite was `handle_pty_bytes` — which is
+    /// never re-entered while the app is silent, so the watchdog never
+    /// fired.
+    #[test]
+    fn should_force_flush_reports_true_after_timeout_with_no_further_input() {
+        let started_at = Instant::now();
+        // The watchdog wake-up is scheduled at exactly BSU_TIMEOUT; the
+        // OS-level coalescing means we land at-or-after that point.
+        let wake = started_at + BSU_TIMEOUT;
+        assert!(should_force_flush(started_at, wake));
+        // A few milliseconds late (typical OS jitter) is still true.
+        let wake_late = started_at + BSU_TIMEOUT + Duration::from_millis(7);
+        assert!(should_force_flush(started_at, wake_late));
+        // And a few milliseconds early (timer fired ahead of schedule —
+        // not expected, but be explicit about the >= boundary) is false.
+        // `checked_sub` keeps clippy::unchecked_time_subtraction happy;
+        // arithmetic is trivially in-range here so unwrap is fine.
+        let wake_early = (started_at + BSU_TIMEOUT)
+            .checked_sub(Duration::from_millis(1))
+            .expect("BSU_TIMEOUT is well above 1ms");
+        assert!(!should_force_flush(started_at, wake_early));
     }
 }
