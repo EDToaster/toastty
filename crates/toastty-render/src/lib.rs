@@ -27,6 +27,8 @@ pub mod color;
 pub mod surface_format;
 pub mod text;
 
+use std::time::{Duration, Instant};
+
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
 use toastty_term::Term;
@@ -185,6 +187,61 @@ pub struct Renderer {
     /// fully paints), on resize / theme / font swap, and whenever the
     /// term reports `damage.all` (M8 corrective-flush path).
     needs_full_clear: bool,
+    /// Cursor blink state machine.
+    blink: CursorBlink,
+}
+
+/// Default cursor blink half-cycle (matches gnome-terminal / kitty).
+pub const DEFAULT_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+
+/// Standalone cursor-blink state machine. Lives on `Renderer` but is
+/// pulled out so the blink logic can be tested without a GPU.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CursorBlink {
+    pub last_at: Instant,
+    pub visible: bool,
+    pub interval: Duration,
+}
+
+impl CursorBlink {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_at: now,
+            visible: true,
+            interval: DEFAULT_CURSOR_BLINK_INTERVAL,
+        }
+    }
+
+    /// True iff a tick is due. Always false when `blink_enabled` is
+    /// false (DECSCUSR Ps=2/4/6 → steady cursor).
+    fn animation_due(&self, blink_enabled: bool, now: Instant) -> bool {
+        if !blink_enabled {
+            return false;
+        }
+        now.saturating_duration_since(self.last_at) >= self.interval
+    }
+
+    /// Time until the next tick. `None` when blink is disabled.
+    fn next_deadline(&self, blink_enabled: bool, now: Instant) -> Option<Duration> {
+        if !blink_enabled {
+            return None;
+        }
+        let next = self.last_at + self.interval;
+        Some(next.saturating_duration_since(now))
+    }
+
+    /// Toggle visibility and stamp `last_at`. Called by `render_term`
+    /// when `animation_due` returns true.
+    fn tick(&mut self, now: Instant) {
+        self.visible = !self.visible;
+        self.last_at = now;
+    }
+
+    /// Force visibility on. Used when the term has blink disabled
+    /// mid-cycle.
+    fn force_visible(&mut self) {
+        self.visible = true;
+    }
 }
 
 struct TextState {
@@ -300,6 +357,7 @@ impl Renderer {
             // First frame after construction always clears: the
             // back-buffer's initial contents are undefined.
             needs_full_clear: true,
+            blink: CursorBlink::new(Instant::now()),
         })
     }
 
@@ -383,6 +441,35 @@ impl Renderer {
         self.needs_full_clear = true;
     }
 
+    /// Override the cursor blink half-cycle. Used by the config layer
+    /// to thread the `[cursor]` rate through to the runtime.
+    pub fn set_cursor_blink_interval(&mut self, d: Duration) {
+        self.blink.interval = d;
+    }
+
+    /// Current cursor blink half-cycle.
+    #[must_use]
+    pub fn cursor_blink_interval(&self) -> Duration {
+        self.blink.interval
+    }
+
+    /// True iff the cursor is currently in the "on" phase of the blink
+    /// cycle (or the term has blink disabled, in which case the cursor
+    /// is always visible).
+    #[must_use]
+    pub fn cursor_visible(&self) -> bool {
+        self.blink.visible
+    }
+
+    /// Time until the cursor's next blink toggle, given `term`'s blink
+    /// flag. Returns `None` when the term has blink disabled (DECSCUSR
+    /// Ps=2/4/6 → steady cursor) so the binary doesn't pointlessly
+    /// schedule a wake-up.
+    #[must_use]
+    pub fn next_redraw_deadline(&self, term: &Term) -> Option<Duration> {
+        self.blink.next_deadline(term.cursor_blink(), Instant::now())
+    }
+
     /// Current theme.
     pub fn theme(&self) -> Theme {
         self.theme
@@ -463,12 +550,27 @@ impl Renderer {
         // encode + submit entirely. The binary preserves the damage
         // signal across skipped frames (followup C2).
         //
-        // Cursor blink animation is checked here so a "no-op" frame
-        // that lands on the blink toggle still goes through. Step 9
-        // wires the actual blink tick.
-        let cursor_animation_due = false;
+        // Cursor blink animation: when a tick is due AND the term has
+        // blink enabled, force the frame through so the renderer can
+        // toggle `cursor_visible` and emit the updated cursor instance.
+        let now = Instant::now();
+        let cursor_animation_due = self.blink.animation_due(term.cursor_blink(), now);
         if term.damage().is_empty() && !cursor_animation_due && !self.needs_full_clear {
             return Ok(RenderOutcome::Skipped);
+        }
+
+        // If the blink tick fired, flip the visibility flag now —
+        // before instance building reads `cursor_visible`.
+        if cursor_animation_due {
+            self.blink.tick(now);
+        }
+        // If the term has blink disabled, the cursor must always be
+        // visible. We don't update `last_at` because the blink state
+        // is unobservable while disabled, and any future re-enable
+        // should compute the next tick from the moment of re-enable,
+        // not from a stale baseline. Steady cursor:
+        if !term.cursor_blink() && !self.blink.visible {
+            self.blink.force_visible();
         }
 
         let trace = std::env::var_os("TOASTTY_TRACE_RENDER").is_some();
@@ -549,7 +651,7 @@ impl Renderer {
         // read `text.line_cache` immutably while writing to the scratch;
         // can't hold two borrows of TextState at once.
         let damage_all = term.damage().all;
-        let cursor_visible = true; // wired to blink state in M9.9
+        let cursor_visible = self.blink.visible;
         let text = self.text.as_mut().expect("text init");
         let mut instances = std::mem::take(&mut text.instances_scratch);
         let t_bi = if trace { Some(std::time::Instant::now()) } else { None };
@@ -790,5 +892,82 @@ mod tests {
         let o = RenderOutcome::Skipped;
         let p = o;
         assert_eq!(o, p);
+    }
+
+    // ----- M9 cursor blink ------------------------------------------------
+
+    #[test]
+    fn cursor_blink_animation_due_after_interval() {
+        let now = Instant::now();
+        let blink = CursorBlink {
+            last_at: now - Duration::from_millis(600),
+            visible: true,
+            interval: Duration::from_millis(530),
+        };
+        assert!(blink.animation_due(true, now));
+    }
+
+    #[test]
+    fn cursor_blink_animation_not_due_before_interval() {
+        let now = Instant::now();
+        let blink = CursorBlink {
+            last_at: now,
+            visible: true,
+            interval: Duration::from_millis(530),
+        };
+        assert!(!blink.animation_due(true, now));
+    }
+
+    #[test]
+    fn cursor_blink_toggles_after_interval() {
+        let mut blink = CursorBlink::new(Instant::now());
+        let was_visible = blink.visible;
+        blink.tick(Instant::now());
+        assert_ne!(blink.visible, was_visible);
+    }
+
+    #[test]
+    fn cursor_blink_disabled_when_term_blink_off() {
+        let now = Instant::now();
+        let blink = CursorBlink {
+            last_at: now - Duration::from_secs(10),
+            visible: true,
+            interval: Duration::from_millis(530),
+        };
+        // Term has blink disabled → animation NEVER due.
+        assert!(!blink.animation_due(false, now));
+        // And no deadline scheduled.
+        assert!(blink.next_deadline(false, now).is_none());
+    }
+
+    #[test]
+    fn next_redraw_deadline_is_some_when_blink_on() {
+        let now = Instant::now();
+        let blink = CursorBlink::new(now);
+        let d = blink.next_deadline(true, now);
+        assert!(d.is_some(), "deadline must be Some when blink is on");
+        let d = d.unwrap();
+        // Just after construction, the next toggle is ~`interval` away.
+        assert!(d <= blink.interval);
+    }
+
+    #[test]
+    fn next_redraw_deadline_saturates_at_zero_when_overdue() {
+        let now = Instant::now();
+        let blink = CursorBlink {
+            last_at: now - Duration::from_secs(5),
+            visible: true,
+            interval: Duration::from_millis(530),
+        };
+        let d = blink.next_deadline(true, now).unwrap();
+        assert_eq!(d, Duration::ZERO, "overdue deadline must saturate to 0");
+    }
+
+    #[test]
+    fn cursor_blink_force_visible_resets_phase() {
+        let mut blink = CursorBlink::new(Instant::now());
+        blink.visible = false;
+        blink.force_visible();
+        assert!(blink.visible);
     }
 }
