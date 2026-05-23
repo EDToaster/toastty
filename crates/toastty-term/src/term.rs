@@ -2355,6 +2355,17 @@ mod tests {
     }
 
     #[test]
+    fn decset_2048_survives_resize() {
+        // Mode 2048 is meant for apps that want resize reports on
+        // *future* geometry changes — it must survive an actual
+        // resize() call (which mostly rebuilds grid state).
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?2048h");
+        t.resize(4, 8);
+        assert!(t.inband_resize_mode());
+    }
+
+    #[test]
     fn force_flush_sync_output_sets_timeout_flag_and_dirties_all() {
         let mut t = Term::new(2, 4, 0);
         feed(&mut t, b"\x1b[?2026h");
