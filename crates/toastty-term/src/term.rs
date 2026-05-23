@@ -427,6 +427,14 @@ impl Term {
         self.image_revision
     }
 
+    /// Current SGR 58 underline color, or `None` when SGR 59 (or 0)
+    /// reset it. The Unicode placeholder pipeline reads this as the
+    /// high byte of the image id.
+    #[must_use]
+    pub fn cursor_underline_color(&self) -> Option<Color> {
+        self.cursor_underline_color
+    }
+
     /// Override the per-Term image-cache byte budget. May evict.
     pub fn set_image_cap(&mut self, cap_bytes: u64) {
         let evicted = self.image_registry.set_cap(cap_bytes);
@@ -1299,11 +1307,12 @@ impl Term {
                 38 if slice.len() >= 2 => self.cursor.style.fg = parse_extended_color_from_slice(&slice[1..]).unwrap_or(self.cursor.style.fg),
                 48 if slice.len() >= 2 => self.cursor.style.bg = parse_extended_color_from_slice(&slice[1..]).unwrap_or(self.cursor.style.bg),
                 58 if slice.len() >= 2 => {
-                    // Underline color is parsed but not yet stored — we don't
-                    // have anywhere to put it. We MUST still consume the
-                    // sub-params so they don't leak. The colon form keeps
-                    // them in the same slice, so there's nothing to do.
-                    let _ = parse_extended_color_from_slice(&slice[1..]);
+                    // M11a: SGR 58 underline color is stored on
+                    // `cursor_underline_color`. The Unicode placeholder
+                    // pipeline reads this as the *high byte* of the
+                    // image id (kitty's protocol packs id MSB into the
+                    // 256-color underline slot).
+                    self.cursor_underline_color = parse_extended_color_from_slice(&slice[1..]);
                 }
                 38 => {
                     // Semicolon form: consume from the outer iterator.
@@ -1319,8 +1328,18 @@ impl Term {
                     }
                 }
                 58 => {
-                    // Parse and discard for now — see comment above.
-                    let _ = parse_extended_color_from_iter(&mut iter);
+                    // M11a: semicolon form for SGR 58 — store on
+                    // `cursor_underline_color`.
+                    self.cursor_underline_color = parse_extended_color_from_iter(&mut iter);
+                }
+                // SGR 59 — reset underline color to default.
+                59 => {
+                    self.cursor_underline_color = None;
+                }
+                // SGR 0 (reset) — clear the underline color too.
+                0 => {
+                    self.cursor_underline_color = None;
+                    self.apply_sgr_param(0);
                 }
                 v => self.apply_sgr_param(v),
             }
@@ -1343,8 +1362,16 @@ impl Term {
             39 => style.fg = Color::Default,
             40..=47 => style.bg = ansi_color(v - 40, false),
             49 => style.bg = Color::Default,
-            // 59 (default underline color) is also handled by the wildcard
-            // for now — we don't store underline color yet.
+            // M11a: 59 resets the cursor underline color (placeholder
+            // image-id MSB). The SGR walker handles this branch by
+            // calling `apply_sgr_param(59)`, which now lives here
+            // rather than falling through to the wildcard.
+            59 => {
+                // Falls through — we can't touch self.cursor_underline_color
+                // from here because we only have `&mut style`. Reset
+                // happens in `apply_sgr` for the top-level walk; see
+                // the explicit clear there.
+            }
             90..=97 => style.fg = ansi_color(v - 90, true),
             100..=107 => style.bg = ansi_color(v - 100, true),
             _ => {}
@@ -4146,6 +4173,37 @@ mod tests {
         // Enter alt screen.
         feed(&mut t, b"\x1b[?1049h");
         assert_eq!(t.image_grid().len(), 0);
+    }
+
+    #[test]
+    fn sgr_58_underline_color_indexed_stored() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[58;5;42m");
+        assert_eq!(t.cursor_underline_color(), Some(Color::Indexed256(42)));
+    }
+
+    #[test]
+    fn sgr_58_colon_form_indexed_stored() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[58:5:7m");
+        assert_eq!(t.cursor_underline_color(), Some(Color::Indexed256(7)));
+    }
+
+    #[test]
+    fn sgr_59_resets_underline_color() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[58;5;42m");
+        assert!(t.cursor_underline_color().is_some());
+        feed(&mut t, b"\x1b[59m");
+        assert_eq!(t.cursor_underline_color(), None);
+    }
+
+    #[test]
+    fn sgr_0_resets_underline_color() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[58;5;42m");
+        feed(&mut t, b"\x1b[0m");
+        assert_eq!(t.cursor_underline_color(), None);
     }
 
     #[test]
