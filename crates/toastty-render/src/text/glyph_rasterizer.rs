@@ -98,7 +98,9 @@ impl GlyphRasterizer {
                 )));
         }
 
-        let metrics = Metrics::new(font_size, font_size * 1.25);
+        // Line height ratio: 1.25 was too tight (descenders kissed the
+        // next line's ascenders). 1.4 matches what most terminals use.
+        let metrics = Metrics::new(font_size, font_size * 1.4);
 
         // Determine cell size by shaping the reference glyph "M".
         let cell_size = measure_cell(&mut font_system, metrics, font_name);
