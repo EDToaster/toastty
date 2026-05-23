@@ -175,6 +175,16 @@ pub struct Term {
     /// the PTY from inside a `Perform` callback) lets the parsing layer
     /// stay free of I/O concerns and keeps `Term` reentrancy-safe.
     pty_replies: Vec<u8>,
+    /// OSC 4 palette overrides. `None` at an index means "fall through to
+    /// the renderer's built-in xterm 256-color table"; `Some([r, g, b])`
+    /// is the app-supplied sRGB triple. Boxed because a flat
+    /// `[Option<[u8; 3]>; 256]` is 1 KB; keeping it on the heap avoids
+    /// inflating `Term` itself.
+    palette_overrides: Box<[Option<[u8; 3]>; 256]>,
+    /// Bump-counter incremented every time an OSC 4 set lands. The
+    /// renderer keeps a cached linear-light palette and compares
+    /// revisions to decide when to rebuild.
+    palette_revision: u32,
 }
 
 /// One semantic prompt marker recorded from OSC 133.
@@ -247,6 +257,8 @@ impl Term {
             cwd: String::new(),
             prompt_marks: Vec::new(),
             pty_replies: Vec::new(),
+            palette_overrides: Box::new([None; 256]),
+            palette_revision: 0,
         }
     }
 
@@ -263,6 +275,32 @@ impl Term {
     /// asynchronously-produced replies through the same drain.
     pub fn push_pty_reply(&mut self, bytes: &[u8]) {
         self.pty_replies.extend_from_slice(bytes);
+    }
+
+    /// Read the override for palette index `idx`. Returns `None` if no
+    /// override is active for that slot (the renderer should fall back
+    /// to its built-in 256-color table).
+    #[must_use]
+    pub fn palette_override(&self, idx: u8) -> Option<[u8; 3]> {
+        self.palette_overrides[idx as usize]
+    }
+
+    /// Monotonic revision counter. Bumps on every successful OSC 4 set.
+    /// The renderer reads this once per frame and rebuilds its cached
+    /// linear-light extended palette on change.
+    #[must_use]
+    pub fn palette_revision(&self) -> u32 {
+        self.palette_revision
+    }
+
+    /// Set palette override for `idx` and bump the revision. Marks every
+    /// row dirty so the new color shows immediately under partial
+    /// redraw (since the resolved color of any existing cell drawn at
+    /// `idx` has changed out from under it).
+    fn set_palette_override(&mut self, idx: u8, rgb: [u8; 3]) {
+        self.palette_overrides[idx as usize] = Some(rgb);
+        self.palette_revision = self.palette_revision.wrapping_add(1);
+        self.mark_all_dirty();
     }
 
     /// Most recent cwd advertised via OSC 7. Empty when the shell hasn't
@@ -1353,6 +1391,36 @@ impl Perform for Term {
                 let payload = params.get(1).copied().unwrap_or(b"");
                 let title = String::from_utf8_lossy(payload).into_owned();
                 self.title = title;
+            }
+            // OSC 4 — extended palette query / set.
+            //
+            // Payload is a sequence of `(idx, spec)` pairs. vte splits
+            // on `;`, so `OSC 4 ; 1 ; rgb:ab/cd/ef ; 2 ; ?` arrives as
+            // `params = [b"4", b"1", b"rgb:ab/cd/ef", b"2", b"?"]`. Walk
+            // pairs in steps of two starting at index 1.
+            4 => {
+                let rest = &params[1..];
+                let mut i = 0;
+                while i + 1 < rest.len() {
+                    if let Some(op) =
+                        toastty_protocols::palette::parse_pair(rest[i], rest[i + 1])
+                    {
+                        match op {
+                            toastty_protocols::palette::Osc4Op::Query { idx } => {
+                                let rgb = self.palette_override(idx).unwrap_or_else(|| {
+                                    toastty_protocols::palette::default_xterm_256(idx)
+                                });
+                                let reply =
+                                    toastty_protocols::palette::encode_query_reply(idx, rgb);
+                                self.pty_replies.extend_from_slice(&reply);
+                            }
+                            toastty_protocols::palette::Osc4Op::Set { idx, rgb } => {
+                                self.set_palette_override(idx, rgb);
+                            }
+                        }
+                    }
+                    i += 2;
+                }
             }
             // OSC 7 — current working directory (`file://<host>/<path>`).
             //
@@ -3191,5 +3259,64 @@ mod tests {
     fn pty_reply_queue_starts_empty() {
         let mut t = Term::new(2, 4, 0);
         assert!(t.drain_pty_replies().is_empty());
+    }
+
+    // ----- OSC 4 (palette) -------------------------------------------------
+
+    #[test]
+    fn osc4_set_records_override_and_bumps_revision() {
+        let mut t = Term::new(2, 4, 0);
+        let r0 = t.palette_revision();
+        feed(&mut t, b"\x1b]4;1;rgb:ab/cd/ef\x1b\\");
+        assert_eq!(t.palette_override(1), Some([0xab, 0xcd, 0xef]));
+        assert_ne!(t.palette_revision(), r0);
+    }
+
+    #[test]
+    fn osc4_set_marks_all_dirty() {
+        let mut t = Term::new(2, 4, 0);
+        t.clear_damage();
+        feed(&mut t, b"\x1b]4;5;rgb:00/00/00\x1b\\");
+        assert!(t.damage().all, "palette change must invalidate every row");
+    }
+
+    #[test]
+    fn osc4_query_enqueues_reply() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]4;1;?\x1b\\");
+        let bytes = t.drain_pty_replies();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        // Default xterm-256 red is 0x800000 → "8080/0000/0000".
+        assert_eq!(s, "\x1b]4;1;rgb:8080/0000/0000\x1b\\");
+    }
+
+    #[test]
+    fn osc4_query_returns_override_when_set() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]4;1;rgb:ab/cd/ef\x1b\\");
+        let _ = t.drain_pty_replies();
+        feed(&mut t, b"\x1b]4;1;?\x1b\\");
+        let bytes = t.drain_pty_replies();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(s, "\x1b]4;1;rgb:abab/cdcd/efef\x1b\\");
+    }
+
+    #[test]
+    fn osc4_multi_pair_handled() {
+        let mut t = Term::new(2, 4, 0);
+        feed(
+            &mut t,
+            b"\x1b]4;1;rgb:11/22/33;2;rgb:44/55/66\x1b\\",
+        );
+        assert_eq!(t.palette_override(1), Some([0x11, 0x22, 0x33]));
+        assert_eq!(t.palette_override(2), Some([0x44, 0x55, 0x66]));
+    }
+
+    #[test]
+    fn osc4_malformed_pair_does_not_panic() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]4;notanumber;rgb:ab/cd/ef\x1b\\");
+        // No override applied, no panic.
+        assert!(t.palette_overrides.iter().all(Option::is_none));
     }
 }

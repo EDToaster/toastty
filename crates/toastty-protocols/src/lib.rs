@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod osc_cwd;
+pub mod palette;
 pub mod resize_inband;
 pub mod semantic_prompt;
 pub mod synchronized;

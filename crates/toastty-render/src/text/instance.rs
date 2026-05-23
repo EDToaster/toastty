@@ -237,7 +237,7 @@ impl Theme {
 const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
 /// Convert one sRGB byte channel to linear-light float.
-fn srgb_channel_to_linear(v: u8) -> f32 {
+pub(crate) fn srgb_channel_to_linear(v: u8) -> f32 {
     let c = f32::from(v) / 255.0;
     if c <= 0.040_45 {
         c / 12.92
@@ -246,7 +246,7 @@ fn srgb_channel_to_linear(v: u8) -> f32 {
     }
 }
 
-fn srgb_to_linear_rgba(r: u8, g: u8, b: u8) -> [f32; 4] {
+pub(crate) fn srgb_to_linear_rgba(r: u8, g: u8, b: u8) -> [f32; 4] {
     [
         srgb_channel_to_linear(r),
         srgb_channel_to_linear(g),
