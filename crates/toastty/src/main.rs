@@ -495,6 +495,19 @@ impl App for Toastty {
                 ControlSignal::RedrawIn(Duration::ZERO)
             }
             Event::Redraw => {
+                // BSU watchdog (idle-fire path). If a BSU is still in
+                // flight and its 1 s deadline has passed, force-flush
+                // here — otherwise an app that emits BSU then goes
+                // silent never gets its `ControlSignal::RedrawIn(BSU_TIMEOUT)`
+                // wake-up converted into a corrective frame.
+                // `handle_pty_bytes` covers the BSU-then-more-bytes
+                // case; this branch covers BSU-then-silence.
+                if self.term.pause_rendering()
+                    && let Some(started_at) = self.term.sync_output_started_at()
+                    && should_force_flush(started_at, Instant::now())
+                {
+                    self.term.force_flush_sync_output();
+                }
                 if let Some(r) = self.renderer.as_mut() {
                     if let Err(e) = r.render_term(&self.term) {
                         warn!("render_term error: {e}");
