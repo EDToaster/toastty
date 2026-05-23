@@ -666,4 +666,17 @@ mod tests {
         assert_eq!(d.backends, Backends::PRIMARY);
         assert!(d.display.is_none());
     }
+
+    /// Followup C2: `RenderOutcome` is the contract that lets the binary
+    /// gate the "clear dirty + clear BSU force-flushed" cleanup so it
+    /// only runs after a real render. Skipped and Rendered must be
+    /// distinguishable values so the match arms in main.rs can branch.
+    #[test]
+    fn render_outcome_variants_are_distinct() {
+        assert_ne!(RenderOutcome::Rendered, RenderOutcome::Skipped);
+        // Default-derived Eq + Copy keep the binary's match arms cheap.
+        let o = RenderOutcome::Skipped;
+        let p = o;
+        assert_eq!(o, p);
+    }
 }

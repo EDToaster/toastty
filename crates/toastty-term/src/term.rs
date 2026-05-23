@@ -2514,6 +2514,45 @@ mod tests {
         }
     }
 
+    /// Followup C2: when `render_term` returns `RenderOutcome::Skipped`
+    /// (pause-gated), the binary's `Event::Redraw` branch must NOT clear
+    /// the dirty bitset or the BSU force-flushed flag — both must
+    /// survive until the next non-skipped frame so the corrective full
+    /// redraw is delivered.
+    ///
+    /// This test simulates the binary's "skipped frame" branch by
+    /// mutating Term state in the exact sequence the binary will use:
+    /// force-flush sets the flag and dirties everything; then a
+    /// hypothetical "skipped" frame does NOT call clear_dirty or
+    /// clear_sync_output_force_flushed; the flag and dirty rows must
+    /// still be set on the next observation.
+    #[test]
+    fn sync_output_force_flushed_flag_survives_skipped_frame() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?2026hAB");
+        t.force_flush_sync_output();
+        // Precondition: every row dirty, flag set, pause cleared.
+        assert!(!t.pause_rendering());
+        assert!(t.sync_output_force_flushed());
+        for (i, &d) in t.dirty_rows().iter().enumerate() {
+            assert!(d, "row {i} should be dirty after timeout flush");
+        }
+        // A pause-gated Skipped frame: the binary does NOT call
+        // clear_dirty / clear_sync_output_force_flushed. State must be
+        // identical when we observe it again.
+        assert!(t.sync_output_force_flushed());
+        for (i, &d) in t.dirty_rows().iter().enumerate() {
+            assert!(d, "row {i} dirty bit must survive a skipped frame");
+        }
+        // Now simulate a Rendered frame that consumes the signals.
+        t.clear_dirty();
+        t.clear_sync_output_force_flushed();
+        assert!(!t.sync_output_force_flushed());
+        for (i, &d) in t.dirty_rows().iter().enumerate() {
+            assert!(!d, "row {i} should be clean after a real render");
+        }
+    }
+
     #[test]
     fn sync_output_force_flush_after_bsu_only_renders_partial_state() {
         // App emits BSU + content, never sends ESU. Watchdog calls
