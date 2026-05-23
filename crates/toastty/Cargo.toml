@@ -24,6 +24,7 @@ tracing-subscriber.workspace = true
 toastty-config.workspace = true
 toastty-io.workspace = true
 toastty-parser.workspace = true
+toastty-protocols.workspace = true
 toastty-pty.workspace = true
 toastty-render.workspace = true
 toastty-term.workspace = true

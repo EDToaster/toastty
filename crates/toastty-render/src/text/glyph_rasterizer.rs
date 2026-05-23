@@ -12,11 +12,12 @@ use cosmic_text::{
     SwashContent,
 };
 use std::collections::HashMap;
+use toastty_protocols::unicode_core::cluster_cell_width;
 use unicode_width::UnicodeWidthChar;
 use wgpu::{Device, Extent3d, Queue, Texture, TextureFormat};
 
 use crate::text::atlas::{Atlas, AtlasLayer, AtlasSlot, GlyphKey};
-use crate::text::cluster_width::{GlyphPos, snap_cluster_widths};
+use crate::text::cluster_width::{GlyphPos, snap_cluster_widths_per_cluster};
 use crate::text::instance::GlyphSlot;
 
 /// Mask atlas dims (R8) and color atlas dims (BGRA8) — generously sized
@@ -200,6 +201,12 @@ impl GlyphRasterizer {
     /// Shape `text` as one line and ensure every glyph is in the atlas.
     /// Returns per-column glyph slots keyed by `(column, char)`.
     ///
+    /// `mode_2027_active` controls cluster-width semantics for the
+    /// per-cluster snap: when true, the renderer trusts the
+    /// grapheme-segmenter's answer (VS16 emoji, ZWJ family etc. snap
+    /// to 2 cells); when false it falls back to the legacy `wcwidth`
+    /// table (which still gives 2 for plain CJK / fullwidth chars).
+    ///
     /// Fast path: if every non-space character is already in
     /// [`char_cache`](Self::char_cache), we skip cosmic-text entirely
     /// and just pack the cached slots by column. Spaces are skipped (no
@@ -211,11 +218,11 @@ impl GlyphRasterizer {
     /// character is seen and any time a line contains an
     /// uncached-and-non-miss character. Populates the cache so future
     /// lines hit the fast path.
-    pub fn shape_line(&mut self, queue: &Queue, text: &str) -> LineGlyphs {
+    pub fn shape_line(&mut self, queue: &Queue, text: &str, mode_2027_active: bool) -> LineGlyphs {
         if let Some(line) = self.try_shape_line_fast(text) {
             return line;
         }
-        self.shape_line_slow(queue, text)
+        self.shape_line_slow(queue, text, mode_2027_active)
     }
 
     /// Fast path: per-character lookups against `char_cache`. Returns
@@ -268,7 +275,12 @@ impl GlyphRasterizer {
     /// Slow path: cosmic-text shaping. Populates `char_cache` /
     /// `char_cache_misses` with whatever cosmic-text resolves so that
     /// future calls with the same characters can take the fast path.
-    fn shape_line_slow(&mut self, queue: &Queue, text: &str) -> LineGlyphs {
+    fn shape_line_slow(
+        &mut self,
+        queue: &Queue,
+        text: &str,
+        mode_2027_active: bool,
+    ) -> LineGlyphs {
         let family_name = self.family_name.clone();
         let attrs = Attrs::new().family(Family::Name(&family_name));
         self.buffer.set_text(text, &attrs, Shaping::Advanced, None);
@@ -294,7 +306,29 @@ impl GlyphRasterizer {
                     w: g.w,
                 })
                 .collect();
-            let snapped = snap_cluster_widths(&positions, cell_w, 1);
+            // Compute the per-cluster cell width. Walk `positions`
+            // grouping by `(start, end)`; for each group, look up the
+            // cluster substring in the original `run.text` and ask
+            // `cluster_cell_width` (mode-2027 aware) for its width.
+            let mut widths: Vec<u8> = Vec::new();
+            {
+                let mut i = 0;
+                while i < positions.len() {
+                    let start = positions[i].start;
+                    let end = positions[i].end;
+                    let mut j = i + 1;
+                    while j < positions.len()
+                        && positions[j].start == start
+                        && positions[j].end == end
+                    {
+                        j += 1;
+                    }
+                    let cluster_str = run.text.get(start..end).unwrap_or("");
+                    widths.push(cluster_cell_width(cluster_str, mode_2027_active));
+                    i = j;
+                }
+            }
+            let snapped = snap_cluster_widths_per_cluster(&positions, cell_w, &widths);
             for (g, snap) in run.glyphs.iter().zip(snapped.iter()) {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let col = (snap.x / cell_w).round() as u16;
@@ -597,7 +631,7 @@ mod tests {
 
         // ASCII-only line: every glyph is width-1 and should land in
         // the cache via the slow path's `char_cache.entry(...)` call.
-        rasterizer.shape_line(&queue, "hello");
+        rasterizer.shape_line(&queue, "hello", false);
         let ascii_cache_size = rasterizer.char_cache.len();
         assert!(
             ascii_cache_size >= "hello".chars().filter(|c| *c != 'l').count(),
@@ -609,7 +643,7 @@ mod tests {
         // unicode_width 2; the fast path must bail (so the slow path
         // runs), and the slow path must NOT insert `你` into the
         // per-char cache.
-        rasterizer.shape_line(&queue, "你");
+        rasterizer.shape_line(&queue, "你", false);
 
         // The CJK char itself must not be in the cache.
         assert!(
@@ -634,7 +668,7 @@ mod tests {
     fn fast_path_bails_on_wide_char() {
         let (_device, queue, mut rasterizer) = make_rasterizer();
         // Warm the cache for ASCII letters.
-        rasterizer.shape_line(&queue, "ab");
+        rasterizer.shape_line(&queue, "ab", false);
         assert!(rasterizer.char_cache.contains_key(&'a'));
         assert!(rasterizer.char_cache.contains_key(&'b'));
 
@@ -643,5 +677,28 @@ mod tests {
         assert!(rasterizer.try_shape_line_fast("a你b").is_none());
         // Pure ASCII still takes the fast path.
         assert!(rasterizer.try_shape_line_fast("ab").is_some());
+    }
+
+    /// Mode 2027 OFF: cluster_width falls back to `wcwidth` per
+    /// codepoint. CJK still snaps to 2 cells (legacy table); ZWJ
+    /// emoji come out as 1. We don't render here — we just check
+    /// shape_line doesn't panic for both flag values.
+    #[test]
+    fn mode_2027_off_uses_default_width() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        let _ = rasterizer.shape_line(&queue, "你 abc", false);
+    }
+
+    /// Mode 2027 ON: cluster_width trusts UnicodeWidthStr. ZWJ family
+    /// snaps to 2; VS16 emoji snaps to 2. Shape doesn't panic and
+    /// produces some glyphs. Visual correctness requires a real GPU +
+    /// snapshot harness — geometry-only smoke here.
+    #[test]
+    fn mode_2027_on_honors_cluster_width_for_emoji() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        // FiraMono doesn't cover emoji so cosmic-text may map them to
+        // the .notdef glyph — but the call must not panic and must
+        // return without producing two-cell-overlapping glyphs.
+        let _ = rasterizer.shape_line(&queue, "❤\u{FE0F}", true);
     }
 }

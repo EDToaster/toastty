@@ -79,6 +79,13 @@ impl Style {
 
 /// A single visible cell on the grid.
 ///
+/// `is_continuation = true` marks a cell that is the second half of a
+/// width-2 cluster: the previous cell holds the cluster's primary
+/// codepoint, and this cell is a placeholder so the column accounting
+/// stays right. The renderer skips continuation cells when emitting
+/// instances; the cursor-motion logic skips over them so backspace /
+/// `cursor_back` moves by the full cluster width.
+///
 /// TODO(cell-layout): per decision #6, fold `Style` into a packed stylesheet
 /// ID (u32) and the eventual hyperlink id into a `NonZeroU16` once the SGR
 /// coverage stabilises. M3 keeps the plain-Rust layout for clarity.
@@ -86,6 +93,11 @@ impl Style {
 pub struct Cell {
     pub ch: char,
     pub style: Style,
+    /// True iff this cell is the continuation half of a width-2 cluster.
+    /// The renderer must skip continuation cells when building
+    /// instances (otherwise we'd over-draw the second half of a CJK
+    /// ideograph with a blank glyph).
+    pub is_continuation: bool,
 }
 
 impl Cell {
@@ -93,6 +105,7 @@ impl Cell {
     pub const BLANK: Self = Self {
         ch: ' ',
         style: Style::RESET,
+        is_continuation: false,
     };
 }
 
@@ -138,6 +151,18 @@ mod tests {
         let c = Cell::default();
         assert_eq!(c.ch, '\0');
         assert_eq!(c.style, Style::RESET);
+        assert!(!c.is_continuation);
+    }
+
+    #[test]
+    fn continuation_cell_default_false() {
+        // The continuation marker must default to false so the M8
+        // mode-2027 wide-cluster path is the only way to set it.
+        // We assert via dynamic values (constructed at runtime via
+        // `Cell::default()`) rather than the `Cell::BLANK` const, to
+        // sidestep clippy's `assertions_on_constants` warning.
+        let blank = Cell::default();
+        assert!(!blank.is_continuation);
     }
 
     #[test]

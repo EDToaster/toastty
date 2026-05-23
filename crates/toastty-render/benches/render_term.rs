@@ -150,7 +150,11 @@ impl Harness {
                 .iter()
                 .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
                 .collect();
-            self.line_cache[r as usize] = Some(self.rasterizer.shape_line(&self.queue, &line_text));
+            self.line_cache[r as usize] = Some(self.rasterizer.shape_line(
+                &self.queue,
+                &line_text,
+                term.grapheme_cluster_mode(),
+            ));
         }
 
         let theme = self.theme;
@@ -259,7 +263,11 @@ impl Harness {
                 .iter()
                 .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
                 .collect();
-            self.line_cache[r as usize] = Some(self.rasterizer.shape_line(&self.queue, &line_text));
+            self.line_cache[r as usize] = Some(self.rasterizer.shape_line(
+                &self.queue,
+                &line_text,
+                term.grapheme_cluster_mode(),
+            ));
             shaped += 1;
         }
         let shape_ms = t_shape.elapsed().as_secs_f64() * 1000.0;

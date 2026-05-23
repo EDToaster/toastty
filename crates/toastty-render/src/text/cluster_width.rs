@@ -11,11 +11,10 @@
 //! (group of glyphs sharing a `(start..end)` byte range) snaps to
 //! `cluster_cells * cell_width`.
 //!
-//! # M4b scope
-//!
-//! Only the **1-cell** case is implemented. Mode 2027 multi-cell clusters
-//! are wired through the `cluster_cells` parameter but only `1` is honored;
-//! see TODO below.
+//! M8 lifts the M4b "only 1-cell case" restriction; `cluster_cells`
+//! now snaps each cluster's total advance to a true integer multiple
+//! of `cell_width`, so CJK / VS16 / ZWJ emoji land cleanly on the
+//! grid.
 
 /// A glyph's position and advance, abstracted so tests don't need a GPU
 /// type or a real `cosmic_text::LayoutGlyph`.
@@ -32,48 +31,65 @@ pub struct GlyphPos {
     pub w: f32,
 }
 
-/// Snap each cluster's total advance to a multiple of `cell_width`.
+/// Snap each cluster's total advance to a multiple of `cell_width`,
+/// using the **same** `cluster_cells` value for every cluster in the
+/// run. For runs that mix narrow + wide clusters, use
+/// [`snap_cluster_widths_per_cluster`].
 ///
 /// `cluster_cells` is the declared cell-width of clusters: `1` for the
-/// common case (default mode 2027 off), `2` for wide CJK / VS16 / ZWJ
-/// emoji. **Only `1` is implemented in M4b** — wider clusters fall back
-/// to whatever the shaper produced (with a TODO marker below).
-///
-/// The returned vec has the same length as `glyphs`, in the same order.
-///
-/// # Algorithm
-///
-/// 1. Walk `glyphs`, grouping by identical `(start, end)`.
-/// 2. For each cluster, target width = `cluster_cells * cell_width`.
-/// 3. Position cluster at the running x cursor; redistribute glyph widths
-///    proportionally to their original `w` (so multi-glyph ligatures keep
-///    their relative spacing).
-/// 4. Update the running x cursor by `target_width`.
-///
-/// If `glyphs` is empty, returns an empty vec.
-///
-/// If a cluster's total natural width is `0` (degenerate), we redistribute
-/// equally rather than divide by zero.
+/// default case, `2` for wide CJK / VS16 / ZWJ emoji. A value of `0` is
+/// treated as `1` (defensive — see the docstring note below).
 #[must_use]
 pub fn snap_cluster_widths(
     glyphs: &[GlyphPos],
     cell_width: f32,
     cluster_cells: u8,
 ) -> Vec<GlyphPos> {
+    let cells = if cluster_cells == 0 { 1 } else { cluster_cells };
+    snap_cluster_widths_impl(glyphs, cell_width, ClusterWidths::Uniform(cells))
+}
+
+/// Per-cluster cell-width variant of [`snap_cluster_widths`]: the
+/// `widths` slice supplies one `u8` per cluster, in the order clusters
+/// appear in `glyphs` (grouped by `(start, end)`).
+///
+/// Excess `widths` entries are ignored; missing entries fall back to
+/// `1` cell.
+#[must_use]
+pub fn snap_cluster_widths_per_cluster(
+    glyphs: &[GlyphPos],
+    cell_width: f32,
+    widths: &[u8],
+) -> Vec<GlyphPos> {
+    snap_cluster_widths_impl(glyphs, cell_width, ClusterWidths::PerCluster(widths))
+}
+
+enum ClusterWidths<'a> {
+    Uniform(u8),
+    PerCluster(&'a [u8]),
+}
+
+impl ClusterWidths<'_> {
+    fn width_for(&self, cluster_idx: usize) -> u8 {
+        match self {
+            ClusterWidths::Uniform(w) => *w,
+            ClusterWidths::PerCluster(slice) => slice.get(cluster_idx).copied().unwrap_or(1),
+        }
+    }
+}
+
+fn snap_cluster_widths_impl(
+    glyphs: &[GlyphPos],
+    cell_width: f32,
+    widths: ClusterWidths<'_>,
+) -> Vec<GlyphPos> {
     if glyphs.is_empty() {
         return Vec::new();
     }
 
-    // TODO(mode-2027): honor cluster_cells > 1 once mode 2027 wiring lands
-    // in toastty-protocols. For now we only snap the 1-cell case; wider
-    // clusters keep their natural width.
-    if cluster_cells != 1 {
-        return glyphs.to_vec();
-    }
-
     let mut out = Vec::with_capacity(glyphs.len());
     let mut cursor_x: f32 = glyphs[0].x;
-    let target_width = f32::from(cluster_cells) * cell_width;
+    let mut cluster_idx: usize = 0;
 
     let mut i = 0;
     while i < glyphs.len() {
@@ -86,6 +102,9 @@ pub fn snap_cluster_widths(
             j += 1;
         }
 
+        let cells = widths.width_for(cluster_idx);
+        let cells_nonzero = if cells == 0 { 1 } else { cells };
+        let target_width = f32::from(cells_nonzero) * cell_width;
         let cluster_natural: f32 = glyphs[i..j].iter().map(|g| g.w).sum();
 
         // Redistribute. Equal split if natural width is degenerate.
@@ -110,6 +129,7 @@ pub fn snap_cluster_widths(
         }
 
         cursor_x += target_width;
+        cluster_idx += 1;
         i = j;
     }
 
@@ -254,9 +274,9 @@ mod tests {
     }
 
     #[test]
-    fn cluster_cells_greater_than_one_is_pass_through() {
-        // M4b: we only honor the 1-cell case; wider clusters keep natural
-        // widths. The TODO in the module covers this.
+    fn cluster_cells_two_snaps_to_2x_cell_width() {
+        // CJK ideograph case: cosmic-text reported 13.71 px for a width-2
+        // cluster (text-stack.md table). Snap must yield exactly 16 px.
         let glyphs = [GlyphPos {
             start: 0,
             end: 4,
@@ -265,16 +285,18 @@ mod tests {
         }];
         let out = snap_cluster_widths(&glyphs, 8.0, 2);
         assert_eq!(out.len(), 1);
-        assert!(approx(out[0].w, 13.71));
+        assert!(approx(out[0].w, 16.0));
     }
 
     #[test]
-    fn cluster_cells_zero_is_pass_through() {
+    fn cluster_cells_zero_treats_as_one() {
+        // 0 cells is nonsense for a terminal grid — we clamp to 1 cell
+        // rather than passing through whatever the shaper produced.
         let glyphs = [GlyphPos {
             start: 0,
             end: 1,
             x: 0.0,
-            w: 8.0,
+            w: 8.57,
         }];
         let out = snap_cluster_widths(&glyphs, 8.0, 0);
         assert_eq!(out.len(), 1);
@@ -311,5 +333,91 @@ mod tests {
             assert!(approx(g.x, i_f * 8.0), "x at {i}: {}", g.x);
             assert!(approx(g.w, 8.0), "w at {i}: {}", g.w);
         }
+    }
+
+    #[test]
+    fn per_cluster_widths_with_mixed_1_and_2_cells() {
+        // Three single-glyph clusters, widths [1, 2, 1]: total span
+        // 1+2+1 = 4 cells = 32 px starting at x=0.
+        let glyphs = [
+            GlyphPos {
+                start: 0,
+                end: 1,
+                x: 0.0,
+                w: 7.7,
+            },
+            GlyphPos {
+                start: 1,
+                end: 4,
+                x: 7.7,
+                w: 13.71,
+            },
+            GlyphPos {
+                start: 4,
+                end: 5,
+                x: 21.41,
+                w: 8.1,
+            },
+        ];
+        let out = snap_cluster_widths_per_cluster(&glyphs, 8.0, &[1, 2, 1]);
+        assert_eq!(out.len(), 3);
+        // Cluster 0: x=0, w=8
+        assert!(approx(out[0].x, 0.0));
+        assert!(approx(out[0].w, 8.0));
+        // Cluster 1: x=8, w=16 (two cells)
+        assert!(approx(out[1].x, 8.0));
+        assert!(approx(out[1].w, 16.0));
+        // Cluster 2: x=24, w=8
+        assert!(approx(out[2].x, 24.0));
+        assert!(approx(out[2].w, 8.0));
+    }
+
+    #[test]
+    fn single_int_variant_matches_per_cluster_uniform() {
+        // The single-int variant and the per-cluster variant must agree
+        // when the per-cluster slice is a constant.
+        let glyphs = [
+            GlyphPos {
+                start: 0,
+                end: 1,
+                x: 0.0,
+                w: 7.4,
+            },
+            GlyphPos {
+                start: 1,
+                end: 2,
+                x: 7.4,
+                w: 8.6,
+            },
+        ];
+        let single = snap_cluster_widths(&glyphs, 8.0, 1);
+        let per = snap_cluster_widths_per_cluster(&glyphs, 8.0, &[1, 1]);
+        assert_eq!(single.len(), per.len());
+        for (a, b) in single.iter().zip(per.iter()) {
+            assert!(approx(a.x, b.x));
+            assert!(approx(a.w, b.w));
+        }
+    }
+
+    #[test]
+    fn per_cluster_missing_entries_default_to_one_cell() {
+        // Two clusters but widths slice is empty — both default to 1.
+        let glyphs = [
+            GlyphPos {
+                start: 0,
+                end: 1,
+                x: 0.0,
+                w: 8.7,
+            },
+            GlyphPos {
+                start: 1,
+                end: 2,
+                x: 8.7,
+                w: 7.4,
+            },
+        ];
+        let out = snap_cluster_widths_per_cluster(&glyphs, 8.0, &[]);
+        assert_eq!(out.len(), 2);
+        assert!(approx(out[1].x - out[0].x, 8.0));
     }
 }

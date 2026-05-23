@@ -3040,6 +3040,7 @@ dependencies = [
  "toastty-config",
  "toastty-io",
  "toastty-parser",
+ "toastty-protocols",
  "toastty-pty",
  "toastty-render",
  "toastty-term",
@@ -3097,6 +3098,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toastty-parser",
  "toastty-term",
+ "unicode-width",
 ]
 
 [[package]]
@@ -3126,6 +3128,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toastty-config",
  "toastty-parser",
+ "toastty-protocols",
  "toastty-term",
  "toastty-window",
  "tracing",
@@ -3144,6 +3147,7 @@ dependencies = [
  "toastty-config",
  "toastty-parser",
  "toastty-pty",
+ "unicode-width",
 ]
 
 [[package]]

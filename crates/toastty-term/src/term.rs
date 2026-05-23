@@ -4,6 +4,10 @@
 //! effect. Implements `toastty_parser::Perform` so the parser can drive it
 //! directly.
 
+use std::time::Instant;
+
+use unicode_width::UnicodeWidthChar;
+
 use crate::cell::{Cell, Color, Style};
 use crate::cursor::Cursor;
 use crate::grid::Grid;
@@ -62,6 +66,28 @@ impl MouseMode {
     pub fn report_any_motion(&self) -> bool {
         matches!(self.protocol, MouseProtocol::AnyMotion)
     }
+}
+
+/// Synchronized-output (DECSET 2026) state.
+///
+/// When BSU (`CSI ? 2026 h`) is received, `active` flips to true and
+/// `started_at` records the wall-clock instant. The renderer must skip
+/// frames while `active` is true. If ESU (`CSI ? 2026 l`) doesn't arrive
+/// within the timeout (~1s, matching tmux), the binary's watchdog calls
+/// [`Term::force_flush_sync_output`] which clears `active` and sets
+/// `timeout_force_flushed` so the very next post-flush render performs a
+/// corrective full redraw (decision #7).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SyncOutput {
+    /// BSU received, ESU not yet.
+    pub active: bool,
+    /// Wall-clock instant BSU went high; used by the watchdog timer.
+    pub started_at: Option<Instant>,
+    /// Set when the watchdog force-flushed the pause without an ESU. The
+    /// renderer reads this on the next frame to ensure a full redraw, then
+    /// the binary clears it via
+    /// [`Term::clear_sync_output_force_flushed`].
+    pub timeout_force_flushed: bool,
 }
 
 // ---- Kitty keyboard protocol flag bits ----
@@ -124,6 +150,12 @@ pub struct Term {
     /// behaviour. Capped at 8 entries (more than enough — kitty docs say
     /// "small stack").
     kitty_keyboard_stack: Vec<u8>,
+    /// DECSET 2026 — synchronized output (BSU/ESU) state.
+    sync_output: SyncOutput,
+    /// DECSET 2027 — grapheme cluster processing opt-in.
+    grapheme_cluster_mode: bool,
+    /// DECSET 2048 — in-band resize notifications opt-in.
+    inband_resize_mode: bool,
 }
 
 impl Term {
@@ -159,6 +191,9 @@ impl Term {
             report_focus: false,
             mouse_mode: MouseMode::default(),
             kitty_keyboard_stack: Vec::new(),
+            sync_output: SyncOutput::default(),
+            grapheme_cluster_mode: false,
+            inband_resize_mode: false,
         }
     }
 
@@ -166,6 +201,90 @@ impl Term {
     #[must_use]
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
+    }
+
+    /// True when DECSET 2026 (synchronized output) is active and the
+    /// renderer must skip submitting frames. Cleared on ESU or by the
+    /// watchdog after the timeout.
+    #[must_use]
+    pub fn pause_rendering(&self) -> bool {
+        self.sync_output.active
+    }
+
+    /// True when DECSET 2027 (grapheme cluster processing) is active.
+    #[must_use]
+    pub fn grapheme_cluster_mode(&self) -> bool {
+        self.grapheme_cluster_mode
+    }
+
+    /// True when DECSET 2048 (in-band resize notifications) is active.
+    #[must_use]
+    pub fn inband_resize_mode(&self) -> bool {
+        self.inband_resize_mode
+    }
+
+    /// Wall-clock instant the current BSU went high. `None` if no BSU is
+    /// currently active. Exposed for the binary's watchdog timer.
+    #[must_use]
+    pub fn sync_output_started_at(&self) -> Option<Instant> {
+        self.sync_output.started_at
+    }
+
+    /// True when the BSU watchdog timed out and force-flushed the pause;
+    /// the renderer must emit a corrective full redraw before the binary
+    /// clears the flag via
+    /// [`Term::clear_sync_output_force_flushed`].
+    #[must_use]
+    pub fn sync_output_force_flushed(&self) -> bool {
+        self.sync_output.timeout_force_flushed
+    }
+
+    /// Clear the timeout-force-flushed flag. Called by the binary right
+    /// after the corrective full redraw has been issued.
+    pub fn clear_sync_output_force_flushed(&mut self) {
+        self.sync_output.timeout_force_flushed = false;
+    }
+
+    /// Force-flush the synchronized-output pause: clear `active`, set
+    /// `timeout_force_flushed = true`, and mark every visible row dirty
+    /// so the next frame issues a corrective full redraw (decision #7).
+    ///
+    /// Idempotent: calling twice in a row clears nothing new and leaves
+    /// the flag latched until the renderer consumes it.
+    pub fn force_flush_sync_output(&mut self) {
+        if !self.sync_output.active && !self.sync_output.timeout_force_flushed {
+            // Nothing to do — and we don't want to needlessly mark rows
+            // dirty when no BSU was ever in flight.
+            return;
+        }
+        self.sync_output.active = false;
+        self.sync_output.started_at = None;
+        self.sync_output.timeout_force_flushed = true;
+        self.mark_all_dirty_internal();
+    }
+
+    /// Internal: handle a DECSET 2026 toggle. Enable-side captures the
+    /// wall-clock so the watchdog can compute elapsed time. Disable-side
+    /// clears the pause and marks every row dirty so the post-ESU frame
+    /// is a full redraw — both the watchdog and the normal ESU paths
+    /// share this corrective-redraw behaviour.
+    ///
+    /// Reentrant guard: a second BSU while already active must NOT
+    /// restart the timer (the spec says successive BSUs without an ESU
+    /// in between are a single contiguous batch).
+    fn set_sync_output(&mut self, enable: bool) {
+        if enable {
+            if !self.sync_output.active {
+                self.sync_output.active = true;
+                self.sync_output.started_at = Some(Instant::now());
+            }
+            // Reentrant BSU: leave started_at unchanged.
+        } else {
+            // ESU: clear and force a corrective full redraw.
+            self.sync_output.active = false;
+            self.sync_output.started_at = None;
+            self.mark_all_dirty_internal();
+        }
     }
 
     /// True when DECSET 1004 (focus reporting) is active.
@@ -387,9 +506,43 @@ impl Term {
         }
     }
 
+    /// Cell width of `c` per `unicode-width` (legacy `wcwidth` table).
+    ///
+    /// Returns `1` for ordinary text / unknown chars, `2` for CJK
+    /// ideographs / emoji / fullwidth forms, `0` for combining marks
+    /// and other zero-width controls. Mode 2027 (
+    /// [`Term::grapheme_cluster_mode`]) only re-shapes the renderer's
+    /// width snap — `Term::print` operates per-char and trusts the
+    /// `unicode-width` table either way (matching xterm / kitty
+    /// behaviour for the legacy stream-of-chars `print` path).
+    fn char_cell_width(c: char) -> u16 {
+        match UnicodeWidthChar::width(c) {
+            Some(0) => 0,
+            // Wide (2+) → 2 cells; narrow / unknown → 1. `None`
+            // (unprintable) is treated as 1 so the cursor never gets
+            // stuck on a no-width codepoint that wasn't filtered out
+            // upstream.
+            Some(w) if w >= 2 => 2,
+            _ => 1,
+        }
+    }
+
     fn print_char(&mut self, c: char) {
-        // Wrap before printing if the cursor is past the last column.
-        if self.cursor.col >= self.cols {
+        let cell_w = Self::char_cell_width(c);
+        // Zero-width chars (combining marks, controls) currently fall
+        // through as a no-op. A future pass can attach them to the
+        // previous cell's grapheme; for M8 we just drop them so the
+        // cursor doesn't advance into a dead cell.
+        if cell_w == 0 {
+            return;
+        }
+
+        // Wrap before printing if the cursor is past the last column
+        // OR — for a width-2 char — there's only 1 column left. The
+        // width-2 wrap case matches xterm: a wide char never splits.
+        let needs_wrap = self.cursor.col >= self.cols
+            || (cell_w == 2 && self.cursor.col + 1 >= self.cols);
+        if needs_wrap {
             // Mark the row we're leaving as soft-wrapped (decision #6).
             let leaving = self.cursor.row;
             self.active_grid_mut().row_mut(leaving).soft_wrap = true;
@@ -397,16 +550,28 @@ impl Term {
             self.cursor.col = 0;
             self.linefeed();
         }
-        let cell = Cell {
+        let primary = Cell {
             ch: c,
             style: self.cursor.style,
+            is_continuation: false,
         };
         let col = self.cursor.col;
         let row = self.cursor.row;
         let max_cols = self.cols;
-        self.active_grid_mut().row_mut(row).put(col, cell, max_cols);
+        self.active_grid_mut().row_mut(row).put(col, primary, max_cols);
+        if cell_w == 2 {
+            // Continuation marker: '\0' with the same style.
+            let cont = Cell {
+                ch: '\0',
+                style: self.cursor.style,
+                is_continuation: true,
+            };
+            self.active_grid_mut()
+                .row_mut(row)
+                .put(col + 1, cont, max_cols);
+        }
         self.mark_dirty(row);
-        self.cursor.col += 1;
+        self.cursor.col += cell_w;
     }
 
     fn handle_csi(&mut self, params: &Params, intermediates: &[u8], action: char) {
@@ -535,8 +700,28 @@ impl Term {
     }
 
     fn cursor_back(&mut self, n: u16) {
-        let new_col = self.cursor.col.saturating_sub(n);
+        let mut new_col = self.cursor.col.saturating_sub(n);
+        // Snap onto the start of a width-2 cluster: if the landing
+        // column is a continuation cell, step one more column left so
+        // the cursor lands on the cluster's primary cell. Bounds-
+        // checked so we don't underflow at column 0.
+        new_col = self.snap_back_off_continuation(new_col);
         self.move_cursor(self.cursor.row, new_col);
+    }
+
+    /// If `col` points at a continuation cell, return `col - 1`
+    /// (the cluster's primary). Otherwise return `col` unchanged.
+    /// Bounds-checked: column 0 cannot be a valid continuation, so the
+    /// answer is always in-range.
+    fn snap_back_off_continuation(&self, col: u16) -> u16 {
+        if col == 0 || col >= self.cols {
+            return col;
+        }
+        let cells = &self.active_grid().row(self.cursor.row).cells;
+        let is_cont = cells
+            .get(col as usize)
+            .is_some_and(|c| c.is_continuation);
+        if is_cont { col - 1 } else { col }
     }
 
     fn cursor_position(&mut self, row_1based: u16, col_1based: u16) {
@@ -735,7 +920,19 @@ impl Term {
                 2004 => {
                     self.bracketed_paste = enable;
                 }
-                // TODO(modes): 1, 7, 12, 25, 2026, 2027, 2048, etc.
+                // 2026 — synchronized output (BSU/ESU).
+                2026 => {
+                    self.set_sync_output(enable);
+                }
+                // 2027 — grapheme cluster processing opt-in.
+                2027 => {
+                    self.grapheme_cluster_mode = enable;
+                }
+                // 2048 — in-band resize notifications.
+                2048 => {
+                    self.inband_resize_mode = enable;
+                }
+                // TODO(modes): 1, 7, 12, 25, etc.
                 _ => {}
             }
         }
@@ -883,9 +1080,13 @@ impl Perform for Term {
             b'\r' => self.cursor.col = 0,
             b'\n' | 0x0B | 0x0C => self.linefeed(),
             0x08 => {
-                // BS: move cursor left one, no wrap.
+                // BS: move cursor left one, no wrap. Snap off the
+                // continuation half of a wide cluster so two BSes
+                // in a row don't strand the cursor inside a CJK
+                // ideograph.
                 if self.cursor.col > 0 {
                     self.cursor.col -= 1;
+                    self.cursor.col = self.snap_back_off_continuation(self.cursor.col);
                 }
             }
             b'\t' => {
@@ -2075,6 +2276,245 @@ mod tests {
         t.set_cursor_default(CursorShape::Underline, false);
         assert_eq!(t.cursor_shape(), CursorShape::Underline);
         assert!(!t.cursor_blink());
+    }
+
+    // ---- M8 mode toggle tests --------------------------------------------
+
+    #[test]
+    fn decset_2026_pauses_rendering() {
+        let mut t = Term::new(2, 4, 0);
+        assert!(!t.pause_rendering());
+        feed(&mut t, b"\x1b[?2026h");
+        assert!(t.pause_rendering());
+        assert!(t.sync_output_started_at().is_some());
+    }
+
+    #[test]
+    fn decset_2026_disable_clears_pause_and_marks_dirty() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?2026h");
+        // Clear dirty so we can observe the disable-side effect.
+        t.clear_dirty();
+        feed(&mut t, b"\x1b[?2026l");
+        assert!(!t.pause_rendering());
+        assert!(t.sync_output_started_at().is_none());
+        // Every visible row should now be dirty so the post-ESU frame
+        // does a full redraw.
+        for (i, &d) in t.dirty_rows().iter().enumerate() {
+            assert!(d, "row {i} should be dirty after ESU");
+        }
+    }
+
+    #[test]
+    fn decset_2026_reentrant_bsu_does_not_restart_timer() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?2026h");
+        let first = t.sync_output_started_at().expect("first BSU recorded");
+        // Sleep is allergy-inducing in tests; we just trust the
+        // wall-clock monotonicity here and re-enable. The flag must
+        // NOT bump `started_at` forward.
+        feed(&mut t, b"\x1b[?2026h");
+        let second = t.sync_output_started_at().expect("still active");
+        assert_eq!(first, second, "reentrant BSU must not restart timer");
+    }
+
+    #[test]
+    fn decset_2027_toggles_grapheme_cluster_mode() {
+        let mut t = Term::new(2, 4, 0);
+        assert!(!t.grapheme_cluster_mode());
+        feed(&mut t, b"\x1b[?2027h");
+        assert!(t.grapheme_cluster_mode());
+        feed(&mut t, b"\x1b[?2027l");
+        assert!(!t.grapheme_cluster_mode());
+    }
+
+    #[test]
+    fn decset_2027_is_independent_of_other_modes() {
+        // Toggling 2027 must not affect 2026 or 2048 (no cross-mode
+        // bleed). Catches accidental field-confusion regressions.
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?2026h");
+        feed(&mut t, b"\x1b[?2048h");
+        feed(&mut t, b"\x1b[?2027h");
+        assert!(t.grapheme_cluster_mode());
+        assert!(t.pause_rendering());
+        assert!(t.inband_resize_mode());
+        feed(&mut t, b"\x1b[?2027l");
+        assert!(!t.grapheme_cluster_mode());
+        // Other modes unaffected.
+        assert!(t.pause_rendering());
+        assert!(t.inband_resize_mode());
+    }
+
+    #[test]
+    fn decset_2048_toggles_inband_resize_mode() {
+        let mut t = Term::new(2, 4, 0);
+        assert!(!t.inband_resize_mode());
+        feed(&mut t, b"\x1b[?2048h");
+        assert!(t.inband_resize_mode());
+        feed(&mut t, b"\x1b[?2048l");
+        assert!(!t.inband_resize_mode());
+    }
+
+    #[test]
+    fn decset_2048_survives_resize() {
+        // Mode 2048 is meant for apps that want resize reports on
+        // *future* geometry changes — it must survive an actual
+        // resize() call (which mostly rebuilds grid state).
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?2048h");
+        t.resize(4, 8);
+        assert!(t.inband_resize_mode());
+    }
+
+    #[test]
+    fn force_flush_sync_output_sets_timeout_flag_and_dirties_all() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?2026h");
+        assert!(t.pause_rendering());
+        t.clear_dirty();
+        t.force_flush_sync_output();
+        assert!(!t.pause_rendering());
+        assert!(t.sync_output_force_flushed());
+        for (i, &d) in t.dirty_rows().iter().enumerate() {
+            assert!(d, "row {i} should be dirty after timeout flush");
+        }
+    }
+
+    #[test]
+    fn force_flush_sync_output_is_idempotent_when_no_bsu() {
+        let mut t = Term::new(2, 4, 0);
+        t.clear_dirty();
+        // No BSU in flight — flush is a no-op.
+        t.force_flush_sync_output();
+        assert!(!t.sync_output_force_flushed());
+        for &d in t.dirty_rows() {
+            assert!(!d, "no row should be dirty when there was no BSU to flush");
+        }
+    }
+
+    #[test]
+    fn sync_output_force_flushed_is_consumed_by_clear() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?2026h");
+        t.force_flush_sync_output();
+        assert!(t.sync_output_force_flushed());
+        t.clear_sync_output_force_flushed();
+        assert!(!t.sync_output_force_flushed());
+    }
+
+    #[test]
+    fn print_wide_cluster_writes_continuation_cell() {
+        // Print a CJK ideograph at column 0. The primary cell holds
+        // the character; the next cell is a continuation marker.
+        // Cursor advances by 2 columns.
+        let mut t = Term::new(2, 8, 0);
+        feed(&mut t, "你".as_bytes());
+        let row = t.row(0);
+        assert_eq!(row.cells[0].ch, '你');
+        assert!(!row.cells[0].is_continuation);
+        assert!(row.cells[1].is_continuation);
+        assert_eq!(row.cells[1].ch, '\0');
+        // Continuation inherits the style of the cluster's primary.
+        assert_eq!(row.cells[1].style, row.cells[0].style);
+        assert_eq!(t.cursor().col, 2);
+    }
+
+    #[test]
+    fn print_wide_cluster_wraps_when_only_one_column_left() {
+        // Grid is 3 cols wide. Print "ab" → cursor at col 2. Next
+        // print of "你" should wrap to the next row instead of
+        // splitting the cluster.
+        let mut t = Term::new(3, 3, 0);
+        feed(&mut t, b"ab");
+        assert_eq!(t.cursor().col, 2);
+        feed(&mut t, "你".as_bytes());
+        // Wrap took effect: the wide cluster lands on row 1.
+        assert_eq!(t.row(1).cells[0].ch, '你');
+        assert!(t.row(1).cells[1].is_continuation);
+        // Row 0 marked soft-wrap.
+        assert!(t.row(0).soft_wrap);
+    }
+
+    #[test]
+    fn print_two_wide_clusters_fill_grid() {
+        // 4-column row, two CJK ideographs.
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, "你好".as_bytes());
+        let row = t.row(0);
+        assert_eq!(row.cells[0].ch, '你');
+        assert!(row.cells[1].is_continuation);
+        assert_eq!(row.cells[2].ch, '好');
+        assert!(row.cells[3].is_continuation);
+        // Cursor sits one past the last column (pending-wrap).
+        assert_eq!(t.cursor().col, 4);
+    }
+
+    #[test]
+    fn backspace_skips_continuation_cell() {
+        // After printing one wide cluster, cursor is at col 2.
+        // BS should land on col 1? No — the continuation cell should
+        // be skipped, so cursor lands on col 0 (the cluster's
+        // primary). Two BSes after a single wide cluster shouldn't
+        // strand the cursor on a continuation half.
+        let mut t = Term::new(1, 8, 0);
+        feed(&mut t, "你".as_bytes());
+        assert_eq!(t.cursor().col, 2);
+        feed(&mut t, b"\x08");
+        // After one BS, cursor steps off the continuation: lands at
+        // col 0 (the cluster's primary).
+        assert_eq!(t.cursor().col, 0);
+    }
+
+    #[test]
+    fn cursor_back_skips_continuation_cell() {
+        // CUB n by 1 from col 2 should land on col 0 (jumping over
+        // the continuation cell at col 1).
+        let mut t = Term::new(1, 8, 0);
+        feed(&mut t, "你".as_bytes());
+        assert_eq!(t.cursor().col, 2);
+        feed(&mut t, b"\x1b[1D");
+        assert_eq!(t.cursor().col, 0);
+    }
+
+    #[test]
+    fn sync_output_full_flow_bsu_then_esu_in_one_batch() {
+        // App emits BSU, writes a row of cells, then ESU all in one
+        // PTY batch. After the batch:
+        // - pause_rendering is false (ESU lowered it)
+        // - every row is dirty (post-ESU full redraw)
+        // - the cell content is what the app wrote
+        let mut t = Term::new(2, 4, 0);
+        t.clear_dirty();
+        feed(&mut t, b"\x1b[?2026hAB\x1b[?2026l");
+        assert!(!t.pause_rendering());
+        assert_eq!(row_text(&t, 0), "AB");
+        // All rows dirty (the ESU disable path marks everything).
+        for (i, &d) in t.dirty_rows().iter().enumerate() {
+            assert!(d, "row {i} should be dirty after batch ESU");
+        }
+    }
+
+    #[test]
+    fn sync_output_force_flush_after_bsu_only_renders_partial_state() {
+        // App emits BSU + content, never sends ESU. Watchdog calls
+        // force_flush_sync_output. After the flush, the partial cell
+        // content is visible AND every row is dirty so the renderer
+        // emits a corrective full redraw (decision #7 subtlety).
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?2026hAB");
+        // Pre-condition: paused, content written.
+        assert!(t.pause_rendering());
+        assert_eq!(row_text(&t, 0), "AB");
+        t.clear_dirty();
+        t.force_flush_sync_output();
+        assert!(!t.pause_rendering());
+        assert!(t.sync_output_force_flushed());
+        for (i, &d) in t.dirty_rows().iter().enumerate() {
+            assert!(d, "row {i} should be dirty after timeout flush");
+        }
+        // Content is still there.
+        assert_eq!(row_text(&t, 0), "AB");
     }
 
     #[test]

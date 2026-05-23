@@ -98,7 +98,7 @@ pub(crate) fn render_term_offscreen(term: &Term, width: u32, height: u32) -> Rgb
             .iter()
             .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
             .collect();
-        row_glyphs.push(rasterizer.shape_line(&queue, &line_text));
+        row_glyphs.push(rasterizer.shape_line(&queue, &line_text, term.grapheme_cluster_mode()));
     }
 
     // Build instances.
