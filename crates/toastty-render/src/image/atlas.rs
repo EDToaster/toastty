@@ -98,6 +98,20 @@ impl ImageTextureCache {
         }
     }
 
+    /// Predict the ids that `insert(id, _)` would evict, without
+    /// mutating the cache. Caller uses this to release GPU slots
+    /// *before* allocating the new one, so the underlying storage
+    /// can stay bounded at `max_active` rather than spiking to
+    /// `max_active + 1` mid-insert.
+    #[must_use]
+    pub fn peek_evictions_for_insert(&self, id: u32) -> Vec<u32> {
+        if self.entries.contains_key(&id) {
+            return Vec::new();
+        }
+        let needed = (self.entries.len() + 1).saturating_sub(self.max_active);
+        self.lru.iter().take(needed).copied().collect()
+    }
+
     /// Insert (or replace) `id`'s entry. Returns the evicted ids (if
     /// any) — the caller is responsible for dropping the matching
     /// `wgpu::Texture` from external storage.
@@ -211,6 +225,22 @@ mod tests {
         assert_eq!(c.len(), 1);
         // Re-insert is not flagged as evicting anything.
         assert!(c.insert(3, entry(2)).is_empty());
+    }
+
+    #[test]
+    fn repeated_inserts_past_cap_evict_in_lru_order() {
+        // 2-slot cap; insert ids 1..=5 in order. Each insert past
+        // the cap must evict exactly one id, and they must come out
+        // in LRU order (1, 2, 3) so the caller can free the slot.
+        let mut c = ImageTextureCache::new(2);
+        assert!(c.insert(1, entry(10)).is_empty());
+        assert!(c.insert(2, entry(11)).is_empty());
+        assert_eq!(c.insert(3, entry(12)), vec![1]);
+        assert_eq!(c.insert(4, entry(13)), vec![2]);
+        assert_eq!(c.insert(5, entry(14)), vec![3]);
+        assert_eq!(c.len(), 2);
+        assert!(c.get(4).is_some());
+        assert!(c.get(5).is_some());
     }
 
     #[test]

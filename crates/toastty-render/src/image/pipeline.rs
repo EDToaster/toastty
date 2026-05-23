@@ -5,6 +5,7 @@
 //! textures simultaneously, well within the downlevel limit).
 
 use bytemuck::{Pod, Zeroable};
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use toastty_term::{ImageData, ImageRegistry};
 
@@ -197,6 +198,33 @@ impl ImagePipeline {
                 }
                 _ => {
                     // Insert (or replace).
+                    //
+                    // Two leak paths to plug:
+                    //   1. Replace: if `id` already had an entry, its
+                    //      old texture_index is about to be orphaned
+                    //      by the new one. Free the slot first.
+                    //   2. Evict: `cache.insert` may pop the LRU
+                    //      victim(s). Predict them via
+                    //      `peek_evictions_for_insert`, free their
+                    //      slots, *then* allocate so the new texture
+                    //      can reuse the just-freed slot. This keeps
+                    //      `self.textures` bounded at `max_active`.
+                    let prior_idx = cache.get(id).map(|e| e.texture_index);
+                    if let Some(old) = prior_idx {
+                        self.release_texture(old);
+                    }
+                    let predicted_evict = cache.peek_evictions_for_insert(id);
+                    if !predicted_evict.is_empty() {
+                        let pre_state: HashMap<u32, usize> = cache
+                            .iter()
+                            .map(|(id, e)| (id, e.texture_index))
+                            .collect();
+                        for victim in &predicted_evict {
+                            if let Some(&slot) = pre_state.get(victim) {
+                                self.release_texture(slot);
+                            }
+                        }
+                    }
                     let idx = self.allocate_texture(device, queue, data);
                     let entry = ImageTexEntry {
                         texture_index: idx,
@@ -204,22 +232,11 @@ impl ImagePipeline {
                         height: data.height,
                         content_hash: hash,
                     };
-                    let evicted = cache.insert(id, entry);
-                    for victim in evicted {
-                        // The cache returns evicted ids; we need the
-                        // texture_index it owned. We already removed
-                        // them above via `remove`, but the cache's own
-                        // insert may have evicted on insertion. Look
-                        // up the prior entry (it was removed
-                        // internally) — we have to track this on the
-                        // side. Simplest fix: re-derive from
-                        // `cache.iter()`'s pre-state. Since we don't
-                        // have that, the entry's texture_index is
-                        // already freed by the next code path: just
-                        // skip — at worst we leak a slot until the
-                        // next sync. (TODO: tighten.)
-                        let _ = victim;
-                    }
+                    let actual_evicted = cache.insert(id, entry);
+                    debug_assert_eq!(
+                        actual_evicted, predicted_evict,
+                        "peek_evictions_for_insert disagreed with actual insert"
+                    );
                     changed = true;
                 }
             }
@@ -420,5 +437,87 @@ mod tests {
         let a = img(2, 2, 0);
         let b = img(2, 2, 1);
         assert_ne!(hash_image(&a), hash_image(&b));
+    }
+
+    /// Drives `ImagePipeline::sync_registry` past a tiny cache cap and
+    /// asserts that the pipeline's slot bookkeeping stays bounded (no
+    /// per-eviction texture leak).
+    ///
+    /// Without C1's fix, `textures.len()` grows monotonically because
+    /// the cache evicts ids while the pipeline never recycles their
+    /// slots into `free_indices`.
+    #[test]
+    fn sync_registry_does_not_leak_textures_past_cap() {
+        use crate::{instance_descriptor, instance_flags_for_tests};
+        use pollster::block_on;
+        use toastty_term::ImageRegistry;
+        use wgpu::{DeviceDescriptor, PowerPreference, RequestAdapterOptions};
+
+        let instance = wgpu::Instance::new(instance_descriptor(instance_flags_for_tests()));
+        let Ok(adapter) = block_on(instance.request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::LowPower,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        })) else {
+            // No GPU available in CI sandbox — skip.
+            return;
+        };
+        let Ok((device, queue)) = block_on(adapter.request_device(&DeviceDescriptor {
+            label: Some("image_pipeline test device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            trace: wgpu::Trace::Off,
+        })) else {
+            return;
+        };
+
+        let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let cap = 2usize;
+        let mut cache = ImageTextureCache::new(cap);
+        let mut registry = ImageRegistry::new(1024 * 1024);
+
+        // Insert 6 images one at a time, syncing after each. The live
+        // slot count (textures.len() - free_indices.len()) must equal
+        // cache.len() and stay <= cap. Without C1's fix, free_indices
+        // never grows on eviction and textures grows unboundedly.
+        for id in 1u32..=6 {
+            registry.insert(id, img(4, 4, id as u8)).unwrap();
+            pipeline.sync_registry(&device, &queue, &registry, &mut cache);
+            let live = pipeline.textures.len() - pipeline.free_indices.len();
+            assert_eq!(
+                live,
+                cache.len(),
+                "live slot count must match cache size after id={id} \
+                 (textures={}, free_indices={}, cache={})",
+                pipeline.textures.len(),
+                pipeline.free_indices.len(),
+                cache.len()
+            );
+            assert!(cache.len() <= cap);
+            // `textures.len()` is also bounded by the cap once we've
+            // hit steady state — eviction must recycle slots, not
+            // grow the vec.
+            assert!(
+                pipeline.textures.len() <= cap,
+                "textures vec grew past cap={cap} (id={id}): len={}, free={}",
+                pipeline.textures.len(),
+                pipeline.free_indices.len()
+            );
+        }
+
+        // Replace path: re-insert id=6 with a different content hash;
+        // the pipeline should release the old slot and reuse it.
+        registry.insert(6, img(4, 4, 99)).unwrap();
+        let len_before = pipeline.textures.len();
+        pipeline.sync_registry(&device, &queue, &registry, &mut cache);
+        let live = pipeline.textures.len() - pipeline.free_indices.len();
+        assert_eq!(live, cache.len());
+        assert_eq!(
+            pipeline.textures.len(),
+            len_before,
+            "replace must not grow the textures vec"
+        );
     }
 }
