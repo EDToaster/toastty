@@ -105,13 +105,20 @@ struct Toastty {
     /// Most recent physical pixel size — kept so we can re-derive the
     /// cell grid on resize.
     physical_size: (u32, u32),
+    /// Last title we pushed to `winit::Window::set_title`. Tracked so
+    /// we don't churn the compositor on every `PtyBytes` batch — only
+    /// change the title when it actually differs.
+    last_title: Option<String>,
 }
 
 impl Toastty {
     fn new(config: Config) -> Self {
         let scrollback = config.scrollback.lines.try_into().unwrap_or(u16::MAX);
         // Start at a tiny grid; init() resizes once we know cell dimensions.
-        let term = Term::new(24, 80, scrollback);
+        let mut term = Term::new(24, 80, scrollback);
+        // Thread the `[cursor]` config table through to the runtime —
+        // DECSCUSR can still override at runtime per app.
+        term.set_cursor_default(config.cursor.shape, config.cursor.blink);
         Self {
             config,
             window: None,
@@ -121,6 +128,32 @@ impl Toastty {
             pty: None,
             reader: None,
             physical_size: DEFAULT_WINDOW_SIZE,
+            last_title: None,
+        }
+    }
+
+    /// Sync the window title with whatever the PTY most recently set via
+    /// OSC 0 / 2. Called once after every `parser.advance()` so the
+    /// shell's `PROMPT_COMMAND` (or vim's `:set title`) lands on the
+    /// window decoration. We cache `last_title` to avoid round-tripping
+    /// through winit's `set_title` when nothing changed — it's
+    /// moderately expensive on Wayland / macOS.
+    fn sync_title(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let cur = self.term.title();
+        if cur.is_empty() {
+            return;
+        }
+        // Only call into winit if the title actually changed.
+        let changed = match &self.last_title {
+            Some(last) => last != cur,
+            None => true,
+        };
+        if changed {
+            window.set_title(cur);
+            self.last_title = Some(cur.to_owned());
         }
     }
 
@@ -155,6 +188,10 @@ impl Toastty {
 
     fn handle_pty_bytes(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
+        // OSC 0/1/2 may have changed the title — sync to the window
+        // decoration. `sync_title` is a no-op when the title is
+        // unchanged, so calling on every batch is cheap.
+        self.sync_title();
         // Redraw is requested via ControlSignal::RedrawIn(ZERO) from the
         // PtyBytes handler — that path wakes the event loop reliably on
         // macOS. Bare `request_redraw()` + ControlSignal::Continue queues
@@ -200,9 +237,21 @@ impl App for Toastty {
         info!(?program, ?args, rows, cols, "spawning shell");
         let pixel_width = u16::try_from(size.0).unwrap_or(u16::MAX);
         let pixel_height = u16::try_from(size.1).unwrap_or(u16::MAX);
+        // TERM: until `terminfo/toastty.terminfo` is installed via
+        // `tic -x`, advertise `xterm-256color`. That's a near-superset
+        // of what we currently implement (256-color + truecolor + alt
+        // screen + DECSCUSR + OSC 0/2 title). Users who install our
+        // terminfo can override via `TERM=toastty` in their shell rc
+        // — `env()` runs *after* `with_current_env()`, so the explicit
+        // value wins regardless of what the host environment had.
+        //
+        // TODO(M6+): once `terminfo/toastty.terminfo` is documented as a
+        // shipped install step, flip this default to "toastty" with a
+        // `tput -T toastty colors` probe + fallback.
         let spec = PtySpec::program(program)
             .args(args)
             .with_current_env()
+            .env("TERM", "xterm-256color")
             .size(WinSize {
                 rows,
                 cols,

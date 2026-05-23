@@ -8,7 +8,7 @@
 //! resulting `Vec<CellInstance>` to the vertex buffer.
 
 use bytemuck::{Pod, Zeroable};
-use toastty_term::{Cell, Color as TColor, Style, Term};
+use toastty_term::{Cell, Color as TColor, CursorShape, Style, Term};
 
 /// Flag bit: instance is the text-cursor block (forces inverse rendering,
 /// no glyph sample).
@@ -67,6 +67,9 @@ impl CellInstance {
 
     /// Construct the cursor instance: full block at `pos`, inverted fg/bg.
     /// The shader treats this as a full-cell solid fill.
+    ///
+    /// This is the default "block" cursor. For runtime cursor-shape
+    /// switching (DECSCUSR), use [`CellInstance::cursor_for_shape`].
     #[must_use]
     pub fn cursor(pos: [f32; 2], size: [f32; 2], cursor_color: [f32; 4]) -> Self {
         Self {
@@ -80,6 +83,68 @@ impl CellInstance {
             pad: [0; 3],
         }
     }
+
+    /// Construct the cursor instance for a given runtime shape.
+    ///
+    /// `cell_pos` is the top-left of the *cell* the cursor occupies;
+    /// `cell_size` is the full cell extent. The function clips down to
+    /// the appropriate sub-rect for `Bar` (narrow strip on the left
+    /// edge) and `Underline` (thin strip on the bottom edge).
+    ///
+    /// Bar / underline thickness is `max(2.0, cell_w * 0.15)` capped at
+    /// 3.0 — gives 2 px on small fonts and ~2.4 px on `HiDPI` without
+    /// becoming a second block.
+    ///
+    /// **Blink is not rendered yet.** DECSCUSR's blink flag is stored on
+    /// `Term` but the animation tick lands with M9 (see
+    /// `docs/milestones/m06-color-and-chrome.md`). For now this function
+    /// emits the same quad whether the cursor is blinking or steady.
+    #[must_use]
+    pub fn cursor_for_shape(
+        cell_pos: [f32; 2],
+        cell_size: [f32; 2],
+        shape: CursorShape,
+        cursor_color: [f32; 4],
+    ) -> Self {
+        let (cell_w, cell_h) = (cell_size[0], cell_size[1]);
+        // Same flag set for every shape: solid fill, no glyph sample.
+        // The pos/size are what actually changes between block / bar /
+        // underline.
+        let (pos, size) = match shape {
+            CursorShape::Block => (cell_pos, cell_size),
+            CursorShape::Bar => {
+                // Narrow vertical strip on the left edge.
+                let thickness = cursor_bar_thickness(cell_w);
+                (cell_pos, [thickness, cell_h])
+            }
+            CursorShape::Underline => {
+                // Thin horizontal strip on the bottom edge. We position
+                // it flush with the cell bottom so it lines up with
+                // descenders the way xterm does.
+                let thickness = cursor_bar_thickness(cell_w);
+                let y = cell_pos[1] + cell_h - thickness;
+                ([cell_pos[0], y], [cell_w, thickness])
+            }
+        };
+        Self {
+            pos,
+            size,
+            uv_min: [0.0, 0.0],
+            uv_max: [0.0, 0.0],
+            fg: [0.0, 0.0, 0.0, 1.0],
+            bg: cursor_color,
+            flags: FLAG_CURSOR | FLAG_NO_GLYPH,
+            pad: [0; 3],
+        }
+    }
+}
+
+/// Cursor bar / underline thickness in pixels. 2 px minimum so the
+/// stripe is visible at small font sizes; scales to ~15% of cell width
+/// on `HiDPI`, capped at 3 px so it doesn't morph into a second block.
+fn cursor_bar_thickness(cell_w: f32) -> f32 {
+    let scaled = cell_w * 0.15;
+    scaled.clamp(2.0, 3.0)
 }
 
 /// A glyph located in the atlas, ready to plug into a `CellInstance`.
@@ -367,11 +432,20 @@ pub fn build_instances_into<F>(
     }
 
     // Append cursor as the last instance. Clamp position into the grid.
+    // Shape comes from `Term::cursor_shape()` (set by config + DECSCUSR).
+    // TODO(M9): respect `Term::cursor_blink()` once the animation tick
+    // lands. For now blink is stored but not rendered — a blinking
+    // cursor is drawn the same as a steady one.
     let cur = term.cursor();
     let cur_col = u16::min(cur.col, cols.saturating_sub(1));
     let cur_row = u16::min(cur.row, rows.saturating_sub(1));
     let pos = [f32::from(cur_col) * cell_w, f32::from(cur_row) * cell_h];
-    out.push(CellInstance::cursor(pos, [cell_w, cell_h], theme.cursor));
+    out.push(CellInstance::cursor_for_shape(
+        pos,
+        [cell_w, cell_h],
+        term.cursor_shape(),
+        theme.cursor,
+    ));
 }
 
 #[cfg(test)]
@@ -698,5 +772,114 @@ mod tests {
         // refactor can't UB. Exercise it directly.
         assert_eq!(super::palette_index(TColor::Indexed256(200)), 0);
         assert_eq!(super::palette_index(TColor::Rgb(1, 2, 3)), 0);
+    }
+
+    // ----- Runtime cursor shape (M6) ---------------------------------------
+
+    /// Compute the cursor instance from a `Term`, by shape, for tests
+    /// that only care about cursor geometry.
+    fn cursor_for(shape: CursorShape, cell_size: (f32, f32)) -> CellInstance {
+        let mut t = Term::new(1, 4, 0);
+        t.set_cursor_default(shape, false);
+        let v = build_instances(&t, cell_size, &Theme::default_dark(), |_, _, _, _| None);
+        *cursor_instance(&v)
+    }
+
+    #[test]
+    fn block_cursor_fills_full_cell() {
+        let cur = cursor_for(CursorShape::Block, (8.0, 16.0));
+        assert_eq!(cur.size, [8.0, 16.0]);
+        assert_eq!(cur.pos, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn bar_cursor_has_narrow_width_full_height() {
+        // Bar cursor: width < cell_w, height == cell_h, positioned at
+        // the cell's top-left corner (left edge).
+        let cell_w = 8.0;
+        let cell_h = 16.0;
+        let cur = cursor_for(CursorShape::Bar, (cell_w, cell_h));
+        assert!(
+            cur.size[0] < cell_w,
+            "bar width {} should be < cell_w {cell_w}",
+            cur.size[0],
+        );
+        assert!(cur.size[0] >= 2.0, "bar width must be at least 2 px");
+        assert!(
+            (cur.size[1] - cell_h).abs() < 1e-3,
+            "bar height should equal cell height",
+        );
+        assert_eq!(cur.pos, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn underline_cursor_has_thin_height_full_width() {
+        // Underline cursor: width == cell_w, height < cell_h,
+        // positioned flush with the cell's bottom edge.
+        let cell_w = 8.0;
+        let cell_h = 16.0;
+        let cur = cursor_for(CursorShape::Underline, (cell_w, cell_h));
+        assert!(
+            (cur.size[0] - cell_w).abs() < 1e-3,
+            "underline width should equal cell width",
+        );
+        assert!(
+            cur.size[1] < cell_h,
+            "underline height {} should be < cell_h {cell_h}",
+            cur.size[1],
+        );
+        assert!(cur.size[1] >= 2.0, "underline height must be at least 2 px");
+        // Y should land near the bottom — exactly `cell_h - thickness`.
+        let expected_y = cell_h - cur.size[1];
+        assert!((cur.pos[1] - expected_y).abs() < 1e-3);
+        assert!((cur.pos[0]).abs() < 1e-3);
+    }
+
+    #[test]
+    fn cursor_for_shape_keeps_cursor_flag_and_no_glyph() {
+        for shape in [CursorShape::Block, CursorShape::Bar, CursorShape::Underline] {
+            let cur = cursor_for(shape, (8.0, 16.0));
+            assert!(cur.flags & FLAG_CURSOR != 0, "shape {shape:?}");
+            assert!(cur.flags & FLAG_NO_GLYPH != 0, "shape {shape:?}");
+        }
+    }
+
+    #[test]
+    fn cursor_thickness_scales_with_cell_width() {
+        // Tiny cell — thickness floors at 2 px.
+        let cur = cursor_for(CursorShape::Bar, (6.0, 12.0));
+        assert!((cur.size[0] - 2.0).abs() < 1e-3, "tiny cell: width = {}", cur.size[0]);
+        // Big cell (HiDPI) — thickness scales up to ~15% but caps at 3 px.
+        let cur = cursor_for(CursorShape::Bar, (40.0, 80.0));
+        assert!(
+            cur.size[0] >= 2.0 && cur.size[0] <= 3.0,
+            "big cell: width {} should be in [2, 3]",
+            cur.size[0],
+        );
+    }
+
+    #[test]
+    fn decscusr_runtime_switch_changes_cursor_geometry() {
+        // End-to-end: feed DECSCUSR to Term, then verify build_instances
+        // emits the right shape.
+        let mut t = Term::new(1, 4, 0);
+        // Default = block.
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        assert_eq!(cursor_instance(&v).size, [8.0, 16.0]);
+        // Switch to bar (Ps=5 → bar, blinking).
+        feed(&mut t, b"\x1b[5 q");
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        assert!(cursor_instance(&v).size[0] < 8.0, "bar after Ps=5");
+        // Switch to underline (Ps=4).
+        feed(&mut t, b"\x1b[4 q");
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        assert!(
+            cursor_instance(&v).size[1] < 16.0,
+            "underline after Ps=4",
+        );
+        // Back to block (Ps=2).
+        feed(&mut t, b"\x1b[2 q");
+        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
+        assert_eq!(cursor_instance(&v).size, [8.0, 16.0]);
     }
 }

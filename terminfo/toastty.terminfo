@@ -1,0 +1,117 @@
+# toastty terminfo entry
+#
+# Declares the capabilities toastty actually implements as of M6.
+# Install with:
+#
+#     tic -x terminfo/toastty.terminfo
+#
+# Then export TERM=toastty in your shell rc. Until installed, the
+# binary spawns child processes with TERM=xterm-256color, which is a
+# near-superset of what we support (the only false-advertised bits are
+# mouse and bracketed paste — both land in M7).
+#
+# Base: xterm-256color, with caps trimmed for things we DON'T support
+# yet (mouse, bracketed paste, focus, kitty keyboard, sixel/kitty
+# graphics). We ADD Tc to advertise 24-bit truecolor; Ss/Se for
+# DECSCUSR cursor-shape control; tsl/fsl for OSC 2 title-setting.
+
+toastty|toastty terminal emulator,
+# ----- Booleans ------------------------------------------------------
+    am, bce, mir, msgr, npc, xenl,
+# am  — auto right margin (wrap)
+# bce — background color erase: erases use the active bg
+# mir — safe to move in insert mode
+# msgr— safe to move in standout
+# npc — no pad character (we never emit XON/XOFF padding)
+# xenl— newline glitch: cursor sits one past last col after writing it
+#
+# ----- Numbers -------------------------------------------------------
+    colors#0x100, cols#80, it#8, lines#24, pairs#0x10000,
+# colors#256 + pairs#65536: 256-color terminfo schema. Truecolor is
+# advertised via the Tc extension cap below.
+#
+# ----- Strings: alt screen -------------------------------------------
+    rmcup=\E[?1049l\E[23;0;0t,
+    smcup=\E[?1049h\E[22;0;0t,
+#
+# ----- Strings: cursor motion ----------------------------------------
+    cub1=^H,
+    cud1=^J,
+    cuf1=\E[C,
+    cuu1=\E[A,
+    cub=\E[%p1%dD,
+    cud=\E[%p1%dB,
+    cuf=\E[%p1%dC,
+    cuu=\E[%p1%dA,
+    cup=\E[%i%p1%d;%p2%dH,
+    home=\E[H,
+    hpa=\E[%i%p1%dG,
+    vpa=\E[%i%p1%dd,
+    cr=^M,
+    nel=\EE,
+    ht=^I,
+    cbt=\E[Z,
+#
+# ----- Strings: SGR --------------------------------------------------
+    bold=\E[1m,
+    sitm=\E[3m, ritm=\E[23m,
+    smul=\E[4m, rmul=\E[24m,
+    rev=\E[7m,
+    sgr0=\E(B\E[m,
+    setaf=\E[%?%p1%{8}%<%t3%p1%d%e%p1%{16}%<%t9%p1%{8}%-%d%e38;5;%p1%d%;m,
+    setab=\E[%?%p1%{8}%<%t4%p1%d%e%p1%{16}%<%t10%p1%{8}%-%d%e48;5;%p1%d%;m,
+    op=\E[39;49m,
+#
+# ----- Strings: erase ------------------------------------------------
+    el=\E[K, el1=\E[1K,
+    ed=\E[J,
+    clear=\E[H\E[2J,
+    dch1=\E[P, dch=\E[%p1%dP,
+    dl1=\E[M, dl=\E[%p1%dM,
+    ich=\E[%p1%d@,
+    il1=\E[L, il=\E[%p1%dL,
+    ech=\E[%p1%dX,
+#
+# ----- Strings: scrolling region -------------------------------------
+    csr=\E[%i%p1%d;%p2%dr,
+    rc=\E8, sc=\E7,
+    ind=^J, ri=\EM,
+    rin=\E[%p1%dT, indn=\E[%p1%dS,
+#
+# ----- Strings: keypad keys ------------------------------------------
+    kbs=^?,
+    kcub1=\EOD, kcud1=\EOB, kcuf1=\EOC, kcuu1=\EOA,
+    khome=\EOH, kend=\EOF,
+    kich1=\E[2~, kdch1=\E[3~,
+    knp=\E[6~, kpp=\E[5~,
+    kcbt=\E[Z,
+    kent=\EOM,
+    kf1=\EOP, kf2=\EOQ, kf3=\EOR, kf4=\EOS,
+    kf5=\E[15~, kf6=\E[17~, kf7=\E[18~, kf8=\E[19~,
+    kf9=\E[20~, kf10=\E[21~, kf11=\E[23~, kf12=\E[24~,
+#
+# ----- Strings: window title (OSC 0/2) -------------------------------
+# tsl/fsl are how curses-aware apps (vim, tmux, screen) set the
+# terminal's window title. We map this to OSC 2 ; <text> ST.
+    hs,
+    tsl=\E]2;,
+    fsl=^G,
+#
+# ----- Strings: cursor shape (DECSCUSR) ------------------------------
+# Ss / Se are the extended caps tmux + neovim look for to switch
+# cursor shape per app. Argument is the DECSCUSR Ps value.
+    Ss=\E[%p1%d\sq,
+    Se=\E[\sq,
+#
+# ----- Truecolor advertisement ---------------------------------------
+# Tc is the user-extension cap that tells curses-aware apps they can
+# emit `CSI 38;2;R;G;B m` / `CSI 48;2;R;G;B m` directly.
+    Tc,
+#
+# ----- NOT supported (deliberately omitted) -------------------------
+# - kmous / XM mouse capabilities (M7)
+# - BE / BD bracketed paste (M7)
+# - kxIN / kxOUT focus events (M7)
+# - kitty keyboard extensions (M7)
+# - sixel / kitty graphics (M11)
+# - hyperlinks (OSC 8) (M10)
