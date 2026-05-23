@@ -250,10 +250,14 @@ section "M7.4 — Kitty keyboard protocol (CSI u, disambiguate + events)"
 note "Pushing flags = 3 (disambiguate + report event types)."
 note "Press a, A, Ctrl+A, Ctrl+Shift+A. They should now emit"
 note "distinct CSI u sequences (e.g. CSI 97;6:1 u for Ctrl+Shift+A)."
-note "Press Enter when done."
+note ""
+note "NOTE: with disambiguate on, Enter is ALSO reframed as CSI u"
+note "(13;1:1u press / 13;1:3u release), so 'read' can't see a newline."
+note "Auto-advancing in 8 seconds — type during the window."
 printf '%s>3u' "$csi"
-read -r _
+sleep 8
 printf '%s<u' "$csi"
+note "Flags popped — Enter is back to \\r."
 
 # ─────────────────────────────────────────────────────────────────
 section "Done"
