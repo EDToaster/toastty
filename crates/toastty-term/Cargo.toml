@@ -11,6 +11,7 @@ thiserror.workspace = true
 unicode-width.workspace = true
 
 toastty-config.workspace = true
+toastty-graphics.workspace = true
 toastty-parser.workspace = true
 toastty-protocols.workspace = true
 

@@ -3325,6 +3325,7 @@ dependencies = [
  "smallvec",
  "thiserror 2.0.18",
  "toastty-config",
+ "toastty-graphics",
  "toastty-parser",
  "toastty-protocols",
  "toastty-pty",

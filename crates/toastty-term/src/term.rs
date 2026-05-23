@@ -13,6 +13,9 @@ use crate::cursor::Cursor;
 use crate::damage::Damage;
 use crate::grid::Grid;
 use toastty_config::CursorShape;
+use toastty_graphics::kitty::handler::{KittyHandler, KittySink};
+use toastty_graphics::kitty::header::DeleteSpec;
+use toastty_graphics::{ImageData, ImageGrid, ImageRegistry, Placement};
 use toastty_parser::{Params, Perform};
 
 /// Width of a hard tab. Eight is the canonical default; once we expose
@@ -207,6 +210,57 @@ pub struct Term {
     clipboard_requests: Vec<ClipboardRequest>,
     /// Security gates from the user's `[security]` config.
     security: SecurityFlags,
+    // ----- M11a: Kitty graphics + image protocols -----
+    /// Buffer of APC payload bytes for the current `APC ... ST` packet.
+    /// Cleared on `apc_start`; appended via `apc_chunk`; consumed by
+    /// `apc_end`.
+    apc_buffer: Vec<u8>,
+    /// Stateful Kitty dispatcher. Owns chunked-upload reassembly.
+    image_handler: KittyHandler,
+    /// Cache of decoded image bytes keyed by Kitty image id.
+    image_registry: ImageRegistry,
+    /// Parallel layer of placements over the cell grid.
+    image_grid: ImageGrid,
+    /// Monotonic counter bumped whenever the registry or grid mutates.
+    /// The renderer compares against its cached value to decide when
+    /// to re-sync GPU textures (and force a full clear of the frame).
+    image_revision: u32,
+    /// SGR 58 underline color. Stored but not yet rendered as an
+    /// underline color; the Unicode placeholder pipeline reads it as
+    /// the *low byte* of the image id (kitty's protocol).
+    cursor_underline_color: Option<Color>,
+    /// Unicode placeholder run-in-progress.
+    placeholder_run: Option<PlaceholderRun>,
+}
+
+/// In-progress run of Kitty Unicode placeholder cells.
+///
+/// Apps emit `<PLACEHOLDER><d_row><d_col>(<d_id_msb>)?` per cell as the
+/// foreground SGR encodes the low byte of the image id. We collect the
+/// run greedily until the next non-placeholder/non-diacritic codepoint
+/// arrives, then materialize placements.
+#[derive(Debug)]
+pub(crate) struct PlaceholderRun {
+    /// Image id whose low byte was taken from the cursor fg color.
+    pub image_id_low: u8,
+    /// Cursor underline color encoded the optional 8-bit MSB extension
+    /// of the image id (kitty supports a 24-bit id via SGR 38;5 + 58;5).
+    pub image_id_high: Option<u8>,
+    /// Cells collected so far: `(row, col, diacritics)`.
+    pub cells: Vec<PlaceholderCell>,
+    /// Starting row (so we can detect newline boundaries).
+    pub start_row: u16,
+}
+
+/// One placeholder cell within a [`PlaceholderRun`].
+#[derive(Debug, Clone)]
+pub(crate) struct PlaceholderCell {
+    pub row: u16,
+    pub col: u16,
+    /// Diacritic indices in emission order. The first encodes the source
+    /// image row, the second the source image column, the third (optional)
+    /// the image id MSB extension.
+    pub diacritics: smallvec::SmallVec<[u16; 3]>,
 }
 
 /// One pending OSC 52 clipboard operation, queued by [`Term`] and
@@ -308,6 +362,15 @@ impl Term {
             current_hyperlink: None,
             clipboard_requests: Vec::new(),
             security: SecurityFlags::default(),
+            apc_buffer: Vec::new(),
+            image_handler: KittyHandler::new(),
+            // Default 256 MiB image cache cap. Generous but bounded; the
+            // binary can shrink via `Term::set_image_cap`.
+            image_registry: ImageRegistry::new(256 * 1024 * 1024),
+            image_grid: ImageGrid::new(),
+            image_revision: 0,
+            cursor_underline_color: None,
+            placeholder_run: None,
         }
     }
 
@@ -342,6 +405,38 @@ impl Term {
     /// asynchronously-produced replies through the same drain.
     pub fn push_pty_reply(&mut self, bytes: &[u8]) {
         self.pty_replies.extend_from_slice(bytes);
+    }
+
+    /// Read-only view of the cached image bytes.
+    #[must_use]
+    pub fn image_registry(&self) -> &ImageRegistry {
+        &self.image_registry
+    }
+
+    /// Read-only view of placements over the cell grid.
+    #[must_use]
+    pub fn image_grid(&self) -> &ImageGrid {
+        &self.image_grid
+    }
+
+    /// Monotonic image-content revision. Bumps when the registry or
+    /// placement grid changes. Renderer compares to its cached value
+    /// to decide when to re-sync GPU textures.
+    #[must_use]
+    pub fn image_revision(&self) -> u32 {
+        self.image_revision
+    }
+
+    /// Override the per-Term image-cache byte budget. May evict.
+    pub fn set_image_cap(&mut self, cap_bytes: u64) {
+        let evicted = self.image_registry.set_cap(cap_bytes);
+        if !evicted.is_empty() {
+            for id in &evicted {
+                self.image_grid.remove_image(*id);
+            }
+            self.image_revision = self.image_revision.wrapping_add(1);
+            self.mark_all_dirty();
+        }
     }
 
     /// Read the override for palette index `idx`. Returns `None` if no
