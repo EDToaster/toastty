@@ -234,6 +234,31 @@ impl Term {
     /// the renderer must emit a corrective full redraw before the binary
     /// clears the flag via
     /// [`Term::clear_sync_output_force_flushed`].
+    ///
+    /// ## Why this flag exists alongside the dirty bitset
+    ///
+    /// The corrective full redraw is mechanically delivered by
+    /// [`Term::force_flush_sync_output`] calling `mark_all_dirty` on
+    /// the per-row bitset — so for M8's row-level damage signal this
+    /// flag carries no extra information that the renderer's hot path
+    /// needs (the dirty bitset already forces re-shape of every row).
+    ///
+    /// We keep the flag distinct because M9 splits the damage signal
+    /// into finer-grained dirty rectangles / dirty cells (see
+    /// `docs/milestones/m09-damage-tracking.md`). At that point the
+    /// renderer needs to distinguish:
+    ///
+    /// 1. "Dirty list covers every cell because the app actually
+    ///    rewrote every cell" → small per-cell list still valid,
+    ///    `LoadOp::Load` is fine.
+    /// 2. "Dirty list is tiny because the app only wrote a few cells
+    ///    but we're recovering from a forced ESU mid-batch — the
+    ///    underlying framebuffer holds half-painted state" →
+    ///    `LoadOp::Clear` + repaint everything.
+    ///
+    /// Case 2 is exactly what `sync_output_force_flushed` signals.
+    /// The binary clears the flag immediately after a render that
+    /// actually went out (followup C2 — only on `RenderOutcome::Rendered`).
     #[must_use]
     pub fn sync_output_force_flushed(&self) -> bool {
         self.sync_output.timeout_force_flushed
