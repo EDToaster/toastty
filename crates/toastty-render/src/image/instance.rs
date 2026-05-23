@@ -28,7 +28,9 @@ pub struct ImageInstance {
     pub texture_index: u32,
     /// Z order. The host splits below/above text using sign.
     pub z: i32,
-    /// Padding for std430 alignment.
+    /// Padding for std430 alignment. Not consumed by callers; the
+    /// underscore prefix tells Rust it's intentional.
+    #[allow(clippy::pub_underscore_fields)]
     pub _pad: [u32; 2],
 }
 
@@ -76,6 +78,7 @@ impl ImageInstance {
 /// text via the sign of `z`.
 ///
 /// `cell_size` is `(w, h)` in pixels.
+#[allow(clippy::cast_precision_loss)] // image dims fit comfortably in 23-bit mantissa.
 pub fn build_image_instances(
     out: &mut Vec<ImageInstance>,
     grid: &ImageGrid,

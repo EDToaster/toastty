@@ -71,7 +71,7 @@ impl ImageTextureCache {
         self.entries.is_empty()
     }
 
-    /// Iterate (image_id, entry) in resident order.
+    /// Iterate `(image_id, entry)` in resident order.
     pub fn iter(&self) -> impl Iterator<Item = (u32, ImageTexEntry)> + '_ {
         self.entries.iter().map(|(k, v)| (*k, *v))
     }

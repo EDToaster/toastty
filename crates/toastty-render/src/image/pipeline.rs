@@ -39,6 +39,7 @@ pub struct ImagePipeline {
 
 impl ImagePipeline {
     /// Build the pipeline (idempotent — call once at startup).
+    #[allow(clippy::too_many_lines)] // wgpu builder is long but linear.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("toastty-image shader"),
@@ -179,11 +180,11 @@ impl ImagePipeline {
         // Drop entries the host removed.
         let resident_ids: Vec<u32> = cache.iter().map(|(id, _)| id).collect();
         for id in resident_ids {
-            if !registry.contains(id) {
-                if let Some(entry) = cache.remove(id) {
-                    self.release_texture(entry.texture_index);
-                    changed = true;
-                }
+            if !registry.contains(id)
+                && let Some(entry) = cache.remove(id)
+            {
+                self.release_texture(entry.texture_index);
+                changed = true;
             }
         }
 
@@ -257,7 +258,7 @@ impl ImagePipeline {
         queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
         // Grow instance buffer if needed.
-        let needed = (instances.len() * std::mem::size_of::<ImageInstance>()) as u64;
+        let needed = std::mem::size_of_val(instances) as u64;
         if needed > self.instance_buf_cap {
             let new_cap = needed.next_power_of_two();
             self.instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -275,9 +276,8 @@ impl ImagePipeline {
 
         // One draw per instance, rebinding the texture between draws.
         for (i, inst) in instances.iter().enumerate() {
-            let view = match self.views.get(inst.texture_index as usize) {
-                Some(v) => v,
-                None => continue,
+            let Some(view) = self.views.get(inst.texture_index as usize) else {
+                continue;
             };
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("toastty-image bg per-draw"),

@@ -65,7 +65,7 @@ pub trait KittySink {
         u64::MAX
     }
 
-    /// Hint: the cursor should advance after a TransmitAndPlace that
+    /// Hint: the cursor should advance after a `TransmitAndPlace` that
     /// didn't set `C=1`. The host translates this into actual cursor
     /// motion. Default is a no-op so simple test sinks don't need to
     /// care about cursor state.

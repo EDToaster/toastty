@@ -1070,6 +1070,7 @@ impl Term {
     /// Materialize the accumulated placeholder run into image
     /// placements over the cells the run touched. Called when the
     /// stream emits a non-placeholder/non-diacritic codepoint.
+    #[allow(clippy::needless_pass_by_value)] // run is conceptually consumed.
     fn finalize_placeholder_run(&mut self, run: PlaceholderRun) {
         if run.cells.is_empty() {
             return;
@@ -1548,16 +1549,11 @@ impl Term {
             39 => style.fg = Color::Default,
             40..=47 => style.bg = ansi_color(v - 40, false),
             49 => style.bg = Color::Default,
-            // M11a: 59 resets the cursor underline color (placeholder
-            // image-id MSB). The SGR walker handles this branch by
-            // calling `apply_sgr_param(59)`, which now lives here
-            // rather than falling through to the wildcard.
-            59 => {
-                // Falls through — we can't touch self.cursor_underline_color
-                // from here because we only have `&mut style`. Reset
-                // happens in `apply_sgr` for the top-level walk; see
-                // the explicit clear there.
-            }
+            // M11a: 59 (default underline color) is handled at the
+            // `apply_sgr` walker level — we clear
+            // `self.cursor_underline_color` there because we don't
+            // have access to `self` from inside `apply_sgr_param`
+            // (only `&mut style`).
             90..=97 => style.fg = ansi_color(v - 90, true),
             100..=107 => style.bg = ansi_color(v - 100, true),
             _ => {}
@@ -4440,6 +4436,20 @@ mod tests {
         feed(&mut t, s.as_bytes());
         // No placements created.
         assert_eq!(t.image_grid().len(), 0);
+    }
+
+    #[test]
+    fn image_place_marks_cells_dirty() {
+        let mut t = Term::new(4, 8, 0);
+        t.clear_damage();
+        assert!(t.damage().is_empty());
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=3,r=2;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        // Damage should now cover the cells the placement landed on.
+        assert!(!t.damage().is_empty());
     }
 
     #[test]

@@ -1011,6 +1011,7 @@ impl Renderer {
 
             // M11a draw order: below-text images → text → above-text
             // images. All target `scratch_view`.
+            #[allow(clippy::cast_precision_loss)] // viewport in 16k-px range.
             let viewport = (self.config.width as f32, self.config.height as f32);
             if let Some(img_pipe) = self.image_pipeline.as_mut()
                 && !self.image_instances_below.is_empty()

@@ -451,12 +451,11 @@ impl GlyphRasterizer {
         // shelf and retry once. Failing that, degrade by returning
         // `None` — the renderer falls back to a background-only
         // instance and the next frame will re-shape the row.
-        let slot = match self.atlas.reserve(key, layer, w, h) {
-            Ok(s) => s,
-            Err(_) => {
-                self.atlas.evict_oldest_shelf(layer);
-                self.atlas.reserve(key, layer, w, h).ok()?
-            }
+        let slot = if let Ok(s) = self.atlas.reserve(key, layer, w, h) {
+            s
+        } else {
+            self.atlas.evict_oldest_shelf(layer);
+            self.atlas.reserve(key, layer, w, h).ok()?
         };
 
         upload_glyph_pixels(queue, self.atlas_texture_for(layer), slot, &image.data);
