@@ -56,7 +56,10 @@ fn alt_screen_isolates_writes_from_primary() {
     assert_eq!(row_text(&t, 0), "ABCD");
     assert_eq!(row_text(&t, 1).trim_end(), "WXYZ");
     // No "HIDDEN" visible anywhere.
-    let combined: String = (0..3).map(|r| row_text(&t, r)).collect::<Vec<_>>().join("|");
+    let combined: String = (0..3)
+        .map(|r| row_text(&t, r))
+        .collect::<Vec<_>>()
+        .join("|");
     assert!(!combined.contains("HIDDEN"), "got: {combined}");
 }
 

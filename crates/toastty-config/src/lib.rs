@@ -175,10 +175,7 @@ mod tests {
 
     #[test]
     fn partial_toml_only_overrides_listed_fields() {
-        let cfg = Config::parse_str(
-            "[font]\nsize_px = 18.0\n",
-        )
-        .expect("partial toml ok");
+        let cfg = Config::parse_str("[font]\nsize_px = 18.0\n").expect("partial toml ok");
         assert!((cfg.font.size_px - 18.0).abs() < 1e-6);
         // Other font fields still default.
         assert_eq!(cfg.font.family, "Fira Mono");
@@ -255,8 +252,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "[font]\nsize_px = 22.5\n").unwrap();
 
-        let resolved =
-            test_support::resolve_with_env(Some(&xdg), None).expect("path resolves");
+        let resolved = test_support::resolve_with_env(Some(&xdg), None).expect("path resolves");
         assert_eq!(resolved, path);
         let cfg = Config::load_from_path(&resolved).expect("load");
         assert!((cfg.font.size_px - 22.5).abs() < 1e-6);

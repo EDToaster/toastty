@@ -165,22 +165,22 @@ fn palette_index(c: TColor) -> usize {
 /// gamma-corrected sRGB → linear so the shader (writing into an sRGB
 /// swapchain) produces faithful colors.
 const DEFAULT_PALETTE_LINEAR: [[f32; 4]; 16] = [
-    [0.000, 0.000, 0.000, 1.0],            // Black
-    [0.500, 0.020, 0.020, 1.0],            // Red
-    [0.020, 0.350, 0.020, 1.0],            // Green
-    [0.500, 0.350, 0.020, 1.0],            // Yellow
-    [0.020, 0.020, 0.500, 1.0],            // Blue
-    [0.350, 0.020, 0.350, 1.0],            // Magenta
-    [0.020, 0.350, 0.500, 1.0],            // Cyan
-    [0.700, 0.700, 0.700, 1.0],            // White
-    [0.250, 0.250, 0.250, 1.0],            // BrightBlack (dark gray)
-    [0.900, 0.150, 0.150, 1.0],            // BrightRed
-    [0.150, 0.750, 0.150, 1.0],            // BrightGreen
-    [0.900, 0.750, 0.150, 1.0],            // BrightYellow
-    [0.250, 0.350, 0.900, 1.0],            // BrightBlue
-    [0.700, 0.150, 0.700, 1.0],            // BrightMagenta
-    [0.150, 0.700, 0.750, 1.0],            // BrightCyan
-    [1.000, 1.000, 1.000, 1.0],            // BrightWhite
+    [0.000, 0.000, 0.000, 1.0], // Black
+    [0.500, 0.020, 0.020, 1.0], // Red
+    [0.020, 0.350, 0.020, 1.0], // Green
+    [0.500, 0.350, 0.020, 1.0], // Yellow
+    [0.020, 0.020, 0.500, 1.0], // Blue
+    [0.350, 0.020, 0.350, 1.0], // Magenta
+    [0.020, 0.350, 0.500, 1.0], // Cyan
+    [0.700, 0.700, 0.700, 1.0], // White
+    [0.250, 0.250, 0.250, 1.0], // BrightBlack (dark gray)
+    [0.900, 0.150, 0.150, 1.0], // BrightRed
+    [0.150, 0.750, 0.150, 1.0], // BrightGreen
+    [0.900, 0.750, 0.150, 1.0], // BrightYellow
+    [0.250, 0.350, 0.900, 1.0], // BrightBlue
+    [0.700, 0.150, 0.700, 1.0], // BrightMagenta
+    [0.150, 0.700, 0.750, 1.0], // BrightCyan
+    [1.000, 1.000, 1.000, 1.0], // BrightWhite
 ];
 
 /// True if the cell holds nothing worth drawing.
@@ -271,11 +271,7 @@ where
             }
 
             if let Some(slot) = locate_glyph(r, c, cell.ch, &cell.style) {
-                let flags = if slot.is_color {
-                    FLAG_COLOR_GLYPH
-                } else {
-                    0
-                };
+                let flags = if slot.is_color { FLAG_COLOR_GLYPH } else { 0 };
                 // Glyph quad: position is cell + glyph bearing; size is
                 // the glyph's own pixel extent (matches the atlas
                 // region). The fragment shader's UV interpolation then
@@ -317,7 +313,10 @@ mod tests {
     }
 
     fn count_non_cursor(instances: &[CellInstance]) -> usize {
-        instances.iter().filter(|i| i.flags & FLAG_CURSOR == 0).count()
+        instances
+            .iter()
+            .filter(|i| i.flags & FLAG_CURSOR == 0)
+            .count()
     }
 
     fn cursor_instance(instances: &[CellInstance]) -> &CellInstance {
@@ -461,7 +460,10 @@ mod tests {
         let bright_red = theme.resolve_fg(TColor::BrightRed);
         assert_ne!(red, theme.fg);
         assert_ne!(red, bright_red);
-        assert_ne!(theme.resolve_fg(TColor::Green), theme.resolve_fg(TColor::Red));
+        assert_ne!(
+            theme.resolve_fg(TColor::Green),
+            theme.resolve_fg(TColor::Red)
+        );
     }
 
     #[test]
@@ -509,10 +511,7 @@ mod tests {
         feed(&mut t, b"a");
         let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), |_, _, _, _| None);
         assert_eq!(count_non_cursor(&v), 1);
-        let bg_inst = v
-            .iter()
-            .find(|i| i.flags & FLAG_CURSOR == 0)
-            .unwrap();
+        let bg_inst = v.iter().find(|i| i.flags & FLAG_CURSOR == 0).unwrap();
         assert!(bg_inst.flags & FLAG_NO_GLYPH != 0);
     }
 
@@ -535,10 +534,22 @@ mod tests {
         // theme fg/bg, not palette[0], inside resolve_fg/bg.)
         let theme = Theme::default_dark();
         let vs = [
-            TColor::Black, TColor::Red, TColor::Green, TColor::Yellow, TColor::Blue,
-            TColor::Magenta, TColor::Cyan, TColor::White,
-            TColor::BrightBlack, TColor::BrightRed, TColor::BrightGreen, TColor::BrightYellow,
-            TColor::BrightBlue, TColor::BrightMagenta, TColor::BrightCyan, TColor::BrightWhite,
+            TColor::Black,
+            TColor::Red,
+            TColor::Green,
+            TColor::Yellow,
+            TColor::Blue,
+            TColor::Magenta,
+            TColor::Cyan,
+            TColor::White,
+            TColor::BrightBlack,
+            TColor::BrightRed,
+            TColor::BrightGreen,
+            TColor::BrightYellow,
+            TColor::BrightBlue,
+            TColor::BrightMagenta,
+            TColor::BrightCyan,
+            TColor::BrightWhite,
         ];
         for c in vs {
             let v = theme.resolve_fg(c);

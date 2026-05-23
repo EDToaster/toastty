@@ -6,11 +6,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-mio.workspace = true
-thiserror.workspace = true
+libc = "0.2"
+mio = { workspace = true, features = ["os-poll", "os-ext"] }
 tracing.workspace = true
 winit.workspace = true
 
+[dev-dependencies]
 toastty-pty.workspace = true
 
 [lints]

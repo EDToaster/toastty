@@ -36,8 +36,8 @@ use wgpu::{
     RequestAdapterOptions, Surface, SurfaceConfiguration, TextureFormat, TextureUsages,
 };
 
-use crate::text::glyph_rasterizer::{GlyphRasterizer, LineGlyphs, DEFAULT_LINE_HEIGHT_RATIO};
-use crate::text::instance::{build_instances, CellInstance, Theme};
+use crate::text::glyph_rasterizer::{DEFAULT_LINE_HEIGHT_RATIO, GlyphRasterizer, LineGlyphs};
+use crate::text::instance::{CellInstance, Theme, build_instances};
 use crate::text::pipeline::{GlobalsUbo, TextPipeline};
 
 fn build_term_instances(
@@ -254,12 +254,7 @@ impl Renderer {
     /// `line_height` is `× font_size_px`. The renderer's snapshots were
     /// captured at [`DEFAULT_LINE_HEIGHT`] (`1.4`). Callers loading a
     /// `toastty_config::FontConfig` should pass `font.line_height` here.
-    pub fn with_font_ex(
-        &mut self,
-        font_name: Option<&str>,
-        font_size_px: f32,
-        line_height: f32,
-    ) {
+    pub fn with_font_ex(&mut self, font_name: Option<&str>, font_size_px: f32, line_height: f32) {
         // Resolve the font family. We always bundle FiraMono so the
         // caller can pass `None` and still get text.
         let family = font_name.unwrap_or("Fira Mono");
@@ -374,9 +369,9 @@ impl Renderer {
             // visible without rebinding so this is precautionary).
             let mask_view = text::pipeline::default_view(text.rasterizer.mask_texture());
             let color_view = text::pipeline::default_view(text.rasterizer.color_texture());
-            text.bind_group =
-                text.pipeline
-                    .make_bind_group(&self.device, &mask_view, &color_view);
+            text.bind_group = text
+                .pipeline
+                .make_bind_group(&self.device, &mask_view, &color_view);
         }
 
         let theme = self.theme;

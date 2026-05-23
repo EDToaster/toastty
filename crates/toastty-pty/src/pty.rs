@@ -105,9 +105,7 @@ impl Pty {
     /// data right now."
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
         // SAFETY: master fd is valid; buf describes a valid mutable slice.
-        let n = unsafe {
-            libc::read(self.master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
-        };
+        let n = unsafe { libc::read(self.master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
         if n < 0 {
             return Err(PtyError::Io(io::Error::last_os_error()));
         }
@@ -118,9 +116,7 @@ impl Pty {
     /// as stdin.
     pub fn write(&self, buf: &[u8]) -> Result<usize> {
         // SAFETY: master fd is valid; buf describes a valid slice.
-        let n = unsafe {
-            libc::write(self.master.as_raw_fd(), buf.as_ptr().cast(), buf.len())
-        };
+        let n = unsafe { libc::write(self.master.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
         if n < 0 {
             return Err(PtyError::Io(io::Error::last_os_error()));
         }
@@ -188,8 +184,7 @@ fn open_pair(size: WinSize) -> Result<(OwnedFd, OwnedFd)> {
     let name = ptsname(&master, Vec::new()).map_err(PtyError::Open)?;
     let path = Path::new(OsStr::from_bytes(name.as_bytes()));
 
-    let slave = open(path, OFlags::RDWR | OFlags::NOCTTY, Mode::empty())
-        .map_err(PtyError::Open)?;
+    let slave = open(path, OFlags::RDWR | OFlags::NOCTTY, Mode::empty()).map_err(PtyError::Open)?;
 
     set_winsize(master.as_fd(), size)?;
 

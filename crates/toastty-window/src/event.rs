@@ -139,9 +139,15 @@ pub enum Event {
     /// Window close requested (user clicked the close button, etc).
     Close,
     /// A user-event posted via `WindowHandle::wake`. Used by the mio PTY
-    /// thread to nudge the event loop. The payload is unit for now; expand
-    /// to an enum if we need typed user events.
+    /// thread to nudge the event loop.
     User,
+    /// PTY bytes arrived on the master fd (delivered via
+    /// `toastty_io::spawn_pty_reader`). The binary feeds these to the
+    /// parser and requests a redraw.
+    PtyBytes(Vec<u8>),
+    /// PTY master closed (child exited / EIO). The binary should reap
+    /// and exit.
+    PtyClosed,
 }
 
 /// What `run` should do after the app callback returns.

@@ -46,10 +46,22 @@ fn hex(s: &str) -> Color {
 
 fn default_palette() -> [Color; 16] {
     [
-        hex("#000000"), hex("#cc3030"), hex("#30cc30"), hex("#cccc30"),
-        hex("#3030cc"), hex("#cc30cc"), hex("#30cccc"), hex("#cccccc"),
-        hex("#666666"), hex("#ff5050"), hex("#50ff50"), hex("#ffff50"),
-        hex("#5050ff"), hex("#ff50ff"), hex("#50ffff"), hex("#ffffff"),
+        hex("#000000"),
+        hex("#cc3030"),
+        hex("#30cc30"),
+        hex("#cccc30"),
+        hex("#3030cc"),
+        hex("#cc30cc"),
+        hex("#30cccc"),
+        hex("#cccccc"),
+        hex("#666666"),
+        hex("#ff5050"),
+        hex("#50ff50"),
+        hex("#ffff50"),
+        hex("#5050ff"),
+        hex("#ff50ff"),
+        hex("#50ffff"),
+        hex("#ffffff"),
     ]
 }
 

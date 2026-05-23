@@ -89,11 +89,19 @@ impl Term {
     }
 
     fn active_grid(&self) -> &Grid {
-        if self.alt_active { &self.alt } else { &self.primary }
+        if self.alt_active {
+            &self.alt
+        } else {
+            &self.primary
+        }
     }
 
     fn active_grid_mut(&mut self) -> &mut Grid {
-        if self.alt_active { &mut self.alt } else { &mut self.primary }
+        if self.alt_active {
+            &mut self.alt
+        } else {
+            &mut self.primary
+        }
     }
 
     fn clamp_cursor(&mut self) {
@@ -126,7 +134,10 @@ impl Term {
             self.cursor.col = 0;
             self.linefeed();
         }
-        let cell = Cell { ch: c, style: self.cursor.style };
+        let cell = Cell {
+            ch: c,
+            style: self.cursor.style,
+        };
         let col = self.cursor.col;
         let row = self.cursor.row;
         let max_cols = self.cols;
@@ -202,7 +213,8 @@ impl Term {
                     row.erase(0, cols, style);
                     row.soft_wrap = false;
                 }
-                grid.row_mut(cur_row).erase(0, cur_col.saturating_add(1), style);
+                grid.row_mut(cur_row)
+                    .erase(0, cur_col.saturating_add(1), style);
             }
             // 2/3: entire screen (3 = also scrollback, which we treat the same in M3).
             _ => {
@@ -358,13 +370,7 @@ impl Perform for Term {
         }
     }
 
-    fn csi_dispatch(
-        &mut self,
-        params: &Params,
-        intermediates: &[u8],
-        _ignore: bool,
-        action: char,
-    ) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         self.handle_csi(params, intermediates, action);
     }
 
@@ -640,7 +646,12 @@ mod tests {
         let a = t.row(0).cells[0].style.flags;
         assert_eq!(
             a,
-            StyleFlags { bold: true, italic: true, underline: true, reverse: true }
+            StyleFlags {
+                bold: true,
+                italic: true,
+                underline: true,
+                reverse: true
+            }
         );
         let b = t.row(0).cells[1].style.flags;
         assert_eq!(b, StyleFlags::default());
@@ -821,7 +832,10 @@ mod tests {
         t.cursor.style = Style {
             fg: Color::Red,
             bg: Color::Default,
-            flags: StyleFlags { bold: true, ..StyleFlags::default() },
+            flags: StyleFlags {
+                bold: true,
+                ..StyleFlags::default()
+            },
         };
         t.apply_sgr(&Params::default());
         assert_eq!(t.cursor.style, Style::RESET);

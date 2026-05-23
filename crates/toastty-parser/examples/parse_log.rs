@@ -30,13 +30,7 @@ impl Perform for Logger {
         };
         println!("exec   {byte:#04x} ({name})");
     }
-    fn csi_dispatch(
-        &mut self,
-        params: &Params,
-        intermediates: &[u8],
-        _ignore: bool,
-        action: char,
-    ) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         println!(
             "CSI    {} intermediates={:?} action={:?}",
             fmt_params(params),

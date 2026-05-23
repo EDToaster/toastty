@@ -30,7 +30,11 @@ fn main() {
 
         let module = match naga::front::wgsl::parse_str(&src) {
             Ok(m) => m,
-            Err(e) => panic!("WGSL parse error in {}:\n{}", path.display(), e.emit_to_string(&src)),
+            Err(e) => panic!(
+                "WGSL parse error in {}:\n{}",
+                path.display(),
+                e.emit_to_string(&src)
+            ),
         };
 
         let mut validator = naga::valid::Validator::new(

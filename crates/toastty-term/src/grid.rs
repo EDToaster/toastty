@@ -220,7 +220,10 @@ mod tests {
     #[test]
     fn row_clear_resets_cells_and_soft_wrap() {
         let mut r = Row::blank(3);
-        r.cells[0] = Cell { ch: 'x', style: red_style() };
+        r.cells[0] = Cell {
+            ch: 'x',
+            style: red_style(),
+        };
         r.soft_wrap = true;
         r.clear();
         assert!(r.cells.iter().all(|c| *c == Cell::BLANK));
@@ -243,7 +246,14 @@ mod tests {
     #[test]
     fn row_put_grows_up_to_max_cols() {
         let mut r = Row::blank(2);
-        r.put(4, Cell { ch: 'z', style: Style::RESET }, 8);
+        r.put(
+            4,
+            Cell {
+                ch: 'z',
+                style: Style::RESET,
+            },
+            8,
+        );
         assert_eq!(r.cells.len(), 5);
         assert_eq!(r.cells[4].ch, 'z');
         // intermediate cells should be blanks
@@ -255,7 +265,14 @@ mod tests {
         let mut r = Row::blank(0);
         // max_cols = 3 so attempting to put at col 10 just grows to 3 — and
         // the write at col 10 is silently dropped.
-        r.put(10, Cell { ch: 'x', style: Style::RESET }, 3);
+        r.put(
+            10,
+            Cell {
+                ch: 'x',
+                style: Style::RESET,
+            },
+            3,
+        );
         assert_eq!(r.cells.len(), 3);
         assert!(r.cells.iter().all(|c| *c == Cell::BLANK));
     }
@@ -264,12 +281,27 @@ mod tests {
     fn row_erase_handles_range_and_clamping() {
         let mut r = Row::blank(5);
         for (i, c) in r.cells.iter_mut().enumerate() {
-            *c = Cell { ch: char::from(b'a' + i as u8), style: Style::RESET };
+            *c = Cell {
+                ch: char::from(b'a' + i as u8),
+                style: Style::RESET,
+            };
         }
         r.erase(1, 3, red_style());
         assert_eq!(r.cells[0].ch, 'a');
-        assert_eq!(r.cells[1], Cell { ch: ' ', style: red_style() });
-        assert_eq!(r.cells[2], Cell { ch: ' ', style: red_style() });
+        assert_eq!(
+            r.cells[1],
+            Cell {
+                ch: ' ',
+                style: red_style()
+            }
+        );
+        assert_eq!(
+            r.cells[2],
+            Cell {
+                ch: ' ',
+                style: red_style()
+            }
+        );
         assert_eq!(r.cells[3].ch, 'd');
         // Out-of-range end gets clamped.
         r.erase(4, 100, Style::RESET);
@@ -299,8 +331,22 @@ mod tests {
     #[test]
     fn grid_scroll_up_rotates_head() {
         let mut g = Grid::new(2, 3, 2);
-        g.row_mut(0).put(0, Cell { ch: 'a', style: Style::RESET }, 3);
-        g.row_mut(1).put(0, Cell { ch: 'b', style: Style::RESET }, 3);
+        g.row_mut(0).put(
+            0,
+            Cell {
+                ch: 'a',
+                style: Style::RESET,
+            },
+            3,
+        );
+        g.row_mut(1).put(
+            0,
+            Cell {
+                ch: 'b',
+                style: Style::RESET,
+            },
+            3,
+        );
         g.scroll_up();
         // Now row 0 should hold what was row 1.
         assert_eq!(g.row(0).cells[0].ch, 'b');
@@ -311,12 +357,23 @@ mod tests {
     #[test]
     fn grid_clear_visible_paints_blanks_with_style() {
         let mut g = Grid::new(2, 3, 3);
-        g.row_mut(0).put(0, Cell { ch: 'x', style: Style::RESET }, 3);
+        g.row_mut(0).put(
+            0,
+            Cell {
+                ch: 'x',
+                style: Style::RESET,
+            },
+            3,
+        );
         g.row_mut(0).soft_wrap = true;
         g.clear_visible(red_style());
         for r in 0..2 {
             let row = g.row(r);
-            assert!(row.cells.iter().all(|c| c.ch == ' ' && c.style == red_style()));
+            assert!(
+                row.cells
+                    .iter()
+                    .all(|c| c.ch == ' ' && c.style == red_style())
+            );
             assert!(!row.soft_wrap);
         }
     }
@@ -324,7 +381,14 @@ mod tests {
     #[test]
     fn grid_resize_same_cap_only_adjusts_cols() {
         let mut g = Grid::new(3, 4, 3);
-        g.row_mut(0).put(2, Cell { ch: 'a', style: Style::RESET }, 4);
+        g.row_mut(0).put(
+            2,
+            Cell {
+                ch: 'a',
+                style: Style::RESET,
+            },
+            4,
+        );
         g.resize(3, 6, 3);
         assert_eq!(g.cols(), 6);
         assert_eq!(g.row(0).cells.len(), 6);
@@ -334,8 +398,22 @@ mod tests {
     #[test]
     fn grid_resize_different_cap_preserves_visible_rows() {
         let mut g = Grid::new(2, 3, 4);
-        g.row_mut(0).put(0, Cell { ch: 'a', style: Style::RESET }, 3);
-        g.row_mut(1).put(0, Cell { ch: 'b', style: Style::RESET }, 3);
+        g.row_mut(0).put(
+            0,
+            Cell {
+                ch: 'a',
+                style: Style::RESET,
+            },
+            3,
+        );
+        g.row_mut(1).put(
+            0,
+            Cell {
+                ch: 'b',
+                style: Style::RESET,
+            },
+            3,
+        );
         g.resize(3, 3, 6);
         assert_eq!(g.cap(), 6);
         assert_eq!(g.visible_rows(), 3);

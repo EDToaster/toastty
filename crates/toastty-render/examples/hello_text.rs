@@ -105,8 +105,7 @@ impl Demo {
 impl App for Demo {
     fn init(&mut self, window: ToasttyWindow, _handle: WindowHandle) {
         let size = window.physical_size();
-        let mut renderer =
-            block_on(Renderer::new(window.clone(), size)).expect("renderer init");
+        let mut renderer = block_on(Renderer::new(window.clone(), size)).expect("renderer init");
 
         // Plumb config → renderer:
         //   font.family + font.size_px + font.line_height → with_font_ex
@@ -178,7 +177,10 @@ fn load_config(explicit: Option<&std::path::Path>) -> (Config, ConfigSource) {
         match Config::load_from_path(p) {
             Ok(cfg) => (cfg, ConfigSource::File(p.to_path_buf())),
             Err(e) => {
-                eprintln!("config: failed to load {}: {e}; falling back to defaults", p.display());
+                eprintln!(
+                    "config: failed to load {}: {e}; falling back to defaults",
+                    p.display()
+                );
                 (Config::defaults(), ConfigSource::Defaults)
             }
         }
