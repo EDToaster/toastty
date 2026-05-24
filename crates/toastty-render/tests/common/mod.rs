@@ -71,6 +71,26 @@ pub(crate) fn render_term_offscreen(term: &Term, width: u32, height: u32) -> Rgb
     });
     let view = target.create_view(&TextureViewDescriptor::default());
 
+    // M12d: text pipeline now requires a depth attachment. The
+    // snapshot harness creates its own render pass (bypassing
+    // `Renderer::render_term`), so we allocate a matching
+    // `Depth32Float` texture and attach it below.
+    let depth = device.create_texture(&TextureDescriptor {
+        label: Some("snapshot depth"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Depth32Float,
+        usage: TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let depth_view = depth.create_view(&TextureViewDescriptor::default());
+
     // Construct the text path manually (no Renderer; that needs a window).
     // Use the same default line-height ratio the renderer applies so
     // snapshots stay byte-comparable to the M4b goldens.
@@ -149,7 +169,14 @@ pub(crate) fn render_term_offscreen(term: &Term, width: u32, height: u32) -> Rgb
                     store: StoreOp::Store,
                 },
             })],
-            depth_stencil_attachment: None,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth_view,
+                depth_ops: Some(Operations {
+                    load: LoadOp::Clear(1.0),
+                    store: StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,

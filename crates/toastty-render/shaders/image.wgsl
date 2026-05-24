@@ -55,7 +55,10 @@ fn vs_main(
     let ndc_x = (p.x / globals.viewport.x) * 2.0 - 1.0;
     let ndc_y = 1.0 - (p.y / globals.viewport.y) * 2.0;
     var out: VsOut;
-    out.clip = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
+    // NDC z = 0.5: image layer shares the cell-layer depth with
+    // text so RGP placements can occlude or sit underneath both.
+    // See `docs/decisions/rgp-protocol.md` §3.
+    out.clip = vec4<f32>(ndc_x, ndc_y, 0.5, 1.0);
     out.uv = mix(instance.uv_min, instance.uv_max, c);
     return out;
 }

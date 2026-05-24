@@ -15,6 +15,13 @@ use crate::grid::Grid;
 use toastty_config::CursorShape;
 use toastty_graphics::kitty::handler::{KittyHandler, KittySink};
 use toastty_graphics::kitty::header::DeleteSpec;
+use toastty_graphics::rgp::glb_loader::load_glb;
+use toastty_graphics::rgp::handler::{RgpHandler, RgpSink};
+use toastty_graphics::rgp::operation::{
+    RGP_PREFIX, RgpAnchor, RgpFormat, RgpPlacementStyle, RgpPlacementUpdate,
+};
+use toastty_graphics::rgp::path_resolver::resolve as resolve_rgp_path;
+use toastty_graphics::rgp::scene::{RgpAsset, RgpScene};
 use toastty_graphics::{ImageData, ImageGrid, ImageRegistry, Placement};
 use toastty_parser::{Params, Perform};
 
@@ -265,6 +272,15 @@ pub struct Term {
     /// scrollback (or past the live grid's bottom during fractional
     /// scrolling). Resized in [`Term::resize`].
     blank_row: crate::grid::Row,
+    // ----- M12a: Ratty Graphics Protocol -----
+    /// Stateful RGP dispatcher. Owns per-id chunked-payload
+    /// reassembly. The `apc_end` demux peeks at the leading bytes of
+    /// `apc_buffer` and routes `ratty;g;...` payloads here.
+    rgp_handler: RgpHandler,
+    /// In-memory RGP scene: registered assets + live placements.
+    /// Accessor-only API; the renderer pulls from `Term::rgp_scene`
+    /// on revision advance, mirrors the M11a image-registry pattern.
+    rgp_scene: RgpScene,
 }
 
 /// In-progress run of Kitty Unicode placeholder cells.
@@ -421,6 +437,8 @@ impl Term {
             cursor_visible: true,
             viewport: crate::viewport::Viewport::new(),
             blank_row: crate::grid::Row::blank(cols),
+            rgp_handler: RgpHandler::new(),
+            rgp_scene: RgpScene::new(),
         }
     }
 
@@ -475,6 +493,21 @@ impl Term {
     #[must_use]
     pub fn image_revision(&self) -> u32 {
         self.image_revision
+    }
+
+    /// Read-only view of the RGP scene (registered assets + live
+    /// placements). M12d's renderer pulls from this every frame.
+    #[must_use]
+    pub fn rgp_scene(&self) -> &RgpScene {
+        &self.rgp_scene
+    }
+
+    /// Monotonic RGP scene revision. Bumps on every mutation
+    /// (register / place / update / delete). Renderer compares to
+    /// its cached value to decide when to re-sync GPU meshes.
+    #[must_use]
+    pub fn rgp_revision(&self) -> u32 {
+        self.rgp_scene.revision()
     }
 
     /// Current SGR 58 underline color, or `None` when SGR 59 (or 0)
@@ -2407,27 +2440,34 @@ impl Perform for Term {
 
     fn apc_end(&mut self) {
         // Take ownership of the buffered payload so we can borrow
-        // `self` mutably as the sink. Defensive: if the payload doesn't
-        // start with `G`, it's not a Kitty graphics packet — silently
-        // drop. (Other APC users — e.g. tmux passthrough — might pass
-        // through; we ignore them for M11a.)
+        // `self` mutably as the sink.
         let payload = std::mem::take(&mut self.apc_buffer);
-        if payload.is_empty() || payload[0] != b'G' {
+        if payload.is_empty() {
             return;
         }
-        // Split on the first `;` into header vs body.
-        let split = payload.iter().position(|&b| b == b';');
-        let (header_bytes, body): (&[u8], &[u8]) = match split {
-            Some(idx) => (&payload[..idx], &payload[idx + 1..]),
-            None => (&payload[..], &[]),
-        };
-        // Pull the handler out so we can pass &mut self as the sink.
-        let mut handler = std::mem::take(&mut self.image_handler);
-        // Swallow the Result — header errors do not reach the sink so
-        // there's no reply to emit. (A future enhancement could push a
-        // synthetic error reply here.)
-        let _ = handler.process(header_bytes, body, self);
-        self.image_handler = handler;
+        if payload[0] == b'G' {
+            // Kitty graphics. Split on the first `;` into header
+            // vs body.
+            let split = payload.iter().position(|&b| b == b';');
+            let (header_bytes, body): (&[u8], &[u8]) = match split {
+                Some(idx) => (&payload[..idx], &payload[idx + 1..]),
+                None => (&payload[..], &[]),
+            };
+            let mut handler = std::mem::take(&mut self.image_handler);
+            // Swallow the Result — header errors do not reach the
+            // sink so there's no reply to emit. (A future
+            // enhancement could push a synthetic error reply here.)
+            let _ = handler.process(header_bytes, body, self);
+            self.image_handler = handler;
+        } else if payload.starts_with(RGP_PREFIX) {
+            // Ratty Graphics Protocol. Same `mem::take` dance —
+            // the handler dispatches to `self` as the sink.
+            let mut handler = std::mem::take(&mut self.rgp_handler);
+            let _ = handler.process(&payload, self);
+            self.rgp_handler = handler;
+        }
+        // else: not a protocol we own (tmux passthrough etc.) —
+        // silently drop.
     }
 }
 
@@ -2606,6 +2646,93 @@ impl KittySink for Term {
 
     fn cursor_col(&self) -> u16 {
         self.cursor.col.min(self.cols.saturating_sub(1))
+    }
+}
+
+// ---- M12a: RgpSink ----
+//
+// The handler hands us parsed RgpOperations; we apply them to the
+// `RgpScene` and queue any reply bytes back to the PTY. Path-based
+// register is parsed but not resolved here — M12b adds the embedded
+// asset bundle and the optional config-dir resolver.
+
+impl RgpSink for Term {
+    fn register_asset(
+        &mut self,
+        id: u32,
+        format: RgpFormat,
+        name: Option<String>,
+        bytes: Vec<u8>,
+    ) -> bool {
+        // M12b: parse the .glb bytes via the gltf crate. Failure
+        // to parse means we DON'T register the asset — the app
+        // sees the next `p;id=...` for this id silently noop, the
+        // same as if the register never arrived. (M12e will queue
+        // an error reply here once we settle on a reply shape.)
+        match load_glb(&bytes) {
+            Ok(data) => {
+                self.rgp_scene.apply_register(
+                    id,
+                    RgpAsset {
+                        format,
+                        name,
+                        data,
+                    },
+                );
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn register_asset_by_path(
+        &mut self,
+        id: u32,
+        format: RgpFormat,
+        name: String,
+    ) -> bool {
+        // M12b: resolve `name` against the embedded asset bundle
+        // (+ optional config dir, future work). Decision §1's "B′"
+        // policy: separators, `..`, and hidden names are rejected
+        // up-front by the resolver.
+        //
+        // `asset_dir` is wired in a follow-up — for v1 only the
+        // embedded bundle is consulted (which is enough for the
+        // M12 demo: `path=cube`).
+        let asset_dir = None;
+        match resolve_rgp_path(&name, asset_dir) {
+            Ok(data) => {
+                self.rgp_scene.apply_register(
+                    id,
+                    RgpAsset {
+                        format,
+                        name: Some(name),
+                        data,
+                    },
+                );
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn place(&mut self, id: u32, anchor: RgpAnchor, style: RgpPlacementStyle) {
+        self.rgp_scene.apply_place(id, anchor, style);
+    }
+
+    fn update(&mut self, id: u32, update: RgpPlacementUpdate) {
+        self.rgp_scene.apply_update(id, &update);
+    }
+
+    fn delete(&mut self, id: Option<u32>) {
+        match id {
+            Some(n) => self.rgp_scene.apply_delete_one(n),
+            None => self.rgp_scene.apply_delete_all(),
+        }
+    }
+
+    fn queue_reply(&mut self, bytes: &[u8]) {
+        self.pty_replies.extend_from_slice(bytes);
     }
 }
 

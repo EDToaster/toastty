@@ -79,7 +79,11 @@ fn vs_main(
     let has_glyph = 1.0 - max(no_glyph_flagged, zero_extent);
 
     var out: VsOut;
-    out.clip = vec4<f32>(clip_x, clip_y, 0.0, 1.0);
+    // NDC z = 0.5: cell layer sits in the middle of the depth
+    // buffer so RGP objects with protocol `depth < 0` render in
+    // front and `depth > 0` render behind. See
+    // `docs/decisions/rgp-protocol.md` §3.
+    out.clip = vec4<f32>(clip_x, clip_y, 0.5, 1.0);
     out.uv = vec2<f32>(u, v);
     out.fg = inst.fg;
     out.bg = inst.bg;

@@ -98,6 +98,144 @@ fn split_input_across_advance_calls() {
     assert_eq!(bulk.cursor(), byte.cursor());
 }
 
+// ---- M12a: end-to-end APC → RGP scene wiring ----
+//
+// These tests drive the *real* Parser + Term combination, so they
+// double as coverage for the APC demux in `Term::apc_end` (Kitty vs
+// RGP) plus the `RgpHandler` → `RgpSink for Term` plumbing.
+
+/// Build an APC packet around an RGP body: `ESC _ ratty;g;<body> ESC \`.
+fn rgp_apc(body: &str) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"\x1b_ratty;g;");
+    v.extend_from_slice(body.as_bytes());
+    v.extend_from_slice(b"\x1b\\");
+    v
+}
+
+#[test]
+fn rgp_support_query_queues_reply_through_term() {
+    let bytes = rgp_apc("s");
+    let mut t = Term::new(4, 16, 0);
+    let mut p = Parser::new();
+    p.advance(&mut t, &bytes);
+    let reply = t.drain_pty_replies();
+    assert!(
+        reply.starts_with(b"\x1b_ratty;g;s;"),
+        "reply must be APC-framed support response: {reply:?}"
+    );
+    assert!(reply.ends_with(b"\x1b\\"));
+}
+
+#[test]
+fn rgp_place_through_term_lands_in_scene() {
+    let bytes = rgp_apc("p;id=1;row=2;col=3;w=4;h=2;ry=45");
+    let mut t = Term::new(8, 16, 0);
+    let mut p = Parser::new();
+    p.advance(&mut t, &bytes);
+    let scene = t.rgp_scene();
+    let placement = scene.placement(1).expect("placement must exist");
+    assert_eq!(placement.anchor.row, 2);
+    assert_eq!(placement.anchor.col, 3);
+    assert_eq!(placement.anchor.cols, 4);
+    assert_eq!(placement.anchor.rows, 2);
+    assert!((placement.style.rotation[1] - 45.0).abs() < 1e-6);
+    assert!(t.rgp_revision() > 0);
+}
+
+#[test]
+fn rgp_register_then_place_then_update_then_delete_through_term() {
+    let mut t = Term::new(8, 16, 0);
+    let mut p = Parser::new();
+    // Register via the bundled cube — exercises `path=` resolution.
+    p.advance(&mut t, &rgp_apc("r;id=1;fmt=glb;path=cube"));
+    p.advance(&mut t, &rgp_apc("p;id=1;row=0;col=0;w=2;h=2"));
+    p.advance(&mut t, &rgp_apc("u;id=1;brightness=0.5"));
+
+    let scene = t.rgp_scene();
+    let asset = scene.asset(1).expect("asset registered");
+    assert_eq!(asset.name.as_deref(), Some("cube"));
+    assert_eq!(asset.data.mesh.positions.len(), 24, "cube has 24 vertices");
+    let p1 = scene.placement(1).expect("placement set");
+    assert!((p1.style.brightness - 0.5).abs() < 1e-6);
+
+    // Delete one — placement gone, asset stays.
+    p.advance(&mut t, &rgp_apc("d;id=1"));
+    assert!(t.rgp_scene().placement(1).is_none());
+    assert!(t.rgp_scene().asset(1).is_some(), "delete-one keeps asset");
+
+    // Delete all — asset gone too.
+    p.advance(&mut t, &rgp_apc("d"));
+    assert!(t.rgp_scene().asset(1).is_none());
+}
+
+#[test]
+fn rgp_path_register_with_unknown_name_does_not_register() {
+    let mut t = Term::new(4, 16, 0);
+    let mut p = Parser::new();
+    // Leaf name not in the embedded bundle and no asset_dir
+    // configured → resolver returns NotFound → no asset registered.
+    p.advance(&mut t, &rgp_apc("r;id=1;fmt=glb;path=nope"));
+    assert!(t.rgp_scene().asset(1).is_none());
+}
+
+#[test]
+fn rgp_path_register_rejects_paths_with_separators() {
+    let mut t = Term::new(4, 16, 0);
+    let mut p = Parser::new();
+    // Decision §1: leaf-only. A path containing `/` must be
+    // rejected by the resolver without any I/O attempt.
+    p.advance(&mut t, &rgp_apc("r;id=1;fmt=glb;path=../etc/passwd"));
+    assert!(t.rgp_scene().asset(1).is_none());
+}
+
+#[test]
+fn apc_demux_routes_kitty_and_rgp_to_their_own_handlers() {
+    let mut t = Term::new(8, 16, 0);
+    let mut p = Parser::new();
+    // Kitty query packet — should NOT touch rgp_scene.
+    p.advance(&mut t, b"\x1b_Ga=q,i=1,s=1,v=1;AAAA\x1b\\");
+    assert_eq!(t.rgp_revision(), 0, "Kitty packet must not bump RGP revision");
+    // Then an RGP packet — must NOT show up in image registry/grid.
+    p.advance(&mut t, &rgp_apc("p;id=99;row=1;col=1;w=2;h=2"));
+    assert!(t.rgp_scene().placement(99).is_some());
+    assert!(t.image_grid().is_empty(), "RGP packet must not place a Kitty image");
+}
+
+#[test]
+fn rgp_chunked_payload_register_reassembles_through_term() {
+    use base64::Engine;
+    let mut t = Term::new(4, 16, 0);
+    let mut p = Parser::new();
+    // Build a known-good .glb, base64 it, split into two halves,
+    // and send as a chunked payload register.
+    let glb_bytes = toastty_graphics::rgp::glb_loader::minimal_triangle_glb();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&glb_bytes);
+    let mid = encoded.len() / 2;
+    let (first, second) = encoded.split_at(mid);
+
+    p.advance(
+        &mut t,
+        &rgp_apc(&format!(
+            "r;id=7;fmt=glb;source=payload;more=1;{first}"
+        )),
+    );
+    // Asset must NOT exist yet — we're mid-upload.
+    assert!(t.rgp_scene().asset(7).is_none());
+    p.advance(
+        &mut t,
+        &rgp_apc(&format!(
+            "r;id=7;fmt=glb;source=payload;more=0;{second}"
+        )),
+    );
+    let asset = t
+        .rgp_scene()
+        .asset(7)
+        .expect("asset registered on final chunk");
+    // Loader parsed the triangle's three positions.
+    assert_eq!(asset.data.mesh.positions.len(), 3);
+}
+
 proptest! {
     /// Any random byte stream must not panic the Term/parser stack.
     /// Mirrors the parser-level property (parser/tests/integration.rs).

@@ -6,6 +6,7 @@
 pub mod image_grid;
 pub mod kitty;
 pub mod registry;
+pub mod rgp;
 
 pub use image_grid::{ImageGrid, Placement, PlacementHandle, SrcRect};
 pub use kitty::{
@@ -15,3 +16,15 @@ pub use kitty::{
     reply::{ErrorCode, encode_error, encode_ok},
 };
 pub use registry::{ImageData, ImageRegistry, InsertError, Inserted};
+pub use rgp::{
+    asset::{CpuAsset, CpuMaterial, CpuMesh},
+    glb_loader::{GlbLoadError, load_glb},
+    handler::{RgpHandler, RgpSink},
+    operation::{
+        RGP_PREFIX, RgpAnchor, RgpFormat, RgpOperation, RgpParseError, RgpPlacementStyle,
+        RgpPlacementUpdate, RgpRegisterSource, parse as parse_rgp,
+    },
+    path_resolver::{ResolveError, embedded_bundle_names, resolve as resolve_rgp_path},
+    reply::{frame_apc as frame_rgp_apc, support_reply as rgp_support_reply},
+    scene::{RgpAsset, RgpPlacement, RgpScene},
+};

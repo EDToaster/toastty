@@ -16,6 +16,7 @@ tracing.workspace = true
 unicode-width.workspace = true
 wgpu.workspace = true
 
+toastty-graphics.workspace = true
 toastty-protocols.workspace = true
 toastty-term.workspace = true
 

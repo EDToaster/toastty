@@ -235,7 +235,16 @@ fn make_pipeline(
             unclipped_depth: false,
             conservative: false,
         },
-        depth_stencil: None,
+        // Cell layer writes z=0.5 (from the shader); RGP pass tests
+        // against this so 3D objects can occlude or sit underneath
+        // text by their per-placement `depth` field.
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
         multisample: MultisampleState {
             count: 1,
             mask: !0,

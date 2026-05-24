@@ -10,6 +10,11 @@ thiserror.workspace = true
 base64 = "0.22"
 flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
+# `gltf` for the RGP `.glb` loader. We disable `import` (which pulls
+# in image/urlencoding for file-IO and data-URI handling we don't
+# need — we feed bytes directly) and keep `utils` for the attribute
+# readers.
+gltf = { version = "=1.4.1", default-features = false, features = ["utils"] }
 
 toastty-parser.workspace = true
 

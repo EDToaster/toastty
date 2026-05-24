@@ -25,6 +25,7 @@
 
 pub mod color;
 pub mod image;
+pub mod rgp;
 pub mod surface_format;
 pub mod text;
 
@@ -42,6 +43,7 @@ use wgpu::{
 use crate::image::atlas::ImageTextureCache;
 use crate::image::instance::{ImageInstance, build_image_instances, split_below_above};
 use crate::image::pipeline::ImagePipeline;
+use crate::rgp::{GpuAssetCache, Rgp3dPipeline};
 use crate::text::glyph_rasterizer::{DEFAULT_LINE_HEIGHT_RATIO, GlyphRasterizer, LineGlyphs};
 use crate::text::instance::{CellInstance, Theme};
 use crate::text::pipeline::{GlobalsUbo, TextPipeline};
@@ -239,6 +241,21 @@ pub struct Renderer {
     /// frame at the new y-translation (blank cells skip emission, so
     /// old non-blank content would leak through).
     last_view_offset: (u32, f32),
+    // ----- M12d: RGP 3D pass -----
+    /// Depth attachment shared by the RGP, text, and image pipelines.
+    /// Same dims as the scratch color texture; recreated on resize.
+    /// Format: `Depth32Float`. RGP renders into this with
+    /// `depth_compare: LessEqual`; text/image both write z=0.5 via
+    /// their shaders so 3D objects can occlude or sit underneath.
+    scratch_depth_texture: wgpu::Texture,
+    scratch_depth_view: wgpu::TextureView,
+    /// 3D pipeline + draw-uniform slot pool. Lazy-initialised
+    /// alongside the text pipeline in `with_font_ex`.
+    rgp_pipeline: Option<Rgp3dPipeline>,
+    /// GPU mesh cache keyed by RGP asset id.
+    rgp_cache: GpuAssetCache,
+    /// Last `Term::rgp_revision()` we synced.
+    rgp_revision_seen: u32,
 }
 
 /// Build the scratch render target. Same dims/format as the surface;
@@ -262,6 +279,31 @@ fn create_scratch(
         dimension: wgpu::TextureDimension::D2,
         format,
         usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+/// Build the depth attachment that pairs with the scratch FB.
+/// `Depth32Float`, same dims, `RENDER_ATTACHMENT` only.
+fn create_scratch_depth(
+    device: &Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("toastty-render scratch depth"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -456,6 +498,8 @@ impl Renderer {
 
         let (scratch_texture, scratch_view) =
             create_scratch(&device, config.width, config.height, format);
+        let (scratch_depth_texture, scratch_depth_view) =
+            create_scratch_depth(&device, config.width, config.height);
 
         Ok(Self {
             device,
@@ -479,6 +523,11 @@ impl Renderer {
             image_instances_below: Vec::new(),
             image_instances_above: Vec::new(),
             last_view_offset: (0, 0.0),
+            scratch_depth_texture,
+            scratch_depth_view,
+            rgp_pipeline: None,
+            rgp_cache: GpuAssetCache::new(),
+            rgp_revision_seen: u32::MAX,
         })
     }
 
@@ -557,6 +606,10 @@ impl Renderer {
         // pipeline shares the swapchain format.
         if self.image_pipeline.is_none() {
             self.image_pipeline = Some(ImagePipeline::new(&self.device, self.config.format));
+        }
+        // Same for the RGP pipeline.
+        if self.rgp_pipeline.is_none() {
+            self.rgp_pipeline = Some(Rgp3dPipeline::new(&self.device, self.config.format));
         }
         // Font swap invalidates the cell grid — force the next frame
         // to clear.
@@ -641,6 +694,12 @@ impl Renderer {
             create_scratch(&self.device, self.config.width, self.config.height, self.config.format);
         self.scratch_texture = tex;
         self.scratch_view = view;
+        // Depth attachment shares dims with the color scratch; recreate
+        // it for the same reason.
+        let (dtex, dview) =
+            create_scratch_depth(&self.device, self.config.width, self.config.height);
+        self.scratch_depth_texture = dtex;
+        self.scratch_depth_view = dview;
         self.needs_full_clear = true;
     }
 
@@ -742,6 +801,16 @@ impl Renderer {
         if cur_view != self.last_view_offset {
             self.needs_full_clear = true;
             self.last_view_offset = cur_view;
+        }
+
+        // M12d: RGP scene sync. Same pattern as the image registry —
+        // when the term's RGP revision advances, diff the GPU cache
+        // against the scene's asset table and force a full clear.
+        if term.rgp_revision() != self.rgp_revision_seen {
+            self.rgp_cache.sync(&self.device, term.rgp_scene());
+            self.rgp_revision_seen = term.rgp_revision();
+            self.needs_full_clear = true;
+            term.mark_all_dirty();
         }
 
         // M9 skip-submit: if no cells changed AND no animation tick is
@@ -1036,6 +1105,16 @@ impl Renderer {
             wgpu::LoadOp::Load
         };
 
+        // Depth load op tracks the color load op: on a full clear we
+        // clear depth to 1.0 (NDC far); on a partial-redraw frame
+        // we Load so the previous frame's depth (cell layer at 0.5,
+        // any 3D objects at their NDC z) is preserved.
+        let depth_load_op = if self.needs_full_clear {
+            wgpu::LoadOp::Clear(1.0)
+        } else {
+            wgpu::LoadOp::Load
+        };
+
         {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("toastty-render term pass"),
@@ -1054,16 +1133,43 @@ impl Renderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.scratch_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: depth_load_op,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
 
-            // M11a draw order: below-text images → text → above-text
-            // images. All target `scratch_view`.
+            // Draw order:
+            //   1. RGP 3D pass — writes color + depth.
+            //   2. below-text images — depth-tested at z=0.5.
+            //   3. text          — depth-tested at z=0.5.
+            //   4. above-text images.
+            // Z-ordering between 3D and text/images is handled by
+            // the per-placement `depth` field: objects with
+            // `depth < 0` win the depth test against the z=0.5 cell
+            // layer, `depth > 0` lose to it.
             #[allow(clippy::cast_precision_loss)] // viewport in 16k-px range.
             let viewport = (self.config.width as f32, self.config.height as f32);
+
+            if let Some(rgp_pipe) = self.rgp_pipeline.as_mut() {
+                rgp_pipe.render(
+                    &self.device,
+                    &self.queue,
+                    &mut rp,
+                    term.rgp_scene(),
+                    &self.rgp_cache,
+                    viewport,
+                    cell_size,
+                );
+            }
+
             if let Some(img_pipe) = self.image_pipeline.as_mut()
                 && !self.image_instances_below.is_empty()
             {
