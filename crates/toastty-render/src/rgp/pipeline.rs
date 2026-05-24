@@ -217,6 +217,14 @@ impl Rgp3dPipeline {
             let rx = rotate_x_deg(p.style.rotation[0]);
             let ry = rotate_y_deg(p.style.rotation[1]);
             let rz = rotate_z_deg(p.style.rotation[2]);
+            // M12c: `animate=1` rotates the cube around screen-Y
+            // (world Y), composed AFTER the protocol's pose so the
+            // app's chosen `rx/ry/rz` selects an orientation and
+            // the animation spins it around the screen-vertical
+            // axis. `Term::tick_rgp_animations` updates the phase
+            // each frame; the renderer just reads the current
+            // value here.
+            let r_animate = rotate_y_deg(p.animation_phase_rad.to_degrees());
             // Protocol `depth` maps to pixel-z via the decision §3
             // factor: `ndc_z = 0.5 + 0.05 * depth` and the ortho
             // scales pixel z by `0.5 / Z_HALF_RANGE_PX`, so
@@ -231,14 +239,16 @@ impl Rgp3dPipeline {
                 center_px_y + p.style.offset[1] * fit_half,
                 depth_world_z,
             );
-            let model = compose(&[t, rz, ry, rx, s_uniform, s_nonuniform]);
+            // Order applied to v: scale → proto rotate → animate
+            // rotate (world Y) → translate.
+            let model = compose(&[t, r_animate, rz, ry, rx, s_uniform, s_nonuniform]);
             let mvp = mul(&proj, &model);
 
-            // Normal matrix = upper-3x3 of model, transposed and
-            // inverted. For pure-rotation × uniform-scale models
-            // (the common case) this is just the rotation part —
-            // shortcut: compose rotations only.
-            let normal = compose(&[rx, ry, rz]);
+            // Normal matrix mirrors the rotational part of the
+            // model (uniform scales don't disturb normals). Include
+            // the animation phase so lighting tracks the rotating
+            // faces.
+            let normal = compose(&[r_animate, rz, ry, rx]);
 
             // Color tint: base_color × protocol color × brightness.
             let prot_color = p.style.color.unwrap_or([255, 255, 255]);

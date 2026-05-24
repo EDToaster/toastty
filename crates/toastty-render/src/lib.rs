@@ -671,7 +671,15 @@ impl Renderer {
     /// schedule a wake-up.
     #[must_use]
     pub fn next_redraw_deadline(&self, term: &Term) -> Option<Duration> {
-        self.blink.next_deadline(term.cursor_blink(), Instant::now())
+        let blink = self.blink.next_deadline(term.cursor_blink(), Instant::now());
+        let rgp = term.rgp_scene().animation_deadline();
+        // Whichever fires first wins. Both are `Option<Duration>`.
+        match (blink, rgp) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
     }
 
     /// Current theme.
@@ -827,7 +835,19 @@ impl Renderer {
         // immediately fire a tick (which would flash the cursor).
         self.blink.sync_enabled(term.cursor_blink(), now);
         let cursor_animation_due = self.blink.animation_due(term.cursor_blink(), now);
-        if term.damage().is_empty() && !cursor_animation_due && !self.needs_full_clear {
+        // M12c: RGP animations force frames through the skip-submit
+        // gate the same way cursor blink does. Tick BEFORE the
+        // skip check so animation_phase_rad is current for this
+        // frame; the tick itself doesn't bump revision.
+        let rgp_animation_active = term.rgp_scene().has_active_animations();
+        if rgp_animation_active {
+            term.tick_rgp_animations(now);
+        }
+        if term.damage().is_empty()
+            && !cursor_animation_due
+            && !rgp_animation_active
+            && !self.needs_full_clear
+        {
             return Ok(RenderOutcome::Skipped);
         }
 

@@ -512,6 +512,15 @@ impl Term {
         self.rgp_scene.revision()
     }
 
+    /// Advance per-placement animation phases for `animate=1`
+    /// placements. The renderer calls this once per frame before
+    /// reading `rgp_scene()` so the model matrices reflect the
+    /// current rotation. Does NOT bump `rgp_revision` — animation
+    /// is transient and the GPU mesh cache is unaffected.
+    pub fn tick_rgp_animations(&mut self, now: std::time::Instant) {
+        self.rgp_scene.tick_animations(now);
+    }
+
     /// Current SGR 58 underline color, or `None` when SGR 59 (or 0)
     /// reset it. The Unicode placeholder pipeline reads this as the
     /// high byte of the image id.
