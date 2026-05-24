@@ -85,16 +85,19 @@ pub fn mul(a: &Mat4, b: &Mat4) -> Mat4 {
     out
 }
 
-/// Orthographic projection: world XYZ in pixel space → NDC.
+/// Orthographic projection: world XYZ in mixed units → NDC.
 ///
-/// - `width_px` × `height_px`: viewport in physical pixels.
-/// - World x ∈ `[0, width_px]` → NDC x ∈ `[-1, 1]`.
-/// - World y ∈ `[0, height_px]` → NDC y ∈ `[1, -1]` (Y-down screen → Y-up NDC).
-/// - World z ∈ `[-1, 1]` → NDC z ∈ `[0, 1]` (depth=0 → NDC 0.5).
+/// **X / Y are pixels** (viewport in physical pixels): world x ∈
+/// `[0, width_px]` → NDC x ∈ `[-1, 1]`, world y ∈ `[0, height_px]`
+/// → NDC y ∈ `[1, -1]` (Y-down screen → Y-up NDC).
 ///
-/// The 0.5 factor on z keeps the cell layer co-planar with protocol
-/// `depth=0` (decision §3); per-placement `depth=` is folded into
-/// the model matrix's z translation by the caller.
+/// **Z is abstract units, NOT pixels**: world z ∈ `[-1, 1]` → NDC z
+/// ∈ `[0, 1]` (z=0 → NDC 0.5, co-planar with the cell layer per
+/// decision §3). Callers must keep model z + depth offsets inside
+/// ±1 to avoid depth clipping — the pipeline composes the model so
+/// this holds: the cube's z extent is scaled to a small abstract
+/// value (not pixel-scale), and the protocol `depth=` field is
+/// mapped via the decision §3 factor (0.05 per unit).
 #[must_use]
 pub fn ortho_screen(width_px: f32, height_px: f32) -> Mat4 {
     let mut m = identity();

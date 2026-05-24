@@ -87,7 +87,11 @@ impl Rgp3dPipeline {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
+                // No back-face culling: v1's procedural cube + glTF
+                // loader don't guarantee a winding convention, and
+                // back-facing fragments contribute (lambertian → 0,
+                // ambient only) without harming the look.
+                cull_mode: None,
                 unclipped_depth: false,
                 polygon_mode: wgpu::PolygonMode::Fill,
                 conservative: false,
@@ -201,20 +205,33 @@ impl Rgp3dPipeline {
             let fit_half = half_w_px.min(half_h_px) * p.style.scale;
 
             // Model: scale × non-uniform scale × rotate × translate.
-            let s_uniform = scale(fit_half, fit_half, fit_half);
+            //
+            // X / Y scale is pixel-space (so the cube fits the cell
+            // box). Z scale is **abstract**, chosen so the cube's
+            // local z extent (±0.5 from `CpuMesh::unit_cube`) maps
+            // to ±0.25 in world z — well inside the ortho's [-1, 1]
+            // world-z window (which becomes NDC [0, 1] per
+            // decision §3). Mixing pixel-x/y with abstract-z is the
+            // whole point of the orthographic projection's split
+            // unit convention.
+            const Z_MODEL_SCALE: f32 = 0.5;
+            let s_uniform = scale(fit_half, fit_half, Z_MODEL_SCALE);
             let s_nonuniform = scale(p.style.scale3[0], p.style.scale3[1], p.style.scale3[2]);
             let rx = rotate_x_deg(p.style.rotation[0]);
             let ry = rotate_y_deg(p.style.rotation[1]);
             let rz = rotate_z_deg(p.style.rotation[2]);
-            // depth: protocol depth maps to a pixel-space z offset
-            // that the orthographic projection will rescale. We
-            // multiply by `fit_half` so the depth field stays in the
-            // same "object-extent" units as scale.
-            let depth_px = p.style.depth * fit_half * 0.1 + p.style.offset[2] * fit_half;
+            // Protocol `depth` maps to abstract world-z via the
+            // decision §3 factor (`ndc_z = 0.5 + 0.05 * depth`,
+            // i.e. `world_z = 0.1 * depth` since the ortho scales
+            // world-z by 0.5). The placement's `pz` offset uses
+            // the same abstract scale.
+            const PROTOCOL_DEPTH_TO_WORLD_Z: f32 = 0.1;
+            let depth_world_z =
+                p.style.depth * PROTOCOL_DEPTH_TO_WORLD_Z + p.style.offset[2] * Z_MODEL_SCALE;
             let t = translate(
                 center_px_x + p.style.offset[0] * fit_half,
                 center_px_y + p.style.offset[1] * fit_half,
-                depth_px,
+                depth_world_z,
             );
             let model = compose(&[t, rz, ry, rx, s_uniform, s_nonuniform]);
             let mvp = mul(&proj, &model);
