@@ -15,10 +15,12 @@ use crate::grid::Grid;
 use toastty_config::CursorShape;
 use toastty_graphics::kitty::handler::{KittyHandler, KittySink};
 use toastty_graphics::kitty::header::DeleteSpec;
+use toastty_graphics::rgp::glb_loader::load_glb;
 use toastty_graphics::rgp::handler::{RgpHandler, RgpSink};
 use toastty_graphics::rgp::operation::{
     RGP_PREFIX, RgpAnchor, RgpFormat, RgpPlacementStyle, RgpPlacementUpdate,
 };
+use toastty_graphics::rgp::path_resolver::resolve as resolve_rgp_path;
 use toastty_graphics::rgp::scene::{RgpAsset, RgpScene};
 use toastty_graphics::{ImageData, ImageGrid, ImageRegistry, Placement};
 use toastty_parser::{Params, Perform};
@@ -2461,29 +2463,56 @@ impl RgpSink for Term {
         name: Option<String>,
         bytes: Vec<u8>,
     ) -> bool {
-        self.rgp_scene.apply_register(
-            id,
-            RgpAsset {
-                format,
-                name,
-                bytes,
-            },
-        );
-        true
+        // M12b: parse the .glb bytes via the gltf crate. Failure
+        // to parse means we DON'T register the asset — the app
+        // sees the next `p;id=...` for this id silently noop, the
+        // same as if the register never arrived. (M12e will queue
+        // an error reply here once we settle on a reply shape.)
+        match load_glb(&bytes) {
+            Ok(data) => {
+                self.rgp_scene.apply_register(
+                    id,
+                    RgpAsset {
+                        format,
+                        name,
+                        data,
+                    },
+                );
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     fn register_asset_by_path(
         &mut self,
-        _id: u32,
-        _format: RgpFormat,
-        _name: String,
+        id: u32,
+        format: RgpFormat,
+        name: String,
     ) -> bool {
-        // M12a: path-based register is parsed and dispatched, but
-        // the resolver doesn't exist yet. Silently no-op. M12b
-        // wires the embedded asset bundle + the optional config
-        // directory lookup behind a path policy that rejects
-        // anything containing a separator or parent-component.
-        false
+        // M12b: resolve `name` against the embedded asset bundle
+        // (+ optional config dir, future work). Decision §1's "B′"
+        // policy: separators, `..`, and hidden names are rejected
+        // up-front by the resolver.
+        //
+        // `asset_dir` is wired in a follow-up — for v1 only the
+        // embedded bundle is consulted (which is enough for the
+        // M12 demo: `path=cube`).
+        let asset_dir = None;
+        match resolve_rgp_path(&name, asset_dir) {
+            Ok(data) => {
+                self.rgp_scene.apply_register(
+                    id,
+                    RgpAsset {
+                        format,
+                        name: Some(name),
+                        data,
+                    },
+                );
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     fn place(&mut self, id: u32, anchor: RgpAnchor, style: RgpPlacementStyle) {

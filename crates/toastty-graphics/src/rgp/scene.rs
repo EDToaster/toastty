@@ -14,23 +14,27 @@
 
 use std::collections::HashMap;
 
+use crate::rgp::asset::CpuAsset;
 use crate::rgp::operation::{
     RgpAnchor, RgpFormat, RgpPlacementStyle, RgpPlacementUpdate,
 };
 
-/// A registered RGP asset. Held in its source-bytes form until the
-/// loader (M12b) parses it into vertex / index / material data —
-/// in M12a it's just a placeholder so the scene structure is
-/// complete end-to-end.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A registered RGP asset.
+///
+/// `data` is the parsed mesh + material. M12b's payload-mode `r`
+/// verb runs `glb_loader::load_glb` on the incoming base64 and
+/// fails registration if parsing fails — see decision §1 ("we
+/// register the asset OR we return an error reply; we never
+/// silently register garbage").
+#[derive(Debug, Clone, PartialEq)]
 pub struct RgpAsset {
     /// Declared format on the wire.
     pub format: RgpFormat,
     /// Optional `name=` hint, kept for diagnostics only.
     pub name: Option<String>,
-    /// Raw asset bytes. M12b parses these into mesh/material data;
-    /// M12a stops here.
-    pub bytes: Vec<u8>,
+    /// Parsed CPU-side mesh + material, ready for the renderer to
+    /// upload.
+    pub data: CpuAsset,
 }
 
 /// A live placement of a registered asset.
@@ -161,6 +165,14 @@ mod tests {
         }
     }
 
+    fn dummy_asset() -> RgpAsset {
+        RgpAsset {
+            format: RgpFormat::Glb,
+            name: None,
+            data: CpuAsset::unit_cube(),
+        }
+    }
+
     #[test]
     fn new_scene_is_empty() {
         let s = RgpScene::new();
@@ -174,14 +186,7 @@ mod tests {
     #[test]
     fn register_then_place_bumps_revision_each_step() {
         let mut s = RgpScene::new();
-        s.apply_register(
-            1,
-            RgpAsset {
-                format: RgpFormat::Glb,
-                name: None,
-                bytes: vec![1, 2, 3],
-            },
-        );
+        s.apply_register(1, dummy_asset());
         assert_eq!(s.revision(), 1);
         s.apply_place(1, dummy_anchor(), RgpPlacementStyle::default());
         assert_eq!(s.revision(), 2);
@@ -225,14 +230,7 @@ mod tests {
     #[test]
     fn delete_one_drops_placement_keeps_asset() {
         let mut s = RgpScene::new();
-        s.apply_register(
-            1,
-            RgpAsset {
-                format: RgpFormat::Glb,
-                name: None,
-                bytes: vec![],
-            },
-        );
+        s.apply_register(1, dummy_asset());
         s.apply_place(1, dummy_anchor(), RgpPlacementStyle::default());
         let rev_before = s.revision();
         s.apply_delete_one(1);
@@ -244,14 +242,7 @@ mod tests {
     #[test]
     fn delete_all_wipes_everything() {
         let mut s = RgpScene::new();
-        s.apply_register(
-            1,
-            RgpAsset {
-                format: RgpFormat::Glb,
-                name: None,
-                bytes: vec![],
-            },
-        );
+        s.apply_register(1, dummy_asset());
         s.apply_place(1, dummy_anchor(), RgpPlacementStyle::default());
         s.apply_delete_all();
         assert!(s.asset(1).is_none());

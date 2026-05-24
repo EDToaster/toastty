@@ -147,17 +147,15 @@ fn rgp_place_through_term_lands_in_scene() {
 fn rgp_register_then_place_then_update_then_delete_through_term() {
     let mut t = Term::new(8, 16, 0);
     let mut p = Parser::new();
-    // base64 "abc" = "YWJj"
-    p.advance(
-        &mut t,
-        &rgp_apc("r;id=1;fmt=glb;source=payload;more=0;YWJj"),
-    );
+    // Register via the bundled cube — exercises `path=` resolution.
+    p.advance(&mut t, &rgp_apc("r;id=1;fmt=glb;path=cube"));
     p.advance(&mut t, &rgp_apc("p;id=1;row=0;col=0;w=2;h=2"));
     p.advance(&mut t, &rgp_apc("u;id=1;brightness=0.5"));
 
     let scene = t.rgp_scene();
     let asset = scene.asset(1).expect("asset registered");
-    assert_eq!(asset.bytes, b"abc".to_vec());
+    assert_eq!(asset.name.as_deref(), Some("cube"));
+    assert_eq!(asset.data.mesh.positions.len(), 24, "cube has 24 vertices");
     let p1 = scene.placement(1).expect("placement set");
     assert!((p1.style.brightness - 0.5).abs() < 1e-6);
 
@@ -168,6 +166,26 @@ fn rgp_register_then_place_then_update_then_delete_through_term() {
 
     // Delete all — asset gone too.
     p.advance(&mut t, &rgp_apc("d"));
+    assert!(t.rgp_scene().asset(1).is_none());
+}
+
+#[test]
+fn rgp_path_register_with_unknown_name_does_not_register() {
+    let mut t = Term::new(4, 16, 0);
+    let mut p = Parser::new();
+    // Leaf name not in the embedded bundle and no asset_dir
+    // configured → resolver returns NotFound → no asset registered.
+    p.advance(&mut t, &rgp_apc("r;id=1;fmt=glb;path=nope"));
+    assert!(t.rgp_scene().asset(1).is_none());
+}
+
+#[test]
+fn rgp_path_register_rejects_paths_with_separators() {
+    let mut t = Term::new(4, 16, 0);
+    let mut p = Parser::new();
+    // Decision §1: leaf-only. A path containing `/` must be
+    // rejected by the resolver without any I/O attempt.
+    p.advance(&mut t, &rgp_apc("r;id=1;fmt=glb;path=../etc/passwd"));
     assert!(t.rgp_scene().asset(1).is_none());
 }
 
@@ -186,21 +204,36 @@ fn apc_demux_routes_kitty_and_rgp_to_their_own_handlers() {
 
 #[test]
 fn rgp_chunked_payload_register_reassembles_through_term() {
+    use base64::Engine;
     let mut t = Term::new(4, 16, 0);
     let mut p = Parser::new();
-    // base64("hello ") + base64("world") split across two `r` packets.
+    // Build a known-good .glb, base64 it, split into two halves,
+    // and send as a chunked payload register.
+    let glb_bytes = toastty_graphics::rgp::glb_loader::minimal_triangle_glb();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&glb_bytes);
+    let mid = encoded.len() / 2;
+    let (first, second) = encoded.split_at(mid);
+
     p.advance(
         &mut t,
-        &rgp_apc("r;id=7;fmt=glb;source=payload;more=1;aGVsbG8g"),
+        &rgp_apc(&format!(
+            "r;id=7;fmt=glb;source=payload;more=1;{first}"
+        )),
     );
     // Asset must NOT exist yet — we're mid-upload.
     assert!(t.rgp_scene().asset(7).is_none());
     p.advance(
         &mut t,
-        &rgp_apc("r;id=7;fmt=glb;source=payload;more=0;d29ybGQ="),
+        &rgp_apc(&format!(
+            "r;id=7;fmt=glb;source=payload;more=0;{second}"
+        )),
     );
-    let asset = t.rgp_scene().asset(7).expect("asset registered on final chunk");
-    assert_eq!(asset.bytes, b"hello world".to_vec());
+    let asset = t
+        .rgp_scene()
+        .asset(7)
+        .expect("asset registered on final chunk");
+    // Loader parsed the triangle's three positions.
+    assert_eq!(asset.data.mesh.positions.len(), 3);
 }
 
 proptest! {

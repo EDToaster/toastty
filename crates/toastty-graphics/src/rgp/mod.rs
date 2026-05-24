@@ -12,8 +12,19 @@
 //!   reassembly that calls back into a [`handler::RgpSink`] (the
 //!   host's interpretation of "register / place / update / delete /
 //!   queue reply").
+//! - [`asset`] — CPU-side mesh + material types ([`asset::CpuMesh`],
+//!   [`asset::CpuMaterial`], [`asset::CpuAsset`]) and the bundled
+//!   procedural cube ([`asset::CpuMesh::unit_cube`]).
+//! - [`glb_loader`] — `.glb` byte slice → [`asset::CpuAsset`] via
+//!   the `gltf` crate. Used by the payload-mode `r` verb.
+//! - [`path_resolver`] — leaf-name `path=` lookup against the
+//!   embedded bundle + optional `[rgp] asset_dir`. Decision §1's
+//!   "B′" policy.
 
+pub mod asset;
+pub mod glb_loader;
 pub mod handler;
 pub mod operation;
+pub mod path_resolver;
 pub mod reply;
 pub mod scene;
