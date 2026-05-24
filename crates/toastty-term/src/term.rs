@@ -2669,8 +2669,20 @@ impl RgpSink for Term {
         // sees the next `p;id=...` for this id silently noop, the
         // same as if the register never arrived. (M12e will queue
         // an error reply here once we settle on a reply shape.)
+        tracing::info!(
+            target: "rgp",
+            id, ?format, name = ?name, bytes_len = bytes.len(),
+            "rgp: register_asset (payload)",
+        );
         match load_glb(&bytes) {
             Ok(data) => {
+                tracing::info!(
+                    target: "rgp",
+                    id,
+                    vertices = data.mesh.positions.len(),
+                    indices = data.mesh.indices.len(),
+                    "rgp: register_asset ok",
+                );
                 self.rgp_scene.apply_register(
                     id,
                     RgpAsset {
@@ -2681,7 +2693,14 @@ impl RgpSink for Term {
                 );
                 true
             }
-            Err(_) => false,
+            Err(e) => {
+                tracing::warn!(
+                    target: "rgp",
+                    id, error = %e,
+                    "rgp: register_asset failed",
+                );
+                false
+            }
         }
     }
 
@@ -2711,8 +2730,22 @@ impl RgpSink for Term {
                 .to_string_lossy()
                 .into_owned()
         };
+        tracing::info!(
+            target: "rgp",
+            id, ?format, requested = %name, resolved = %resolved,
+            shell_cwd = %self.cwd,
+            toastty_cwd = ?std::env::current_dir().ok(),
+            "rgp: register_asset_by_path",
+        );
         match resolve_rgp_path(&resolved, None) {
             Ok(data) => {
+                tracing::info!(
+                    target: "rgp",
+                    id,
+                    vertices = data.mesh.positions.len(),
+                    indices = data.mesh.indices.len(),
+                    "rgp: register_asset_by_path ok",
+                );
                 self.rgp_scene.apply_register(
                     id,
                     RgpAsset {
@@ -2723,11 +2756,33 @@ impl RgpSink for Term {
                 );
                 true
             }
-            Err(_) => false,
+            Err(e) => {
+                tracing::warn!(
+                    target: "rgp",
+                    id, error = %e,
+                    "rgp: register_asset_by_path failed",
+                );
+                false
+            }
         }
     }
 
     fn place(&mut self, id: u32, anchor: RgpAnchor, style: RgpPlacementStyle) {
+        let asset_known = self.rgp_scene.asset(id).is_some();
+        tracing::info!(
+            target: "rgp",
+            id,
+            row = anchor.row, col = anchor.col, cols = anchor.cols, rows = anchor.rows,
+            asset_known,
+            "rgp: place",
+        );
+        if !asset_known {
+            tracing::warn!(
+                target: "rgp",
+                id,
+                "rgp: place — id has no registered asset; placement will not render",
+            );
+        }
         self.rgp_scene.apply_place(id, anchor, style);
     }
 

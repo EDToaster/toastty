@@ -3380,6 +3380,7 @@ dependencies = [
  "toastty-parser",
  "toastty-protocols",
  "toastty-pty",
+ "tracing",
  "unicode-width",
 ]
 
