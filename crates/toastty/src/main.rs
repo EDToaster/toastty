@@ -387,6 +387,19 @@ impl Toastty {
     fn handle_pty_bytes(&mut self, bytes: &[u8]) -> bool {
         self.pty_log.log(Direction::FromApp, bytes);
         let was_paused = self.term.pause_rendering();
+        // Refresh the foreground-process CWD before parsing this
+        // batch — if an RGP `r;path=...` arrives in these bytes,
+        // `Term::register_asset_by_path` needs to know the current
+        // shell-side CWD to resolve relative paths. macOS uses
+        // `proc_pidinfo`; Linux uses `/proc/<pid>/cwd`.
+        if let Some(pty) = self.pty.as_ref()
+            && let Some(cwd) = toastty_pty::pty_foreground_cwd(pty.master_fd())
+        {
+            let cwd_str = cwd.to_string_lossy();
+            if cwd_str != self.term.cwd() {
+                self.term.set_cwd(cwd_str.into_owned());
+            }
+        }
         self.parser.advance(&mut self.term, bytes);
         // OSC 0/1/2 may have changed the title — sync to the window
         // decoration. `sync_title` is a no-op when the title is

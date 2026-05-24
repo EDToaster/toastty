@@ -11,9 +11,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod error;
+pub mod foreground_cwd;
 mod pty;
 mod spec;
 
 pub use error::{PtyError, Result};
+pub use foreground_cwd::{foreground_cwd as pty_foreground_cwd, foreground_pid, process_cwd};
 pub use pty::Pty;
 pub use spec::{PtySpec, WinSize};

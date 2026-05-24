@@ -606,6 +606,15 @@ impl Term {
         &self.cwd
     }
 
+    /// Override the tracked CWD. Used by the binary to feed in the
+    /// foreground process's actual CWD (via `libproc` / `/proc`) so
+    /// RGP path resolution doesn't depend on the shell having
+    /// OSC 7 wired up. Accepts an owned `String` so callers can
+    /// move a `PathBuf::to_string_lossy().into_owned()`.
+    pub fn set_cwd(&mut self, cwd: String) {
+        self.cwd = cwd;
+    }
+
     /// Read-only view of the OSC 133 prompt marks recorded so far, in
     /// emission order. Capped at 4096 entries; oldest entries roll off
     /// the front when the cap is hit.
