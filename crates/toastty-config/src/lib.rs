@@ -37,7 +37,7 @@ pub use color::Color;
 pub use cursor::{CursorConfig, CursorShape};
 pub use error::ConfigError;
 pub use font::FontConfig;
-pub use scrollback::ScrollbackConfig;
+pub use scrollback::{ScrollbackConfig, SmoothingFunction};
 pub use security::SecurityConfig;
 pub use shell::ShellConfig;
 pub use theme::ThemeConfig;

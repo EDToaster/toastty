@@ -432,16 +432,30 @@ pub fn build_instances_into<F>(
 {
     out.clear();
     let (rows, cols) = term.size();
-    let needed = usize::from(rows) * usize::from(cols);
+    let cell_w = cell_size.0;
+    let cell_h = cell_size.1;
+
+    // Sub-row scroll offset. When the user is fractionally scrolled
+    // we render one extra row at the top (the partial row that hangs
+    // above y=0) and y-translate every row by `view_offset_pixel -
+    // cell_h`. At a whole-row offset (pixel == 0) no extra row is
+    // needed and the y-translate is 0.
+    let view_pixel = term.view_offset_pixel();
+    let pixel_extra: u16 = if view_pixel > 0.0 { 1 } else { 0 };
+    let rows_rendered = rows + pixel_extra;
+    let y_translate: f32 = if pixel_extra > 0 {
+        view_pixel - cell_h
+    } else {
+        0.0
+    };
+
+    let needed = usize::from(rows_rendered) * usize::from(cols);
     if out.capacity() < needed {
         out.reserve(needed - out.capacity());
     }
 
-    let cell_w = cell_size.0;
-    let cell_h = cell_size.1;
-
-    for r in 0..rows {
-        let row = term.row(r);
+    for r in 0..rows_rendered {
+        let row = term.view_row(r);
         for c in 0..cols {
             let Some(cell) = row.cells.get(c as usize) else {
                 continue;
@@ -459,7 +473,7 @@ pub fn build_instances_into<F>(
                 continue;
             }
 
-            let pos = [f32::from(c) * cell_w, f32::from(r) * cell_h];
+            let pos = [f32::from(c) * cell_w, f32::from(r) * cell_h + y_translate];
             let (fg, bg) = resolve_cell_colors(cell, theme, ext_palette);
 
             // Always emit a cell-sized background quad. The glyph (if
@@ -538,11 +552,16 @@ pub fn build_instances_into<F>(
     // Blink visibility is gated by `build_dirty_instances_into` /
     // `Renderer::render_term`; the unconditional `build_instances_into`
     // path always emits the cursor (legacy behavior, used by tests and
-    // the first frame).
+    // the first frame). The y-translate is the same one applied to
+    // every other instance so the cursor stays aligned with the live
+    // grid while the viewport animates back to the bottom.
     let cur = term.cursor();
     let cur_col = u16::min(cur.col, cols.saturating_sub(1));
     let cur_row = u16::min(cur.row, rows.saturating_sub(1));
-    let pos = [f32::from(cur_col) * cell_w, f32::from(cur_row) * cell_h];
+    let pos = [
+        f32::from(cur_col) * cell_w,
+        f32::from(cur_row) * cell_h + y_translate,
+    ];
     out.push(CellInstance::cursor_for_shape(
         pos,
         [cell_w, cell_h],
@@ -605,8 +624,20 @@ pub fn build_dirty_instances_into<F>(
     let cell_w = cell_size.0;
     let cell_h = cell_size.1;
 
+    // Sub-row scroll y-translation. See [`build_instances_into`] for
+    // the geometry. Under steady-state scrollback (view_offset_lines >
+    // 0, view_offset_pixel == 0) the dirty builder is still relevant
+    // (e.g. cursor blink) and needs `view_row` semantics.
+    let view_pixel = term.view_offset_pixel();
+    let pixel_extra: u16 = if view_pixel > 0.0 { 1 } else { 0 };
+    let y_translate: f32 = if pixel_extra > 0 {
+        view_pixel - cell_h
+    } else {
+        0.0
+    };
+
     for (r, row_damage) in damage.iter_rows() {
-        let row = term.row(r);
+        let row = term.view_row(r);
         // Build the per-cell iteration source. all_cols expands to the
         // full column range; otherwise iterate the sparse list.
         let row_cols = cols;
@@ -627,7 +658,7 @@ pub fn build_dirty_instances_into<F>(
                 continue;
             }
 
-            let pos = [f32::from(c) * cell_w, f32::from(r) * cell_h];
+            let pos = [f32::from(c) * cell_w, f32::from(r) * cell_h + y_translate];
             let (fg, bg) = resolve_cell_colors(cell, theme, ext_palette);
 
             // Always emit a background quad — even for blank cells —
@@ -694,12 +725,17 @@ pub fn build_dirty_instances_into<F>(
     }
 
     // Cursor is the last instance — guarantees it renders on top of
-    // any cell at the same coordinates. Gated on visibility (blink).
+    // any cell at the same coordinates. Gated on visibility (blink),
+    // which the renderer also ANDs with `!is_view_scrolled_back()` so
+    // the cursor disappears while the user is in scrollback.
     if cursor_visible {
         let cur = term.cursor();
         let cur_col = u16::min(cur.col, cols.saturating_sub(1));
         let cur_row = u16::min(cur.row, rows.saturating_sub(1));
-        let pos = [f32::from(cur_col) * cell_w, f32::from(cur_row) * cell_h];
+        let pos = [
+            f32::from(cur_col) * cell_w,
+            f32::from(cur_row) * cell_h + y_translate,
+        ];
         out.push(CellInstance::cursor_for_shape(
             pos,
             [cell_w, cell_h],

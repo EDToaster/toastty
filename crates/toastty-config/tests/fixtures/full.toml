@@ -24,6 +24,9 @@ args    = []
 
 [scrollback]
 lines = 10000
+smooth_scrolling = true
+smoothing_function = "exp_decay"
+lines_per_notch = 3
 
 [security]
 osc_52_read  = false

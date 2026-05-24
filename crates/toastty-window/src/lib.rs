@@ -29,6 +29,7 @@ pub mod led;
 
 pub use event::{
     ControlSignal, Event, KeyState, LogicalKey, Modifiers, MouseButton, NamedKey, PhysicalKey,
+    ScrollKind,
 };
 
 use std::sync::Arc;
@@ -384,9 +385,14 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<'_, A> {
                 self.mouse_pos = (position.x, position.y);
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                let kind = match delta {
+                    MouseScrollDelta::LineDelta(..) => event::ScrollKind::Lines,
+                    MouseScrollDelta::PixelDelta(..) => event::ScrollKind::Pixels,
+                };
                 let (dx, dy) = translate_scroll(delta);
                 self.dispatch(
                     Event::Scroll {
+                        kind,
                         delta_x: dx,
                         delta_y: dy,
                     },

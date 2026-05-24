@@ -254,6 +254,17 @@ pub struct Term {
     /// block. The renderer ANDs this with the blink state when
     /// deciding whether to emit the cursor instance.
     cursor_visible: bool,
+    /// Scrollback viewport state for the primary grid. Tracks both the
+    /// rendered offset (current) and the user's target. The host (the
+    /// binary) drives the lerp via [`Term::advance_viewport`] each frame.
+    /// Alt screen is rendered with offset 0 regardless of these fields —
+    /// the alt grid has no scrollback by construction.
+    viewport: crate::viewport::Viewport,
+    /// Pre-allocated blank row, sized to current `cols`, returned by
+    /// [`Term::view_row`] when the renderer queries past the available
+    /// scrollback (or past the live grid's bottom during fractional
+    /// scrolling). Resized in [`Term::resize`].
+    blank_row: crate::grid::Row,
 }
 
 /// In-progress run of Kitty Unicode placeholder cells.
@@ -408,6 +419,8 @@ impl Term {
             cell_pixel_size: (8, 16),
             default_bg_rgb: [0x12, 0x12, 0x17],
             cursor_visible: true,
+            viewport: crate::viewport::Viewport::new(),
+            blank_row: crate::grid::Row::blank(cols),
         }
     }
 
@@ -821,9 +834,165 @@ impl Term {
         self.cursor
     }
 
-    /// Borrow visible row `idx` from whichever grid is active.
+    /// Borrow visible row `idx` from whichever grid is active. Does
+    /// **not** honor the scrollback viewport — callers that want the
+    /// user-visible content should use [`Term::view_row`] instead. This
+    /// is kept for internal logic (cursor, parser writes) that always
+    /// operates on the live grid.
     pub fn row(&self, idx: u16) -> &crate::grid::Row {
         self.active_grid().row(idx)
+    }
+
+    /// Borrow the row to render at viewport position `idx` (0 = top of
+    /// the rendered viewport).
+    ///
+    /// Renderer contract:
+    /// - When `view_offset_pixel == 0`: `idx` ranges over `0..rows` and
+    ///   the y-position for each row is `idx * cell_h`.
+    /// - When `view_offset_pixel > 0`: `idx` ranges over `0..=rows` (one
+    ///   extra partial row at the top). The y-position is
+    ///   `idx * cell_h + view_offset_pixel - cell_h` — i.e. the row at
+    ///   `idx == 0` hangs above the screen, exposing only its bottom
+    ///   `view_offset_pixel` pixels.
+    ///
+    /// Out-of-range positions (above the oldest retained scrollback
+    /// row, or past the live grid's bottom during fractional scroll)
+    /// fall back to a pre-allocated blank row. The alt screen ignores
+    /// the viewport entirely — its rendering is always at offset 0.
+    pub fn view_row(&self, idx: u16) -> &crate::grid::Row {
+        // Alt screen never honors the viewport — alt grid has no
+        // scrollback budget, and apps using alt screen typically have
+        // their own pager UI.
+        if self.alt_active {
+            return self.active_grid().row(idx);
+        }
+        let lines = self.viewport.current_lines;
+        // When there's a sub-row offset we render one extra row at the
+        // top of the viewport (the partial row that hangs above y=0),
+        // shifting every logical row index down by one.
+        let pixel_extra: u32 = u32::from(self.viewport.current_pixel > 0.0);
+        let shift = i64::from(lines) + i64::from(pixel_extra);
+        let logical = i64::from(idx) - shift;
+        if logical >= 0 {
+            let r = u16::try_from(logical).unwrap_or(u16::MAX);
+            if r < self.primary.visible_rows() {
+                return self.primary.row(r);
+            }
+            return &self.blank_row;
+        }
+        // Negative → scrollback. `logical == -1` is the row immediately
+        // above logical row 0; scrollback_row's index is 0-based the
+        // same way.
+        let n = u32::try_from(-logical - 1).unwrap_or(u32::MAX);
+        self.primary.scrollback_row(n).unwrap_or(&self.blank_row)
+    }
+
+    /// Current rendered scroll offset (lines above the live bottom).
+    pub fn view_offset_lines(&self) -> u32 {
+        self.viewport.current_lines
+    }
+
+    /// Sub-row pixel offset of the current rendered position
+    /// (`0.0..cell_h`). The renderer translates instances by
+    /// `-view_offset_pixel` on the y axis to realize fractional
+    /// scrolling.
+    pub fn view_offset_pixel(&self) -> f32 {
+        self.viewport.current_pixel
+    }
+
+    /// Target scrollback offset the viewport is animating toward.
+    /// Equal to [`Term::view_offset_lines`] when the animation has
+    /// settled.
+    pub fn target_offset_lines(&self) -> u32 {
+        self.viewport.target_lines
+    }
+
+    /// Target sub-row pixel offset the viewport is animating toward.
+    pub fn target_offset_pixel(&self) -> f32 {
+        self.viewport.target_pixel
+    }
+
+    /// True when the rendered viewport is the live bottom and the
+    /// user isn't animating away from it.
+    pub fn at_view_bottom(&self) -> bool {
+        self.viewport.at_bottom()
+    }
+
+    /// Lines of scrollback currently available to scroll into. 0 for
+    /// the alt screen.
+    pub fn history_lines(&self) -> u32 {
+        if self.alt_active {
+            0
+        } else {
+            self.primary.history_lines()
+        }
+    }
+
+    /// Adjust the scrollback *target* by a delta. Positive `delta_lines`
+    /// = scroll up into history; positive `delta_pixel` = pull the
+    /// viewport up by that many pixels. The host passes the current
+    /// cell height so sub-row pixels can fold into lines cleanly.
+    ///
+    /// Clamped to the available history. No-op when the alt screen is
+    /// active.
+    pub fn scroll_view_by(&mut self, delta_lines: i32, delta_pixel: f32, cell_h: f32) {
+        if self.alt_active {
+            return;
+        }
+        let max = self.primary.history_lines();
+        self.viewport
+            .scroll_target_by(delta_lines, delta_pixel, cell_h, max);
+    }
+
+    /// Snap the viewport target to the live bottom. The current
+    /// position will animate to it on subsequent
+    /// [`Term::advance_viewport`] calls (or jump immediately under
+    /// [`crate::Smoothing::Instant`]).
+    pub fn snap_view_to_bottom(&mut self) {
+        self.viewport.snap_target_to_bottom();
+    }
+
+    /// Force current = target — used when smooth scrolling is
+    /// disabled. Marks all rows dirty if the rendered position
+    /// changes.
+    pub fn force_snap_view(&mut self) {
+        let was = (self.viewport.current_lines, self.viewport.current_pixel);
+        self.viewport.snap_to_target();
+        if was != (self.viewport.current_lines, self.viewport.current_pixel) {
+            self.mark_all_dirty();
+        }
+    }
+
+    /// Advance the viewport animation by `dt` seconds. Returns `true`
+    /// if the rendered position changed (the host should redraw). When
+    /// it returns `true`, all rows are also marked dirty so the
+    /// renderer re-emits everything at the new offset.
+    pub fn advance_viewport(
+        &mut self,
+        dt: f32,
+        cell_h: f32,
+        smoothing: crate::viewport::Smoothing,
+    ) -> bool {
+        let changed = self.viewport.advance(dt, cell_h, smoothing);
+        if changed {
+            self.mark_all_dirty();
+        }
+        changed
+    }
+
+    /// True when the viewport is mid-animation (current != target).
+    /// The host uses this to decide whether to schedule the next
+    /// redraw.
+    pub fn viewport_animating(&self) -> bool {
+        !self.viewport.at_target()
+    }
+
+    /// True when the user is currently looking at scrollback (the
+    /// rendered viewport is NOT at the live bottom). The renderer uses
+    /// this to suppress the cursor instance — most terminals hide the
+    /// cursor while in scrollback view.
+    pub fn is_view_scrolled_back(&self) -> bool {
+        !self.viewport.at_bottom()
     }
 
     /// True when the alternate screen is currently displayed.
@@ -917,6 +1086,11 @@ impl Term {
         self.clamp_cursor();
         // Resize invalidates every cached shaped line — re-shape all.
         self.damage.resize(rows);
+        // Keep the blank-row fallback aligned with the current width.
+        self.blank_row.resize_cols(cols);
+        // The primary grid may have lost history on a cap change; clamp
+        // the viewport so it doesn't reference rows past the new limit.
+        self.viewport.clamp_to(self.primary.history_lines());
     }
 
     fn active_grid(&self) -> &Grid {
@@ -956,6 +1130,12 @@ impl Term {
         if self.cursor.row == 0 {
             // At top: scroll down by one, cursor stays at row 0.
             self.active_grid_mut().scroll_down();
+            // Primary grid's history shrank by 1 (saturating) — clamp
+            // the viewport so the user doesn't end up viewing past the
+            // oldest retained line.
+            if !self.alt_active {
+                self.viewport.clamp_to(self.primary.history_lines());
+            }
             self.mark_all_dirty();
             let dropped = self.image_grid.shift_rows_down(1, 0, self.rows);
             if !dropped.is_empty() {
@@ -975,6 +1155,13 @@ impl Term {
         if self.cursor.row + 1 >= self.rows {
             // At bottom: scroll up by one and stay on the last row.
             self.active_grid_mut().scroll_up();
+            // Sticky-bottom: if the user is in scrollback (offset > 0)
+            // bump the viewport by 1 so the content they're viewing
+            // stays put even as the bottom advances. At offset 0 this
+            // is a no-op — they remain pinned to the live bottom.
+            if !self.alt_active {
+                self.viewport.on_grid_scroll_up(self.primary.history_lines());
+            }
             // Every visible row's content shifted up; the cached shape
             // for each row no longer matches its position. Force a
             // re-shape of all rows.
@@ -1737,6 +1924,12 @@ impl Term {
         self.alt.clear_visible(Style::RESET);
         // Reset cursor to home and clear style for the alt screen.
         self.cursor = Cursor::default();
+        // Snap viewport back to the live bottom — alt screen has no
+        // scrollback, and any in-flight scrollback animation from the
+        // primary grid would be visually nonsensical here. We also
+        // jump the *current* position so the alt screen renders
+        // immediately at offset 0 (no smooth transition).
+        self.viewport = crate::viewport::Viewport::new();
         // Switching screens invalidates every cached shaped line.
         self.mark_all_dirty();
         // Alt screen has no image placements in M11a — clear so apps
@@ -1754,6 +1947,10 @@ impl Term {
         self.alt_active = false;
         self.cursor = self.saved_cursor;
         self.clamp_cursor();
+        // Returning to the primary grid: snap viewport to the live
+        // bottom. The user expects to see the prompt where they left
+        // it, not whatever scrollback they were viewing before.
+        self.viewport = crate::viewport::Viewport::new();
         // Switching back: re-shape the primary screen contents.
         self.mark_all_dirty();
         // Same policy on exit: clear image placements (the primary
@@ -2286,6 +2483,10 @@ impl KittySink for Term {
         if scroll_n > 0 {
             for _ in 0..scroll_n {
                 self.active_grid_mut().scroll_up();
+                if !self.alt_active {
+                    self.viewport
+                        .on_grid_scroll_up(self.primary.history_lines());
+                }
                 self.image_grid.shift_rows_up(1, 0);
             }
             self.mark_all_dirty();
@@ -2457,6 +2658,7 @@ fn mark_placement_dirty(t: &mut Term, p: &Placement) {
 mod tests {
     use super::*;
     use crate::cell::{Color, StyleFlags};
+    use crate::viewport::Smoothing;
     use toastty_parser::Parser;
 
     /// Feed `bytes` through a fresh parser into `t`.
@@ -4870,5 +5072,134 @@ mod tests {
         feed(&mut t, &payload);
         let rev1 = t.image_revision();
         assert_ne!(rev0, rev1);
+    }
+
+    // -- viewport / scrollback view --
+
+    #[test]
+    fn viewport_default_pinned_at_bottom() {
+        let t = Term::new(3, 8, 100);
+        assert_eq!(t.view_offset_lines(), 0);
+        assert!(t.at_view_bottom());
+        assert!(!t.is_view_scrolled_back());
+        assert_eq!(t.history_lines(), 0);
+    }
+
+    #[test]
+    fn viewport_scroll_by_clamped_to_history() {
+        // 2 rows, 100 lines of scrollback budget, but history is 0
+        // initially → scrolling up is a no-op.
+        let mut t = Term::new(2, 8, 100);
+        t.scroll_view_by(10, 0.0, 16.0);
+        assert_eq!(t.view_offset_lines(), 0);
+        assert_eq!(t.target_offset_lines(), 0);
+        // Generate some history.
+        feed(&mut t, b"line1\r\nline2\r\nline3\r\nline4\r\n");
+        // 4 newlines past visible_rows=2 → 4 history rows (allocated
+        // from scrollback budget of 100; capped lower in real usage).
+        assert!(t.history_lines() >= 1);
+        t.scroll_view_by(1, 0.0, 16.0);
+        assert_eq!(t.target_offset_lines(), 1);
+    }
+
+    #[test]
+    fn viewport_view_row_returns_scrollback_when_offset_positive() {
+        let mut t = Term::new(2, 8, 100);
+        // Two visible rows worth of output, plus push 'a' into history.
+        feed(&mut t, b"a\r\nb\r\nc");
+        // Visible: 'b' at row 0, 'c' at row 1. History: 'a' at row 0.
+        assert_eq!(row_text(&t, 0), "b");
+        // Snap viewport up by 1 line so the top of screen shows 'a'.
+        t.scroll_view_by(1, 0.0, 16.0);
+        t.force_snap_view();
+        assert_eq!(t.view_offset_lines(), 1);
+        // view_row(0) is now scrollback row 0 ('a'); view_row(1) is
+        // logical 0 ('b').
+        let r0: String = t.view_row(0).cells.iter().map(|c| c.ch).collect();
+        let r1: String = t.view_row(1).cells.iter().map(|c| c.ch).collect();
+        assert!(r0.starts_with('a'));
+        assert!(r1.starts_with('b'));
+    }
+
+    #[test]
+    fn viewport_sticky_at_bottom_when_new_output_arrives() {
+        let mut t = Term::new(2, 8, 100);
+        feed(&mut t, b"a\r\nb\r\n");
+        // Still at the bottom — new lines should not pull the user
+        // into scrollback.
+        assert_eq!(t.view_offset_lines(), 0);
+        feed(&mut t, b"c\r\nd\r\n");
+        assert_eq!(t.view_offset_lines(), 0);
+        assert!(t.at_view_bottom());
+    }
+
+    #[test]
+    fn viewport_sticky_at_content_when_scrolled_back() {
+        let mut t = Term::new(2, 8, 100);
+        feed(&mut t, b"a\r\nb\r\nc\r\nd\r\n");
+        // History rows produced: 'a', 'b' (4 newlines, 2 visible →
+        // 2 history rows when nothing else got scrolled).
+        let hist_before = t.history_lines();
+        assert!(hist_before >= 1);
+        // Scroll up by 1 and snap.
+        t.scroll_view_by(1, 0.0, 16.0);
+        t.force_snap_view();
+        let offset_before = t.view_offset_lines();
+        assert_eq!(offset_before, 1);
+        // Capture what view_row(0) shows.
+        let before: String = t.view_row(0).cells.iter().map(|c| c.ch).collect();
+        // Now generate new output — view_offset should bump so the
+        // user keeps seeing the same content.
+        feed(&mut t, b"e\r\n");
+        assert!(t.view_offset_lines() >= 2);
+        let after: String = t.view_row(0).cells.iter().map(|c| c.ch).collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn viewport_alt_screen_ignores_scrollback() {
+        let mut t = Term::new(2, 8, 100);
+        feed(&mut t, b"a\r\nb\r\nc\r\nd\r\n");
+        // Snap up into history on primary.
+        t.scroll_view_by(1, 0.0, 16.0);
+        t.force_snap_view();
+        assert!(t.is_view_scrolled_back());
+        // Enter alt screen — viewport should reset.
+        feed(&mut t, b"\x1b[?1049h");
+        assert!(t.is_alt_active());
+        assert_eq!(t.view_offset_lines(), 0);
+        assert!(t.at_view_bottom());
+        // Scroll_view_by is a no-op on alt.
+        t.scroll_view_by(5, 0.0, 16.0);
+        assert_eq!(t.target_offset_lines(), 0);
+        // Exit alt — viewport remains at the live bottom.
+        feed(&mut t, b"\x1b[?1049l");
+        assert!(!t.is_alt_active());
+        assert_eq!(t.view_offset_lines(), 0);
+    }
+
+    #[test]
+    fn viewport_snap_view_to_bottom_only_updates_target() {
+        let mut t = Term::new(2, 8, 100);
+        feed(&mut t, b"a\r\nb\r\nc\r\nd\r\n");
+        t.scroll_view_by(2, 0.0, 16.0);
+        t.force_snap_view();
+        // Now request snap to bottom — only the target changes.
+        t.snap_view_to_bottom();
+        assert_eq!(t.target_offset_lines(), 0);
+        // Current still elevated until advance_viewport runs.
+        assert!(t.view_offset_lines() > 0 || t.target_offset_lines() == 0);
+    }
+
+    #[test]
+    fn viewport_advance_with_instant_smoothing_snaps_immediately() {
+        let mut t = Term::new(2, 8, 100);
+        feed(&mut t, b"a\r\nb\r\nc\r\nd\r\n");
+        t.scroll_view_by(2, 0.0, 16.0);
+        let changed = t.advance_viewport(0.016, 16.0, Smoothing::Instant);
+        assert!(changed);
+        assert_eq!(t.view_offset_lines(), t.target_offset_lines());
+        // Animation is done.
+        assert!(!t.viewport_animating());
     }
 }

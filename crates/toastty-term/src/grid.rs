@@ -88,6 +88,12 @@ impl Row {
 /// `visible_rows` is the number of rows the renderer treats as on-screen;
 /// the slots past that are scrollback (for the primary grid) or unused
 /// (for the alt grid, where `cap == visible_rows`).
+///
+/// Invariant for off-screen slots: each one is either (a) within the most
+/// recent `history_lines` slots immediately preceding `head` (mod `cap`)
+/// and holds a valid scrollback row, or (b) blank. `scroll_up` /
+/// `scroll_down` are the only places that touch off-screen slots, and
+/// they uphold this invariant.
 #[derive(Debug)]
 pub struct Grid {
     rows: Box<[Row]>,
@@ -95,6 +101,10 @@ pub struct Grid {
     head: usize,
     cols: u16,
     visible_rows: u16,
+    /// Number of scrollback rows currently retained above the visible
+    /// region. Grows on `scroll_up`, capped at `cap - visible_rows`.
+    /// For the alt grid (`cap == visible_rows`) this is always 0.
+    history_lines: u32,
 }
 
 impl Grid {
@@ -115,6 +125,7 @@ impl Grid {
             head: 0,
             cols,
             visible_rows,
+            history_lines: 0,
         }
     }
 
@@ -128,6 +139,13 @@ impl Grid {
 
     pub fn cap(&self) -> usize {
         self.rows.len()
+    }
+
+    /// Number of scrollback rows currently retained above the visible
+    /// region (0..=`cap - visible_rows`). Use [`Grid::scrollback_row`] to
+    /// read them.
+    pub fn history_lines(&self) -> u32 {
+        self.history_lines
     }
 
     fn slot(&self, idx: u16) -> usize {
@@ -145,25 +163,56 @@ impl Grid {
         &mut self.rows[s]
     }
 
-    /// Scroll up by one: the top row becomes scrollback, a fresh blank
-    /// row appears at the bottom. O(1) thanks to the ring layout.
+    /// Borrow scrollback row `n` where `n == 0` is the row immediately
+    /// above logical row 0 (the most recent scrollback line). Returns
+    /// `None` when `n >= history_lines()`.
+    pub fn scrollback_row(&self, n: u32) -> Option<&Row> {
+        if n >= self.history_lines {
+            return None;
+        }
+        // (head - 1 - n) mod cap, using usize math without underflow.
+        let cap = self.rows.len();
+        let offset = (n as usize) + 1;
+        let slot = (self.head + cap - (offset % cap)) % cap;
+        Some(&self.rows[slot])
+    }
+
+    /// Scroll up by one: the top row rotates into scrollback, a fresh
+    /// blank row appears at the bottom. O(1) thanks to the ring layout.
     pub fn scroll_up(&mut self) {
-        // The slot that was logical row 0 becomes the new "bottom" row;
-        // clear it so it acts as the freshly-blank line at the bottom.
-        let bottom_slot = self.head;
-        self.rows[bottom_slot].clear();
-        self.rows[bottom_slot].resize_cols(self.cols);
-        self.head = (self.head + 1) % self.rows.len();
+        // The slot that's about to enter the visible region as the new
+        // bottom (rotating around the ring) becomes the freshly-blank
+        // line. Pre-blanking here preserves the off-screen-blank
+        // invariant: when this slot rotates *out* again as scrollback
+        // beyond the cap, the eviction is just an overwrite of blank
+        // space.
+        //
+        // The slot at `head` (old logical row 0) is left untouched and
+        // becomes scrollback row 0 after the head bump — that's the
+        // retention path.
+        let cap = self.rows.len();
+        let new_bottom_slot = (self.head + self.visible_rows as usize) % cap;
+        self.rows[new_bottom_slot].clear();
+        self.rows[new_bottom_slot].resize_cols(self.cols);
+        self.head = (self.head + 1) % cap;
+        // Grow history, capped at the ring's scrollback budget.
+        let max_history = (cap as u32).saturating_sub(u32::from(self.visible_rows));
+        if self.history_lines < max_history {
+            self.history_lines += 1;
+        }
+        // When max_history == 0 (alt grid, cap == visible) the field
+        // stays at 0 — the cleared slot is just the rotated-around top.
     }
 
     /// Scroll down by one: a fresh blank row appears at the top, the
-    /// bottom visible row falls off (xterm-style — *not* preserved for a
-    /// later `scroll_up`). Used by RI / DECSTBM-less reverse scrolling.
+    /// bottom visible row falls off (xterm-style — *not* preserved as
+    /// new scrollback). Used by RI / DECSTBM-less reverse scrolling.
     ///
-    /// Symmetric to `scroll_up`: we clear the slot that's leaving the
-    /// visible region (the visible bottom) so it stays blank while
-    /// off-screen — preserving the "off-screen ring slots are blank"
-    /// invariant `scroll_up` relies on.
+    /// If there's existing scrollback, the most-recent scrollback row
+    /// rotates back in as the new top (it occupies the slot at
+    /// `head - 1`, which becomes the new logical row 0 after the head
+    /// decrement). Otherwise the new top is a blank off-screen slot.
+    /// Either way, `history_lines` shrinks by 1 (saturating at 0).
     pub fn scroll_down(&mut self) {
         // Clear the visible-bottom slot *before* moving the head, so the
         // row that's about to scroll off-screen goes out blank.
@@ -171,13 +220,14 @@ impl Grid {
         self.rows[bottom_slot].clear();
         self.rows[bottom_slot].resize_cols(self.cols);
         // Decrement head with wrap-around. The slot that was at logical
-        // row `cap - 1` (off-screen, blank by invariant) becomes the new
-        // logical row 0.
+        // row `-1` (the most recent scrollback row, blank if no history)
+        // becomes the new logical row 0.
         self.head = if self.head == 0 {
             self.rows.len() - 1
         } else {
             self.head - 1
         };
+        self.history_lines = self.history_lines.saturating_sub(1);
     }
 
     /// Clear every visible row. Scrollback is left untouched (used by the
@@ -202,6 +252,9 @@ impl Grid {
 
     /// Resize: change rows/cols. `Cell` content is best-effort preserved
     /// (decision #6 explicitly defers reflow); we only fix up widths.
+    /// Scrollback is preserved in the same-cap path (the ring stays put)
+    /// but cleared when `cap` changes — reflow across a new ring is a
+    /// future-work item per `decisions/scrollback.md`.
     pub fn resize(&mut self, visible_rows: u16, cols: u16, cap: usize) {
         // TODO(reflow): walk soft-wrapped runs and re-shape per
         // decisions/scrollback.md. For M3 we resize widths and reallocate
@@ -225,9 +278,18 @@ impl Grid {
             }
             self.rows = v.into_boxed_slice();
             self.head = 0;
+            // Cap changed → fresh ring; existing scrollback is dropped.
+            self.history_lines = 0;
         }
         self.cols = cols;
         self.visible_rows = visible_rows;
+        // Re-clamp history to the new scrollback budget. If the visible
+        // region grew within the same cap, some scrollback slots may now
+        // overlap the visible region.
+        let max_history = (cap as u32).saturating_sub(u32::from(self.visible_rows));
+        if self.history_lines > max_history {
+            self.history_lines = max_history;
+        }
     }
 }
 
@@ -545,5 +607,126 @@ mod tests {
         g.row_mut(0).cells.truncate(1);
         g.clear_visible(Style::RESET);
         assert_eq!(g.row(0).cells.len(), 3);
+    }
+
+    /// Test helper: write `ch` into column 0 of `row`.
+    fn put_at(g: &mut Grid, row: u16, ch: char) {
+        let cols = g.cols();
+        g.row_mut(row).put(
+            0,
+            Cell {
+                ch,
+                style: Style::RESET,
+                is_continuation: false,
+                hyperlink_id: None,
+            },
+            cols,
+        );
+    }
+
+    #[test]
+    fn grid_scroll_up_preserves_top_row_as_scrollback() {
+        // cap=4, vis=2 → up to 2 scrollback rows.
+        let mut g = Grid::new(2, 3, 4);
+        put_at(&mut g, 0, 'a');
+        put_at(&mut g, 1, 'b');
+        g.scroll_up();
+        // Visible: 'b' at top, blank at bottom.
+        assert_eq!(g.row(0).cells[0].ch, 'b');
+        assert_eq!(g.row(1).cells[0], Cell::BLANK);
+        // History: 'a' is now scrollback row 0 (most recent).
+        assert_eq!(g.history_lines(), 1);
+        assert_eq!(g.scrollback_row(0).unwrap().cells[0].ch, 'a');
+        assert!(g.scrollback_row(1).is_none());
+    }
+
+    #[test]
+    fn grid_scroll_up_accumulates_history_up_to_cap() {
+        // cap=4, vis=2 → max 2 scrollback rows.
+        //
+        // Each iteration: write a char to the *top* visible row and then
+        // scroll up, so the just-written char enters scrollback.
+        let mut g = Grid::new(2, 3, 4);
+        for c in ['a', 'b', 'c', 'd', 'e'] {
+            put_at(&mut g, 0, c);
+            g.scroll_up();
+        }
+        // History saturates at cap - vis = 2; older entries evicted.
+        assert_eq!(g.history_lines(), 2);
+        // Most recent scrollback rows are 'e' (row 0) then 'd' (row 1);
+        // 'a', 'b', 'c' were evicted.
+        assert_eq!(g.scrollback_row(0).unwrap().cells[0].ch, 'e');
+        assert_eq!(g.scrollback_row(1).unwrap().cells[0].ch, 'd');
+        assert!(g.scrollback_row(2).is_none());
+    }
+
+    #[test]
+    fn grid_scrollback_row_evicts_oldest_when_full() {
+        let mut g = Grid::new(1, 3, 3); // cap=3, vis=1 → 2 scrollback rows.
+        put_at(&mut g, 0, '1');
+        g.scroll_up();
+        put_at(&mut g, 0, '2');
+        g.scroll_up();
+        put_at(&mut g, 0, '3');
+        g.scroll_up();
+        // History is full; '1' was evicted. Most recent is '3', then '2'.
+        assert_eq!(g.history_lines(), 2);
+        assert_eq!(g.scrollback_row(0).unwrap().cells[0].ch, '3');
+        assert_eq!(g.scrollback_row(1).unwrap().cells[0].ch, '2');
+    }
+
+    #[test]
+    fn grid_alt_screen_never_grows_history() {
+        // cap == visible_rows → no scrollback budget.
+        let mut g = Grid::new(3, 4, 3);
+        for _ in 0..10 {
+            g.scroll_up();
+        }
+        assert_eq!(g.history_lines(), 0);
+        assert!(g.scrollback_row(0).is_none());
+    }
+
+    #[test]
+    fn grid_scroll_down_consumes_history() {
+        let mut g = Grid::new(2, 3, 4);
+        put_at(&mut g, 0, 'a');
+        put_at(&mut g, 1, 'b');
+        g.scroll_up();
+        assert_eq!(g.history_lines(), 1);
+        g.scroll_down();
+        // History row consumed as new top; counter decremented.
+        assert_eq!(g.history_lines(), 0);
+    }
+
+    #[test]
+    fn grid_scroll_down_no_history_saturates_at_zero() {
+        let mut g = Grid::new(2, 3, 4);
+        g.scroll_down();
+        g.scroll_down();
+        assert_eq!(g.history_lines(), 0);
+    }
+
+    #[test]
+    fn grid_resize_smaller_cap_clears_history() {
+        let mut g = Grid::new(2, 3, 4);
+        put_at(&mut g, 0, 'a');
+        g.scroll_up();
+        assert_eq!(g.history_lines(), 1);
+        g.resize(2, 3, 2);
+        assert_eq!(g.history_lines(), 0);
+    }
+
+    #[test]
+    fn grid_resize_grows_visible_clamps_history() {
+        // cap=4, vis=2 → history budget 2. Grow vis to 4 (cap stays 4) →
+        // history budget 0, existing history must be clamped.
+        let mut g = Grid::new(2, 3, 4);
+        put_at(&mut g, 0, 'a');
+        g.scroll_up();
+        put_at(&mut g, 0, 'b');
+        g.scroll_up();
+        assert_eq!(g.history_lines(), 2);
+        g.resize(4, 3, 4);
+        assert_eq!(g.history_lines(), 0);
     }
 }

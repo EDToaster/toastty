@@ -22,7 +22,7 @@ use toastty_protocols::resize_inband::encode_resize_report;
 use toastty_protocols::synchronized::{BSU_TIMEOUT, should_force_flush};
 use toastty_pty::{Pty, PtySpec, WinSize};
 use toastty_render::{RenderOutcome, Renderer};
-use toastty_term::{ClipboardRequest, SecurityFlags, Term};
+use toastty_term::{ClipboardRequest, SecurityFlags, Smoothing, Term};
 use toastty_window::{
     App, ControlSignal, Event, KeyState, LogicalKey, Modifiers, MouseButton, ToasttyWindow,
     WindowHandle, WindowOptions, run,
@@ -45,6 +45,43 @@ use toastty::theme_bridge::theme_from_config;
 /// Default initial window size in pixels. M5 does not yet read this from
 /// a `[window]` config section — that lands in M6.
 const DEFAULT_WINDOW_SIZE: (u32, u32) = (1280, 800);
+
+/// Target wake-up cadence while the scrollback viewport is animating.
+/// 16 ms ≈ 60 Hz — fast enough to feel smooth on macOS trackpad
+/// inertia frames without burning the event loop when idle.
+const VIEWPORT_ANIM_TICK: Duration = Duration::from_millis(16);
+
+/// Convert a config `SmoothingFunction` into the per-frame easing
+/// the term consumes. Tuning constants are local to the binary so
+/// changes don't churn the term crate's public API.
+fn smoothing_from_config(cfg: &Config) -> Smoothing {
+    if !cfg.scrollback.smooth_scrolling {
+        return Smoothing::Instant;
+    }
+    match cfg.scrollback.smoothing_function {
+        toastty_config::SmoothingFunction::Instant => Smoothing::Instant,
+        toastty_config::SmoothingFunction::Linear => Smoothing::Linear {
+            pixels_per_sec: 600.0,
+        },
+        toastty_config::SmoothingFunction::EaseOut => Smoothing::EaseOut {
+            duration_sec: 0.25,
+        },
+        toastty_config::SmoothingFunction::ExpDecay => Smoothing::ExpDecay {
+            halflife_sec: 0.08,
+        },
+    }
+}
+
+/// Take the shorter of two optional deadlines. `None` means "no
+/// deadline". Used when combining the cursor-blink wake with the
+/// viewport-animation tick.
+fn min_deadline(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+    match (a, b) {
+        (None, b) => b,
+        (a, None) => a,
+        (Some(x), Some(y)) => Some(x.min(y)),
+    }
+}
 
 fn main() -> Result<()> {
     // Parse args BEFORE tracing init — otherwise --print-default-config
@@ -133,6 +170,19 @@ struct Toastty {
     /// Optional bidirectional PTY-byte logger, enabled by
     /// `TOASTTY_PTY_LOG=<path>`. No-op when the env var is unset.
     pty_log: PtyLogger,
+    /// Sub-row pixel accumulator for the alt-screen-arrow translation
+    /// path. macOS trackpad inertial frames arrive as small per-frame
+    /// pixel deltas; we accumulate them here and emit one ↑/↓ arrow
+    /// once the magnitude crosses one cell height.
+    alt_scroll_pixel_accum: f64,
+    /// Sub-row pixel accumulator for the primary-grid scrollback path
+    /// when `smooth_scrolling = false`. Trackpad pixel deltas pile up
+    /// here; we apply whole-row deltas only, leaving the residual
+    /// behind for the next frame.
+    scroll_pixel_residual: f64,
+    /// Last render-time we ticked the viewport animation. Used to
+    /// compute `dt` for [`Term::advance_viewport`].
+    last_viewport_tick: Option<Instant>,
 }
 
 impl Toastty {
@@ -163,6 +213,9 @@ impl Toastty {
             mouse_held: None,
             clipboard: None,
             pty_log: PtyLogger::from_env(),
+            alt_scroll_pixel_accum: 0.0,
+            scroll_pixel_residual: 0.0,
+            last_viewport_tick: None,
         }
     }
 
@@ -222,6 +275,9 @@ impl Toastty {
         };
         let bytes = wrap_for_paste(&text, self.term.bracketed_paste());
         self.write_pty(&bytes);
+        // A paste is user-driven PTY output — snap the viewport to
+        // the live bottom so the pasted text lands at the prompt.
+        self.snap_view_after_input();
     }
 
     fn write_pty(&mut self, bytes: &[u8]) {
@@ -541,6 +597,13 @@ impl Toastty {
             repeat,
         ) {
             self.write_pty(&bytes);
+            // Typing snaps the view back to the live bottom so the
+            // user lands on the prompt, not on whatever scrollback
+            // they were reading. Press-only — releases shouldn't
+            // trigger an animation snap.
+            if state == KeyState::Pressed {
+                self.snap_view_after_input();
+            }
         }
         ControlSignal::Continue
     }
@@ -599,7 +662,16 @@ impl Toastty {
         self.term.hyperlink_url(id).map(str::to_string)
     }
 
-    fn handle_scroll(&mut self, delta_x: f64, delta_y: f64) -> ControlSignal {
+    fn handle_scroll(
+        &mut self,
+        scroll_kind: toastty_window::ScrollKind,
+        delta_x: f64,
+        delta_y: f64,
+    ) -> ControlSignal {
+        // Priority 1: app has mouse-tracking on. Forward the wheel
+        // event verbatim — apps like btop/htop/neovim consume scroll
+        // as input, and they always win over the local scrollback
+        // view.
         let mode = self.term.mouse_mode();
         let kind = MouseEventKind::Scroll {
             dx: delta_x,
@@ -610,8 +682,162 @@ impl Toastty {
             if let Some(bytes) = encode_mouse(kind, cell, Modifiers::empty(), mode) {
                 self.write_pty(&bytes);
             }
+            return ControlSignal::Continue;
         }
-        ControlSignal::Continue
+
+        // We need the cell height for both the pixel-accumulator
+        // (alt-screen path) and the viewport (primary path). Without a
+        // renderer we can't size anything, so drop the event.
+        let Some(cell_h) = self.renderer.as_ref().map(|r| r.cell_size().1) else {
+            return ControlSignal::Continue;
+        };
+        if cell_h <= 0.0 {
+            return ControlSignal::Continue;
+        }
+
+        // Priority 2: alt screen + no mouse mode. Apps like `less`,
+        // `man`, plain `vim` (without `set mouse=a`) sit on the alt
+        // screen and expect arrow keys for navigation. Translate
+        // wheel/trackpad into ↑/↓ sequences. The helper returns a
+        // signed line count — positive == scroll DOWN, negative ==
+        // scroll UP — folding in the running pixel accumulator so a
+        // brief direction reversal mid-inertia doesn't emit an arrow
+        // in the wrong direction.
+        if self.term.is_alt_active() {
+            let signed = self.alt_screen_arrows_for_scroll(scroll_kind, delta_y, f64::from(cell_h));
+            if signed != 0 {
+                let bytes = if signed > 0 {
+                    b"\x1b[B".as_slice()
+                } else {
+                    b"\x1b[A".as_slice()
+                };
+                let count = signed.unsigned_abs() as usize;
+                let mut out: Vec<u8> = Vec::with_capacity(bytes.len() * count);
+                for _ in 0..count {
+                    out.extend_from_slice(bytes);
+                }
+                self.write_pty(&out);
+            }
+            return ControlSignal::Continue;
+        }
+
+        // Priority 3: primary grid scrollback view.
+        let lines_per_notch = self.config.scrollback.lines_per_notch.max(1) as f64;
+        match scroll_kind {
+            toastty_window::ScrollKind::Lines => {
+                // Discrete notch. Round to an integer line count and
+                // animate via the configured smoothing function.
+                let raw = -delta_y * lines_per_notch;
+                #[allow(clippy::cast_possible_truncation)]
+                let delta_lines = raw.round() as i32;
+                if delta_lines != 0 {
+                    self.term.scroll_view_by(delta_lines, 0.0, cell_h);
+                }
+            }
+            toastty_window::ScrollKind::Pixels => {
+                // Continuous pixel stream (incl. macOS inertia).
+                // Positive delta_y == content moves down ==> view
+                // target moves toward the bottom (decreases lines).
+                let delta_pixel = -delta_y;
+                if delta_pixel.abs() > f64::EPSILON {
+                    if self.config.scrollback.smooth_scrolling {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let delta_f32 = delta_pixel as f32;
+                        self.term.scroll_view_by(0, delta_f32, cell_h);
+                        // Pixel deltas can leave the *current* position
+                        // behind by a fraction of a cell after the
+                        // target moves. The lerp normally catches up,
+                        // but for trackpad inertia where the user wants
+                        // pixel-perfect tracking, snap current to
+                        // target immediately. The animation tick will
+                        // still smooth out wheel notches that arrive
+                        // separately.
+                        self.term.force_snap_view();
+                    } else {
+                        // Smooth scrolling disabled: accumulate pixels
+                        // and only apply whole-row deltas. The residual
+                        // stays in `scroll_pixel_residual` so a slow
+                        // trackpad drag eventually advances by a row.
+                        self.scroll_pixel_residual += delta_pixel;
+                        let cell_h_f = f64::from(cell_h);
+                        let crossings = (self.scroll_pixel_residual / cell_h_f).trunc();
+                        self.scroll_pixel_residual -= crossings * cell_h_f;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let delta_lines = crossings as i32;
+                        if delta_lines != 0 {
+                            self.term.scroll_view_by(delta_lines, 0.0, cell_h);
+                            self.term.force_snap_view();
+                        }
+                    }
+                }
+            }
+        }
+        // Any user-driven scroll should kick the viewport animation
+        // into motion if it isn't already running. The redraw is
+        // scheduled by returning a non-Continue control signal below
+        // when the animation has work to do.
+        if self.term.viewport_animating() {
+            ControlSignal::RedrawIn(Duration::ZERO)
+        } else {
+            ControlSignal::Continue
+        }
+    }
+
+    /// Signed line count for an alt-screen scroll translation.
+    /// Positive == press DOWN that many times, negative == press UP.
+    /// For `Lines` kind, rounds to the nearest signed line count after
+    /// multiplying by `lines_per_notch`. For `Pixels`, accumulates
+    /// into [`Self::alt_scroll_pixel_accum`] and returns the signed
+    /// number of whole-row thresholds crossed (positive == DOWN-net
+    /// motion).
+    fn alt_screen_arrows_for_scroll(
+        &mut self,
+        kind: toastty_window::ScrollKind,
+        delta_y: f64,
+        cell_h: f64,
+    ) -> i32 {
+        match kind {
+            toastty_window::ScrollKind::Lines => {
+                let raw = delta_y * f64::from(self.config.scrollback.lines_per_notch.max(1));
+                #[allow(clippy::cast_possible_truncation)]
+                let n = raw.round() as i32;
+                // Reset pixel accumulator — switching back to a notch
+                // wheel mid-stream shouldn't carry over a partial
+                // trackpad value.
+                self.alt_scroll_pixel_accum = 0.0;
+                n
+            }
+            toastty_window::ScrollKind::Pixels => {
+                // Accumulate signed pixel motion so direction reversal
+                // cancels out before any arrow is emitted. Sign of
+                // `crossings` is the net direction.
+                self.alt_scroll_pixel_accum += delta_y;
+                let crossings = (self.alt_scroll_pixel_accum / cell_h).trunc();
+                self.alt_scroll_pixel_accum -= crossings * cell_h;
+                #[allow(clippy::cast_possible_truncation)]
+                let n = crossings as i32;
+                n
+            }
+        }
+    }
+
+    /// Snap the viewport target to the live bottom and schedule a
+    /// redraw. Called from the key handler whenever a press produces
+    /// PTY output — matches the iTerm2/Kitty/Alacritty convention of
+    /// "typing brings you back to the prompt".
+    fn snap_view_after_input(&mut self) {
+        if !self.term.at_view_bottom() || self.term.viewport_animating() {
+            self.term.snap_view_to_bottom();
+            // Under instant smoothing or smooth_scrolling=off, jump
+            // right away so the first frame after the keystroke is
+            // already at the bottom.
+            if !self.config.scrollback.smooth_scrolling
+                || self.config.scrollback.smoothing_function
+                    == toastty_config::SmoothingFunction::Instant
+            {
+                self.term.force_snap_view();
+            }
+        }
     }
 }
 
@@ -670,6 +896,24 @@ impl App for Toastty {
                 {
                     self.term.force_flush_sync_output();
                 }
+                // Scrollback viewport animation tick. Runs before the
+                // render so the frame we're about to draw reflects the
+                // newly-lerped position. When the animation is at rest,
+                // `advance_viewport` is a cheap no-op that returns false.
+                let now = Instant::now();
+                if let Some(r) = self.renderer.as_ref() {
+                    let cell_h = r.cell_size().1;
+                    if cell_h > 0.0 {
+                        let dt = match self.last_viewport_tick {
+                            Some(t) => now.duration_since(t).as_secs_f32().min(0.1),
+                            None => 1.0 / 60.0,
+                        };
+                        let smoothing = smoothing_from_config(&self.config);
+                        self.term.advance_viewport(dt, cell_h, smoothing);
+                    }
+                }
+                self.last_viewport_tick = Some(now);
+
                 let mut next_blink: Option<Duration> = None;
                 if let Some(r) = self.renderer.as_mut() {
                     match r.render_term(&mut self.term) {
@@ -699,7 +943,17 @@ impl App for Toastty {
                     // loop.
                     next_blink = r.next_redraw_deadline(&self.term);
                 }
-                match next_blink {
+                // If the viewport is still animating, schedule the next
+                // frame ~60 Hz. Combined with any blink deadline via
+                // `min_deadline`. Once the animation settles, we stop
+                // ticking and the event loop goes back to idle.
+                let next_anim = if self.term.viewport_animating() {
+                    Some(VIEWPORT_ANIM_TICK)
+                } else {
+                    self.last_viewport_tick = None;
+                    None
+                };
+                match min_deadline(next_blink, next_anim) {
                     Some(d) => ControlSignal::RedrawIn(d),
                     None => ControlSignal::Continue,
                 }
@@ -732,7 +986,11 @@ impl App for Toastty {
                 position,
                 modifiers,
             } => self.handle_mouse(button, state, position, modifiers),
-            Event::Scroll { delta_x, delta_y } => self.handle_scroll(delta_x, delta_y),
+            Event::Scroll {
+                kind,
+                delta_x,
+                delta_y,
+            } => self.handle_scroll(kind, delta_x, delta_y),
             Event::PtyBytes(bytes) => {
                 let fresh_bsu = self.handle_pty_bytes(&bytes);
                 // If a BSU just went high we still want to wake the

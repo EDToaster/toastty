@@ -101,6 +101,23 @@ pub enum PhysicalKey {
     Unidentified,
 }
 
+/// Whether a scroll event originated from a discrete wheel notch
+/// (`Lines`) or a continuous pixel stream (`Pixels`). The terminal
+/// uses this to choose between animated jumps (for notches) and
+/// direct pixel-accurate scrolling (for trackpad inertia).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollKind {
+    /// Notched wheel — the delta is in "lines" (typically ±1 per
+    /// notch). The terminal multiplies this by the configured
+    /// `lines_per_notch` and animates between positions.
+    Lines,
+    /// Trackpad / high-resolution wheel — the delta is in physical
+    /// pixels (often fractional, including inertial decay frames
+    /// from macOS). The terminal feeds these straight into the
+    /// viewport target without further animation.
+    Pixels,
+}
+
 /// One window event consumable by the binary / renderer.
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -123,10 +140,15 @@ pub enum Event {
         position: (f64, f64),
         modifiers: Modifiers,
     },
-    /// Scroll wheel / trackpad scroll. Values are in pixels for
-    /// `PixelDelta`-style input and in "lines" for notched wheels.
+    /// Scroll wheel / trackpad scroll. `kind` distinguishes a discrete
+    /// notch (`Lines`) from a continuous pixel stream (`Pixels`, the
+    /// usual macOS trackpad path including inertial momentum frames).
     /// Sign convention matches winit: positive y == content moves down.
-    Scroll { delta_x: f64, delta_y: f64 },
+    Scroll {
+        kind: ScrollKind,
+        delta_x: f64,
+        delta_y: f64,
+    },
     /// Window resized — `width`/`height` are physical pixels.
     Resize {
         width: u32,

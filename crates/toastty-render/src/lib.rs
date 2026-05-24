@@ -234,6 +234,11 @@ pub struct Renderer {
     /// vectors. Cleared every frame; allocation survives across frames.
     image_instances_below: Vec<ImageInstance>,
     image_instances_above: Vec<ImageInstance>,
+    /// Last viewport offset rendered. When it changes we force a full
+    /// clear — partial redraw can't reliably overpaint the previous
+    /// frame at the new y-translation (blank cells skip emission, so
+    /// old non-blank content would leak through).
+    last_view_offset: (u32, f32),
 }
 
 /// Build the scratch render target. Same dims/format as the surface;
@@ -473,6 +478,7 @@ impl Renderer {
             image_revision_seen: u32::MAX,
             image_instances_below: Vec::new(),
             image_instances_above: Vec::new(),
+            last_view_offset: (0, 0.0),
         })
     }
 
@@ -726,6 +732,18 @@ impl Renderer {
             term.mark_all_dirty();
         }
 
+        // Detect a viewport-offset change since the last render. The
+        // renderer's partial-redraw path can't reliably overpaint the
+        // previous frame at a new y-translation (blank cells skip
+        // emission), so we force `LoadOp::Clear` whenever the offset
+        // moves. Term::advance_viewport already calls `mark_all_dirty`
+        // so the full-build path runs; this just gets the LoadOp right.
+        let cur_view = (term.view_offset_lines(), term.view_offset_pixel());
+        if cur_view != self.last_view_offset {
+            self.needs_full_clear = true;
+            self.last_view_offset = cur_view;
+        }
+
         // M9 skip-submit: if no cells changed AND no animation tick is
         // due, there's nothing to draw. Skip the surface acquire +
         // encode + submit entirely. The binary preserves the damage
@@ -782,12 +800,25 @@ impl Renderer {
             cell_size = text.rasterizer.cell_size();
             atlas_dims = text.rasterizer.atlas_dims();
 
-            // Resize the row-shape cache to match the visible row count.
+            // Resize the row-shape cache. We always allocate one extra
+            // slot beyond `rows` so the renderer can shape the partial
+            // top row during sub-pixel scrolling without reallocating.
             // Growth is dirty (new entries are `None`); shrinking just
             // drops old slots.
-            if text.line_cache.len() != rows as usize {
-                text.line_cache.resize(rows as usize, None);
+            let cache_len = rows as usize + 1;
+            if text.line_cache.len() != cache_len {
+                text.line_cache.resize(cache_len, None);
             }
+
+            // Number of rows to actually render this frame: one extra
+            // when there's a sub-row pixel offset (the partial top row
+            // that hangs above y=0).
+            let pixel_extra: u16 = if term.view_offset_pixel() > 0.0 {
+                1
+            } else {
+                0
+            };
+            let rows_rendered = rows + pixel_extra;
 
             // Re-shape only dirty rows; reuse cached `LineGlyphs` for
             // the rest. The atlas itself never shrinks, so a clean row's
@@ -795,7 +826,7 @@ impl Renderer {
             let damage = term.damage();
             let mut shaped = 0u32;
             let t_shape = if trace { Some(std::time::Instant::now()) } else { None };
-            for r in 0..rows {
+            for r in 0..rows_rendered {
                 let is_dirty = damage.all
                     || damage
                         .rows
@@ -805,7 +836,7 @@ impl Renderer {
                 if !is_dirty {
                     continue;
                 }
-                let row = term.row(r);
+                let row = term.view_row(r);
                 // Reuse a per-call String allocation; under release LLVM
                 // hoists the small allocation per row, but a future
                 // optimization could move the buffer into TextState.
@@ -865,8 +896,11 @@ impl Renderer {
         // Combine blink state with the app-side hide flag (DECSET 25).
         // Apps like yazi / helix / neovim toggle 25 to hide the cursor
         // during their alt-screen UI; if we ignored it the cursor block
-        // sat over their layout.
-        let cursor_visible = self.blink.visible && term.cursor_visible();
+        // sat over their layout. Also suppress the cursor while the
+        // user is scrolled back into history — convention matches Kitty
+        // and Alacritty.
+        let cursor_visible =
+            self.blink.visible && term.cursor_visible() && !term.is_view_scrolled_back();
         // Split-borrow: take a shared borrow of `ext_palette` and a
         // mutable borrow of `text` from disjoint fields of `self` so
         // the builders can read the cached OSC 4 palette while we hold

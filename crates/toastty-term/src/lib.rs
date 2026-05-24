@@ -24,6 +24,7 @@ mod cursor;
 mod damage;
 mod grid;
 mod term;
+mod viewport;
 
 pub use cell::{Cell, Color, HyperlinkId, Style, StyleFlags};
 pub use cursor::Cursor;
@@ -34,6 +35,7 @@ pub use term::{
     KITTY_FLAG_REPORT_ALTERNATE, KITTY_FLAG_REPORT_EVENTS, KITTY_FLAG_REPORT_TEXT, MouseMode,
     MouseProtocol, PromptMark, PromptMarkKind, SecurityFlags, Term,
 };
+pub use viewport::{Smoothing, Viewport};
 
 /// Re-export so the renderer / window crates can refer to the runtime
 /// cursor shape via `toastty_term` instead of taking a direct dep on
