@@ -85,25 +85,35 @@ pub fn mul(a: &Mat4, b: &Mat4) -> Mat4 {
     out
 }
 
-/// Orthographic projection: world XYZ in mixed units → NDC.
+/// Z range mapped to NDC `[0, 1]` by [`ortho_screen`]. World z ∈
+/// `[-Z_HALF_RANGE_PX, +Z_HALF_RANGE_PX]` → NDC z ∈ `[0, 1]`. The
+/// pipeline picks this generously so a typical placement's pixel-
+/// scaled cube (≤ ~50 px half-extent) plus protocol depth offsets
+/// (up to ±100 px at depth=±10 per the decision §3 mapping) all
+/// fit comfortably without depth-clipping.
+pub const Z_HALF_RANGE_PX: f32 = 200.0;
+
+/// Orthographic projection: world XYZ in **pixels** → NDC.
 ///
-/// **X / Y are pixels** (viewport in physical pixels): world x ∈
-/// `[0, width_px]` → NDC x ∈ `[-1, 1]`, world y ∈ `[0, height_px]`
-/// → NDC y ∈ `[1, -1]` (Y-down screen → Y-up NDC).
+/// - X: world x ∈ `[0, width_px]` → NDC x ∈ `[-1, 1]`.
+/// - Y: world y ∈ `[0, height_px]` → NDC y ∈ `[1, -1]` (Y-down
+///   screen → Y-up NDC).
+/// - Z: world z ∈ `[-Z_HALF_RANGE_PX, +Z_HALF_RANGE_PX]` → NDC z
+///   ∈ `[0, 1]` (z=0 → NDC 0.5, co-planar with the cell layer per
+///   decision §3).
 ///
-/// **Z is abstract units, NOT pixels**: world z ∈ `[-1, 1]` → NDC z
-/// ∈ `[0, 1]` (z=0 → NDC 0.5, co-planar with the cell layer per
-/// decision §3). Callers must keep model z + depth offsets inside
-/// ±1 to avoid depth clipping — the pipeline composes the model so
-/// this holds: the cube's z extent is scaled to a small abstract
-/// value (not pixel-scale), and the protocol `depth=` field is
-/// mapped via the decision §3 factor (0.05 per unit).
+/// **All three axes are in pixel units.** That's critical: the
+/// pipeline composes the model matrix with a *symmetric* pixel
+/// scale across x, y, and z so rotations preserve cube proportions.
+/// (Mixed units — e.g. pixel x/y but abstract z — make `Ry(90°)`
+/// rotate the pixel x into a tiny abstract z, collapsing the cube
+/// to a line.)
 #[must_use]
 pub fn ortho_screen(width_px: f32, height_px: f32) -> Mat4 {
     let mut m = identity();
     m[0][0] = 2.0 / width_px;
     m[1][1] = -2.0 / height_px;
-    m[2][2] = 0.5;
+    m[2][2] = 0.5 / Z_HALF_RANGE_PX;
     m[3][0] = -1.0;
     m[3][1] = 1.0;
     m[3][2] = 0.5;

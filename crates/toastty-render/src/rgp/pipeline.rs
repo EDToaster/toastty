@@ -12,7 +12,8 @@ use bytemuck::{Pod, Zeroable};
 use toastty_graphics::rgp::scene::{RgpPlacement, RgpScene};
 
 use crate::rgp::matrix::{
-    Mat4, identity, mul, ortho_screen, rotate_x_deg, rotate_y_deg, rotate_z_deg, scale, translate,
+    Mat4, Z_HALF_RANGE_PX, identity, mul, ortho_screen, rotate_x_deg, rotate_y_deg, rotate_z_deg,
+    scale, translate,
 };
 use crate::rgp::mesh::{GpuAssetCache, Vertex};
 
@@ -206,28 +207,25 @@ impl Rgp3dPipeline {
 
             // Model: scale × non-uniform scale × rotate × translate.
             //
-            // X / Y scale is pixel-space (so the cube fits the cell
-            // box). Z scale is **abstract**, chosen so the cube's
-            // local z extent (±0.5 from `CpuMesh::unit_cube`) maps
-            // to ±0.25 in world z — well inside the ortho's [-1, 1]
-            // world-z window (which becomes NDC [0, 1] per
-            // decision §3). Mixing pixel-x/y with abstract-z is the
-            // whole point of the orthographic projection's split
-            // unit convention.
-            const Z_MODEL_SCALE: f32 = 0.5;
-            let s_uniform = scale(fit_half, fit_half, Z_MODEL_SCALE);
+            // All three model axes use the SAME pixel scale. That's
+            // critical: rotations mix axes, and asymmetric scales
+            // (e.g. pixel x/y but abstract z) collapse the cube to a
+            // line at 90° rotations. The ortho projection then maps
+            // pixel z to NDC via `Z_HALF_RANGE_PX`.
+            let s_uniform = scale(fit_half, fit_half, fit_half);
             let s_nonuniform = scale(p.style.scale3[0], p.style.scale3[1], p.style.scale3[2]);
             let rx = rotate_x_deg(p.style.rotation[0]);
             let ry = rotate_y_deg(p.style.rotation[1]);
             let rz = rotate_z_deg(p.style.rotation[2]);
-            // Protocol `depth` maps to abstract world-z via the
-            // decision §3 factor (`ndc_z = 0.5 + 0.05 * depth`,
-            // i.e. `world_z = 0.1 * depth` since the ortho scales
-            // world-z by 0.5). The placement's `pz` offset uses
-            // the same abstract scale.
-            const PROTOCOL_DEPTH_TO_WORLD_Z: f32 = 0.1;
+            // Protocol `depth` maps to pixel-z via the decision §3
+            // factor: `ndc_z = 0.5 + 0.05 * depth` and the ortho
+            // scales pixel z by `0.5 / Z_HALF_RANGE_PX`, so
+            // `world_z_px = 0.1 * Z_HALF_RANGE_PX * depth`. With
+            // Z_HALF_RANGE_PX = 200 → 20 px per protocol unit, so
+            // depth=±10 lands ±200 px from the cell layer, i.e. at
+            // the NDC depth-volume boundary.
             let depth_world_z =
-                p.style.depth * PROTOCOL_DEPTH_TO_WORLD_Z + p.style.offset[2] * Z_MODEL_SCALE;
+                p.style.depth * Z_HALF_RANGE_PX * 0.1 + p.style.offset[2] * fit_half;
             let t = translate(
                 center_px_x + p.style.offset[0] * fit_half,
                 center_px_y + p.style.offset[1] * fit_half,
