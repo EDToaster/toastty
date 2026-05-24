@@ -180,12 +180,16 @@ fn rgp_path_register_with_unknown_name_does_not_register() {
 }
 
 #[test]
-fn rgp_path_register_rejects_paths_with_separators() {
+fn rgp_path_register_with_missing_file_does_not_register() {
     let mut t = Term::new(4, 16, 0);
     let mut p = Parser::new();
-    // Decision §1: leaf-only. A path containing `/` must be
-    // rejected by the resolver without any I/O attempt.
-    p.advance(&mut t, &rgp_apc("r;id=1;fmt=glb;path=../etc/passwd"));
+    // v1 policy is permissive (any relative or absolute path,
+    // resolved from CWD). A file that doesn't exist still fails
+    // gracefully — no asset registered, no panic. See decision §1.
+    p.advance(
+        &mut t,
+        &rgp_apc("r;id=1;fmt=glb;path=definitely/not/here.glb"),
+    );
     assert!(t.rgp_scene().asset(1).is_none());
 }
 

@@ -27,9 +27,39 @@ choice (hand-rolled wgpu).
    the depth test, half fail. The convention is deliberately symmetric so a
    future whole-terminal 3D surface transform composes naturally.
 
-## Decision 1: path policy (B′)
+## Decision 1: path policy
 
-### What we ship
+> **2026-05-23 update.** Decision §1 originally specified the **B′**
+> policy (leaf-only against an embedded bundle + sandboxed
+> `asset_dir`). When we tried running real Ratty ecosystem apps —
+> notably `ratty/widget/examples/big_rat.rs` — every one of them
+> emitted paths like `assets/objects/SpinyMouse.glb`. Strict B′ left
+> them all silently broken (no asset registered, placement no-ops).
+> v1 ships the **permissive (option D-like)** behavior instead:
+> `name` is read directly via `std::fs::read`, with the process CWD
+> as the relative root. Hardening is deferred to v2 — track in the
+> "Open questions" section below rather than as a shipped guarantee.
+>
+> The asymmetry argument below is still valid: `payload=` continues
+> to be the safe path for SSH'd apps, and is unchanged. The
+> permissive `path=` behavior just stops blocking the local-file
+> workflow the rest of the ecosystem assumes.
+
+### What we ship (v1, post-amendment)
+
+The `path=` field is taken at face value:
+1. If `name` is a pure leaf and matches an embedded-bundle entry
+   (currently only `cube`), return that.
+2. Otherwise call `std::fs::read(name)` — relative paths resolve
+   from the process CWD, absolute paths read directly.
+
+This is permissive: nothing prevents `path=/etc/passwd` from
+triggering a read of `/etc/passwd` (the read will succeed if
+permissions allow, and the bytes will then fail glTF parse and
+no asset will be registered). See the open questions list for the
+v2 hardening plan.
+
+### What the original B′ specified (kept for context)
 
 The `path=` field accepts a **leaf name only** (no `/`, no `\`, no `..`, no
 leading `.`). The resolver tries, in order:

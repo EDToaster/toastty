@@ -1,3 +1,5 @@
 -[ ] scrolling is wrong direction on trackpad with macos' reverse scroll (not sure about mouse)
 -[ ] scrolling is too sensitive in vim/helix on trackpad
 -[ ] scrolling doesn't work after exiting vim/helix
+-[ ] path traversal for asset loading in rgp could be unsafe
+-[ ] animate=1 in rgp does not work
