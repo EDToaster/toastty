@@ -20,6 +20,7 @@ pub use rgp::{
     asset::{CpuAsset, CpuMaterial, CpuMesh},
     glb_loader::{GlbLoadError, load_glb},
     handler::{RgpHandler, RgpSink},
+    obj_loader::{ObjLoadError, load_obj},
     operation::{
         RGP_PREFIX, RgpAnchor, RgpFormat, RgpOperation, RgpParseError, RgpPlacementStyle,
         RgpPlacementUpdate, RgpRegisterSource, parse as parse_rgp,

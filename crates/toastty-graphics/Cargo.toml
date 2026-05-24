@@ -15,6 +15,10 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # need — we feed bytes directly) and keep `utils` for the attribute
 # readers.
 gltf = { version = "=1.4.1", default-features = false, features = ["utils"] }
+# Wavefront `.obj` parser for the RGP `fmt=obj` format. Small dep
+# tree (default `ahash` feature on; no other transitives we don't
+# already pull). v1 ignores materials (no `.mtl` resolution).
+tobj = "=4.0.3"
 
 toastty-parser.workspace = true
 

@@ -88,17 +88,19 @@ pub fn load_glb(bytes: &[u8]) -> Result<CpuAsset, GlbLoadError> {
     })
 }
 
-/// Derive flat per-vertex normals when the glTF lacks them. Walks
-/// triangles assuming the position list is already indexable; called
-/// only when `read_normals` returned `None`. Returns a parallel
-/// `Vec` of the same length as `positions`, with each vertex's
-/// normal set to the area-weighted average of its incident
-/// triangles' face normals.
+/// Derive flat per-vertex normals when a source lacks them. Walks
+/// triangles assuming the position list is already indexable;
+/// returns a parallel `Vec` of the same length as `positions`, with
+/// each vertex's normal set to the area-weighted average of its
+/// incident triangles' face normals.
+///
+/// Shared with the OBJ loader (which also commonly lacks normals
+/// for hand-authored objects).
 //
 // Short single-letter names (`a`, `b`, `c`, `ab`, `ac`, `n`) are
 // math conventions for triangle vertices and edge vectors.
 #[allow(clippy::many_single_char_names)]
-fn derive_flat_normals(positions: &[[f32; 3]]) -> Vec<[f32; 3]> {
+pub(crate) fn derive_flat_normals(positions: &[[f32; 3]]) -> Vec<[f32; 3]> {
     let mut acc = vec![[0.0_f32; 3]; positions.len()];
     let mut i = 0;
     while i + 2 < positions.len() {

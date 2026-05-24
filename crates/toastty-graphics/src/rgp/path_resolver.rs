@@ -21,6 +21,8 @@ use thiserror::Error;
 
 use crate::rgp::asset::CpuAsset;
 use crate::rgp::glb_loader::{GlbLoadError, load_glb};
+use crate::rgp::obj_loader::{ObjLoadError, load_obj};
+use crate::rgp::operation::RgpFormat;
 
 /// Errors from [`resolve`].
 #[derive(Debug, Error)]
@@ -34,15 +36,23 @@ pub enum ResolveError {
     Io(String, std::io::Error),
     /// Bytes loaded but failed glTF parse.
     #[error("glb decode failed for `{0}`: {1}")]
-    Decode(String, GlbLoadError),
+    DecodeGlb(String, GlbLoadError),
+    /// Bytes loaded but failed OBJ parse.
+    #[error("obj decode failed for `{0}`: {1}")]
+    DecodeObj(String, ObjLoadError),
 }
 
 /// Resolve a `path=` value to a [`CpuAsset`].
 ///
-/// `_asset_dir` is reserved for the v2 sandboxed-resolver design;
-/// v1 ignores it and reads from the process CWD or absolute paths
-/// directly.
-pub fn resolve(name: &str, _asset_dir: Option<&Path>) -> Result<CpuAsset, ResolveError> {
+/// `format` selects the parser when the bytes come from disk:
+/// `Glb` → `gltf` crate, `Obj` → `tobj`. The embedded bundle short-
+/// circuits format dispatch (assets are pre-parsed). `_asset_dir`
+/// is reserved for the v2 sandboxed-resolver design.
+pub fn resolve(
+    name: &str,
+    format: RgpFormat,
+    _asset_dir: Option<&Path>,
+) -> Result<CpuAsset, ResolveError> {
     if name.is_empty() {
         return Err(ResolveError::Empty);
     }
@@ -56,7 +66,14 @@ pub fn resolve(name: &str, _asset_dir: Option<&Path>) -> Result<CpuAsset, Resolv
     }
     let bytes =
         std::fs::read(Path::new(name)).map_err(|e| ResolveError::Io(name.to_string(), e))?;
-    load_glb(&bytes).map_err(|e| ResolveError::Decode(name.to_string(), e))
+    match format {
+        RgpFormat::Glb => {
+            load_glb(&bytes).map_err(|e| ResolveError::DecodeGlb(name.to_string(), e))
+        }
+        RgpFormat::Obj => {
+            load_obj(&bytes).map_err(|e| ResolveError::DecodeObj(name.to_string(), e))
+        }
+    }
 }
 
 /// The embedded asset bundle. v1: a single name, `cube`, returns
@@ -81,19 +98,19 @@ mod tests {
 
     #[test]
     fn cube_resolves_from_bundle() {
-        let a = resolve("cube", None).expect("cube is bundled");
+        let a = resolve("cube", RgpFormat::Glb, None).expect("cube is bundled");
         assert_eq!(a.mesh.positions.len(), 24);
     }
 
     #[test]
     fn empty_name_rejected() {
-        let e = resolve("", None).unwrap_err();
+        let e = resolve("", RgpFormat::Glb, None).unwrap_err();
         assert!(matches!(e, ResolveError::Empty));
     }
 
     #[test]
     fn missing_path_returns_io_error() {
-        let e = resolve("definitely/not/here.glb", None).unwrap_err();
+        let e = resolve("definitely/not/here.glb", RgpFormat::Glb, None).unwrap_err();
         assert!(matches!(e, ResolveError::Io(_, _)), "got {e:?}");
     }
 

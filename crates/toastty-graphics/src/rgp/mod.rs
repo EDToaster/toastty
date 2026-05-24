@@ -16,14 +16,20 @@
 //!   [`asset::CpuMaterial`], [`asset::CpuAsset`]) and the bundled
 //!   procedural cube ([`asset::CpuMesh::unit_cube`]).
 //! - [`glb_loader`] — `.glb` byte slice → [`asset::CpuAsset`] via
-//!   the `gltf` crate. Used by the payload-mode `r` verb.
+//!   the `gltf` crate. Used by the payload-mode `r` verb when
+//!   `fmt=glb`.
+//! - [`obj_loader`] — `.obj` byte slice → [`asset::CpuAsset`] via
+//!   the `tobj` crate. Used when `fmt=obj`. Materials (the
+//!   referenced `.mtl` file) are not resolved — v1's renderer
+//!   uses a solid base color.
 //! - [`path_resolver`] — leaf-name `path=` lookup against the
 //!   embedded bundle + optional `[rgp] asset_dir`. Decision §1's
-//!   "B′" policy.
+//!   policy (now permissive, see the doc amendment).
 
 pub mod asset;
 pub mod glb_loader;
 pub mod handler;
+pub mod obj_loader;
 pub mod operation;
 pub mod path_resolver;
 pub mod reply;

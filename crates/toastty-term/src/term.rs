@@ -15,8 +15,10 @@ use crate::grid::Grid;
 use toastty_config::CursorShape;
 use toastty_graphics::kitty::handler::{KittyHandler, KittySink};
 use toastty_graphics::kitty::header::DeleteSpec;
+use toastty_graphics::rgp::asset::CpuAsset;
 use toastty_graphics::rgp::glb_loader::load_glb;
 use toastty_graphics::rgp::handler::{RgpHandler, RgpSink};
+use toastty_graphics::rgp::obj_loader::load_obj;
 use toastty_graphics::rgp::operation::{
     RGP_PREFIX, RgpAnchor, RgpFormat, RgpPlacementStyle, RgpPlacementUpdate,
 };
@@ -2683,7 +2685,11 @@ impl RgpSink for Term {
             id, ?format, name = ?name, bytes_len = bytes.len(),
             "rgp: register_asset (payload)",
         );
-        match load_glb(&bytes) {
+        let result: Result<CpuAsset, String> = match format {
+            RgpFormat::Glb => load_glb(&bytes).map_err(|e| e.to_string()),
+            RgpFormat::Obj => load_obj(&bytes).map_err(|e| e.to_string()),
+        };
+        match result {
             Ok(data) => {
                 tracing::info!(
                     target: "rgp",
@@ -2702,10 +2708,10 @@ impl RgpSink for Term {
                 );
                 true
             }
-            Err(e) => {
+            Err(error) => {
                 tracing::warn!(
                     target: "rgp",
-                    id, error = %e,
+                    id, %error,
                     "rgp: register_asset failed",
                 );
                 false
@@ -2746,7 +2752,7 @@ impl RgpSink for Term {
             toastty_cwd = ?std::env::current_dir().ok(),
             "rgp: register_asset_by_path",
         );
-        match resolve_rgp_path(&resolved, None) {
+        match resolve_rgp_path(&resolved, format, None) {
             Ok(data) => {
                 tracing::info!(
                     target: "rgp",
