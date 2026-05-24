@@ -2691,16 +2691,27 @@ impl RgpSink for Term {
         format: RgpFormat,
         name: String,
     ) -> bool {
-        // M12b: resolve `name` against the embedded asset bundle
-        // (+ optional config dir, future work). Decision §1's "B′"
-        // policy: separators, `..`, and hidden names are rejected
-        // up-front by the resolver.
+        // The app emits `path=` relative to ITS own CWD (e.g.
+        // `path=assets/objects/SpinyMouse.glb`). Toastty's own
+        // `std::fs::read` resolves relative to TOASTTY's CWD, which
+        // is different. Bridge the gap via OSC 7 — `self.cwd` is the
+        // shell's last-advertised working directory.
         //
-        // `asset_dir` is wired in a follow-up — for v1 only the
-        // embedded bundle is consulted (which is enough for the
-        // M12 demo: `path=cube`).
-        let asset_dir = None;
-        match resolve_rgp_path(&name, asset_dir) {
+        // Pure leaf names (no separators) skip the join so the
+        // resolver consults the embedded bundle first (`path=cube`).
+        // Absolute paths skip the join trivially.
+        let resolved = if (!name.contains('/') && !name.contains('\\'))
+            || std::path::Path::new(&name).is_absolute()
+            || self.cwd.is_empty()
+        {
+            name.clone()
+        } else {
+            std::path::Path::new(&self.cwd)
+                .join(&name)
+                .to_string_lossy()
+                .into_owned()
+        };
+        match resolve_rgp_path(&resolved, None) {
             Ok(data) => {
                 self.rgp_scene.apply_register(
                     id,
