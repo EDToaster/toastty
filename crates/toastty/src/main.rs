@@ -55,6 +55,15 @@ const VIEWPORT_ANIM_TICK: Duration = Duration::from_millis(16);
 /// short-circuit to skip-submit and the displayed FPS would freeze).
 const DEBUG_OVERLAY_TICK: Duration = Duration::from_millis(250);
 
+/// Maximum gap between two `ScrollKind::Pixels` events for them to be
+/// counted as part of the same continuous gesture / inertia stream.
+/// macOS delivers trackpad frames at ~60 Hz (~16 ms apart) during
+/// both the physical gesture and the momentum tail, so any
+/// inter-frame gap larger than ~150 ms reliably signals "the stream
+/// has actually ended; the next event begins a new gesture". Used by
+/// the inertia-swallow heuristic below — see [`Toastty::handle_scroll`].
+const SCROLL_STREAM_LULL: Duration = Duration::from_millis(150);
+
 /// Convert a config `SmoothingFunction` into the per-frame easing
 /// the term consumes. Tuning constants are local to the binary so
 /// changes don't churn the term crate's public API.
@@ -219,6 +228,22 @@ struct Toastty {
     /// Most recent config-load error from startup (if any). Promoted to
     /// `banner_text` once the renderer is available in `init_impl`.
     pending_load_error: Option<ConfigError>,
+    /// Timestamp of the most recent `ScrollKind::Pixels` event we
+    /// observed, regardless of routing. Together with
+    /// `swallow_pixel_stream` this drives the inertia-swallow
+    /// heuristic: a Pixels event whose gap to its predecessor is
+    /// shorter than [`SCROLL_STREAM_LULL`] is part of the *same*
+    /// continuous gesture / inertia tail; a larger gap marks the
+    /// boundary between streams. `None` before the first scroll.
+    last_pixel_scroll_at: Option<Instant>,
+    /// True while the *current* `Pixels` stream should be ignored.
+    /// Set by [`Self::snap_view_after_input`] when typing snapped
+    /// the viewport to the bottom, so the trailing inertia frames
+    /// macOS keeps delivering can't undo the snap. Cleared
+    /// automatically at the next `SCROLL_STREAM_LULL`-or-larger gap
+    /// — i.e., when the stream genuinely ends — so the next
+    /// deliberate gesture goes through.
+    swallow_pixel_stream: bool,
 }
 
 impl Toastty {
@@ -266,6 +291,8 @@ impl Toastty {
             config_watcher: None,
             banner_text: None,
             pending_load_error: load_err,
+            last_pixel_scroll_at: None,
+            swallow_pixel_stream: false,
         }
     }
 
@@ -896,6 +923,28 @@ impl Toastty {
         let delta_y = -delta_y;
         let delta_x = -delta_x;
 
+        // Maintain the inertia-swallow stream-tracking state up-front,
+        // before any routing decision. We update on every `Pixels`
+        // event (even ones we end up forwarding to a mouse-mode app)
+        // so the state stays coherent if the app toggles mouse-tracking
+        // mid-stream.
+        //
+        // Rule: a gap >= SCROLL_STREAM_LULL between two Pixels events
+        // means the previous gesture / inertia tail has truly ended
+        // and the new event begins a fresh stream. That's the cue to
+        // *clear* the per-stream "swallow" flag the typing path
+        // armed.
+        if scroll_kind == toastty_window::ScrollKind::Pixels {
+            let now = Instant::now();
+            let stream_continues = self
+                .last_pixel_scroll_at
+                .is_some_and(|t| now.duration_since(t) < SCROLL_STREAM_LULL);
+            if !stream_continues {
+                self.swallow_pixel_stream = false;
+            }
+            self.last_pixel_scroll_at = Some(now);
+        }
+
         // Priority 1: app has mouse-tracking on. Forward the wheel
         // event verbatim — apps like btop/htop/neovim consume scroll
         // as input, and they always win over the local scrollback
@@ -932,6 +981,13 @@ impl Toastty {
         // brief direction reversal mid-inertia doesn't emit an arrow
         // in the wrong direction.
         if self.term.is_alt_active() {
+            // Same inertia-swallow guard as the primary-grid path:
+            // if typing snapped state during a Pixels stream, drop
+            // the trailing inertia frames so phantom arrow keys
+            // don't get pushed into the alt-screen app afterwards.
+            if scroll_kind == toastty_window::ScrollKind::Pixels && self.swallow_pixel_stream {
+                return ControlSignal::Continue;
+            }
             let signed = self.alt_screen_arrows_for_scroll(scroll_kind, delta_y, f64::from(cell_h));
             if signed != 0 {
                 let bytes = if signed > 0 {
@@ -950,6 +1006,18 @@ impl Toastty {
         }
 
         // Priority 3: primary grid scrollback view.
+        //
+        // Inertia-swallow: typing armed `swallow_pixel_stream`; while
+        // the macOS inertia tail is still arriving (gap from the
+        // previous Pixels event < SCROLL_STREAM_LULL) the flag stays
+        // set and we drop every frame, so the snap-to-bottom isn't
+        // undone. The first scroll after a real gap clears the flag
+        // (handled at the top of this function), so the next
+        // deliberate gesture lands cleanly. Lines/notch events are
+        // intentional and pass through.
+        if scroll_kind == toastty_window::ScrollKind::Pixels && self.swallow_pixel_stream {
+            return ControlSignal::Continue;
+        }
         let lines_per_notch = self.config.scrollback.lines_per_notch.max(1) as f64;
         match scroll_kind {
             toastty_window::ScrollKind::Lines => {
@@ -1066,6 +1134,22 @@ impl Toastty {
                 self.term.force_snap_view();
             }
         }
+        // macOS keeps delivering `ScrollKind::Pixels` inertia frames
+        // for hundreds of milliseconds (sometimes >1s) after the
+        // physical gesture ends. Marking the *current* Pixels stream
+        // as swallowed means every remaining frame in that stream is
+        // dropped, instead of guessing how long inertia will last.
+        // [`handle_scroll`] clears the flag automatically at the
+        // next inter-frame gap >= [`SCROLL_STREAM_LULL`], i.e. the
+        // moment the stream genuinely ends — so the user's *next*
+        // deliberate gesture still works. Wheel-notch (`Lines`)
+        // events are intentional input and are never swallowed.
+        self.swallow_pixel_stream = true;
+        // Any pixel accumulators built up during the original gesture
+        // would otherwise wait around and apply on the next scroll —
+        // drop them so the post-typing state starts clean.
+        self.scroll_pixel_residual = 0.0;
+        self.alt_scroll_pixel_accum = 0.0;
     }
 }
 
