@@ -29,6 +29,7 @@ mod scrollback;
 mod security;
 mod shell;
 mod theme;
+mod window;
 mod xdg;
 
 use std::path::{Path, PathBuf};
@@ -41,6 +42,7 @@ pub use scrollback::{ScrollbackConfig, SmoothingFunction};
 pub use security::SecurityConfig;
 pub use shell::ShellConfig;
 pub use theme::ThemeConfig;
+pub use window::WindowConfig;
 
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +60,7 @@ pub struct Config {
     pub shell: ShellConfig,
     pub scrollback: ScrollbackConfig,
     pub security: SecurityConfig,
+    pub window: WindowConfig,
 }
 
 impl Default for Config {
@@ -80,6 +83,7 @@ impl Config {
             shell: ShellConfig::defaults(),
             scrollback: ScrollbackConfig::defaults(),
             security: SecurityConfig::defaults(),
+            window: WindowConfig::defaults(),
         }
     }
 

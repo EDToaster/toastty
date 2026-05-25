@@ -310,7 +310,14 @@ mod tests {
         let s = std::str::from_utf8(&buf).unwrap();
 
         // Sanity: contains every top-level section.
-        for section in ["[font]", "[theme]", "[cursor]", "[shell]", "[scrollback]"] {
+        for section in [
+            "[font]",
+            "[theme]",
+            "[cursor]",
+            "[shell]",
+            "[scrollback]",
+            "[window]",
+        ] {
             assert!(s.contains(section), "missing section {section} in:\n{s}");
         }
 

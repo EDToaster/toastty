@@ -44,10 +44,6 @@ use toastty::pty_log::{Direction, PtyLogger};
 use toastty::shell::resolve_command;
 use toastty::theme_bridge::theme_from_config;
 
-/// Default initial window size in pixels. M5 does not yet read this from
-/// a `[window]` config section — that lands in M6.
-const DEFAULT_WINDOW_SIZE: (u32, u32) = (1280, 800);
-
 /// Target wake-up cadence while the scrollback viewport is animating.
 /// 16 ms ≈ 60 Hz — fast enough to feel smooth on macOS trackpad
 /// inertia frames without burning the event loop when idle.
@@ -132,13 +128,14 @@ fn main() -> Result<()> {
         debug!("running with built-in defaults");
     }
 
+    let initial_size = (config.window.width.max(1), config.window.height.max(1));
     let opts = WindowOptions {
         title: "toastty".into(),
-        size: DEFAULT_WINDOW_SIZE,
+        size: initial_size,
         ime: true,
     };
 
-    let app = Toastty::new(config, command_override);
+    let app = Toastty::new(config, command_override, initial_size);
     run(opts, app).context("window run")?;
     Ok(())
 }
@@ -206,7 +203,11 @@ struct Toastty {
 }
 
 impl Toastty {
-    fn new(config: Config, command_override: Option<CommandOverride>) -> Self {
+    fn new(
+        config: Config,
+        command_override: Option<CommandOverride>,
+        initial_size: (u32, u32),
+    ) -> Self {
         let scrollback = config.scrollback.lines.try_into().unwrap_or(u16::MAX);
         // Start at a tiny grid; init() resizes once we know cell dimensions.
         let mut term = Term::new(24, 80, scrollback);
@@ -228,7 +229,7 @@ impl Toastty {
             term,
             pty: None,
             reader: None,
-            physical_size: DEFAULT_WINDOW_SIZE,
+            physical_size: initial_size,
             last_title: None,
             mouse_pos: (0.0, 0.0),
             mouse_held: None,

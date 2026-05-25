@@ -31,3 +31,7 @@ lines_per_notch = 3
 [security]
 osc_52_read  = false
 osc_52_write = false
+
+[window]
+width  = 1280
+height = 800
