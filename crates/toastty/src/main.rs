@@ -732,6 +732,14 @@ impl Toastty {
         delta_x: f64,
         delta_y: f64,
     ) -> ControlSignal {
+        // winit's `MouseWheel` y sign is opposite to what every downstream
+        // path here was assuming (primary scrollback, alt-screen arrow
+        // translation, and the SGR mouse encoder). Negating once at the
+        // entry point lines all three up — without it, scrolling moved in
+        // the wrong direction across the board.
+        let delta_y = -delta_y;
+        let delta_x = -delta_x;
+
         // Priority 1: app has mouse-tracking on. Forward the wheel
         // event verbatim — apps like btop/htop/neovim consume scroll
         // as input, and they always win over the local scrollback
