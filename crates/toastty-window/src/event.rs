@@ -118,6 +118,28 @@ pub enum ScrollKind {
     Pixels,
 }
 
+/// Lifecycle phase of a trackpad scroll stream. Maps from winit's
+/// `TouchPhase`, which on macOS in turn folds together `NSEvent.phase`
+/// and `NSEvent.momentumPhase` (gesture and momentum tail share the
+/// same enum). So a single swipe-with-inertia emits **two** complete
+/// `Started → Moved* → Ended` cycles back-to-back: the first for the
+/// physical gesture, the second for the momentum coast.
+///
+/// Note this can't distinguish a fresh-gesture `Started` from a
+/// momentum-begin `Started`; consumers needing that distinction must
+/// combine `phase` with inter-event timing.
+///
+/// Mouse wheels (LineDelta) on most platforms only emit `Moved`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollPhase {
+    /// A new gesture or momentum burst has begun.
+    Started,
+    /// Continuation of an active gesture or momentum burst.
+    Moved,
+    /// The gesture lifted off, OR the momentum burst exhausted.
+    Ended,
+}
+
 /// One window event consumable by the binary / renderer.
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -150,9 +172,12 @@ pub enum Event {
     /// Scroll wheel / trackpad scroll. `kind` distinguishes a discrete
     /// notch (`Lines`) from a continuous pixel stream (`Pixels`, the
     /// usual macOS trackpad path including inertial momentum frames).
+    /// `phase` tags the position of this event in the gesture
+    /// lifecycle — see [`ScrollPhase`] for the macOS subtleties.
     /// Sign convention matches winit: positive y == content moves down.
     Scroll {
         kind: ScrollKind,
+        phase: ScrollPhase,
         delta_x: f64,
         delta_y: f64,
     },

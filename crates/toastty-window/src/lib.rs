@@ -29,7 +29,7 @@ pub mod led;
 
 pub use event::{
     ControlSignal, Event, KeyState, LogicalKey, Modifiers, MouseButton, NamedKey, PhysicalKey,
-    ScrollKind,
+    ScrollKind, ScrollPhase,
 };
 // Re-exported so downstream crates (toastty bin) can ship background
 // threads that push events into the event loop without taking a direct
@@ -45,7 +45,7 @@ use raw_window_handle::{
 use thiserror::Error;
 use tracing::{debug, trace, warn};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey as WNamedKey, PhysicalKey as WPhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
@@ -410,15 +410,27 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<'_, A> {
                     event_loop,
                 );
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, phase, .. } => {
                 let kind = match delta {
                     MouseScrollDelta::LineDelta(..) => event::ScrollKind::Lines,
                     MouseScrollDelta::PixelDelta(..) => event::ScrollKind::Pixels,
+                };
+                // Map winit TouchPhase → our ScrollPhase. winit folds
+                // macOS NSEvent.phase and NSEvent.momentumPhase into
+                // one enum, so `Started` and `Ended` arrive twice per
+                // swipe-with-inertia (once for the gesture, once for
+                // the momentum tail). Cancelled is folded into Ended
+                // to keep downstream handling symmetric.
+                let phase = match phase {
+                    TouchPhase::Started => event::ScrollPhase::Started,
+                    TouchPhase::Ended | TouchPhase::Cancelled => event::ScrollPhase::Ended,
+                    TouchPhase::Moved => event::ScrollPhase::Moved,
                 };
                 let (dx, dy) = translate_scroll(delta);
                 self.dispatch(
                     Event::Scroll {
                         kind,
+                        phase,
                         delta_x: dx,
                         delta_y: dy,
                     },

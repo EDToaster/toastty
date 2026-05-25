@@ -55,14 +55,22 @@ const VIEWPORT_ANIM_TICK: Duration = Duration::from_millis(16);
 /// short-circuit to skip-submit and the displayed FPS would freeze).
 const DEBUG_OVERLAY_TICK: Duration = Duration::from_millis(250);
 
-/// Maximum gap between two `ScrollKind::Pixels` events for them to be
-/// counted as part of the same continuous gesture / inertia stream.
-/// macOS delivers trackpad frames at ~60 Hz (~16 ms apart) during
-/// both the physical gesture and the momentum tail, so any
-/// inter-frame gap larger than ~150 ms reliably signals "the stream
-/// has actually ended; the next event begins a new gesture". Used by
-/// the inertia-swallow heuristic below — see [`Toastty::handle_scroll`].
+/// General lull threshold for the inertia-swallow heuristic. A
+/// `ScrollKind::Pixels` event arriving more than this long after the
+/// previous one is treated as the start of a fresh stream regardless
+/// of phase — covers platforms that don't emit reliable phase
+/// information for mouse-wheel events. See
+/// [`Toastty::handle_scroll`].
 const SCROLL_STREAM_LULL: Duration = Duration::from_millis(150);
+
+/// Smaller lull threshold gating the `ScrollPhase::Started`-as-fresh-
+/// gesture signal. macOS's momentum-begin `Started` follows the
+/// gesture's `Ended` within one frame (~16 ms); a real user
+/// re-engaging the trackpad takes much longer than 50 ms. So a
+/// `Started` with at least this much gap from the previous event is
+/// almost certainly a fresh gesture and the swallow flag can be
+/// cleared faster than waiting out the full [`SCROLL_STREAM_LULL`].
+const FRESH_STARTED_GAP: Duration = Duration::from_millis(50);
 
 /// Convert a config `SmoothingFunction` into the per-frame easing
 /// the term consumes. Tuning constants are local to the binary so
@@ -912,6 +920,7 @@ impl Toastty {
     fn handle_scroll(
         &mut self,
         scroll_kind: toastty_window::ScrollKind,
+        scroll_phase: toastty_window::ScrollPhase,
         delta_x: f64,
         delta_y: f64,
     ) -> ControlSignal {
@@ -929,17 +938,30 @@ impl Toastty {
         // so the state stays coherent if the app toggles mouse-tracking
         // mid-stream.
         //
-        // Rule: a gap >= SCROLL_STREAM_LULL between two Pixels events
-        // means the previous gesture / inertia tail has truly ended
-        // and the new event begins a fresh stream. That's the cue to
-        // *clear* the per-stream "swallow" flag the typing path
-        // armed.
+        // Two ways to declare a fresh stream and clear the per-stream
+        // swallow flag:
+        //
+        //   1. **Gap >= SCROLL_STREAM_LULL.** Works on every platform
+        //      and for every phase value — the inertia tail can't
+        //      survive a >150 ms silence, so anything arriving after
+        //      it is a new stream.
+        //   2. **`ScrollPhase::Started` with a gap >= FRESH_STARTED_GAP.**
+        //      Started fires both for fingers-touching and for
+        //      momentum-begin — but momentum-begin lands within ~16 ms
+        //      of the preceding Ended, while a fresh user gesture
+        //      takes much longer than 50 ms to set up. So a Started
+        //      that didn't follow the prior event nearly-instantly is
+        //      definitely user intent, and we can release the swallow
+        //      faster than waiting out the full 150 ms lull.
         if scroll_kind == toastty_window::ScrollKind::Pixels {
             let now = Instant::now();
-            let stream_continues = self
+            let gap = self
                 .last_pixel_scroll_at
-                .is_some_and(|t| now.duration_since(t) < SCROLL_STREAM_LULL);
-            if !stream_continues {
+                .map(|t| now.duration_since(t));
+            let big_gap = gap.is_none_or(|g| g >= SCROLL_STREAM_LULL);
+            let fresh_started = scroll_phase == toastty_window::ScrollPhase::Started
+                && gap.is_none_or(|g| g >= FRESH_STARTED_GAP);
+            if big_gap || fresh_started {
                 self.swallow_pixel_stream = false;
             }
             self.last_pixel_scroll_at = Some(now);
@@ -1347,9 +1369,10 @@ impl App for Toastty {
             } => self.handle_mouse_motion(position, modifiers),
             Event::Scroll {
                 kind,
+                phase,
                 delta_x,
                 delta_y,
-            } => self.handle_scroll(kind, delta_x, delta_y),
+            } => self.handle_scroll(kind, phase, delta_x, delta_y),
             Event::PtyBytes(bytes) => {
                 let fresh_bsu = self.handle_pty_bytes(&bytes);
                 // If a BSU just went high we still want to wake the
