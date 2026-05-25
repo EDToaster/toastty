@@ -114,13 +114,36 @@ impl Config {
     /// (e.g. when the user passed `--config <path>` explicitly).
     #[must_use]
     pub fn load_default() -> (Self, ConfigSource) {
+        let (cfg, src, _err) = Self::load_default_with_error();
+        (cfg, src)
+    }
+
+    /// Same as [`Config::load_default`] but also returns any parse /
+    /// I/O error encountered. On error the config falls back to
+    /// defaults (so the terminal still boots), and the caller can use
+    /// the error to surface a banner inside the running window. Missing
+    /// file is *not* an error: it yields `(defaults, Defaults, None)`.
+    #[must_use]
+    pub fn load_default_with_error() -> (Self, ConfigSource, Option<ConfigError>) {
         let Some(path) = xdg::default_config_path() else {
-            return (Self::defaults(), ConfigSource::Defaults);
+            return (Self::defaults(), ConfigSource::Defaults, None);
         };
-        match Self::load_from_path(&path) {
-            Ok(cfg) => (cfg, ConfigSource::File(path)),
-            Err(_) => (Self::defaults(), ConfigSource::Defaults),
+        if !path.exists() {
+            return (Self::defaults(), ConfigSource::Defaults, None);
         }
+        match Self::load_from_path(&path) {
+            Ok(cfg) => (cfg, ConfigSource::File(path), None),
+            Err(e) => (Self::defaults(), ConfigSource::Defaults, Some(e)),
+        }
+    }
+
+    /// The XDG-style path this binary would look at, regardless of
+    /// whether the file currently exists. Useful for the file watcher
+    /// — we want to react to a file being created later, not just to
+    /// modifications of an already-present file.
+    #[must_use]
+    pub fn default_path() -> Option<PathBuf> {
+        xdg::default_config_path()
     }
 }
 

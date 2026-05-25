@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use pollster::block_on;
-use toastty_config::{Config, ConfigSource};
+use toastty_config::{Config, ConfigError, ConfigSource};
 use toastty_parser::Parser;
 use toastty_protocols::resize_inband::encode_resize_report;
 use toastty_protocols::synchronized::{BSU_TIMEOUT, should_force_flush};
@@ -33,6 +33,7 @@ use tracing_subscriber::EnvFilter;
 
 use toastty::cli;
 use toastty::cli::CommandOverride;
+use toastty::config_watcher::ConfigWatcher;
 use toastty::focus::encode_focus;
 use toastty::geometry::grid_dims_from_pixels;
 use toastty::keyboard::encode_key;
@@ -122,10 +123,13 @@ fn main() -> Result<()> {
 
     info!("toastty {} starting", env!("CARGO_PKG_VERSION"));
 
-    let (config, source) = Config::load_default();
+    let (config, source, load_err) = Config::load_default_with_error();
     info!("config source: {source}");
     if matches!(source, ConfigSource::Defaults) {
         debug!("running with built-in defaults");
+    }
+    if let Some(ref e) = load_err {
+        warn!("config load failed, using defaults: {e}");
     }
 
     let initial_size = (config.window.width.max(1), config.window.height.max(1));
@@ -135,7 +139,7 @@ fn main() -> Result<()> {
         ime: true,
     };
 
-    let app = Toastty::new(config, command_override, initial_size);
+    let app = Toastty::new(config, command_override, initial_size, load_err);
     run(opts, app).context("window run")?;
     Ok(())
 }
@@ -203,6 +207,18 @@ struct Toastty {
     /// Reusable buffer for the FPS overlay text. Avoids a per-frame
     /// `format!()` allocation when `debug_enabled` is on.
     fps_buf: String,
+    /// Resolved path of the config file we read at startup (if any).
+    /// Used to install the hot-reload watcher in `init_impl`.
+    config_path: Option<std::path::PathBuf>,
+    /// File-watcher driving hot-reload. `None` if the parent directory
+    /// is missing or the watcher couldn't be installed.
+    config_watcher: Option<ConfigWatcher>,
+    /// Currently-displayed error banner string. Tracked so we only call
+    /// `Renderer::set_error_banner` when the contents actually change.
+    banner_text: Option<String>,
+    /// Most recent config-load error from startup (if any). Promoted to
+    /// `banner_text` once the renderer is available in `init_impl`.
+    pending_load_error: Option<ConfigError>,
 }
 
 impl Toastty {
@@ -210,6 +226,7 @@ impl Toastty {
         config: Config,
         command_override: Option<CommandOverride>,
         initial_size: (u32, u32),
+        load_err: Option<ConfigError>,
     ) -> Self {
         let scrollback = config.scrollback.lines.try_into().unwrap_or(u16::MAX);
         // Start at a tiny grid; init() resizes once we know cell dimensions.
@@ -245,6 +262,10 @@ impl Toastty {
             debug_enabled: std::env::var_os("TOASTTY_DEBUG").is_some(),
             frame_times: VecDeque::with_capacity(128),
             fps_buf: String::with_capacity(16),
+            config_path: Config::default_path(),
+            config_watcher: None,
+            banner_text: None,
+            pending_load_error: load_err,
         }
     }
 
@@ -606,10 +627,118 @@ impl Toastty {
         self.pty = Some(pty);
         self.reader = Some(reader);
 
+        // Install hot-reload watcher on the resolved config path
+        // (even if the file doesn't currently exist — the parent dir
+        // watch still picks up a future CREATE event).
+        if let Some(path) = self.config_path.clone() {
+            self.config_watcher =
+                ConfigWatcher::spawn(path, handle.event_loop_proxy());
+        }
+
+        // Promote any startup config load error to the in-window
+        // banner now that the renderer exists.
+        if let Some(err) = self.pending_load_error.take() {
+            self.set_banner_from_error(&err);
+        }
+
         // Kick off the first frame. macOS doesn't always fire an
         // initial RedrawRequested on first display — without this,
         // the window stays black until the user moves the mouse or
         // types a key.
+        if let Some(w) = self.window.as_ref() {
+            w.request_redraw();
+        }
+    }
+
+    /// Apply currently-stored config fields to the live renderer and
+    /// term. Skips knobs that aren't safely live-applicable (window
+    /// size, shell program, scrollback ring capacity).
+    fn apply_config_to_runtime(&mut self) {
+        if let Some(r) = self.renderer.as_mut() {
+            r.with_font_ex(
+                Some(self.config.font.family.as_str()),
+                self.config.font.size_px,
+                self.config.font.line_height,
+            );
+            r.set_theme(theme_from_config(&self.config.theme));
+            // Re-plumb the theme bg into Term so OSC 11 queries reply
+            // with the new value.
+            let theme_bg = r.theme().bg;
+            let bg_rgb = [
+                linear_to_srgb_u8(theme_bg[0]),
+                linear_to_srgb_u8(theme_bg[1]),
+                linear_to_srgb_u8(theme_bg[2]),
+            ];
+            self.term.set_default_bg(bg_rgb);
+            r.invalidate_framebuffer();
+        }
+        self.term
+            .set_cursor_default(self.config.cursor.shape, self.config.cursor.blink);
+        self.term.set_security(SecurityFlags {
+            osc_52_read: self.config.security.osc_52_read,
+            osc_52_write: self.config.security.osc_52_write,
+        });
+        // Font swap may have changed the cell size; recompute the grid
+        // so columns/rows still match the window pixels.
+        self.resync_grid();
+        if let Some(w) = self.window.as_ref() {
+            w.request_redraw();
+        }
+    }
+
+    /// Re-parse the watched config file and either apply it (clearing
+    /// any banner) or surface the error in the banner without
+    /// touching live state.
+    fn reload_config(&mut self) {
+        let Some(path) = self.config_path.clone() else {
+            return;
+        };
+        if !path.exists() {
+            // File was deleted: keep running with current settings,
+            // surface a banner so the user knows we're holding the
+            // previous state.
+            self.set_banner(Some(format!(
+                "config file missing: {}\n(continuing with previous settings; recreate or restart)",
+                path.display()
+            )));
+            return;
+        }
+        match Config::load_from_path(&path) {
+            Ok(cfg) => {
+                self.config = cfg;
+                self.apply_config_to_runtime();
+                self.set_banner(None);
+                info!("config reloaded from {}", path.display());
+            }
+            Err(e) => {
+                warn!("config reload failed: {e}");
+                self.set_banner_from_error(&e);
+            }
+        }
+    }
+
+    fn set_banner_from_error(&mut self, err: &ConfigError) {
+        let path_line = match self.config_path.as_ref() {
+            Some(p) => format!("config error in {}", p.display()),
+            None => "config error".to_string(),
+        };
+        // Wrap the typed error's Display output across multiple lines
+        // if it contains newlines (the toml crate's parse errors
+        // already carry a multi-line caret display).
+        let msg = format!(
+            "{path_line}\n{err}\n(fix the file and save — toastty will reload automatically)"
+        );
+        self.set_banner(Some(msg));
+    }
+
+    fn set_banner(&mut self, text: Option<String>) {
+        if self.banner_text == text {
+            return;
+        }
+        self.banner_text = text;
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_error_banner(self.banner_text.as_deref());
+        }
         if let Some(w) = self.window.as_ref() {
             w.request_redraw();
         }
@@ -1153,8 +1282,21 @@ impl App for Toastty {
                 }
                 ControlSignal::Exit
             }
-            // Unhandled variants (e.g. Event::User, synthetic wakeups).
-            Event::User => ControlSignal::Continue,
+            Event::User => {
+                // The config watcher wakes the loop via Wake on file
+                // changes. Drain its pending flag (atomic swap) and
+                // reload if needed.
+                let should_reload = self
+                    .config_watcher
+                    .as_ref()
+                    .is_some_and(ConfigWatcher::take_pending);
+                if should_reload {
+                    self.reload_config();
+                    ControlSignal::RedrawIn(Duration::ZERO)
+                } else {
+                    ControlSignal::Continue
+                }
+            }
         }
     }
 }

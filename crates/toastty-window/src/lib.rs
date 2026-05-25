@@ -31,6 +31,10 @@ pub use event::{
     ControlSignal, Event, KeyState, LogicalKey, Modifiers, MouseButton, NamedKey, PhysicalKey,
     ScrollKind,
 };
+// Re-exported so downstream crates (toastty bin) can ship background
+// threads that push events into the event loop without taking a direct
+// winit dependency.
+pub use winit::event_loop::EventLoopProxy;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -42,7 +46,7 @@ use thiserror::Error;
 use tracing::{debug, trace, warn};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey as WNamedKey, PhysicalKey as WPhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{Window, WindowId};

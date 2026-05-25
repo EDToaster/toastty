@@ -261,6 +261,12 @@ pub struct Renderer {
     /// skip-submit gate is bypassed so the overlay refreshes even when
     /// the term grid is idle.
     debug_overlay: Option<String>,
+    /// Optional multi-line full-width error banner rendered at the top
+    /// of the surface every frame. Used by the binary to surface config
+    /// parse/validation failures inside the running window so the user
+    /// notices without scanning stderr. When `Some`, bypasses the
+    /// skip-submit gate so the banner shows up even on an idle grid.
+    error_banner: Option<String>,
     /// `TOASTTY_TRACE_RENDER` env var sampled once at construction.
     /// Sampling per-frame was a measurable syscall on the hot path.
     trace_render: bool,
@@ -555,6 +561,7 @@ impl Renderer {
             rgp_cache: GpuAssetCache::new(),
             rgp_revision_seen: u32::MAX,
             debug_overlay: None,
+            error_banner: None,
             trace_render: std::env::var_os("TOASTTY_TRACE_RENDER").is_some(),
             // The very first frame is always a full clear → goes
             // through the direct-to-swapchain path → leaves scratch
@@ -744,6 +751,36 @@ impl Renderer {
         self.debug_overlay.is_some()
     }
 
+    /// Set (or clear) a multi-line full-width error banner painted at
+    /// the top of the surface. Lines are split on `\n`. While `Some`,
+    /// the renderer skips its damage-only short-circuit so the banner
+    /// remains visible on an idle grid.
+    pub fn set_error_banner(&mut self, text: Option<&str>) {
+        match text {
+            Some(s) => {
+                if let Some(buf) = self.error_banner.as_mut() {
+                    buf.clear();
+                    buf.push_str(s);
+                } else {
+                    self.error_banner = Some(s.to_owned());
+                }
+                self.needs_full_clear = true;
+            }
+            None => {
+                if self.error_banner.is_some() {
+                    self.error_banner = None;
+                    self.needs_full_clear = true;
+                }
+            }
+        }
+    }
+
+    /// True when an error banner is currently set.
+    #[must_use]
+    pub fn has_error_banner(&self) -> bool {
+        self.error_banner.is_some()
+    }
+
     /// Current theme.
     pub fn theme(&self) -> Theme {
         self.theme
@@ -918,6 +955,7 @@ impl Renderer {
             && !rgp_animation_active
             && !self.needs_full_clear
             && self.debug_overlay.is_none()
+            && self.error_banner.is_none()
         {
             return Ok(RenderOutcome::Skipped);
         }
@@ -1176,6 +1214,86 @@ impl Renderer {
                         flags,
                         pad: [0; 3],
                     });
+                }
+            }
+        }
+
+        // Config error banner: full-width, multi-line, red bg / white
+        // fg, top-aligned. Painted after the debug overlay so on a
+        // narrow window where they would otherwise overlap, the banner
+        // wins on its rows. We overpaint a bg quad over every cell in
+        // every banner row so previous-frame content underneath is
+        // erased under LoadOp::Load.
+        if let Some(banner) = self.error_banner.as_deref() {
+            #[allow(clippy::cast_precision_loss)]
+            let viewport_w = self.config.width as f32;
+            let cell_w = cell_size.0;
+            let cell_h = cell_size.1;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let cols = (viewport_w / cell_w).floor().max(1.0) as u32;
+            let banner_bg = [0.55, 0.05, 0.05, 1.0];
+            let banner_fg = [1.0, 1.0, 1.0, 1.0];
+            for (row_idx, line) in banner.lines().enumerate() {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+                let y0 = (row_idx as f32) * cell_h;
+                // 1) Paint the full-width bg row so previous content
+                //    is overpainted. Use a single quad spanning all
+                //    columns of this row (one CellInstance per cell
+                //    keeps the renderer's per-instance pipeline happy).
+                for col in 0..cols {
+                    #[allow(clippy::cast_precision_loss)]
+                    let x0 = (col as f32) * cell_w;
+                    instances.push(CellInstance {
+                        pos: [x0, y0],
+                        size: [cell_w, cell_h],
+                        uv_min: [0.0, 0.0],
+                        uv_max: [0.0, 0.0],
+                        fg: banner_fg,
+                        bg: banner_bg,
+                        flags: crate::text::instance::FLAG_NO_GLYPH,
+                        pad: [0; 3],
+                    });
+                }
+                // 2) Shape the line text and emit glyph instances on
+                //    top of the bg row. Truncate to viewport width.
+                if line.is_empty() {
+                    continue;
+                }
+                let lg = text.rasterizer.shape_line(
+                    &self.queue,
+                    line,
+                    term.grapheme_cluster_mode(),
+                );
+                for (i, ch) in line.chars().enumerate() {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let col = i as u32;
+                    if col >= cols {
+                        break;
+                    }
+                    if ch.is_whitespace() {
+                        continue;
+                    }
+                    #[allow(clippy::cast_precision_loss)]
+                    let pos = [(col as f32) * cell_w, y0];
+                    #[allow(clippy::cast_possible_truncation)]
+                    let col_u16 = col as u16;
+                    if let Some(slot) = lg.get(col_u16, ch) {
+                        let flags = if slot.is_color {
+                            crate::text::instance::FLAG_COLOR_GLYPH
+                        } else {
+                            0
+                        };
+                        instances.push(CellInstance {
+                            pos: [pos[0] + slot.glyph_offset[0], pos[1] + slot.glyph_offset[1]],
+                            size: slot.glyph_size,
+                            uv_min: slot.uv_min,
+                            uv_max: slot.uv_max,
+                            fg: banner_fg,
+                            bg: banner_bg,
+                            flags,
+                            pad: [0; 3],
+                        });
+                    }
                 }
             }
         }

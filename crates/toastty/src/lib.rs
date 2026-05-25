@@ -10,6 +10,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod cli;
+pub mod config_watcher;
 pub mod focus;
 pub mod geometry;
 pub mod keyboard;
