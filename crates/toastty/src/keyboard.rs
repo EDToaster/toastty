@@ -205,8 +205,13 @@ fn kitty_event_suffix(state: KeyState, repeat: bool) -> &'static str {
     }
 }
 
-/// Functional-key numeric codes per the kitty spec
-/// (<https://sw.kovidgoyal.net/kitty/keyboard-protocol/#functional-key-definitions>).
+/// Numeric codes for the subset of named keys that the kitty spec encodes
+/// in `CSI <code> u` form. This is only the C0-aliased keys (Escape, Enter,
+/// Tab, Backspace) and Space. Arrows, F-keys, Home/End, PageUp/PageDown,
+/// and Insert/Delete are **not** in this set — per the spec they keep
+/// their legacy CSI form (`CSI 1; mod A`, `CSI 5; mod ~`, etc.) even with
+/// the disambiguate / report-all-as-escape flags on, and have no Private
+/// Use Area codepoints assigned. See `kitty_legacy_form` for those.
 fn kitty_named_keycode(named: NamedKey) -> Option<u32> {
     Some(match named {
         NamedKey::Escape => 27,
@@ -214,29 +219,39 @@ fn kitty_named_keycode(named: NamedKey) -> Option<u32> {
         NamedKey::Tab => 9,
         NamedKey::Backspace => 127,
         NamedKey::Space => 32,
-        NamedKey::Insert => 2,
-        NamedKey::Delete => 3,
-        NamedKey::PageUp => 5,
-        NamedKey::PageDown => 6,
-        NamedKey::Home => 7,
-        NamedKey::End => 8,
-        NamedKey::ArrowUp => 57352,
-        NamedKey::ArrowDown => 57353,
-        NamedKey::ArrowLeft => 57351,
-        NamedKey::ArrowRight => 57350,
-        NamedKey::F(1) => 57364,
-        NamedKey::F(2) => 57365,
-        NamedKey::F(3) => 57366,
-        NamedKey::F(4) => 57367,
-        NamedKey::F(5) => 57368,
-        NamedKey::F(6) => 57369,
-        NamedKey::F(7) => 57370,
-        NamedKey::F(8) => 57371,
-        NamedKey::F(9) => 57372,
-        NamedKey::F(10) => 57373,
-        NamedKey::F(11) => 57374,
-        NamedKey::F(12) => 57375,
-        NamedKey::F(_) | NamedKey::Other => return None,
+        _ => return None,
+    })
+}
+
+/// Legacy-CSI form for keys that the kitty spec keeps in the `CSI ...
+/// [~ABCDEFHPQS]` family rather than the `CSI ... u` family. Returns
+/// `(keycode, final_byte)` where `final_byte` is one of `~ABCDEFHPQS`.
+/// See <https://sw.kovidgoyal.net/kitty/keyboard-protocol/#functional-key-definitions>.
+fn kitty_legacy_form(named: NamedKey) -> Option<(u32, u8)> {
+    Some(match named {
+        NamedKey::ArrowUp => (1, b'A'),
+        NamedKey::ArrowDown => (1, b'B'),
+        NamedKey::ArrowRight => (1, b'C'),
+        NamedKey::ArrowLeft => (1, b'D'),
+        NamedKey::Home => (1, b'H'),
+        NamedKey::End => (1, b'F'),
+        NamedKey::F(1) => (1, b'P'),
+        NamedKey::F(2) => (1, b'Q'),
+        NamedKey::F(3) => (1, b'R'),
+        NamedKey::F(4) => (1, b'S'),
+        NamedKey::Insert => (2, b'~'),
+        NamedKey::Delete => (3, b'~'),
+        NamedKey::PageUp => (5, b'~'),
+        NamedKey::PageDown => (6, b'~'),
+        NamedKey::F(5) => (15, b'~'),
+        NamedKey::F(6) => (17, b'~'),
+        NamedKey::F(7) => (18, b'~'),
+        NamedKey::F(8) => (19, b'~'),
+        NamedKey::F(9) => (20, b'~'),
+        NamedKey::F(10) => (21, b'~'),
+        NamedKey::F(11) => (23, b'~'),
+        NamedKey::F(12) => (24, b'~'),
+        _ => return None,
     })
 }
 
@@ -279,6 +294,14 @@ fn encode_key_kitty(
 
     match logical {
         LogicalKey::Named(named) => {
+            // Keys with a legacy CSI letter/tilde form stay in that form
+            // even under kitty progressive enhancement — that's what the
+            // spec mandates and what every other terminal does. crossterm's
+            // parser also expects this; sending PUA `CSI 57352 u` for Up
+            // would be interpreted as a literal U+E008 character.
+            if let Some((code, final_byte)) = kitty_legacy_form(*named) {
+                return Some(format_kitty_legacy(code, m, event_suffix, final_byte));
+            }
             let code = kitty_named_keycode(*named)?;
             Some(format_kitty(code, m, event_suffix, 'u'))
         }
@@ -312,6 +335,33 @@ fn encode_key_kitty(
             .filter(|t| !t.is_empty())
             .map(|t| t.as_bytes().to_vec()),
     }
+}
+
+/// Format a key in the legacy `CSI [code][;mod[:event]] <final>` form
+/// used for arrows, F-keys, Home/End, PageUp/PageDown, Insert/Delete.
+///
+/// - Letter-final keys (A/B/C/D/H/F/P/Q/R/S): the leading code is omitted
+///   when no modifier and no event-type suffix are present (`CSI A`), so
+///   apps that only handle the bare legacy form still see it.
+/// - Tilde-final keys: the leading code is always emitted (`CSI 5 ~`),
+///   since `CSI ~` alone isn't a valid functional-key encoding.
+fn format_kitty_legacy(code: u32, modifiers: u32, event_suffix: Option<&str>, final_byte: u8) -> Vec<u8> {
+    let mut out: Vec<u8> = b"\x1b[".to_vec();
+    let mods_default = modifiers == 1 && event_suffix.is_none();
+    let is_letter_final = final_byte.is_ascii_alphabetic();
+    if !is_letter_final || !mods_default {
+        out.extend_from_slice(code.to_string().as_bytes());
+    }
+    if !mods_default {
+        out.push(b';');
+        out.extend_from_slice(modifiers.to_string().as_bytes());
+        if let Some(suf) = event_suffix {
+            out.push(b':');
+            out.extend_from_slice(suf.as_bytes());
+        }
+    }
+    out.push(final_byte);
+    out
 }
 
 fn format_kitty(code: u32, modifiers: u32, event_suffix: Option<&str>, final_byte: char) -> Vec<u8> {
@@ -778,12 +828,16 @@ mod tests {
     }
 
     #[test]
-    fn kitty_arrows_use_csi_u_form() {
-        for (k, code) in [
-            (NamedKey::ArrowUp, 57352u32),
-            (NamedKey::ArrowDown, 57353),
-            (NamedKey::ArrowLeft, 57351),
-            (NamedKey::ArrowRight, 57350),
+    fn kitty_arrows_use_legacy_csi_form() {
+        // Per the kitty spec, the main arrow keys keep their legacy CSI
+        // form (`CSI A` etc.) under progressive enhancement — they have no
+        // PUA codepoint assigned. The keypad arrows (KP_*) are separate
+        // keys at codepoints 57417-57420.
+        for (k, final_byte) in [
+            (NamedKey::ArrowUp, b'A'),
+            (NamedKey::ArrowDown, b'B'),
+            (NamedKey::ArrowRight, b'C'),
+            (NamedKey::ArrowLeft, b'D'),
         ] {
             let got = enc_kitty(
                 &named(k),
@@ -793,13 +847,14 @@ mod tests {
                 KeyState::Pressed,
                 false,
             );
-            let want = format!("\x1b[{code}u");
-            assert_eq!(got.as_deref(), Some(want.as_bytes()), "arrow {k:?}");
+            let want = [b'\x1b', b'[', final_byte];
+            assert_eq!(got.as_deref(), Some(&want[..]), "arrow {k:?}");
         }
     }
 
     #[test]
-    fn kitty_ctrl_arrow_includes_modifier() {
+    fn kitty_ctrl_arrow_uses_xterm_modifier_form() {
+        // Ctrl+Up under kitty mode: `CSI 1; 5 A`, not the PUA u form.
         let got = enc_kitty(
             &named(NamedKey::ArrowUp),
             None,
@@ -808,11 +863,85 @@ mod tests {
             KeyState::Pressed,
             false,
         );
-        assert_eq!(got.as_deref(), Some(b"\x1b[57352;5u".as_ref()));
+        assert_eq!(got.as_deref(), Some(b"\x1b[1;5A".as_ref()));
+    }
+
+    #[test]
+    fn kitty_arrow_with_event_suffix_emits_keycode_and_default_modifier() {
+        // Up release with no modifiers but event reporting on: `CSI 1; 1: 3 A`.
+        let got = enc_kitty(
+            &named(NamedKey::ArrowUp),
+            None,
+            Modifiers::empty(),
+            1 | 2,
+            KeyState::Released,
+            false,
+        );
+        assert_eq!(got.as_deref(), Some(b"\x1b[1;1:3A".as_ref()));
+    }
+
+    #[test]
+    fn kitty_home_end() {
+        let home = enc_kitty(
+            &named(NamedKey::Home),
+            None,
+            Modifiers::empty(),
+            1,
+            KeyState::Pressed,
+            false,
+        );
+        assert_eq!(home.as_deref(), Some(b"\x1b[H".as_ref()));
+        let end = enc_kitty(
+            &named(NamedKey::End),
+            None,
+            Modifiers::empty(),
+            1,
+            KeyState::Pressed,
+            false,
+        );
+        assert_eq!(end.as_deref(), Some(b"\x1b[F".as_ref()));
+    }
+
+    #[test]
+    fn kitty_tilde_form_keys() {
+        // Tilde-final keys always carry their keycode, even unmodified.
+        for (k, code) in [
+            (NamedKey::Insert, 2),
+            (NamedKey::Delete, 3),
+            (NamedKey::PageUp, 5),
+            (NamedKey::PageDown, 6),
+        ] {
+            let got = enc_kitty(
+                &named(k),
+                None,
+                Modifiers::empty(),
+                1,
+                KeyState::Pressed,
+                false,
+            );
+            let want = format!("\x1b[{code}~");
+            assert_eq!(got.as_deref(), Some(want.as_bytes()), "tilde {k:?}");
+        }
+    }
+
+    #[test]
+    fn kitty_ctrl_pageup_includes_modifier() {
+        // `CSI 5; 5 ~` — keycode + modifier, tilde final.
+        let got = enc_kitty(
+            &named(NamedKey::PageUp),
+            None,
+            Modifiers::CONTROL,
+            1,
+            KeyState::Pressed,
+            false,
+        );
+        assert_eq!(got.as_deref(), Some(b"\x1b[5;5~".as_ref()));
     }
 
     #[test]
     fn kitty_f_keys() {
+        // F1-F4 use the `1 P/Q/R/S` letter-final form; F5-F12 use the
+        // tilde-final form with the conventional keycodes (15, 17-24).
         let f1 = enc_kitty(
             &named(NamedKey::F(1)),
             None,
@@ -821,7 +950,25 @@ mod tests {
             KeyState::Pressed,
             false,
         );
-        assert_eq!(f1.as_deref(), Some(b"\x1b[57364u".as_ref()));
+        assert_eq!(f1.as_deref(), Some(b"\x1b[P".as_ref()));
+        let f4 = enc_kitty(
+            &named(NamedKey::F(4)),
+            None,
+            Modifiers::empty(),
+            1,
+            KeyState::Pressed,
+            false,
+        );
+        assert_eq!(f4.as_deref(), Some(b"\x1b[S".as_ref()));
+        let f5 = enc_kitty(
+            &named(NamedKey::F(5)),
+            None,
+            Modifiers::empty(),
+            1,
+            KeyState::Pressed,
+            false,
+        );
+        assert_eq!(f5.as_deref(), Some(b"\x1b[15~".as_ref()));
         let f12 = enc_kitty(
             &named(NamedKey::F(12)),
             None,
@@ -830,7 +977,20 @@ mod tests {
             KeyState::Pressed,
             false,
         );
-        assert_eq!(f12.as_deref(), Some(b"\x1b[57375u".as_ref()));
+        assert_eq!(f12.as_deref(), Some(b"\x1b[24~".as_ref()));
+    }
+
+    #[test]
+    fn kitty_ctrl_f1_uses_modifier_form() {
+        let got = enc_kitty(
+            &named(NamedKey::F(1)),
+            None,
+            Modifiers::CONTROL,
+            1,
+            KeyState::Pressed,
+            false,
+        );
+        assert_eq!(got.as_deref(), Some(b"\x1b[1;5P".as_ref()));
     }
 
     #[test]
