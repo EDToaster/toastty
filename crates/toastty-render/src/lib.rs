@@ -1218,31 +1218,46 @@ impl Renderer {
             }
         }
 
-        // Config error banner: full-width, multi-line, red bg / white
-        // fg, top-aligned. Painted after the debug overlay so on a
-        // narrow window where they would otherwise overlap, the banner
-        // wins on its rows. We overpaint a bg quad over every cell in
-        // every banner row so previous-frame content underneath is
-        // erased under LoadOp::Load.
+        // Config error banner: full-width, multi-line, dark-red bg /
+        // white fg, anchored to the BOTTOM of the viewport. We have to
+        // emit two cover quads per banner cell because the cell
+        // pipeline draws in two passes (bg + glyph) and the term's
+        // own glyphs land in the glyph pass too — without an opaque
+        // glyph-pass cover, the cells underneath bleed through and
+        // mix into the banner text. So per row we push:
+        //   1. FLAG_NO_GLYPH bg quad — bg pass: paints the banner color
+        //      where the term bg used to be.
+        //   2. FLAG_UNDERLINE cover quad — glyph pass: re-paints the
+        //      banner color over any term glyphs that would otherwise
+        //      render on top.
+        //   3. The banner's own glyph quads — glyph pass: paint after
+        //      the cover, so they land cleanly.
+        // alpha ≈ 0.95 gives a hint of translucency so the panel
+        // doesn't feel hard-edged without letting the underlying
+        // grid be legible through it.
         if let Some(banner) = self.error_banner.as_deref() {
             #[allow(clippy::cast_precision_loss)]
             let viewport_w = self.config.width as f32;
+            #[allow(clippy::cast_precision_loss)]
+            let viewport_h = self.config.height as f32;
             let cell_w = cell_size.0;
             let cell_h = cell_size.1;
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let cols = (viewport_w / cell_w).floor().max(1.0) as u32;
-            let banner_bg = [0.55, 0.05, 0.05, 1.0];
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let num_lines = banner.lines().count().max(1) as u32;
+            #[allow(clippy::cast_precision_loss)]
+            let banner_top_y = (viewport_h - (num_lines as f32) * cell_h).max(0.0);
+            let banner_bg = [0.42, 0.03, 0.03, 0.95];
             let banner_fg = [1.0, 1.0, 1.0, 1.0];
             for (row_idx, line) in banner.lines().enumerate() {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-                let y0 = (row_idx as f32) * cell_h;
-                // 1) Paint the full-width bg row so previous content
-                //    is overpainted. Use a single quad spanning all
-                //    columns of this row (one CellInstance per cell
-                //    keeps the renderer's per-instance pipeline happy).
+                let y0 = banner_top_y + (row_idx as f32) * cell_h;
+                // bg-pass + glyph-pass cover, one of each per column.
                 for col in 0..cols {
                     #[allow(clippy::cast_precision_loss)]
                     let x0 = (col as f32) * cell_w;
+                    // bg pass cover.
                     instances.push(CellInstance {
                         pos: [x0, y0],
                         size: [cell_w, cell_h],
@@ -1253,9 +1268,22 @@ impl Renderer {
                         flags: crate::text::instance::FLAG_NO_GLYPH,
                         pad: [0; 3],
                     });
+                    // glyph pass cover. FLAG_UNDERLINE in fs_glyph
+                    // emits a solid premultiplied `in.bg`, so we
+                    // overpaint any term glyphs the dirty builder
+                    // emitted for these rows.
+                    instances.push(CellInstance {
+                        pos: [x0, y0],
+                        size: [cell_w, cell_h],
+                        uv_min: [0.0, 0.0],
+                        uv_max: [0.0, 0.0],
+                        fg: banner_fg,
+                        bg: banner_bg,
+                        flags: crate::text::instance::FLAG_UNDERLINE
+                            | crate::text::instance::FLAG_NO_GLYPH,
+                        pad: [0; 3],
+                    });
                 }
-                // 2) Shape the line text and emit glyph instances on
-                //    top of the bg row. Truncate to viewport width.
                 if line.is_empty() {
                     continue;
                 }
