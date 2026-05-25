@@ -188,12 +188,18 @@ impl RgpScene {
             return;
         }
         let delta_rad = elapsed.as_secs_f32() * ANIMATION_RATE_RAD_PER_S;
-        let two_pi = std::f32::consts::TAU;
+        // Phase is allowed to grow unbounded. The renderer applies
+        // per-axis multipliers (e.g. 0.7×, 1.0×, 1.3×) when building
+        // the model matrix; wrapping the shared phase at TAU would
+        // create discontinuities on every axis whose multiplier isn't
+        // integral, snapping the object back ~every 6 s. sin/cos
+        // tolerate large arguments for many hours of session before
+        // precision degrades.
         for p in self.placements.values_mut() {
             if !p.style.animate {
                 continue;
             }
-            p.animation_phase_rad = (p.animation_phase_rad + delta_rad) % two_pi;
+            p.animation_phase_rad += delta_rad;
         }
     }
 
