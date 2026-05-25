@@ -192,7 +192,9 @@ pub(crate) fn render_term_offscreen(term: &Term, width: u32, height: u32) -> Rgb
             ],
         };
 
-        text_pipeline.render(&device, &queue, &mut rp, &bind_group, globals, &instances);
+        text_pipeline.upload(&device, &queue, globals, &instances);
+        text_pipeline.render_bg(&mut rp, &bind_group, instances.len());
+        text_pipeline.render_glyph(&mut rp, &bind_group, instances.len());
     }
 
     encoder.copy_texture_to_buffer(

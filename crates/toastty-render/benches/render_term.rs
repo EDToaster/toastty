@@ -46,6 +46,7 @@ struct Harness {
     pipeline: TextPipeline,
     bind_group: wgpu::BindGroup,
     target_view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
     width: u32,
     height: u32,
     theme: Theme,
@@ -94,6 +95,22 @@ impl Harness {
         });
         let target_view = target.create_view(&TextureViewDescriptor::default());
 
+        let depth = device.create_texture(&TextureDescriptor {
+            label: Some("bench depth"),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Depth32Float,
+            usage: TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth.create_view(&TextureViewDescriptor::default());
+
         let rasterizer = GlyphRasterizer::new(
             &device,
             16.0,
@@ -113,6 +130,7 @@ impl Harness {
             pipeline,
             bind_group,
             target_view,
+            depth_view,
             width,
             height,
             theme: Theme::default_dark(),
@@ -209,19 +227,24 @@ impl Harness {
                         store: StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(Operations {
+                        load: LoadOp::Clear(1.0),
+                        store: StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.pipeline.render(
-                &self.device,
-                &self.queue,
-                &mut rp,
-                &self.bind_group,
-                globals,
-                instances,
-            );
+            self.pipeline
+                .upload(&self.device, &self.queue, globals, instances);
+            self.pipeline
+                .render_bg(&mut rp, &self.bind_group, instances.len());
+            self.pipeline
+                .render_glyph(&mut rp, &self.bind_group, instances.len());
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -346,19 +369,24 @@ impl Harness {
                         store: StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(Operations {
+                        load: LoadOp::Clear(1.0),
+                        store: StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.pipeline.render(
-                &self.device,
-                &self.queue,
-                &mut rp,
-                &self.bind_group,
-                globals,
-                instances,
-            );
+            self.pipeline
+                .upload(&self.device, &self.queue, globals, instances);
+            self.pipeline
+                .render_bg(&mut rp, &self.bind_group, instances.len());
+            self.pipeline
+                .render_glyph(&mut rp, &self.bind_group, instances.len());
         }
         let enc_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
 

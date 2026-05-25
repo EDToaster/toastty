@@ -1263,16 +1263,32 @@ impl Renderer {
             });
 
             // Draw order:
-            //   1. RGP 3D pass — writes color + depth.
-            //   2. below-text images — depth-tested at z=0.5.
-            //   3. text          — depth-tested at z=0.5.
-            //   4. above-text images.
-            // Z-ordering between 3D and text/images is handled by
+            //   1. text bg pass — no depth test/write, so 3D overpaints
+            //      cell backgrounds (3D shows through).
+            //   2. RGP 3D pass — writes color + depth.
+            //   3. below-text images — depth-tested at z=0.5.
+            //   4. text glyph pass — depth-tested at z=0.5; cursor,
+            //      underline, and glyphs live here.
+            //   5. above-text images.
+            // Z-ordering between 3D and {glyphs, images} is handled by
             // the per-placement `depth` field: objects with
             // `depth < 0` win the depth test against the z=0.5 cell
-            // layer, `depth > 0` lose to it.
+            // layer, `depth > 0` lose to it. Cell bg is always behind.
             #[allow(clippy::cast_precision_loss)] // viewport in 16k-px range.
             let viewport = (self.config.width as f32, self.config.height as f32);
+
+            // Upload text instances + globals once; both bg and glyph
+            // passes share the buffer. Drop the &mut borrow before
+            // taking the shared refs the render pass holds.
+            {
+                let text_mut = self.text.as_mut().expect("text init checked above");
+                text_mut.pipeline.upload(&self.device, &self.queue, globals, &instances);
+            }
+            let text_ref = self.text.as_ref().expect("text init checked above");
+            let inst_count = instances.len();
+            text_ref
+                .pipeline
+                .render_bg(&mut rp, &text_ref.bind_group, inst_count);
 
             if let Some(rgp_pipe) = self.rgp_pipeline.as_mut() {
                 rgp_pipe.render(
@@ -1298,15 +1314,9 @@ impl Renderer {
                 );
             }
 
-            let text = self.text.as_mut().expect("text init checked above");
-            text.pipeline.render(
-                &self.device,
-                &self.queue,
-                &mut rp,
-                &text.bind_group,
-                globals,
-                &instances,
-            );
+            text_ref
+                .pipeline
+                .render_glyph(&mut rp, &text_ref.bind_group, inst_count);
 
             if let Some(img_pipe) = self.image_pipeline.as_mut()
                 && !self.image_instances_above.is_empty()

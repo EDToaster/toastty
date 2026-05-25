@@ -28,8 +28,21 @@ pub struct GlobalsUbo {
 }
 
 /// The text/cell pipeline plus its bind-group skeleton.
+///
+/// The shader has two fragment entry points so the cell layer can render
+/// in two passes with the RGP 3D pass sandwiched between them:
+///   * `bg_pipeline` runs before RGP. Depth test/write disabled so 3D
+///     overpaints the bg. Straight-alpha blend.
+///   * `glyph_pipeline` runs after RGP. Depth at z=0.5 LessEqual so
+///     glyphs respect the protocol `depth` field. Premultiplied-alpha
+///     blend.
+///
+/// Both pipelines share the same instance buffer and bind group; each
+/// shader entry point uses `discard` to skip the instances it doesn't
+/// care about.
 pub struct TextPipeline {
-    pipeline: RenderPipeline,
+    bg_pipeline: RenderPipeline,
+    glyph_pipeline: RenderPipeline,
     bind_group_layout: BindGroupLayout,
     instance_buffer: Buffer,
     instance_capacity: usize,
@@ -102,7 +115,8 @@ impl TextPipeline {
             immediate_size: 0,
         });
 
-        let pipeline = make_pipeline(device, &shader, &pipeline_layout, color_format);
+        let bg_pipeline = make_bg_pipeline(device, &shader, &pipeline_layout, color_format);
+        let glyph_pipeline = make_glyph_pipeline(device, &shader, &pipeline_layout, color_format);
 
         // Reasonable starting capacity. Grows on demand.
         let instance_capacity = 1024;
@@ -121,7 +135,8 @@ impl TextPipeline {
         });
 
         Self {
-            pipeline,
+            bg_pipeline,
+            glyph_pipeline,
             bind_group_layout,
             instance_buffer,
             instance_capacity,
@@ -171,13 +186,12 @@ impl TextPipeline {
         })
     }
 
-    /// Upload globals + instances and record the draw call into `pass`.
-    pub fn render<'pass>(
-        &'pass mut self,
+    /// Upload globals + instances. Call this once per frame before any
+    /// of the per-pass `render_*` methods; both passes share the buffer.
+    pub fn upload(
+        &mut self,
         device: &Device,
         queue: &Queue,
-        pass: &mut wgpu::RenderPass<'pass>,
-        bind_group: &'pass BindGroup,
         globals: GlobalsUbo,
         instances: &[CellInstance],
     ) {
@@ -200,16 +214,48 @@ impl TextPipeline {
         }
 
         queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
+    }
 
-        pass.set_pipeline(&self.pipeline);
+    /// Record the bg-pass draw. Runs before the RGP 3D pass so 3D
+    /// objects can overpaint cell backgrounds.
+    pub fn render_bg<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        bind_group: &'pass BindGroup,
+        instance_count: usize,
+    ) {
+        if instance_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.bg_pipeline);
         pass.set_bind_group(0, bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-        // Each instance is a 4-vertex triangle strip.
-        pass.draw(0..4, 0..instances.len() as u32);
+        pass.draw(0..4, 0..instance_count as u32);
+    }
+
+    /// Record the glyph-pass draw. Runs after the RGP 3D pass; glyphs
+    /// at z=0.5 with LessEqual depth test so per-placement `depth`
+    /// controls foreground/background ordering.
+    pub fn render_glyph<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        bind_group: &'pass BindGroup,
+        instance_count: usize,
+    ) {
+        if instance_count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.glyph_pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+        pass.draw(0..4, 0..instance_count as u32);
     }
 }
 
-fn make_pipeline(
+/// BG pass pipeline. Depth test/write disabled — the bg always paints
+/// behind the RGP 3D pass (which runs immediately after). Straight-alpha
+/// blend; in practice cell bg is opaque (alpha=1.0).
+fn make_bg_pipeline(
     device: &Device,
     shader: &ShaderModule,
     pipeline_layout: &wgpu::PipelineLayout,
@@ -218,7 +264,7 @@ fn make_pipeline(
     let vertex_layout = instance_buffer_layout();
 
     device.create_render_pipeline(&RenderPipelineDescriptor {
-        label: Some("toastty-text pipeline"),
+        label: Some("toastty-text bg pipeline"),
         layout: Some(pipeline_layout),
         vertex: VertexState {
             module: shader,
@@ -235,9 +281,77 @@ fn make_pipeline(
             unclipped_depth: false,
             conservative: false,
         },
-        // Cell layer writes z=0.5 (from the shader); RGP pass tests
-        // against this so 3D objects can occlude or sit underneath
-        // text by their per-placement `depth` field.
+        // BG always loses to anything drawn after it. Always-pass with
+        // no depth write so the RGP pass sees the cleared depth buffer.
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: MultisampleState {
+            count: 1,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        fragment: Some(FragmentState {
+            module: shader,
+            entry_point: Some("fs_bg"),
+            compilation_options: PipelineCompilationOptions::default(),
+            targets: &[Some(ColorTargetState {
+                format: color_format,
+                blend: Some(BlendState {
+                    color: BlendComponent {
+                        src_factor: BlendFactor::SrcAlpha,
+                        dst_factor: BlendFactor::OneMinusSrcAlpha,
+                        operation: BlendOperation::Add,
+                    },
+                    alpha: BlendComponent {
+                        src_factor: BlendFactor::One,
+                        dst_factor: BlendFactor::OneMinusSrcAlpha,
+                        operation: BlendOperation::Add,
+                    },
+                }),
+                write_mask: ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Glyph pass pipeline. Writes z=0.5 (from the shader) with LessEqual
+/// so RGP `depth < 0` objects occlude glyphs and `depth > 0` lose to
+/// them. Premultiplied-alpha blend — the glyph fragment shader already
+/// premultiplies mono mask coverage; the color atlas is premultiplied
+/// at upload.
+fn make_glyph_pipeline(
+    device: &Device,
+    shader: &ShaderModule,
+    pipeline_layout: &wgpu::PipelineLayout,
+    color_format: TextureFormat,
+) -> RenderPipeline {
+    let vertex_layout = instance_buffer_layout();
+
+    device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("toastty-text glyph pipeline"),
+        layout: Some(pipeline_layout),
+        vertex: VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: PipelineCompilationOptions::default(),
+            buffers: &[vertex_layout],
+        },
+        primitive: PrimitiveState {
+            topology: PrimitiveTopology::TriangleStrip,
+            strip_index_format: None,
+            front_face: FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: Some(true),
@@ -252,13 +366,13 @@ fn make_pipeline(
         },
         fragment: Some(FragmentState {
             module: shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some("fs_glyph"),
             compilation_options: PipelineCompilationOptions::default(),
             targets: &[Some(ColorTargetState {
                 format: color_format,
                 blend: Some(BlendState {
                     color: BlendComponent {
-                        src_factor: BlendFactor::SrcAlpha,
+                        src_factor: BlendFactor::One,
                         dst_factor: BlendFactor::OneMinusSrcAlpha,
                         operation: BlendOperation::Add,
                     },

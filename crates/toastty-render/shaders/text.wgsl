@@ -8,7 +8,16 @@
 //   - cell position + size in pixels
 //   - atlas UV range in pixels (uv_min = uv_max means "no glyph")
 //   - foreground/background color
-//   - flag bits (cursor, color glyph, no glyph)
+//   - flag bits (cursor, color glyph, no glyph, underline)
+//
+// Two fragment entry points so the cell layer can render in two passes
+// with the RGP 3D pass sandwiched between them:
+//   - `fs_bg`   — paints cell backgrounds. Runs before RGP with depth
+//                 test/write disabled, so 3D objects overpaint bg.
+//   - `fs_glyph` — paints glyphs, cursor, underline. Runs after RGP at
+//                  z=0.5 with LessEqual depth test, so 3D objects with
+//                  protocol `depth < 0` occlude glyphs (and depth > 0
+//                  glyphs occlude 3D).
 //
 // Build-time validated by `build.rs`.
 
@@ -44,6 +53,7 @@ struct VsOut {
 const FLAG_CURSOR: u32       = 1u;
 const FLAG_COLOR_GLYPH: u32  = 2u;
 const FLAG_NO_GLYPH: u32     = 4u;
+const FLAG_UNDERLINE: u32    = 8u;
 
 @vertex
 fn vs_main(
@@ -79,10 +89,11 @@ fn vs_main(
     let has_glyph = 1.0 - max(no_glyph_flagged, zero_extent);
 
     var out: VsOut;
-    // NDC z = 0.5: cell layer sits in the middle of the depth
+    // NDC z = 0.5: cell glyph layer sits in the middle of the depth
     // buffer so RGP objects with protocol `depth < 0` render in
-    // front and `depth > 0` render behind. See
-    // `docs/decisions/rgp-protocol.md` §3.
+    // front and `depth > 0` render behind. The bg pass uses a
+    // pipeline with depth test/write disabled, so this z is only
+    // consulted by the glyph pass.
     out.clip = vec4<f32>(clip_x, clip_y, 0.5, 1.0);
     out.uv = vec2<f32>(u, v);
     out.fg = inst.fg;
@@ -92,28 +103,57 @@ fn vs_main(
     return out;
 }
 
+// Background pass. Paints only cell-sized bg quads (FLAG_NO_GLYPH
+// instances that aren't cursors or underline strips). Output is
+// straight-alpha; the pipeline uses SrcAlpha/OneMinusSrcAlpha blend.
 @fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Cursor: solid bg fill, no glyph (yet — could overlay character
-    // later by also passing the cursor's underlying cell).
+fn fs_bg(in: VsOut) -> @location(0) vec4<f32> {
+    // Cursor + underline are foreground decorations — they render in
+    // the glyph pass at z=0.5 so 3D can occlude them.
+    if ((in.flags & (FLAG_CURSOR | FLAG_UNDERLINE)) != 0u) {
+        discard;
+    }
+    // Glyph-shaped instances would only paint a glyph-sized rect, not
+    // the full cell; the cell bg is emitted as a separate FLAG_NO_GLYPH
+    // instance and handled above.
+    if (in.has_glyph >= 0.5) {
+        discard;
+    }
+    return in.bg;
+}
+
+// Glyph pass. Paints glyphs, cursor blocks, and underline strips. Output
+// is premultiplied alpha; the pipeline uses One/OneMinusSrcAlpha blend.
+@fragment
+fn fs_glyph(in: VsOut) -> @location(0) vec4<f32> {
+    // Cursor: solid block. The cursor color lives in `bg` (see
+    // CellInstance::cursor_for_shape). Emit premultiplied.
     if ((in.flags & FLAG_CURSOR) != 0u) {
-        return in.bg;
+        return vec4<f32>(in.bg.rgb * in.bg.a, in.bg.a);
     }
 
+    // Underline strip: SGR underline / OSC 8 hyperlink. The color is
+    // stored in `bg` for backward compatibility with the old combined
+    // shader (see `underline_instance`).
+    if ((in.flags & FLAG_UNDERLINE) != 0u) {
+        return vec4<f32>(in.bg.rgb * in.bg.a, in.bg.a);
+    }
+
+    // Plain bg quad — handled by the bg pass, skip here.
     if (in.has_glyph < 0.5) {
-        return in.bg;
+        discard;
     }
 
     let is_color = (in.flags & FLAG_COLOR_GLYPH) != 0u;
     if (is_color) {
-        let s = textureSampleLevel(color_atlas, atlas_sampler, in.uv, 0.0);
-        // Pre-multiplied: composite over the bg.
-        return vec4<f32>(s.rgb + in.bg.rgb * (1.0 - s.a), s.a + in.bg.a * (1.0 - s.a));
+        // Color atlas is already premultiplied.
+        return textureSampleLevel(color_atlas, atlas_sampler, in.uv, 0.0);
     }
 
-    // Monochrome glyph: sample alpha from R channel; blend fg over bg.
+    // Monochrome glyph: mask in R channel, modulated by fg color.
+    // Output premultiplied so it blends correctly over whatever the bg
+    // pass / RGP pass laid down.
     let mask = textureSampleLevel(mask_atlas, atlas_sampler, in.uv, 0.0).r;
-    let rgb = mix(in.bg.rgb, in.fg.rgb, mask);
-    let a = mix(in.bg.a, in.fg.a, mask);
-    return vec4<f32>(rgb, a);
+    let a = mask * in.fg.a;
+    return vec4<f32>(in.fg.rgb * a, a);
 }
