@@ -223,14 +223,19 @@ impl Rgp3dPipeline {
             let rx = rotate_x_deg(p.style.rotation[0]);
             let ry = rotate_y_deg(p.style.rotation[1]);
             let rz = rotate_z_deg(p.style.rotation[2]);
-            // M12c: `animate=1` rotates the cube around screen-Y
-            // (world Y), composed AFTER the protocol's pose so the
-            // app's chosen `rx/ry/rz` selects an orientation and
-            // the animation spins it around the screen-vertical
-            // axis. `Term::tick_rgp_animations` updates the phase
-            // each frame; the renderer just reads the current
-            // value here.
-            let r_animate = rotate_y_deg(p.animation_phase_rad.to_degrees());
+            // M12c: `animate=1` tumbles the object around all three
+            // world axes simultaneously, composed AFTER the protocol's
+            // pose so the app's chosen `rx/ry/rz` selects a starting
+            // orientation and the animation spins it from there.
+            // Per-axis multipliers are irrational w.r.t. each other so
+            // the object doesn't quickly realign to its starting pose.
+            // `Term::tick_rgp_animations` updates the phase each frame.
+            let phase_deg = p.animation_phase_rad.to_degrees();
+            let r_animate = compose(&[
+                rotate_z_deg(phase_deg * 1.3),
+                rotate_y_deg(phase_deg),
+                rotate_x_deg(phase_deg * 0.7),
+            ]);
             // Protocol `depth` maps to pixel-z via the decision §3
             // factor: `ndc_z = 0.5 + 0.05 * depth` and the ortho
             // scales pixel z by `0.5 / Z_HALF_RANGE_PX`, so
