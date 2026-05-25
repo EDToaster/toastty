@@ -140,6 +140,13 @@ pub enum Event {
         position: (f64, f64),
         modifiers: Modifiers,
     },
+    /// The cursor moved over the window. Dispatched on every winit
+    /// `CursorMoved` — the app is expected to filter at cell granularity
+    /// and against the active DECSET 1000/1002/1003 mouse mode.
+    MouseMotion {
+        position: (f64, f64),
+        modifiers: Modifiers,
+    },
     /// Scroll wheel / trackpad scroll. `kind` distinguishes a discrete
     /// notch (`Lines`) from a continuous pixel stream (`Pixels`, the
     /// usual macOS trackpad path including inertial momentum frames).

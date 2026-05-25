@@ -256,6 +256,11 @@ pub struct Renderer {
     rgp_cache: GpuAssetCache,
     /// Last `Term::rgp_revision()` we synced.
     rgp_revision_seen: u32,
+    /// Optional debug overlay text rendered at the top-right of the
+    /// surface every frame (e.g. an FPS counter). When `Some`, the
+    /// skip-submit gate is bypassed so the overlay refreshes even when
+    /// the term grid is idle.
+    debug_overlay: Option<String>,
 }
 
 /// Build the scratch render target. Same dims/format as the surface;
@@ -528,6 +533,7 @@ impl Renderer {
             rgp_pipeline: None,
             rgp_cache: GpuAssetCache::new(),
             rgp_revision_seen: u32::MAX,
+            debug_overlay: None,
         })
     }
 
@@ -574,9 +580,9 @@ impl Renderer {
     /// Initialize the text rendering pipeline with an explicit
     /// line-height multiplier.
     ///
-    /// `line_height` is `× font_size_px`. The renderer's snapshots were
-    /// captured at [`DEFAULT_LINE_HEIGHT`] (`1.4`). Callers loading a
-    /// `toastty_config::FontConfig` should pass `font.line_height` here.
+    /// `line_height` is `× font_size_px`. The default is
+    /// [`DEFAULT_LINE_HEIGHT`]. Callers loading a `toastty_config::FontConfig`
+    /// should pass `font.line_height` here.
     pub fn with_font_ex(&mut self, font_name: Option<&str>, font_size_px: f32, line_height: f32) {
         // Resolve the font family. We always bundle FiraMono so the
         // caller can pass `None` and still get text.
@@ -680,6 +686,20 @@ impl Renderer {
             (None, Some(b)) => Some(b),
             (None, None) => None,
         }
+    }
+
+    /// Set (or clear) a debug overlay string painted at the top-right
+    /// corner each frame. Used by the binary's `TOASTTY_DEBUG` FPS
+    /// counter. While `Some`, the renderer skips its damage-only
+    /// short-circuit so the overlay text refreshes even on an idle grid.
+    pub fn set_debug_overlay(&mut self, text: Option<String>) {
+        self.debug_overlay = text;
+    }
+
+    /// True when a debug overlay is currently set.
+    #[must_use]
+    pub fn has_debug_overlay(&self) -> bool {
+        self.debug_overlay.is_some()
     }
 
     /// Current theme.
@@ -855,6 +875,7 @@ impl Renderer {
             && !cursor_animation_due
             && !rgp_animation_active
             && !self.needs_full_clear
+            && self.debug_overlay.is_none()
         {
             return Ok(RenderOutcome::Skipped);
         }
@@ -1037,6 +1058,67 @@ impl Renderer {
         if let Some(t) = t_bi {
             let ms = t.elapsed().as_secs_f64() * 1000.0;
             tracing::info!(target: "render_trace", "build_instances n={} took={ms:.3}ms", instances.len());
+        }
+
+        // Debug overlay (TOASTTY_DEBUG FPS counter, etc). Shape the
+        // string fresh each frame and append cell instances aligned to
+        // the top-right corner of the viewport. The per-char glyph cache
+        // makes the shape call cheap for short strings.
+        //
+        // Each frame we re-emit a bg quad over every overlay cell so the
+        // previous frame's text is overpainted under LoadOp::Load — this
+        // is why the caller pads to a fixed width.
+        if let Some(overlay) = self.debug_overlay.clone() {
+            let chars: Vec<char> = overlay.chars().collect();
+            #[allow(clippy::cast_possible_truncation)]
+            let n = chars.len() as u16;
+            let lg = text.rasterizer.shape_line(
+                &self.queue,
+                &overlay,
+                term.grapheme_cluster_mode(),
+            );
+            #[allow(clippy::cast_precision_loss)]
+            let viewport_w = self.config.width as f32;
+            let cell_w = cell_size.0;
+            let cell_h = cell_size.1;
+            let overlay_bg = [0.0, 0.0, 0.0, 0.85];
+            let overlay_fg = [0.95, 0.85, 0.30, 1.0];
+            let x0 = viewport_w - f32::from(n) * cell_w;
+            for (i, ch) in chars.iter().enumerate() {
+                #[allow(clippy::cast_possible_truncation)]
+                let col = i as u16;
+                let pos = [x0 + f32::from(col) * cell_w, 0.0];
+                instances.push(CellInstance {
+                    pos,
+                    size: [cell_w, cell_h],
+                    uv_min: [0.0, 0.0],
+                    uv_max: [0.0, 0.0],
+                    fg: overlay_fg,
+                    bg: overlay_bg,
+                    flags: crate::text::instance::FLAG_NO_GLYPH,
+                    pad: [0; 3],
+                });
+                if ch.is_whitespace() {
+                    continue;
+                }
+                if let Some(slot) = lg.by_column.get(&(col, *ch)) {
+                    let flags = if slot.is_color {
+                        crate::text::instance::FLAG_COLOR_GLYPH
+                    } else {
+                        0
+                    };
+                    instances.push(CellInstance {
+                        pos: [pos[0] + slot.glyph_offset[0], pos[1] + slot.glyph_offset[1]],
+                        size: slot.glyph_size,
+                        uv_min: slot.uv_min,
+                        uv_max: slot.uv_max,
+                        fg: overlay_fg,
+                        bg: overlay_bg,
+                        flags,
+                        pad: [0; 3],
+                    });
+                }
+            }
         }
 
         // M11a: build image instances split by z sign. We clear the

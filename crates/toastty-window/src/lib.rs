@@ -383,6 +383,15 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<'_, A> {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x, position.y);
+                let leds = led::read_led_state();
+                let modifiers = translate_modifiers_with_leds(self.modifiers, leds);
+                self.dispatch(
+                    Event::MouseMotion {
+                        position: self.mouse_pos,
+                        modifiers,
+                    },
+                    event_loop,
+                );
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let kind = match delta {

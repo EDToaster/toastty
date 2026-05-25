@@ -17,13 +17,13 @@ pub struct FontConfig {
 }
 
 impl FontConfig {
-    /// Schema defaults: Fira Mono, 16 px, 1.4× line height.
+    /// Schema defaults: Fira Mono, 16 px, 1.20× line height.
     #[must_use]
     pub fn defaults() -> Self {
         Self {
             family: "Fira Mono".to_string(),
             size_px: 16.0,
-            line_height: 1.4,
+            line_height: 1.20,
         }
     }
 }
@@ -43,7 +43,7 @@ mod tests {
         let f = FontConfig::defaults();
         assert_eq!(f.family, "Fira Mono");
         assert!((f.size_px - 16.0).abs() < 1e-6);
-        assert!((f.line_height - 1.4).abs() < 1e-6);
+        assert!((f.line_height - 1.20).abs() < 1e-6);
     }
 
     #[test]
@@ -56,7 +56,7 @@ mod tests {
         let f: FontConfig = toml::from_str("size_px = 24.0\n").expect("parse");
         assert!((f.size_px - 24.0).abs() < 1e-6);
         assert_eq!(f.family, "Fira Mono");
-        assert!((f.line_height - 1.4).abs() < 1e-6);
+        assert!((f.line_height - 1.20).abs() < 1e-6);
     }
 
     #[test]

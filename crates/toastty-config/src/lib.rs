@@ -162,7 +162,7 @@ mod tests {
         let cfg = Config::defaults();
         assert_eq!(cfg.font.family, "Fira Mono");
         assert!((cfg.font.size_px - 16.0).abs() < 1e-6);
-        assert!((cfg.font.line_height - 1.4).abs() < 1e-6);
+        assert!((cfg.font.line_height - 1.20).abs() < 1e-6);
         assert_eq!(cfg.cursor.shape, CursorShape::Block);
         assert!(cfg.cursor.blink);
         assert_eq!(cfg.shell.program, "auto");
@@ -183,7 +183,7 @@ mod tests {
         assert!((cfg.font.size_px - 18.0).abs() < 1e-6);
         // Other font fields still default.
         assert_eq!(cfg.font.family, "Fira Mono");
-        assert!((cfg.font.line_height - 1.4).abs() < 1e-6);
+        assert!((cfg.font.line_height - 1.20).abs() < 1e-6);
         // Other sections still default.
         assert_eq!(cfg.cursor.shape, CursorShape::Block);
     }

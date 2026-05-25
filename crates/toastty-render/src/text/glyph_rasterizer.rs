@@ -25,11 +25,12 @@ use crate::text::instance::GlyphSlot;
 pub const ATLAS_W: u32 = 1024;
 pub const ATLAS_H: u32 = 1024;
 
-/// Default line-height multiplier (× `font_size_px`). 1.25 was too tight
-/// (descenders kissed the next line's ascenders); 1.4 matches what most
-/// terminals use. The `toastty-config` schema defaults to the same value
-/// so default-no-config renders match the M4b snapshots byte-for-byte.
-pub const DEFAULT_LINE_HEIGHT_RATIO: f32 = 1.4;
+/// Default line-height multiplier (× `font_size_px`). 1.20 is tight enough
+/// that adjacent rows of box-drawing characters connect (`│` to `│`,
+/// `┴` to `┬`) while still keeping enough breathing room above descenders
+/// for most monospace fonts. The `toastty-config` schema defaults to the
+/// same value.
+pub const DEFAULT_LINE_HEIGHT_RATIO: f32 = 1.20;
 
 struct PendingGlyph {
     glyph: LayoutGlyph,
@@ -141,7 +142,7 @@ impl GlyphRasterizer {
         }
 
         // Line height = `font_size * line_height_ratio`. See
-        // [`DEFAULT_LINE_HEIGHT_RATIO`] for the rationale on `1.4`.
+        // [`DEFAULT_LINE_HEIGHT_RATIO`] for the rationale on the default.
         let metrics = Metrics::new(font_size, font_size * line_height_ratio);
 
         // Determine cell size by shaping the reference glyph "M".

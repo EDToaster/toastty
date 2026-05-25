@@ -12,6 +12,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -50,6 +51,11 @@ const DEFAULT_WINDOW_SIZE: (u32, u32) = (1280, 800);
 /// 16 ms ≈ 60 Hz — fast enough to feel smooth on macOS trackpad
 /// inertia frames without burning the event loop when idle.
 const VIEWPORT_ANIM_TICK: Duration = Duration::from_millis(16);
+
+/// Refresh cadence for the `TOASTTY_DEBUG` FPS overlay. Keeps the text
+/// visibly updating when the grid is idle (otherwise the renderer would
+/// short-circuit to skip-submit and the displayed FPS would freeze).
+const DEBUG_OVERLAY_TICK: Duration = Duration::from_millis(250);
 
 /// Convert a config `SmoothingFunction` into the per-frame easing
 /// the term consumes. Tuning constants are local to the binary so
@@ -163,6 +169,11 @@ struct Toastty {
     /// matching release). Used to fill the "button held" slot of motion
     /// reports under DECSET 1002.
     mouse_held: Option<MouseButton>,
+    /// Last (col, row) reported to the PTY via a motion event. Tracked
+    /// so we only emit a motion report when the pointer crosses into a
+    /// new cell — xterm convention, and avoids flooding the PTY with
+    /// one event per pixel of sub-cell trackpad movement.
+    last_reported_cell: Option<(u16, u16)>,
     /// Clipboard handle (lazily initialised on first paste). `arboard`
     /// keeps a connection to the OS clipboard server; constructing it
     /// failed on the user's box is recoverable — we just log + skip.
@@ -183,6 +194,11 @@ struct Toastty {
     /// Last render-time we ticked the viewport animation. Used to
     /// compute `dt` for [`Term::advance_viewport`].
     last_viewport_tick: Option<Instant>,
+    /// When `TOASTTY_DEBUG` is set, we maintain a ring of recent frame
+    /// timestamps and push a "<n> FPS" overlay string to the renderer
+    /// every frame. Empty / disabled when the env var is unset.
+    debug_enabled: bool,
+    frame_times: VecDeque<Instant>,
 }
 
 impl Toastty {
@@ -211,11 +227,14 @@ impl Toastty {
             last_title: None,
             mouse_pos: (0.0, 0.0),
             mouse_held: None,
+            last_reported_cell: None,
             clipboard: None,
             pty_log: PtyLogger::from_env(),
             alt_scroll_pixel_accum: 0.0,
             scroll_pixel_residual: 0.0,
             last_viewport_tick: None,
+            debug_enabled: std::env::var_os("TOASTTY_DEBUG").is_some(),
+            frame_times: VecDeque::with_capacity(128),
         }
     }
 
@@ -621,6 +640,38 @@ impl Toastty {
         ControlSignal::Continue
     }
 
+    /// Report cursor motion under DECSET 1002 (drag) / 1003 (any motion).
+    /// xterm reports motion at cell granularity — emit one event per
+    /// new cell crossed, not per pixel — so dragging within a cell stays
+    /// silent and a slow drag across the grid produces one event per
+    /// column/row boundary.
+    fn handle_mouse_motion(
+        &mut self,
+        position: (f64, f64),
+        modifiers: Modifiers,
+    ) -> ControlSignal {
+        self.mouse_pos = position;
+        let mode = self.term.mouse_mode();
+        let kind = MouseEventKind::Motion {
+            held: self.mouse_held,
+        };
+        if !protocol_wants_event(mode, &kind) {
+            // App hasn't opted into motion reporting; nothing to send.
+            // Clear the de-dup cache so the next opt-in starts fresh.
+            self.last_reported_cell = None;
+            return ControlSignal::Continue;
+        }
+        let cell = self.current_cell();
+        if self.last_reported_cell == Some(cell) {
+            return ControlSignal::Continue;
+        }
+        self.last_reported_cell = Some(cell);
+        if let Some(bytes) = encode_mouse(kind, cell, modifiers, mode) {
+            self.write_pty(&bytes);
+        }
+        ControlSignal::Continue
+    }
+
     fn handle_mouse(
         &mut self,
         button: MouseButton,
@@ -927,6 +978,38 @@ impl App for Toastty {
                 }
                 self.last_viewport_tick = Some(now);
 
+                // Refresh the debug overlay (FPS counter) BEFORE
+                // rendering so it lands on this frame. We retain frame
+                // timestamps from the last second and compute fps =
+                // (n - 1) / (last - first). Empty/single-sample shows
+                // "--" to avoid a misleading huge number on the first
+                // tick.
+                if self.debug_enabled
+                    && let Some(r) = self.renderer.as_mut()
+                {
+                    let cutoff = now - Duration::from_secs(1);
+                    while self.frame_times.front().is_some_and(|t| *t < cutoff) {
+                        self.frame_times.pop_front();
+                    }
+                    let fps_text = if self.frame_times.len() >= 2 {
+                        let span = self
+                            .frame_times
+                            .back()
+                            .unwrap()
+                            .duration_since(*self.frame_times.front().unwrap())
+                            .as_secs_f64();
+                        let fps = if span > 0.0 {
+                            (self.frame_times.len() - 1) as f64 / span
+                        } else {
+                            0.0
+                        };
+                        format!(" {fps:5.1} FPS ")
+                    } else {
+                        format!(" {:>5} FPS ", "--")
+                    };
+                    r.set_debug_overlay(Some(fps_text));
+                }
+
                 let mut next_blink: Option<Duration> = None;
                 if let Some(r) = self.renderer.as_mut() {
                     match r.render_term(&mut self.term) {
@@ -938,6 +1021,9 @@ impl App for Toastty {
                             // exactly one frame.
                             self.term.clear_damage();
                             self.term.clear_sync_output_force_flushed();
+                            if self.debug_enabled {
+                                self.frame_times.push_back(now);
+                            }
                         }
                         Ok(RenderOutcome::Skipped) => {
                             // Frame skipped (pause-gated or surface
@@ -966,7 +1052,12 @@ impl App for Toastty {
                     self.last_viewport_tick = None;
                     None
                 };
-                match min_deadline(next_blink, next_anim) {
+                let next_debug = if self.debug_enabled {
+                    Some(DEBUG_OVERLAY_TICK)
+                } else {
+                    None
+                };
+                match min_deadline(min_deadline(next_blink, next_anim), next_debug) {
                     Some(d) => ControlSignal::RedrawIn(d),
                     None => ControlSignal::Continue,
                 }
@@ -999,6 +1090,10 @@ impl App for Toastty {
                 position,
                 modifiers,
             } => self.handle_mouse(button, state, position, modifiers),
+            Event::MouseMotion {
+                position,
+                modifiers,
+            } => self.handle_mouse_motion(position, modifiers),
             Event::Scroll {
                 kind,
                 delta_x,
