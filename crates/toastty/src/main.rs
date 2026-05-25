@@ -518,6 +518,12 @@ impl Toastty {
             self.config.font.size_px,
             self.config.font.line_height,
         );
+        if !renderer.font_family_available() {
+            warn!(
+                "configured font {:?} not found on this system; falling back to the bundled / system default",
+                self.config.font.family,
+            );
+        }
         renderer.set_theme(theme_from_config(&self.config.theme));
         info!(
             "renderer ready: size={size:?} cell={:?} font={:?} {}px",
@@ -660,6 +666,12 @@ impl Toastty {
                 self.config.font.size_px,
                 self.config.font.line_height,
             );
+            if !r.font_family_available() {
+                warn!(
+                    "configured font {:?} not found on this system; falling back to the bundled / system default",
+                    self.config.font.family,
+                );
+            }
             r.set_theme(theme_from_config(&self.config.theme));
             // Re-plumb the theme bg into Term so OSC 11 queries reply
             // with the new value.

@@ -657,6 +657,26 @@ impl Renderer {
         self.needs_full_clear = true;
     }
 
+    /// True iff the family name passed to the most recent
+    /// [`Self::with_font_ex`] call resolved to a real face in the
+    /// loaded font database. `false` means cosmic-text fell back to
+    /// the host default; the binary should log a warning so the user
+    /// notices their `font.family` didn't take effect.
+    #[must_use]
+    pub fn font_family_available(&self) -> bool {
+        self.text
+            .as_ref()
+            .is_none_or(|t| t.rasterizer.requested_family_available())
+    }
+
+    /// Family name as requested by the most recent
+    /// [`Self::with_font_ex`] call (or `"monospace"` if `None` was
+    /// passed). Useful for log messages.
+    #[must_use]
+    pub fn font_family_name(&self) -> Option<&str> {
+        self.text.as_ref().map(|t| t.rasterizer.family_name())
+    }
+
     /// Current cell size in pixels (width, height). Returns `(0, 0)` if
     /// `with_font` hasn't been called.
     #[must_use]

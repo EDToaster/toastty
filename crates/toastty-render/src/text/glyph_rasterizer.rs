@@ -149,6 +149,13 @@ pub struct GlyphRasterizer {
     /// glyph for them — e.g., zero-width spaces). Recording them stops
     /// repeated misses from triggering the slow path forever.
     char_cache_misses: std::collections::HashSet<char>,
+    /// True iff the family name requested by the caller resolved to at
+    /// least one face in the loaded font database. When false, cosmic-
+    /// text will fall back to whatever the system considers a default
+    /// monospace face — the renderer still works, but the user's
+    /// `font.family` config didn't take effect. Surfaced via
+    /// [`GlyphRasterizer::requested_family_available`].
+    requested_family_available: bool,
 }
 
 impl GlyphRasterizer {
@@ -201,6 +208,25 @@ impl GlyphRasterizer {
 
         let family_name = font_name.unwrap_or("monospace").to_string();
 
+        // Check whether the requested family is actually present in
+        // the font database. `db().faces()` walks every loaded face;
+        // we report whether any face's `families` list contains a
+        // case-insensitive match. The bundled fallback TTF advertises
+        // its own family name (e.g. "Fira Mono"), so requesting that
+        // family will resolve even on a host with no system fonts of
+        // the same name. Used by the binary to log a warning when the
+        // user's `font.family` config doesn't match anything.
+        let requested_family_available = font_name.is_none_or(|requested| {
+            font_system
+                .db()
+                .faces()
+                .any(|face| {
+                    face.families
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case(requested))
+                })
+        });
+
         Self {
             font_system,
             swash_cache,
@@ -214,7 +240,23 @@ impl GlyphRasterizer {
             family_name,
             char_cache: HashMap::new(),
             char_cache_misses: std::collections::HashSet::new(),
+            requested_family_available,
         }
+    }
+
+    /// True when the family name passed to [`Self::new`] resolved to a
+    /// real face. `false` means cosmic-text will fall back to the
+    /// host's default monospace; callers can log a warning so the user
+    /// notices their config didn't take effect.
+    pub fn requested_family_available(&self) -> bool {
+        self.requested_family_available
+    }
+
+    /// Family name as requested by the caller (or `"monospace"` if the
+    /// caller passed `None`). Useful for emitting a "font X not found"
+    /// log line.
+    pub fn family_name(&self) -> &str {
+        &self.family_name
     }
 
     /// Cell size in pixels (width, height).
