@@ -200,6 +200,9 @@ struct Toastty {
     /// every frame. Empty / disabled when the env var is unset.
     debug_enabled: bool,
     frame_times: VecDeque<Instant>,
+    /// Reusable buffer for the FPS overlay text. Avoids a per-frame
+    /// `format!()` allocation when `debug_enabled` is on.
+    fps_buf: String,
 }
 
 impl Toastty {
@@ -241,6 +244,7 @@ impl Toastty {
             last_viewport_tick: None,
             debug_enabled: std::env::var_os("TOASTTY_DEBUG").is_some(),
             frame_times: VecDeque::with_capacity(128),
+            fps_buf: String::with_capacity(16),
         }
     }
 
@@ -1006,11 +1010,13 @@ impl App for Toastty {
                 if self.debug_enabled
                     && let Some(r) = self.renderer.as_mut()
                 {
+                    use std::fmt::Write as _;
                     let cutoff = now - Duration::from_secs(1);
                     while self.frame_times.front().is_some_and(|t| *t < cutoff) {
                         self.frame_times.pop_front();
                     }
-                    let fps_text = if self.frame_times.len() >= 2 {
+                    self.fps_buf.clear();
+                    if self.frame_times.len() >= 2 {
                         let span = self
                             .frame_times
                             .back()
@@ -1022,11 +1028,12 @@ impl App for Toastty {
                         } else {
                             0.0
                         };
-                        format!(" {fps:5.1} FPS ")
+                        // write! into a String is infallible.
+                        let _ = write!(self.fps_buf, " {fps:5.1} FPS ");
                     } else {
-                        format!(" {:>5} FPS ", "--")
-                    };
-                    r.set_debug_overlay(Some(fps_text));
+                        let _ = write!(self.fps_buf, " {:>5} FPS ", "--");
+                    }
+                    r.set_debug_overlay(Some(&self.fps_buf));
                 }
 
                 let mut next_blink: Option<Duration> = None;

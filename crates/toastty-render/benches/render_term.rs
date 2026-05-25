@@ -189,7 +189,7 @@ impl Harness {
             None,
             |row, col, ch, _style| {
                 let lg = line_cache_ref.get(row as usize)?.as_ref()?;
-                lg.by_column.get(&(col, ch)).copied()
+                lg.get(col, ch)
             },
         );
         let instances = &self.instances;
@@ -328,7 +328,7 @@ impl Harness {
             None,
             |row, col, ch, _style| {
                 let lg = line_cache_ref.get(row as usize)?.as_ref()?;
-                lg.by_column.get(&(col, ch)).copied()
+                lg.get(col, ch)
             },
         );
         let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;

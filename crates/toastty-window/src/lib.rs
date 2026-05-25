@@ -260,8 +260,21 @@ impl<A: App> Runner<'_, A> {
             ControlSignal::Continue => event_loop.set_control_flow(ControlFlow::Wait),
             ControlSignal::Exit => event_loop.exit(),
             ControlSignal::RedrawIn(d) => {
-                let deadline = Instant::now().checked_add(d).unwrap_or_else(Instant::now);
-                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                // Duration::ZERO means "wake immediately" — under
+                // ControlFlow::WaitUntil(now), winit's EventLoopWaker
+                // re-arms the CFRunLoopTimer every iteration because
+                // Instant::now() advances each call, defeating its
+                // deadline dedup. Profile showed ~20% of main-thread
+                // time in CFRunLoopTimerSetNextFireDate.
+                // ControlFlow::Poll dedups against a fixed past
+                // instant inside EventLoopWaker::start, so the arm
+                // happens once and subsequent iterations short-circuit.
+                if d.is_zero() {
+                    event_loop.set_control_flow(ControlFlow::Poll);
+                } else {
+                    let deadline = Instant::now().checked_add(d).unwrap_or_else(Instant::now);
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                }
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }

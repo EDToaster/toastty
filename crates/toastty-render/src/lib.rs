@@ -68,7 +68,7 @@ fn build_term_instances_into(
         Some(ext_palette),
         |row, col, ch, _style| {
             let lg = row_glyphs.get(row as usize)?.as_ref()?;
-            lg.by_column.get(&(col, ch)).copied()
+            lg.get(col, ch)
         },
     );
 }
@@ -95,7 +95,7 @@ fn build_term_dirty_instances_into(
         cursor_visible,
         |row, col, ch, _style| {
             let lg = row_glyphs.get(row as usize)?.as_ref()?;
-            lg.by_column.get(&(col, ch)).copied()
+            lg.get(col, ch)
         },
     );
 }
@@ -261,6 +261,9 @@ pub struct Renderer {
     /// skip-submit gate is bypassed so the overlay refreshes even when
     /// the term grid is idle.
     debug_overlay: Option<String>,
+    /// `TOASTTY_TRACE_RENDER` env var sampled once at construction.
+    /// Sampling per-frame was a measurable syscall on the hot path.
+    trace_render: bool,
 }
 
 /// Build the scratch render target. Same dims/format as the surface;
@@ -408,6 +411,11 @@ struct TextState {
     /// Reusable instance buffer. Cleared (not freed) at the start of
     /// every `render_term` so the allocation survives across frames.
     instances_scratch: Vec<CellInstance>,
+    /// Reusable per-row text buffer. `render_term` clears + repopulates
+    /// this for each dirty row instead of allocating a fresh `String`,
+    /// which previously showed up in profile traces as per-row alloc
+    /// churn (one allocation per dirty row, every frame).
+    line_text_scratch: String,
 }
 
 impl std::fmt::Debug for TextState {
@@ -540,6 +548,7 @@ impl Renderer {
             rgp_cache: GpuAssetCache::new(),
             rgp_revision_seen: u32::MAX,
             debug_overlay: None,
+            trace_render: std::env::var_os("TOASTTY_TRACE_RENDER").is_some(),
         })
     }
 
@@ -612,6 +621,7 @@ impl Renderer {
             bind_group,
             line_cache: Vec::new(),
             instances_scratch: Vec::new(),
+            line_text_scratch: String::new(),
         });
         // Lazy-init the image pipeline alongside the text pipeline so
         // both are ready before the first `render_term`. The image
@@ -698,8 +708,22 @@ impl Renderer {
     /// corner each frame. Used by the binary's `TOASTTY_DEBUG` FPS
     /// counter. While `Some`, the renderer skips its damage-only
     /// short-circuit so the overlay text refreshes even on an idle grid.
-    pub fn set_debug_overlay(&mut self, text: Option<String>) {
-        self.debug_overlay = text;
+    ///
+    /// Takes `Option<&str>` and copies into a renderer-owned `String`,
+    /// reusing the existing allocation across frames — callers no
+    /// longer need to allocate a new `String` per FPS-counter update.
+    pub fn set_debug_overlay(&mut self, text: Option<&str>) {
+        match text {
+            Some(s) => {
+                if let Some(buf) = self.debug_overlay.as_mut() {
+                    buf.clear();
+                    buf.push_str(s);
+                } else {
+                    self.debug_overlay = Some(s.to_owned());
+                }
+            }
+            None => self.debug_overlay = None,
+        }
     }
 
     /// True when a debug overlay is currently set.
@@ -913,7 +937,7 @@ impl Renderer {
             self.blink.force_visible();
         }
 
-        let trace = std::env::var_os("TOASTTY_TRACE_RENDER").is_some();
+        let trace = self.trace_render;
         let t_total = if trace { Some(std::time::Instant::now()) } else { None };
 
         let (rows, _) = term.size();
@@ -961,9 +985,8 @@ impl Renderer {
                     continue;
                 }
                 let row = term.view_row(r);
-                // Reuse a per-call String allocation; under release LLVM
-                // hoists the small allocation per row, but a future
-                // optimization could move the buffer into TextState.
+                // Reuse the cross-row scratch String instead of
+                // allocating a fresh one per dirty row.
                 //
                 // Continuation cells are excluded: they're the second
                 // half of a width-2 cluster whose primary cell already
@@ -971,28 +994,28 @@ impl Renderer {
                 // Feeding the continuation in as a space would insert
                 // an extra glyph cosmic-text would shape, shifting every
                 // downstream cluster's snapped column by one.
-                let line_text: String = row
-                    .cells
-                    .iter()
-                    .filter(|c| !c.is_continuation)
-                    .map(|c| {
-                        // Replace Kitty Unicode placeholder cells
-                        // (U+10EEEE) with a space before shaping. The
-                        // codepoint shapes to `.notdef` and its
-                        // cluster width can throw off the snap of
-                        // neighboring chars — we don't want it in the
-                        // glyph cache and the image pipeline draws
-                        // the real pixels anyway.
-                        if c.ch == '\0' || c.ch == toastty_term::PLACEHOLDER {
-                            ' '
-                        } else {
-                            c.ch
-                        }
-                    })
-                    .collect();
+                text.line_text_scratch.clear();
+                for c in &row.cells {
+                    if c.is_continuation {
+                        continue;
+                    }
+                    // Replace Kitty Unicode placeholder cells
+                    // (U+10EEEE) with a space before shaping. The
+                    // codepoint shapes to `.notdef` and its
+                    // cluster width can throw off the snap of
+                    // neighboring chars — we don't want it in the
+                    // glyph cache and the image pipeline draws
+                    // the real pixels anyway.
+                    let ch = if c.ch == '\0' || c.ch == toastty_term::PLACEHOLDER {
+                        ' '
+                    } else {
+                        c.ch
+                    };
+                    text.line_text_scratch.push(ch);
+                }
                 let lg = text.rasterizer.shape_line(
                     &self.queue,
-                    &line_text,
+                    &text.line_text_scratch,
                     term.grapheme_cluster_mode(),
                 );
                 text.line_cache[r as usize] = Some(lg);
@@ -1074,13 +1097,15 @@ impl Renderer {
         // Each frame we re-emit a bg quad over every overlay cell so the
         // previous frame's text is overpainted under LoadOp::Load — this
         // is why the caller pads to a fixed width.
-        if let Some(overlay) = self.debug_overlay.clone() {
-            let chars: Vec<char> = overlay.chars().collect();
+        //
+        // Split-borrow `&self.debug_overlay` (read) from `&mut self.text`
+        // (we already hold `text`) to avoid the per-frame `String` clone.
+        if let Some(overlay) = self.debug_overlay.as_deref() {
             #[allow(clippy::cast_possible_truncation)]
-            let n = chars.len() as u16;
+            let n = overlay.chars().count() as u16;
             let lg = text.rasterizer.shape_line(
                 &self.queue,
-                &overlay,
+                overlay,
                 term.grapheme_cluster_mode(),
             );
             #[allow(clippy::cast_precision_loss)]
@@ -1090,7 +1115,7 @@ impl Renderer {
             let overlay_bg = [0.0, 0.0, 0.0, 0.85];
             let overlay_fg = [0.95, 0.85, 0.30, 1.0];
             let x0 = viewport_w - f32::from(n) * cell_w;
-            for (i, ch) in chars.iter().enumerate() {
+            for (i, ch) in overlay.chars().enumerate() {
                 #[allow(clippy::cast_possible_truncation)]
                 let col = i as u16;
                 let pos = [x0 + f32::from(col) * cell_w, 0.0];
@@ -1107,7 +1132,7 @@ impl Renderer {
                 if ch.is_whitespace() {
                     continue;
                 }
-                if let Some(slot) = lg.by_column.get(&(col, *ch)) {
+                if let Some(slot) = lg.get(col, ch) {
                     let flags = if slot.is_color {
                         crate::text::instance::FLAG_COLOR_GLYPH
                     } else {

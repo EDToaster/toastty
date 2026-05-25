@@ -85,3 +85,8 @@ unnecessary_wraps = "allow"            # `main() -> Result` is normal even when 
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = false

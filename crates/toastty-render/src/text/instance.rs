@@ -587,6 +587,24 @@ pub fn build_instances_into<F>(
 /// Continuation cells (second half of a width-2 cluster) are skipped:
 /// the cluster's primary cell at `(r, c-1)` is responsible for the full
 /// multi-cell quad.
+/// Either-iterator over dirty columns. Replaces `Box<dyn Iterator>`
+/// inside the dirty-row loop so we don't heap-allocate per dirty row
+/// on the render hot path.
+enum DirtyCols<'a> {
+    Range(core::ops::Range<u16>),
+    Slice(core::slice::Iter<'a, u16>),
+}
+
+impl<'a> Iterator for DirtyCols<'a> {
+    type Item = u16;
+    fn next(&mut self) -> Option<u16> {
+        match self {
+            DirtyCols::Range(r) => r.next(),
+            DirtyCols::Slice(it) => it.next().copied(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // mirrors build_instances_into + adds damage/visibility/ext_palette
 pub fn build_dirty_instances_into<F>(
     out: &mut Vec<CellInstance>,
@@ -638,13 +656,13 @@ pub fn build_dirty_instances_into<F>(
 
     for (r, row_damage) in damage.iter_rows() {
         let row = term.view_row(r);
-        // Build the per-cell iteration source. all_cols expands to the
-        // full column range; otherwise iterate the sparse list.
-        let row_cols = cols;
-        let dirty_cells: Box<dyn Iterator<Item = u16>> = if row_damage.all_cols {
-            Box::new(0..row_cols)
+        // Stack-allocated iter enum instead of `Box<dyn Iterator>`:
+        // boxing was a per-dirty-row heap allocation on the render
+        // hot path. Same `all_cols` vs sparse-list dispatch as before.
+        let dirty_cells = if row_damage.all_cols {
+            DirtyCols::Range(0..cols)
         } else {
-            Box::new(row_damage.cols.iter().copied())
+            DirtyCols::Slice(row_damage.cols.iter())
         };
 
         for c in dirty_cells {

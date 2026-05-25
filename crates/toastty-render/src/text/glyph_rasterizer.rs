@@ -20,6 +20,12 @@ use crate::text::atlas::{Atlas, AtlasLayer, AtlasSlot, GlyphKey};
 use crate::text::cluster_width::{GlyphPos, snap_cluster_widths_per_cluster};
 use crate::text::instance::GlyphSlot;
 
+/// Per-row cache slot: which char was shaped into this column and the
+/// atlas slot we got back. Storing `char` keeps the same defense-in-depth
+/// the old `HashMap<(col, char), GlyphSlot>` had — callers re-check the
+/// char so a stale cache entry (e.g. wrong-char lookup) misses cleanly.
+type ColumnSlot = Option<(char, GlyphSlot)>;
+
 /// Mask atlas dims (R8) and color atlas dims (BGRA8) — generously sized
 /// per the M4b "panic when full" policy.
 pub const ATLAS_W: u32 = 1024;
@@ -40,11 +46,42 @@ struct PendingGlyph {
 
 /// Result of laying out a single line: each `(char, glyph_slot)` pair the
 /// caller can plug into `build_instances`.
+///
+/// Stored densely as `by_column[col] = Some((ch, slot))`. Switched from
+/// `HashMap<(col, char), GlyphSlot>` after profiling showed ~1% of
+/// main-thread wall time in hash bucket lookups during `build_instances`,
+/// plus per-row heap allocations populating the map. Columns are 0..N
+/// over a row, so an indexed vec is a strict upgrade.
 #[derive(Debug, Clone, Default)]
 pub struct LineGlyphs {
-    /// Map from (column, char) → atlas slot. The column is post-snap,
-    /// so we can plug it straight into the cell grid.
-    pub by_column: HashMap<(u16, char), GlyphSlot>,
+    /// Slot per column. Indices outside the populated range are
+    /// implicitly `None`. The vec is grown only as far as the highest
+    /// column shaped — wide-character lines that skip over a column
+    /// (CJK / combining-mark continuation cells) leave those slots
+    /// `None`, matching the old "key absent" semantics.
+    pub by_column: Vec<ColumnSlot>,
+}
+
+impl LineGlyphs {
+    /// Look up the slot for `col` matching `ch`. Returns `None` if the
+    /// column is out of range, was never shaped, or holds a different
+    /// char — same semantics as the old `HashMap::get(&(col, ch))`.
+    #[must_use]
+    pub fn get(&self, col: u16, ch: char) -> Option<GlyphSlot> {
+        match self.by_column.get(col as usize) {
+            Some(Some((c, slot))) if *c == ch => Some(*slot),
+            _ => None,
+        }
+    }
+
+    /// Insert a slot at `col`. Grows the underlying vec as needed.
+    pub fn insert(&mut self, col: u16, ch: char, slot: GlyphSlot) {
+        let idx = col as usize;
+        if self.by_column.len() <= idx {
+            self.by_column.resize(idx + 1, None);
+        }
+        self.by_column[idx] = Some((ch, slot));
+    }
 }
 
 /// Cached layout per (text, style fingerprint). M4b doesn't actually
@@ -265,7 +302,7 @@ impl GlyphRasterizer {
             match self.char_cache.get(&ch) {
                 Some(slot) => {
                     #[allow(clippy::cast_possible_truncation)]
-                    out.by_column.insert((col as u16, ch), *slot);
+                    out.insert(col as u16, ch, *slot);
                 }
                 None => return None,
             }
@@ -356,7 +393,7 @@ impl GlyphRasterizer {
         let mut out = LineGlyphs::default();
         for (p, baseline_y) in &pending {
             if let Some(slot) = self.ensure_atlas_slot(queue, &p.glyph, *baseline_y) {
-                out.by_column.insert((p.col, p.ch), slot);
+                out.insert(p.col, p.ch, slot);
                 // Populate the per-character fast-path cache. A single
                 // monospace glyph's slot is column-independent (see
                 // `build_instances`), so reusing it for the next line
