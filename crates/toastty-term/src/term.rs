@@ -2495,8 +2495,21 @@ impl Perform for Term {
 
 impl KittySink for Term {
     fn register_image(&mut self, id_request: u32, data: ImageData) -> Option<u32> {
+        tracing::info!(
+            target: "kitty",
+            id_request,
+            width = data.width, height = data.height,
+            bytes_len = data.pixels.len(),
+            "kitty: register_image (payload)",
+        );
         match self.image_registry.insert(id_request, data) {
             Ok(inserted) => {
+                tracing::info!(
+                    target: "kitty",
+                    id = inserted.id,
+                    evicted = ?inserted.evicted,
+                    "kitty: register_image ok",
+                );
                 // Evicted ids no longer exist in the registry; drop their
                 // placements + mark cells dirty.
                 for evicted in &inserted.evicted {
@@ -2508,11 +2521,37 @@ impl KittySink for Term {
                 self.image_revision = self.image_revision.wrapping_add(1);
                 Some(inserted.id)
             }
-            Err(_) => None,
+            Err(e) => {
+                tracing::warn!(
+                    target: "kitty",
+                    id_request, error = ?e,
+                    "kitty: register_image failed",
+                );
+                None
+            }
         }
     }
 
     fn place_image(&mut self, mut placement: Placement) {
+        let image_known = self.image_registry.contains(placement.image_id);
+        tracing::info!(
+            target: "kitty",
+            image_id = placement.image_id,
+            placement_id = placement.placement_id,
+            row_range = ?placement.row_range,
+            col_range = ?placement.col_range,
+            cursor_row = self.cursor.row,
+            cursor_col = self.cursor.col,
+            image_known,
+            "kitty: place_image",
+        );
+        if !image_known {
+            tracing::warn!(
+                target: "kitty",
+                image_id = placement.image_id,
+                "kitty: place_image — image id not in registry; placement will not render",
+            );
+        }
         // The handler emits placements with row/col fields populated
         // from header.cell_x / cell_y. For a *transmit-and-place*, the
         // semantic is "place at the current cursor" — translate the
@@ -2573,6 +2612,16 @@ impl KittySink for Term {
         let spec_byte = if delete.byte == 0 { b'a' } else { delete.byte };
         let mut dropped_placements = Vec::new();
         let drop_bytes = delete.free_bytes();
+        let spec_char = (spec_byte as char).to_string();
+        tracing::info!(
+            target: "kitty",
+            spec = %spec_char,
+            drop_bytes,
+            image_id = header.image_id,
+            placement_id = header.placement_id,
+            cell_y = header.cell_y,
+            "kitty: delete_image",
+        );
         match spec_byte {
             // `a` / `A` — delete all visible placements (and bytes if
             // uppercase).
@@ -2617,6 +2666,12 @@ impl KittySink for Term {
             // by ranges, ...) are deferred for M11a follow-ups.
             _ => {}
         }
+        tracing::info!(
+            target: "kitty",
+            spec = %spec_char,
+            dropped = dropped_placements.len(),
+            "kitty: delete_image ok",
+        );
         for p in &dropped_placements {
             mark_placement_dirty(self, p);
         }
@@ -2666,6 +2721,10 @@ impl KittySink for Term {
 
     fn cursor_col(&self) -> u16 {
         self.cursor.col.min(self.cols.saturating_sub(1))
+    }
+
+    fn cell_pixel_size(&self) -> (u16, u16) {
+        self.cell_pixel_size
     }
 }
 

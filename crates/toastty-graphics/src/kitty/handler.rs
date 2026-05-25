@@ -95,6 +95,15 @@ pub trait KittySink {
     fn image_exists(&self, _id: u32) -> bool {
         false
     }
+
+    /// Host's cell size in pixels. The handler uses this to derive the
+    /// cell span when the client omits `r=`/`c=` — kitty spec says the
+    /// image then occupies `ceil(img_dim / cell_dim)` cells. Default
+    /// `(1, 1)` keeps test sinks producing the same legacy 1-cell-per-
+    /// pixel behavior unless they override.
+    fn cell_pixel_size(&self) -> (u16, u16) {
+        (1, 1)
+    }
 }
 
 /// In-flight chunked transmission state.
@@ -409,7 +418,9 @@ impl KittyHandler {
         // the cursor. The host's adapter uses the cursor's current
         // (row, col) and the configured cell dims to size the rect.
         if matches!(header.action, Action::TransmitAndPlace) {
-            let placement = default_placement_from_header(&header, final_id, img_w, img_h);
+            let (cell_pw, cell_ph) = sink.cell_pixel_size();
+            let placement =
+                default_placement_from_header(&header, final_id, img_w, img_h, cell_pw, cell_ph);
             let rows_span = placement.row_range.end - placement.row_range.start;
             let cols_span = placement.col_range.end - placement.col_range.start;
             // M11a-followup.N6: capture the cursor's start_col BEFORE
@@ -436,11 +447,17 @@ impl KittyHandler {
             reply_error_if_verbose(&header, sink, ErrorCode::Einval, "place requires i=");
             return;
         }
+        // Standalone `a=p` doesn't carry img dims at this call site; we
+        // pass zeroes so the auto-derive falls back to 1×1 when `c=`/`r=`
+        // are unset (preserving the pre-fix behavior for this path).
+        let (cell_pw, cell_ph) = sink.cell_pixel_size();
         sink.place_image(default_placement_from_header(
             &header,
             header.image_id,
             0,
             0,
+            cell_pw,
+            cell_ph,
         ));
         reply_ok_if_verbose_with_id(&header, sink, header.image_id);
     }
@@ -493,7 +510,14 @@ fn inflate_zlib(input: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn default_placement_from_header(header: &Header, id: u32, img_w: u32, img_h: u32) -> Placement {
+fn default_placement_from_header(
+    header: &Header,
+    id: u32,
+    img_w: u32,
+    img_h: u32,
+    cell_pw: u16,
+    cell_ph: u16,
+) -> Placement {
     // Source rect: take what the header asked for, defaulting to
     // "full image" when unset.
     let src = if header.src_w == 0 && header.src_h == 0 {
@@ -506,17 +530,25 @@ fn default_placement_from_header(header: &Header, id: u32, img_w: u32, img_h: u3
             h: header.src_h,
         }
     };
-    // Cell span: header.cols/rows if specified, else the host must
-    // derive from img dims + cell metrics. The host knows its cell
-    // size; for M11a we encode 0..cols and 0..rows as a *hint* and
-    // let the host expand the actual span when applying.
-    //
-    // For decode-time consistency we encode (0..cols, 0..rows) when
-    // both are provided; otherwise the host fills in based on image
-    // pixel dims / its own cell size.
-    let cols = header.cols.max(1) as u16;
-    let rows = header.rows.max(1) as u16;
-    let _ = (img_w, img_h); // host derives from registry if needed.
+    // Cell span: when `c=`/`r=` are specified, use them. Otherwise the
+    // kitty spec says the image occupies `ceil(img_dim / cell_dim)`
+    // cells. Falling through to 1×1 (the old behavior) made
+    // unannotated transmits — e.g. Ratty's widget demo — render as a
+    // single cell band.
+    let cell_pw = u32::from(cell_pw.max(1));
+    let cell_ph = u32::from(cell_ph.max(1));
+    let derived_cols = (img_w + cell_pw - 1) / cell_pw;
+    let derived_rows = (img_h + cell_ph - 1) / cell_ph;
+    let cols = if header.cols == 0 {
+        derived_cols.max(1) as u16
+    } else {
+        header.cols as u16
+    };
+    let rows = if header.rows == 0 {
+        derived_rows.max(1) as u16
+    } else {
+        header.rows as u16
+    };
     Placement {
         image_id: id,
         placement_id: header.placement_id,
