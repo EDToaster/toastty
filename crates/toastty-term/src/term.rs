@@ -1485,6 +1485,14 @@ impl Term {
             'B' => self.cursor_down(first_param(params, 1).max(1)),
             'C' => self.cursor_forward(first_param(params, 1).max(1)),
             'D' => self.cursor_back(first_param(params, 1).max(1)),
+            // CHA — Cursor Horizontal Absolute. `CSI Ps G` moves the
+            // cursor to column Ps (1-based) on the current row. Used
+            // heavily by Claude Code to lay out tab-stop-style columns
+            // of text on a single line; without it, the words pile up.
+            'G' => {
+                let col = first_param(params, 1).max(1);
+                self.cursor_position(self.cursor.row.saturating_add(1), col);
+            }
             'H' | 'f' => {
                 let r = first_param(params, 1).max(1);
                 let c = nth_param(params, 1, 1).max(1);
@@ -1492,7 +1500,13 @@ impl Term {
             }
             'J' => self.erase_display(first_param(params, 0)),
             'K' => self.erase_line(first_param(params, 0)),
-            'm' => self.apply_sgr(params),
+            // SGR proper has no private marker. `CSI > Ps ; Ps m` is
+            // xterm's XTMODKEYS (modifyOtherKeys); we don't implement
+            // it — apps negotiate the kitty keyboard protocol via the
+            // `u` sequences instead. Without this guard, the `> 4 ; 2`
+            // form was being applied as SGR 4 (underline) + SGR 2
+            // (dim), making every subsequent cell render underlined.
+            'm' if priv_marker.is_none() => self.apply_sgr(params),
             'h' if priv_marker == Some(b'?') => self.apply_decset(params, true),
             'l' if priv_marker == Some(b'?') => self.apply_decset(params, false),
             // DECSCUSR: `CSI Ps SP q` — runtime cursor shape + blink.
@@ -3263,6 +3277,38 @@ mod tests {
         );
         let b = t.row(0).cells[1].style.flags;
         assert_eq!(b, StyleFlags::default());
+    }
+
+    #[test]
+    fn cha_moves_cursor_to_absolute_column() {
+        // `CSI Ps G` (CHA) is how Claude Code lays out words on a row:
+        // it writes a word, then jumps the cursor to a specific column
+        // before writing the next. Without a CHA handler, every word
+        // after the first piles up at whatever column the cursor
+        // happened to land on.
+        let mut t = Term::new(1, 20, 0);
+        feed(&mut t, b"Internal\x1b[15Ginfra");
+        let cells = &t.row(0).cells;
+        assert_eq!(cells[0].ch, 'I');
+        assert_eq!(cells[7].ch, 'l');
+        // CHA jumped to column 15 (1-based) = index 14.
+        assert_eq!(cells[14].ch, 'i');
+        assert_eq!(cells[18].ch, 'a');
+        // Defaults: empty Ps and Ps=1 both mean column 1.
+        feed(&mut t, b"\x1b[GX");
+        assert_eq!(t.row(0).cells[0].ch, 'X');
+    }
+
+    #[test]
+    fn csi_gt_m_is_not_treated_as_sgr() {
+        // `CSI > 4 ; 2 m` is xterm's XTMODKEYS (modifyOtherKeys). It
+        // must not be interpreted as SGR 4 (underline) + SGR 2 (dim) —
+        // Claude Code emits it at startup and previously left every
+        // subsequent cell rendered with underline + dim.
+        let mut t = Term::new(1, 2, 0);
+        feed(&mut t, b"\x1b[>4;2mA");
+        let s = t.row(0).cells[0].style;
+        assert_eq!(s.flags, StyleFlags::default());
     }
 
     #[test]
