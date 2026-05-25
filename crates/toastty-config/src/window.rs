@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Initial window size, in physical pixels.
+/// Window-presentation config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WindowConfig {
@@ -10,16 +10,22 @@ pub struct WindowConfig {
     pub width: u32,
     /// Initial window height in physical pixels.
     pub height: u32,
+    /// Sync presentation to the display refresh. `true` (default) uses
+    /// the platform's vsync (wgpu `AutoVsync` / `Fifo`) — smooth, power-
+    /// friendly, may add ~1 frame of latency. `false` selects
+    /// `AutoNoVsync` (Immediate / Mailbox where available) — minimum
+    /// latency at the cost of possible tearing and higher GPU usage.
+    pub vsync: bool,
 }
 
 impl WindowConfig {
-    /// Schema defaults — 1280 × 800, roughly a comfortable shell window
-    /// on a HiDPI display.
+    /// Schema defaults — 1280 × 800 with vsync on.
     #[must_use]
     pub fn defaults() -> Self {
         Self {
             width: 1280,
             height: 800,
+            vsync: true,
         }
     }
 }
@@ -39,6 +45,7 @@ mod tests {
         let d = WindowConfig::defaults();
         assert_eq!(d.width, 1280);
         assert_eq!(d.height, 800);
+        assert!(d.vsync);
     }
 
     #[test]
@@ -51,10 +58,20 @@ mod tests {
         let w = WindowConfig {
             width: 1920,
             height: 1080,
+            vsync: false,
         };
         let t = toml::to_string(&w).unwrap();
         let p: WindowConfig = toml::from_str(&t).unwrap();
         assert_eq!(p, w);
+    }
+
+    #[test]
+    fn vsync_can_be_disabled() {
+        let cfg: WindowConfig = toml::from_str("vsync = false\n").unwrap();
+        assert!(!cfg.vsync);
+        // Other fields default.
+        assert_eq!(cfg.width, 1280);
+        assert_eq!(cfg.height, 800);
     }
 
     #[test]

@@ -477,7 +477,11 @@ impl Toastty {
         self.physical_size = size;
 
         // Build the renderer.
-        let mut renderer = match block_on(Renderer::new(window.clone(), size)) {
+        let mut renderer = match block_on(Renderer::new(
+            window.clone(),
+            size,
+            self.config.window.vsync,
+        )) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("renderer init failed: {e}");

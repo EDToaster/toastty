@@ -432,7 +432,7 @@ impl Renderer {
     /// `Arc<Window>` (or anything that derefs to a window handle) so the
     /// caller can keep a copy for `request_redraw` etc. The example shows
     /// the pattern.
-    pub async fn new<W>(window: W, size: (u32, u32)) -> Result<Self, RenderError>
+    pub async fn new<W>(window: W, size: (u32, u32), vsync: bool) -> Result<Self, RenderError>
     where
         W: HasDisplayHandle + HasWindowHandle + Send + Sync + 'static,
     {
@@ -485,10 +485,16 @@ impl Renderer {
             format,
             width: size.0.max(1),
             height: size.1.max(1),
-            // Fifo for power friendliness per the spec. Mailbox is a
-            // future config flag; see TODO below.
-            // TODO(mailbox): expose a config knob for Mailbox vs Fifo.
-            present_mode: PresentMode::Fifo,
+            // vsync=true → AutoVsync (Fifo on every platform — strict
+            // vsync, power-friendly). vsync=false → AutoNoVsync, which
+            // wgpu maps to Immediate where supported, falling back to
+            // Mailbox / Fifo. Tearing is possible under AutoNoVsync but
+            // GPU latency is minimized.
+            present_mode: if vsync {
+                PresentMode::AutoVsync
+            } else {
+                PresentMode::AutoNoVsync
+            },
             desired_maximum_frame_latency: 2,
             alpha_mode: caps
                 .alpha_modes
