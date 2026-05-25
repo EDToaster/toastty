@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use toastty_config::ShellConfig;
 
+use crate::cli::CommandOverride;
+
 /// Resolve `cfg.program` (which may be `"auto"`) plus `cfg.args` into a
 /// `(program, args)` pair suitable for a [`toastty_pty::PtySpec`].
 ///
@@ -21,6 +23,19 @@ pub fn resolve_shell(cfg: &ShellConfig) -> (PathBuf, Vec<OsString>) {
     };
     let args = cfg.args.iter().map(OsString::from).collect();
     (program, args)
+}
+
+/// Pick what to launch in the PTY: a CLI override wins; otherwise fall
+/// back to the configured shell.
+#[must_use]
+pub fn resolve_command(
+    cli_override: Option<CommandOverride>,
+    cfg: &ShellConfig,
+) -> (PathBuf, Vec<OsString>) {
+    match cli_override {
+        Some(cmd) => (cmd.program, cmd.args),
+        None => resolve_shell(cfg),
+    }
 }
 
 #[cfg(test)]

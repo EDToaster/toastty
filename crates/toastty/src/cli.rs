@@ -1,17 +1,29 @@
 //! Command-line argument parsing.
 //!
-//! Tiny, dependency-free. We don't take `clap` for two flags — if
-//! the surface grows past ~5 flags, swap to `clap` then.
+//! Tiny, dependency-free. We don't take `clap` for a handful of flags —
+//! if the surface grows past ~5 flags, swap to `clap` then.
 
+use std::ffi::OsString;
 use std::io::Write;
+use std::path::PathBuf;
 
 use toastty_config::Config;
+
+/// Program + args override coming from the CLI. When `Some`, the binary
+/// launches this instead of the configured shell — same convention as
+/// `xterm -e`, `alacritty -e`, `kitty <cmd>`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CommandOverride {
+    pub program: PathBuf,
+    pub args: Vec<OsString>,
+}
 
 /// What the CLI args told the binary to do.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
-    /// Run the terminal normally.
-    Run,
+    /// Run the terminal normally. `command` overrides the configured
+    /// shell when present.
+    Run { command: Option<CommandOverride> },
     /// Print the default config (TOML) to stdout and exit.
     PrintDefaultConfig,
     /// Print the help text to stdout and exit.
@@ -36,25 +48,86 @@ impl std::error::Error for ParseError {}
 
 /// Parse `argv[1..]`. Returns the resolved [`Action`] or a
 /// [`ParseError`] naming the bad flag.
+///
+/// Argument convention:
+/// - Known flags (`--help`, `--version`, `--print-default-config`) are
+///   consumed in any order.
+/// - The first bare token (no leading `-`), OR a `--` separator, OR
+///   `-e` / `--command`, switches the parser into "command mode": every
+///   remaining argument is passed through verbatim as `program` +
+///   `args`. This matches kitty (`kitty <cmd> [args]`) and xterm
+///   (`xterm -e <cmd> [args]`) so users coming from either feel at home.
 pub fn parse<I, S>(args: I) -> Result<Action, ParseError>
 where
     I: IntoIterator<Item = S>,
-    S: AsRef<str>,
+    S: Into<String>,
 {
-    let mut action = Action::Run;
-    for arg in args {
-        match arg.as_ref() {
-            "--print-default-config" => action = Action::PrintDefaultConfig,
-            "--help" | "-h" => action = Action::PrintHelp,
-            "--version" | "-V" => action = Action::PrintVersion,
-            other => {
+    let mut action_kind: Option<ActionKind> = None;
+    let mut command: Option<CommandOverride> = None;
+    let mut iter = args.into_iter().map(Into::into);
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--print-default-config" => action_kind = Some(ActionKind::PrintDefaultConfig),
+            "--help" | "-h" => action_kind = Some(ActionKind::PrintHelp),
+            "--version" | "-V" => action_kind = Some(ActionKind::PrintVersion),
+            // `--` separator, `-e`, `--command`: everything that follows
+            // is the command to run. We don't second-guess it; even
+            // `-h` after the separator is part of the command.
+            "--" | "-e" | "--command" => {
+                command = Some(collect_command(&mut iter, &arg)?);
+                break;
+            }
+            other if other.starts_with('-') => {
                 return Err(ParseError {
                     arg: other.to_string(),
                 });
             }
+            // First bare positional: treat as program; collect the rest
+            // as args. Same as kitty's positional command form.
+            _ => {
+                let mut args_vec = Vec::new();
+                for rest in iter.by_ref() {
+                    args_vec.push(OsString::from(rest));
+                }
+                command = Some(CommandOverride {
+                    program: PathBuf::from(arg),
+                    args: args_vec,
+                });
+                break;
+            }
         }
     }
-    Ok(action)
+    Ok(match action_kind {
+        Some(ActionKind::PrintDefaultConfig) => Action::PrintDefaultConfig,
+        Some(ActionKind::PrintHelp) => Action::PrintHelp,
+        Some(ActionKind::PrintVersion) => Action::PrintVersion,
+        None => Action::Run { command },
+    })
+}
+
+/// Consume the remainder of `iter` as `program` + `args`. The separator
+/// (`--` / `-e` / `--command`) requires *some* following token to name
+/// the program.
+fn collect_command<I>(iter: &mut I, separator: &str) -> Result<CommandOverride, ParseError>
+where
+    I: Iterator<Item = String>,
+{
+    let Some(program) = iter.next() else {
+        return Err(ParseError {
+            arg: format!("{separator} requires a command"),
+        });
+    };
+    let args = iter.map(OsString::from).collect();
+    Ok(CommandOverride {
+        program: PathBuf::from(program),
+        args,
+    })
+}
+
+enum ActionKind {
+    PrintDefaultConfig,
+    PrintHelp,
+    PrintVersion,
 }
 
 /// Human-readable help text. Stable enough to test against.
@@ -63,13 +136,22 @@ pub fn help_text() -> &'static str {
 toastty — lightweight GPU-accelerated terminal emulator
 
 USAGE:
-    toastty [FLAGS]
+    toastty [FLAGS] [-- | -e | --command] <command> [args...]
+    toastty [FLAGS] <command> [args...]
 
 FLAGS:
     --print-default-config    Print the default TOML config to stdout and exit.
                               Useful for bootstrapping: `toastty --print-default-config > ~/.config/toastty/config.toml`
     -h, --help                Print this help and exit
     -V, --version             Print the version and exit
+
+COMMAND:
+    Anything after the first bare positional, after `--`, or after
+    `-e`/`--command` is passed through as the program to launch in the
+    PTY (instead of the configured shell). Examples:
+        toastty bash -c 'echo hi; sleep 5'
+        toastty -e htop
+        toastty -- python -m http.server
 "
 }
 
@@ -95,9 +177,13 @@ pub fn write_default_config<W: Write>(out: &mut W) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    fn run_action() -> Action {
+        Action::Run { command: None }
+    }
+
     #[test]
     fn no_args_runs() {
-        assert_eq!(parse::<_, &str>([]).unwrap(), Action::Run);
+        assert_eq!(parse::<_, &str>([]).unwrap(), run_action());
     }
 
     #[test]
@@ -129,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_arg_errors() {
+    fn unknown_flag_errors() {
         let err = parse(["--nonsense"]).unwrap_err();
         assert_eq!(err.arg, "--nonsense");
     }
@@ -140,6 +226,81 @@ mod tests {
             arg: "--nope".into(),
         };
         assert_eq!(err.to_string(), "unknown argument: --nope");
+    }
+
+    #[test]
+    fn bare_positional_starts_command() {
+        let action = parse(["bash", "-c", "echo hi"]).unwrap();
+        let Action::Run { command: Some(cmd) } = action else {
+            panic!("expected Run with command");
+        };
+        assert_eq!(cmd.program, PathBuf::from("bash"));
+        assert_eq!(
+            cmd.args,
+            vec![OsString::from("-c"), OsString::from("echo hi")]
+        );
+    }
+
+    #[test]
+    fn dash_e_separator_starts_command() {
+        let action = parse(["-e", "htop", "--", "-d", "5"]).unwrap();
+        let Action::Run { command: Some(cmd) } = action else {
+            panic!("expected Run with command");
+        };
+        assert_eq!(cmd.program, PathBuf::from("htop"));
+        assert_eq!(
+            cmd.args,
+            vec![
+                OsString::from("--"),
+                OsString::from("-d"),
+                OsString::from("5"),
+            ]
+        );
+    }
+
+    #[test]
+    fn double_dash_separator_starts_command() {
+        let action = parse(["--", "python", "-m", "http.server"]).unwrap();
+        let Action::Run { command: Some(cmd) } = action else {
+            panic!("expected Run with command");
+        };
+        assert_eq!(cmd.program, PathBuf::from("python"));
+        assert_eq!(
+            cmd.args,
+            vec![OsString::from("-m"), OsString::from("http.server")]
+        );
+    }
+
+    #[test]
+    fn flags_before_command_are_consumed() {
+        // Action-bearing flags before the command still resolve their
+        // action; the command stays attached to Run only if no action
+        // wins. (`--version` here wins.)
+        assert_eq!(
+            parse(["--version", "bash"]).unwrap(),
+            Action::PrintVersion
+        );
+    }
+
+    #[test]
+    fn dash_e_without_program_errors() {
+        let err = parse(["-e"]).unwrap_err();
+        assert!(err.arg.contains("-e"));
+    }
+
+    #[test]
+    fn command_arg_with_leading_dash_passes_through() {
+        // After the separator, leading-dash args are part of the
+        // command — they must NOT be re-interpreted as toastty flags.
+        let action = parse(["--", "bash", "-c", "exit 0"]).unwrap();
+        let Action::Run { command: Some(cmd) } = action else {
+            panic!("expected Run with command");
+        };
+        assert_eq!(cmd.program, PathBuf::from("bash"));
+        assert_eq!(
+            cmd.args,
+            vec![OsString::from("-c"), OsString::from("exit 0")]
+        );
     }
 
     #[test]
@@ -161,6 +322,13 @@ mod tests {
     #[test]
     fn help_text_mentions_print_default_config() {
         assert!(help_text().contains("--print-default-config"));
+    }
+
+    #[test]
+    fn help_text_mentions_command_passthrough() {
+        let help = help_text();
+        assert!(help.contains("-e") || help.contains("--command"));
+        assert!(help.to_lowercase().contains("command"));
     }
 
     #[test]

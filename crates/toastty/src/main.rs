@@ -32,6 +32,7 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use toastty::cli;
+use toastty::cli::CommandOverride;
 use toastty::focus::encode_focus;
 use toastty::geometry::grid_dims_from_pixels;
 use toastty::keyboard::encode_key;
@@ -40,7 +41,7 @@ use toastty::mouse::{
 };
 use toastty::paste::wrap_for_paste;
 use toastty::pty_log::{Direction, PtyLogger};
-use toastty::shell::resolve_shell;
+use toastty::shell::resolve_command;
 use toastty::theme_bridge::theme_from_config;
 
 /// Default initial window size in pixels. M5 does not yet read this from
@@ -100,7 +101,7 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
-    match action {
+    let command_override = match action {
         cli::Action::PrintHelp => {
             print!("{}", cli::help_text());
             return Ok(());
@@ -114,8 +115,8 @@ fn main() -> Result<()> {
                 .context("write default config")?;
             return Ok(());
         }
-        cli::Action::Run => {}
-    }
+        cli::Action::Run { command } => command,
+    };
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -137,7 +138,7 @@ fn main() -> Result<()> {
         ime: true,
     };
 
-    let app = Toastty::new(config);
+    let app = Toastty::new(config, command_override);
     run(opts, app).context("window run")?;
     Ok(())
 }
@@ -146,6 +147,9 @@ fn main() -> Result<()> {
 /// handle happens inside `App::init`.
 struct Toastty {
     config: Config,
+    /// CLI command override. Consumed by `init_impl` when spawning the
+    /// PTY; `None` falls back to the configured shell.
+    command_override: Option<CommandOverride>,
     window: Option<ToasttyWindow>,
     renderer: Option<Renderer>,
     parser: Parser,
@@ -202,7 +206,7 @@ struct Toastty {
 }
 
 impl Toastty {
-    fn new(config: Config) -> Self {
+    fn new(config: Config, command_override: Option<CommandOverride>) -> Self {
         let scrollback = config.scrollback.lines.try_into().unwrap_or(u16::MAX);
         // Start at a tiny grid; init() resizes once we know cell dimensions.
         let mut term = Term::new(24, 80, scrollback);
@@ -217,6 +221,7 @@ impl Toastty {
         });
         Self {
             config,
+            command_override,
             window: None,
             renderer: None,
             parser: Parser::new(),
@@ -511,8 +516,9 @@ impl Toastty {
         ];
         self.term.set_default_bg(bg_rgb);
 
-        // Spawn the PTY.
-        let (program, args) = resolve_shell(&self.config.shell);
+        // Spawn the PTY. CLI command override (xterm-style `-e`,
+        // `kitty <cmd>`, etc.) wins over the configured shell.
+        let (program, args) = resolve_command(self.command_override.take(), &self.config.shell);
         info!(?program, ?args, rows, cols, "spawning shell");
         let pixel_width = u16::try_from(size.0).unwrap_or(u16::MAX);
         let pixel_height = u16::try_from(size.1).unwrap_or(u16::MAX);
