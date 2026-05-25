@@ -133,6 +133,12 @@ pub struct Term {
     /// Cursor snapshot captured on the most recent `1049` enter; restored
     /// on `1049` exit.
     saved_cursor: Cursor,
+    /// DECSC (`ESC 7`) save slot. Separate from `saved_cursor` so a
+    /// `DECSC ... enter-alt-screen ... exit-alt-screen ... DECRC`
+    /// sequence doesn't have the alt-screen path clobber the user's
+    /// save. `None` until DECSC fires; DECRC with no prior save homes
+    /// the cursor and resets SGR, per xterm.
+    decsc_saved: Option<Cursor>,
     alt_active: bool,
     rows: u16,
     cols: u16,
@@ -394,6 +400,7 @@ impl Term {
             alt,
             cursor: Cursor::default(),
             saved_cursor: Cursor::default(),
+            decsc_saved: None,
             alt_active: false,
             rows,
             cols,
@@ -2231,6 +2238,20 @@ impl Perform for Term {
                 self.mark_cell(row, old_col);
                 self.mark_cell(row, 0);
                 self.linefeed();
+            }
+            // DECSC (`ESC 7`) — save cursor position + SGR. Used by
+            // powerlevel10k's instant-prompt to snapshot before
+            // printing a transient prompt, then redraw via DECRC.
+            b'7' => self.decsc_saved = Some(self.cursor),
+            // DECRC (`ESC 8`) — restore the DECSC snapshot. With no
+            // prior save, xterm homes the cursor and resets SGR.
+            b'8' => {
+                let old = self.cursor;
+                let new = self.decsc_saved.unwrap_or_default();
+                self.cursor = new;
+                self.clamp_cursor();
+                self.mark_cell(old.row, old.col);
+                self.mark_cell(self.cursor.row, self.cursor.col);
             }
             _ => {}
         }
@@ -5523,5 +5544,33 @@ mod tests {
         assert_eq!(t.view_offset_lines(), t.target_offset_lines());
         // Animation is done.
         assert!(!t.viewport_animating());
+    }
+
+    /// DECSC (`ESC 7`) / DECRC (`ESC 8`) round-trip: cursor returns to
+    /// the saved (row, col) regardless of where it was when DECRC
+    /// fires. Powerlevel10k's instant-prompt redraw depends on this.
+    #[test]
+    fn decsc_decrc_round_trip() {
+        let mut t = Term::new(4, 8, 0);
+        // Print "ab" so the cursor is at (0, 2), then DECSC.
+        feed(&mut t, b"ab\x1b7");
+        // Move down a couple of lines (NEL twice), print junk.
+        feed(&mut t, b"\x1bE\x1bE??");
+        assert_eq!(t.cursor.row, 2);
+        // DECRC should restore (0, 2).
+        feed(&mut t, b"\x1b8");
+        assert_eq!(t.cursor.row, 0);
+        assert_eq!(t.cursor.col, 2);
+    }
+
+    /// DECRC with no prior DECSC should home the cursor.
+    #[test]
+    fn decrc_without_save_homes_cursor() {
+        let mut t = Term::new(4, 8, 0);
+        feed(&mut t, b"abc\x1bE??");
+        assert!(t.cursor.row > 0 || t.cursor.col > 0);
+        feed(&mut t, b"\x1b8");
+        assert_eq!(t.cursor.row, 0);
+        assert_eq!(t.cursor.col, 0);
     }
 }
