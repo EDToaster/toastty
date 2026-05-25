@@ -1090,15 +1090,24 @@ impl Toastty {
                 }
             }
         }
-        // Any user-driven scroll should kick the viewport animation
-        // into motion if it isn't already running. The redraw is
-        // scheduled by returning a non-Continue control signal below
-        // when the animation has work to do.
-        if self.term.viewport_animating() {
-            ControlSignal::RedrawIn(Duration::ZERO)
-        } else {
-            ControlSignal::Continue
-        }
+        // Reaching here means we actually applied a scroll
+        // (scroll_view_by + optional force_snap_view above). The
+        // term's damage / animation state has been updated, so we
+        // must request a redraw — unconditionally. Returning
+        // `Continue` when `viewport_animating()` happens to be false
+        // (which is the case under the smooth-scroll-pixels +
+        // force_snap_view path: current is snapped to target so
+        // there's nothing to animate) silently skips the frame; the
+        // visible state then drifts away from the internal state
+        // until *something else* requests a redraw, at which point
+        // the deferred scroll appears as a sudden jump. Historically
+        // the cursor-blink cadence masked this, but apps like helix
+        // disable blink via DECSCUSR and leave it off on exit, so
+        // post-helix scrolling looked broken until the next
+        // keystroke. `RedrawIn(ZERO)` is cheap — the renderer's
+        // skip-submit gate will short-circuit when there really is
+        // nothing dirty.
+        ControlSignal::RedrawIn(Duration::ZERO)
     }
 
     /// Signed line count for an alt-screen scroll translation.
