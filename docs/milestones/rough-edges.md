@@ -3,3 +3,5 @@
 -[ ] scrolling doesn't work after exiting vim/helix
 -[ ] path traversal for asset loading in rgp could be unsafe
 -[ ] animate=1 in rgp does not work
+-[ ] cannot click and drag
+-[ ] cannot press up arrow when atuin is active

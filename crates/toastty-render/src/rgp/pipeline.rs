@@ -234,10 +234,10 @@ impl Rgp3dPipeline {
             // Protocol `depth` maps to pixel-z via the decision §3
             // factor: `ndc_z = 0.5 + 0.05 * depth` and the ortho
             // scales pixel z by `0.5 / Z_HALF_RANGE_PX`, so
-            // `world_z_px = 0.1 * Z_HALF_RANGE_PX * depth`. With
-            // Z_HALF_RANGE_PX = 200 → 20 px per protocol unit, so
-            // depth=±10 lands ±200 px from the cell layer, i.e. at
-            // the NDC depth-volume boundary.
+            // `world_z_px = 0.1 * Z_HALF_RANGE_PX * depth`. depth=±10
+            // still spans ±10% of the NDC depth volume regardless of
+            // the constant's value; the headroom (currently 10×) keeps
+            // large rotating placements from clipping the near plane.
             let depth_world_z =
                 p.style.depth * Z_HALF_RANGE_PX * 0.1 + p.style.offset[2] * fit_half;
             let t = translate(

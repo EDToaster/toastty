@@ -54,20 +54,36 @@ pub fn load_glb(bytes: &[u8]) -> Result<CpuAsset, GlbLoadError> {
 
     let reader = prim.reader(|_buffer| Some(doc_blob));
 
-    let positions: Vec<[f32; 3]> = reader
+    let mut positions: Vec<[f32; 3]> = reader
         .read_positions()
         .ok_or(GlbLoadError::NoPositions)?
         .collect();
-    let uvs: Vec<[f32; 2]> = reader
+    let mut uvs: Vec<[f32; 2]> = reader
         .read_tex_coords(0)
         .map_or_else(Vec::new, |t| t.into_f32().collect());
-    let indices: Vec<u32> = match reader.read_indices() {
+    let mut indices: Vec<u32> = match reader.read_indices() {
         Some(it) => it.into_u32().collect(),
         None => (0..u32::try_from(positions.len()).unwrap_or(u32::MAX)).collect(),
     };
     let normals: Vec<[f32; 3]> = if let Some(it) = reader.read_normals() {
         it.collect()
     } else {
+        // No normals in the GLB → synthesise flat per-face. Unweld
+        // first so shared corner vertices (e.g. on a low-poly cube
+        // that ships positions only) get a per-triangle copy with
+        // the face normal, otherwise the fragment stage interpolates
+        // averaged corner normals into a Gouraud-style gradient
+        // across each face.
+        let unwelded_positions: Vec<[f32; 3]> =
+            indices.iter().map(|&i| positions[i as usize]).collect();
+        let unwelded_uvs: Vec<[f32; 2]> = if uvs.is_empty() {
+            Vec::new()
+        } else {
+            indices.iter().map(|&i| uvs[i as usize]).collect()
+        };
+        positions = unwelded_positions;
+        uvs = unwelded_uvs;
+        indices = (0..u32::try_from(positions.len()).unwrap_or(u32::MAX)).collect();
         derive_flat_normals(&positions, &indices)
     };
 

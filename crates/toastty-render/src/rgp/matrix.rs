@@ -91,7 +91,7 @@ pub fn mul(a: &Mat4, b: &Mat4) -> Mat4 {
 /// scaled cube (≤ ~50 px half-extent) plus protocol depth offsets
 /// (up to ±100 px at depth=±10 per the decision §3 mapping) all
 /// fit comfortably without depth-clipping.
-pub const Z_HALF_RANGE_PX: f32 = 200.0;
+pub const Z_HALF_RANGE_PX: f32 = 2000.0;
 
 /// Orthographic projection: world XYZ in **pixels** → NDC.
 ///

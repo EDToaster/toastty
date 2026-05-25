@@ -72,17 +72,35 @@ pub fn load_obj(bytes: &[u8]) -> Result<CpuAsset, ObjLoadError> {
     // load time rather than the render pipeline. GLB is left as-is for
     // parity with ratty, which trusts glTF assets to come pre-scaled.
     normalize_to_unit_extent(&mut positions);
-    let uvs: Vec<[f32; 2]> = mesh
+    let mut uvs: Vec<[f32; 2]> = mesh
         .texcoords
         .chunks_exact(2)
         .map(|c| [c[0], c[1]])
         .collect();
-    let indices: Vec<u32> = if mesh.indices.is_empty() {
+    let mut indices: Vec<u32> = if mesh.indices.is_empty() {
         (0..u32::try_from(positions.len()).unwrap_or(u32::MAX)).collect()
     } else {
         mesh.indices
     };
     let normals: Vec<[f32; 3]> = if mesh.normals.is_empty() {
+        // Source has no normals → we'll synthesise flat per-face
+        // normals. `single_index: true` deduplicates corner vertices
+        // across faces, so a cube corner shared by three faces ends
+        // up with one averaged normal that the fragment stage
+        // interpolates across each triangle — smooth shading. For a
+        // sharp-edged solid that's wrong: each face should be one
+        // colour. Unweld first so every triangle owns its three
+        // vertices, then derive normals per triangle.
+        let unwelded_positions: Vec<[f32; 3]> =
+            indices.iter().map(|&i| positions[i as usize]).collect();
+        let unwelded_uvs: Vec<[f32; 2]> = if uvs.is_empty() {
+            Vec::new()
+        } else {
+            indices.iter().map(|&i| uvs[i as usize]).collect()
+        };
+        positions = unwelded_positions;
+        uvs = unwelded_uvs;
+        indices = (0..u32::try_from(positions.len()).unwrap_or(u32::MAX)).collect();
         derive_flat_normals(&positions, &indices)
     } else {
         mesh.normals
@@ -146,6 +164,55 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn cube_obj_without_normals_is_flat_shaded() {
+        // Cube with shared corner vertices and no normals — the
+        // loader must unweld so each triangle has its own vertex
+        // copies, producing a single face normal per face (flat
+        // shading) instead of averaged corner normals (Gouraud).
+        let src = b"\
+            v -0.5 -0.5  0.5\n\
+            v  0.5 -0.5  0.5\n\
+            v  0.5  0.5  0.5\n\
+            v -0.5  0.5  0.5\n\
+            v -0.5 -0.5 -0.5\n\
+            v  0.5 -0.5 -0.5\n\
+            v  0.5  0.5 -0.5\n\
+            v -0.5  0.5 -0.5\n\
+            f 1 2 3\n\
+            f 1 3 4\n\
+            f 5 8 7\n\
+            f 5 7 6\n\
+            f 2 6 7\n\
+            f 2 7 3\n\
+            f 5 1 4\n\
+            f 5 4 8\n\
+            f 4 3 7\n\
+            f 4 7 8\n\
+            f 5 6 2\n\
+            f 5 2 1\n\
+        ";
+        let asset = load_obj(src).expect("loads");
+        let positions = &asset.mesh.positions;
+        let normals = &asset.mesh.normals;
+        let indices = &asset.mesh.indices;
+        assert_eq!(indices.len() % 3, 0, "indices must be triangles");
+        assert_eq!(positions.len(), normals.len(), "parallel arrays");
+        for tri in indices.chunks_exact(3) {
+            let n0 = normals[tri[0] as usize];
+            let n1 = normals[tri[1] as usize];
+            let n2 = normals[tri[2] as usize];
+            for axis in 0..3 {
+                assert!(
+                    (n0[axis] - n1[axis]).abs() < 1e-4
+                        && (n0[axis] - n2[axis]).abs() < 1e-4,
+                    "triangle {tri:?}: normals diverge on axis {axis}: \
+                     {n0:?} {n1:?} {n2:?}",
+                );
+            }
+        }
     }
 
     #[test]
