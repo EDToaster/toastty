@@ -264,6 +264,13 @@ pub struct Renderer {
     /// `TOASTTY_TRACE_RENDER` env var sampled once at construction.
     /// Sampling per-frame was a measurable syscall on the hot path.
     trace_render: bool,
+    /// True when [`Self::scratch_texture`] holds stale pixels (its last
+    /// write was a direct-to-swapchain frame that bypassed it). The
+    /// partial-redraw path needs `LoadOp::Load` to read a current
+    /// previous frame, so when `scratch_stale` is set and a partial
+    /// redraw is requested we cascade to a full clear instead. Cleared
+    /// when a scratch-path frame restores the texture.
+    scratch_stale: bool,
 }
 
 /// Build the scratch render target. Same dims/format as the surface;
@@ -549,6 +556,11 @@ impl Renderer {
             rgp_revision_seen: u32::MAX,
             debug_overlay: None,
             trace_render: std::env::var_os("TOASTTY_TRACE_RENDER").is_some(),
+            // The very first frame is always a full clear → goes
+            // through the direct-to-swapchain path → leaves scratch
+            // untouched. So scratch is "stale" from the start. Subsequent
+            // frames pick up the cascade rule.
+            scratch_stale: true,
         })
     }
 
@@ -1033,6 +1045,22 @@ impl Renderer {
             // it for real.
         }
 
+        // Cascade rule for the direct-to-swapchain optimization
+        // (must run BEFORE the build-path decision below, otherwise
+        // we'd build *partial* instances and then render with
+        // `LoadOp::Clear`, painting only the dirty cells over a fresh
+        // bg — the rest of the screen would be bg color):
+        //
+        // A partial-redraw frame needs `LoadOp::Load` on a stable
+        // previous-frame target, which is what the scratch texture
+        // provides. If the previous frame went direct-to-swapchain,
+        // scratch holds stale pixels — force a full clear so we
+        // re-emit everything instead of leaking stale content
+        // through `LoadOp::Load`.
+        if !self.needs_full_clear && !term.damage().all && self.scratch_stale {
+            self.needs_full_clear = true;
+        }
+
         let theme = self.theme;
         // Build instances using the cached row glyphs. Reuse the
         // scratch vec across frames. We have to temporarily extract
@@ -1209,9 +1237,6 @@ impl Renderer {
             tracing::info!(target: "render_trace", "surface_acquire took={ms:.3}ms (blocks on vsync under Fifo)");
         }
 
-        // We render into `self.scratch_view`, not into the swapchain
-        // frame, so no need to create a view for `frame.texture` — the
-        // copy_texture_to_texture below takes the texture directly.
         let t_enc = if trace { Some(std::time::Instant::now()) } else { None };
         let mut encoder = self
             .device
@@ -1256,17 +1281,34 @@ impl Renderer {
             wgpu::LoadOp::Load
         };
 
+        // Full-clear frames render directly into the acquired swapchain
+        // back-buffer, skipping the scratch texture and the per-frame
+        // `copy_texture_to_texture` blit (12–36 MB of GPU bandwidth per
+        // frame at typical sizes). LoadOp::Clear means we don't need
+        // the previous-frame contents on the back-buffer, so swapchain
+        // rotation isn't a problem. Partial-redraw frames still target
+        // scratch + blit because LoadOp::Load needs the stable
+        // previous-frame pixels scratch provides.
+        let render_direct = self.needs_full_clear;
+        let frame_view = if render_direct {
+            Some(frame.texture.create_view(&wgpu::TextureViewDescriptor::default()))
+        } else {
+            None
+        };
+        let color_view: &wgpu::TextureView = if let Some(v) = frame_view.as_ref() {
+            v
+        } else {
+            &self.scratch_view
+        };
+
         {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("toastty-render term pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    // Render into the renderer-owned scratch texture, not
-                    // the swapchain frame. Its contents persist across
-                    // frames, so `LoadOp::Load` correctly reads the
-                    // previous frame's pixels for damage-tracked partial
-                    // redraw. The swapchain back-buffer rotation would
-                    // otherwise hand us a 1–2 frame stale buffer.
-                    view: &self.scratch_view,
+                    // Either the scratch texture (partial-redraw path)
+                    // or the acquired swapchain back-buffer (full-clear
+                    // direct path). See `render_direct` selection above.
+                    view: color_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -1356,27 +1398,30 @@ impl Renderer {
             }
         }
 
-        // Blit the scratch texture into the swapchain back-buffer so the
-        // present shows our pixels. The surface config carries COPY_DST.
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.scratch_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &frame.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: self.config.width,
-                height: self.config.height,
-                depth_or_array_layers: 1,
-            },
-        );
+        // Blit scratch → swapchain only on partial-redraw frames; the
+        // direct path rendered straight into the back-buffer and
+        // doesn't need (and would clobber) the copy.
+        if !render_direct {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.scratch_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &frame.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.config.width,
+                    height: self.config.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
 
 
         if let Some(t) = t_enc {
@@ -1404,6 +1449,11 @@ impl Renderer {
         // so the next frame can use LoadOp::Load unless someone
         // explicitly invalidates again.
         self.needs_full_clear = false;
+        // Track which target actually got written this frame:
+        // - direct path wrote the swapchain back-buffer; scratch is
+        //   now stale relative to "what's on screen"
+        // - scratch path wrote scratch (+ blitted); scratch is current
+        self.scratch_stale = render_direct;
         Ok(RenderOutcome::Rendered)
     }
 
