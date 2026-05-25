@@ -193,11 +193,17 @@ impl Rgp3dPipeline {
                 continue;
             };
 
-            // Cell-space anchor → pixel-space centre.
-            let center_px_x = (f32::from(p.anchor.col) + f32::from(p.anchor.cols) * 0.5)
-                * cell_size.0;
-            let center_px_y = (f32::from(p.anchor.row) + f32::from(p.anchor.rows) * 0.5)
-                * cell_size.1;
+            // Cell-space anchor → world-space centre. Per the RGP
+            // spec (protocols/graphics.md §3), `row`/`col` is the
+            // *center* cell of the placement, not its top-left.
+            //
+            // X is straightforward (cells go left→right). Y is
+            // inverted because the ortho projection treats world as
+            // Y-up (matching the OBJ/glTF model-space convention
+            // used by ratty), while terminal rows count top→bottom.
+            let center_px_x = (f32::from(p.anchor.col) + 0.5) * cell_size.0;
+            let center_px_y =
+                viewport.1 - (f32::from(p.anchor.row) + 0.5) * cell_size.1;
             // Pick the half-extent so the unit-cube model fits the
             // placement cell box. Use the smaller dimension so the
             // model isn't stretched in non-square placements.

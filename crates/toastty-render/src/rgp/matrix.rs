@@ -95,9 +95,15 @@ pub const Z_HALF_RANGE_PX: f32 = 200.0;
 
 /// Orthographic projection: world XYZ in **pixels** → NDC.
 ///
+/// World convention is **Y-up** to match the standard model-space
+/// convention used by OBJ / glTF / Bevy (which is what ratty, the
+/// RGP reference impl, ships). Mapping:
+///
 /// - X: world x ∈ `[0, width_px]` → NDC x ∈ `[-1, 1]`.
-/// - Y: world y ∈ `[0, height_px]` → NDC y ∈ `[1, -1]` (Y-down
-///   screen → Y-up NDC).
+/// - Y: world y ∈ `[0, height_px]` → NDC y ∈ `[-1, 1]`.
+///   (Pipeline callers convert cell row → world Y by inverting:
+///   `height_px - (row + 0.5) * cell_h`, so high world Y = top of
+///   screen.)
 /// - Z: world z ∈ `[-Z_HALF_RANGE_PX, +Z_HALF_RANGE_PX]` → NDC z
 ///   ∈ `[0, 1]` (z=0 → NDC 0.5, co-planar with the cell layer per
 ///   decision §3).
@@ -112,10 +118,10 @@ pub const Z_HALF_RANGE_PX: f32 = 200.0;
 pub fn ortho_screen(width_px: f32, height_px: f32) -> Mat4 {
     let mut m = identity();
     m[0][0] = 2.0 / width_px;
-    m[1][1] = -2.0 / height_px;
+    m[1][1] = 2.0 / height_px;
     m[2][2] = 0.5 / Z_HALF_RANGE_PX;
     m[3][0] = -1.0;
-    m[3][1] = 1.0;
+    m[3][1] = -1.0;
     m[3][2] = 0.5;
     m
 }
@@ -173,9 +179,10 @@ mod tests {
     }
 
     #[test]
-    fn ortho_maps_origin_to_topleft_ndc() {
+    fn ortho_maps_origin_to_bottom_left_ndc() {
         let p = ortho_screen(800.0, 600.0);
-        // World (0, 0, 0) → expect NDC (-1, +1, 0.5).
+        // World (0, 0, 0) is bottom-left under Y-up world → NDC
+        // (-1, -1, 0.5).
         let world = [0.0, 0.0, 0.0, 1.0];
         let mut out = [0.0_f32; 4];
         for row in 0..4 {
@@ -184,13 +191,15 @@ mod tests {
             }
         }
         assert!(approx_eq(out[0], -1.0), "x: {}", out[0]);
-        assert!(approx_eq(out[1], 1.0), "y: {}", out[1]);
+        assert!(approx_eq(out[1], -1.0), "y: {}", out[1]);
         assert!(approx_eq(out[2], 0.5), "z: {}", out[2]);
     }
 
     #[test]
-    fn ortho_maps_bottom_right_to_ndc_extents() {
+    fn ortho_maps_top_right_to_ndc_extents() {
         let p = ortho_screen(800.0, 600.0);
+        // World (width, height, 0) is top-right under Y-up → NDC
+        // (1, 1).
         let world = [800.0, 600.0, 0.0, 1.0];
         let mut out = [0.0_f32; 4];
         for row in 0..4 {
@@ -199,6 +208,6 @@ mod tests {
             }
         }
         assert!(approx_eq(out[0], 1.0), "x: {}", out[0]);
-        assert!(approx_eq(out[1], -1.0), "y: {}", out[1]);
+        assert!(approx_eq(out[1], 1.0), "y: {}", out[1]);
     }
 }

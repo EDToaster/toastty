@@ -105,22 +105,26 @@ impl GpuAssetCache {
         }
     }
 
-    /// Diff the cache against `scene`'s registered assets: upload
-    /// any new ids, drop any ids the scene no longer has.
+    /// Rebuild the GPU cache from the scene's registered assets.
+    ///
+    /// Wipes + re-uploads every asset rather than diffing by id. The
+    /// scene's revision counter only bumps on actual mutations
+    /// (register / place / update / delete), so this is not called
+    /// per frame — animation ticks don't bump revision. The
+    /// previous "missing id → upload" diff missed re-registers of
+    /// an existing id (e.g. the `draw` example calling
+    /// `register_payload` repeatedly on id=700 with growing OBJ
+    /// data), leaving the GPU stuck on the first version. Always
+    /// re-uploading is simpler than per-asset version tracking and
+    /// the meshes are small in v1.
     pub fn sync(
         &mut self,
         device: &wgpu::Device,
         scene: &toastty_graphics::rgp::scene::RgpScene,
     ) {
-        // Drop ids no longer in the scene.
-        let scene_ids: std::collections::HashSet<u32> =
-            scene.assets().map(|(id, _)| id).collect();
-        self.meshes.retain(|id, _| scene_ids.contains(id));
-        // Upload any missing.
+        self.meshes.clear();
         for (id, asset) in scene.assets() {
-            if !self.meshes.contains_key(&id) {
-                self.meshes.insert(id, GpuMesh::upload(device, &asset.data));
-            }
+            self.meshes.insert(id, GpuMesh::upload(device, &asset.data));
         }
     }
 }

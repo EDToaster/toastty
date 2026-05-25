@@ -842,6 +842,14 @@ impl Renderer {
         let rgp_animation_active = term.rgp_scene().has_active_animations();
         if rgp_animation_active {
             term.tick_rgp_animations(now);
+            // The previous frame's 3D pose still sits in the scratch
+            // colour + depth attachments (both LoadOp::Load by default
+            // for partial-redraw). Animating placements can sweep
+            // through pixels outside any cell's damage set, so marking
+            // dirty cells doesn't overpaint the trail — force a full
+            // clear, same as when the RGP revision bumps.
+            self.needs_full_clear = true;
+            term.mark_all_dirty();
         }
         if term.damage().is_empty()
             && !cursor_animation_due
