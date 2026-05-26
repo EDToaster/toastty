@@ -104,6 +104,24 @@ fn min_deadline(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
     }
 }
 
+/// Initial working directory to hand the spawned shell.
+///
+/// macOS LaunchServices (Spotlight / Launchpad / Finder) starts apps with
+/// CWD `/`, which leaves the shell stranded at root. Detect that case and
+/// fall back to `$HOME`; when launched from another shell, inherit its CWD.
+fn initial_cwd() -> std::path::PathBuf {
+    let cwd = std::env::current_dir().ok();
+    let launched_from_root = cwd.as_deref().is_some_and(|p| p == std::path::Path::new("/"));
+    if !launched_from_root
+        && let Some(p) = cwd
+    {
+        return p;
+    }
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+}
+
 fn main() -> Result<()> {
     // Parse args BEFORE tracing init — otherwise --print-default-config
     // would have log lines interleaved with the TOML we want to write
@@ -637,6 +655,7 @@ impl Toastty {
             // haven't validated). The value is informational — apps
             // generally treat any non-empty string as "we're in kitty".
             .env("KITTY_WINDOW_ID", "1")
+            .working_dir(initial_cwd())
             .size(WinSize {
                 rows,
                 cols,
