@@ -42,6 +42,13 @@ struct PendingGlyph {
     glyph: LayoutGlyph,
     col: u16,
     ch: char,
+    /// Every char in the source cluster this glyph belongs to. Stored so
+    /// the miss-tracking loop can credit *all* chars in a ligature, not
+    /// just the cluster's first char. Without this, e.g. shaping `!=` as
+    /// a single ligature glyph (cluster chars `['!', '=']`, `ch == '!'`)
+    /// would silently mark `=` as a permanent cache miss because it never
+    /// appeared as a `p.ch`.
+    cluster_chars: Vec<char>,
 }
 
 /// Result of laying out a single line: each `(char, glyph_slot)` pair the
@@ -149,6 +156,29 @@ pub struct GlyphRasterizer {
     /// glyph for them — e.g., zero-width spaces). Recording them stops
     /// repeated misses from triggering the slow path forever.
     char_cache_misses: std::collections::HashSet<char>,
+    /// Characters whose in-context glyph differs from their standalone
+    /// shape — i.e. the font applies GSUB substitution (ligatures /
+    /// contextual alternates) to them. Adding such a char to this set
+    /// forces every line containing it through the slow path, so we
+    /// always shape the correct contextual glyphs and never serve the
+    /// wrong substituted shape out of `char_cache`. Without this guard
+    /// a Fira Code-style `!=` ligature (two single-char-cluster glyphs
+    /// representing the left and right halves of `≠`) would poison
+    /// `char_cache['!']` and `char_cache['=']` with their ligature
+    /// shapes — making subsequent standalone `=` render as `≠` and the
+    /// `!` cell render blank.
+    uncacheable_chars: std::collections::HashSet<char>,
+    /// Lazy cache of each char's standalone glyph id — the glyph id
+    /// produced when the char is shaped alone, without any preceding
+    /// or following chars to trigger GSUB substitution. Used by the
+    /// slow path to detect when an in-context glyph is a contextual
+    /// variant (different id ⇒ substituted ⇒ don't cache, mark char
+    /// uncacheable).
+    standalone_glyph_ids: HashMap<char, Option<u16>>,
+    /// Single-char buffer used by [`Self::standalone_glyph_id_of`] for
+    /// isolation shapes. Kept separate from `buffer` so we don't clobber
+    /// the in-progress full-line shape inside `shape_line_slow`.
+    isolation_buffer: Buffer,
     /// True iff the family name requested by the caller resolved to at
     /// least one face in the loaded font database. When false, cosmic-
     /// text will fall back to whatever the system considers a default
@@ -199,6 +229,12 @@ impl GlyphRasterizer {
         // cluster-width snap fixes its per-glyph rounding (decision §3).
         buffer.set_monospace_width(Some(cell_size.0));
 
+        // Tiny buffer reused for single-char standalone shapes. Same
+        // monospace-width hint so isolated glyphs land at x=0.
+        let mut isolation_buffer = Buffer::new(&mut font_system, metrics);
+        isolation_buffer.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
+        isolation_buffer.set_monospace_width(Some(cell_size.0));
+
         let swash_cache = SwashCache::new();
         let atlas = Atlas::new(ATLAS_W, ATLAS_H);
         let mask_texture =
@@ -240,8 +276,49 @@ impl GlyphRasterizer {
             family_name,
             char_cache: HashMap::new(),
             char_cache_misses: std::collections::HashSet::new(),
+            uncacheable_chars: std::collections::HashSet::new(),
+            standalone_glyph_ids: HashMap::new(),
+            isolation_buffer,
             requested_family_available,
         }
+    }
+
+    /// Glyph id this char would produce shaped alone, with no
+    /// surrounding context to trigger GSUB ligatures or contextual
+    /// alternates. `None` means the font has no glyph for this
+    /// codepoint (rare, but we don't want to crash on it).
+    ///
+    /// Cached after the first lookup — every subsequent call is a
+    /// HashMap hit. Used by [`Self::shape_line_slow`]'s caching block
+    /// to detect contextual substitution: if the in-context glyph id
+    /// differs from this standalone id, we know the font substituted
+    /// the glyph (e.g. as part of a ligature) and we must not cache
+    /// the contextual form under the bare-char key.
+    fn standalone_glyph_id_of(&mut self, ch: char) -> Option<u16> {
+        if let Some(cached) = self.standalone_glyph_ids.get(&ch) {
+            return *cached;
+        }
+
+        let family_name = self.family_name.clone();
+        let attrs = Attrs::new().family(Family::Name(&family_name));
+
+        let mut s = String::with_capacity(4);
+        s.push(ch);
+
+        // Split-borrow disjoint fields so we can pass `&mut font_system`
+        // into the buffer method without aliasing.
+        let font_system = &mut self.font_system;
+        let isolation_buffer = &mut self.isolation_buffer;
+        isolation_buffer.set_text(&s, &attrs, Shaping::Advanced, None);
+        isolation_buffer.shape_until_scroll(font_system, false);
+
+        let id = isolation_buffer
+            .layout_runs()
+            .next()
+            .and_then(|run| run.glyphs.first().map(|g| g.glyph_id));
+
+        self.standalone_glyph_ids.insert(ch, id);
+        id
     }
 
     /// True when the family name passed to [`Self::new`] resolved to a
@@ -335,6 +412,15 @@ impl GlyphRasterizer {
             if ch.width() != Some(1) {
                 return None;
             }
+            // Char has been observed shaping to a contextual glyph
+            // (ligature / GSUB substitution). We can't serve it from
+            // `char_cache` — the cached single-char form might be the
+            // wrong half of a ligature, or the line we're rendering
+            // *now* might want a contextual form. Bail so the slow
+            // path does the right shaping each frame.
+            if self.uncacheable_chars.contains(&ch) {
+                return None;
+            }
             // Already-known miss: skip the cell, but keep going on
             // the fast path. This stops e.g. control characters from
             // forcing every line through cosmic-text forever.
@@ -412,12 +498,15 @@ impl GlyphRasterizer {
             for (g, snap) in run.glyphs.iter().zip(snapped.iter()) {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let col = (snap.x / cell_w).round() as u16;
-                let ch = run.text[g.start..g.end].chars().next().unwrap_or(' ');
+                let cluster_str = run.text.get(g.start..g.end).unwrap_or("");
+                let cluster_chars: Vec<char> = cluster_str.chars().collect();
+                let ch = cluster_chars.first().copied().unwrap_or(' ');
                 pending.push((
                     PendingGlyph {
                         glyph: g.clone(),
                         col,
                         ch,
+                        cluster_chars,
                     },
                     baseline_y,
                 ));
@@ -436,18 +525,46 @@ impl GlyphRasterizer {
         for (p, baseline_y) in &pending {
             if let Some(slot) = self.ensure_atlas_slot(queue, &p.glyph, *baseline_y) {
                 out.insert(p.col, p.ch, slot);
-                // Populate the per-character fast-path cache. A single
-                // monospace glyph's slot is column-independent (see
-                // `build_instances`), so reusing it for the next line
-                // is correct — but ONLY for width-1 chars. Wide and
-                // zero-width chars (CJK, combining marks, controls)
-                // must never enter the cache: their `(col, ch)` keys
-                // wouldn't survive the fast path's column-by-iteration
-                // assumption (invariant #3 on `char_cache`).
-                if p.ch.width() == Some(1) {
-                    self.char_cache.entry(p.ch).or_insert(slot);
+                // Decide whether this glyph is safe to drop into
+                // `char_cache`. Requirements:
+                //   - cluster is exactly one char (no multi-char
+                //     ligatures collapsed into a single glyph),
+                //   - that char is width 1 (invariant #3),
+                //   - the glyph id matches the char's standalone form
+                //     — i.e. the font did NOT apply a contextual GSUB
+                //     substitution. Fira Code-style ligatures keep
+                //     single-char clusters but swap each char's
+                //     glyph id for a half-ligature shape; caching
+                //     those would render every later standalone
+                //     occurrence with the wrong shape.
+                //
+                // When the in-context glyph id differs, also record
+                // `p.ch` in `uncacheable_chars` so future lines
+                // containing it are forced through the slow path
+                // (preserving the ligature visual every frame).
+                if p.cluster_chars.len() == 1 && p.ch.width() == Some(1) {
+                    let standalone = self.standalone_glyph_id_of(p.ch);
+                    if standalone == Some(p.glyph.glyph_id) {
+                        self.char_cache.entry(p.ch).or_insert(slot);
+                    } else if self.uncacheable_chars.insert(p.ch) {
+                        // Already-cached entries from earlier
+                        // standalone-only renders would now be wrong
+                        // (the font wants to substitute), so evict.
+                        self.char_cache.remove(&p.ch);
+                        tracing::debug!(
+                            target: "toastty_render::glyph",
+                            "marking {:?} (U+{:04X}) as contextually-shaped; \
+                             future renders use the slow path",
+                            p.ch, p.ch as u32,
+                        );
+                    }
                 }
-                produced_chars.insert(p.ch);
+                // Credit every char in this glyph's cluster — not just
+                // the cluster's leading char — so ligature partners
+                // aren't falsely marked as misses below.
+                for c in &p.cluster_chars {
+                    produced_chars.insert(*c);
+                }
             }
         }
 
@@ -456,8 +573,12 @@ impl GlyphRasterizer {
             if ch == ' ' || ch == '\0' {
                 continue;
             }
-            if !produced_chars.contains(&ch) {
-                self.char_cache_misses.insert(ch);
+            if !produced_chars.contains(&ch) && self.char_cache_misses.insert(ch) {
+                tracing::debug!(
+                    target: "toastty_render::glyph",
+                    "marking {ch:?} (U+{:04X}) as cache miss; future renders will skip it",
+                    ch as u32,
+                );
             }
         }
 
@@ -496,9 +617,18 @@ impl GlyphRasterizer {
             return Some(make_glyph_slot(existing, placement));
         }
 
-        let image = self
+        let Some(image) = self
             .swash_cache
-            .get_image_uncached(&mut self.font_system, cache_key)?;
+            .get_image_uncached(&mut self.font_system, cache_key)
+        else {
+            tracing::warn!(
+                target: "toastty_render::glyph",
+                "swash returned no image for glyph_id={} font_id={:?} — cell will render bg only",
+                cache_key.glyph_id,
+                cache_key.font_id,
+            );
+            return None;
+        };
 
         let w = image.placement.width;
         let h = image.placement.height;
@@ -534,8 +664,21 @@ impl GlyphRasterizer {
         let slot = if let Ok(s) = self.atlas.reserve(key, layer, w, h) {
             s
         } else {
+            tracing::warn!(
+                target: "toastty_render::glyph",
+                "atlas {layer:?} full — evicting LRU shelf to make room for {w}x{h} glyph",
+            );
             self.atlas.evict_oldest_shelf(layer);
-            self.atlas.reserve(key, layer, w, h).ok()?
+            match self.atlas.reserve(key, layer, w, h) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "toastty_render::glyph",
+                        "atlas {layer:?} reserve failed after eviction: {e:?} — cell will render bg only",
+                    );
+                    return None;
+                }
+            }
         };
 
         upload_glyph_pixels(queue, self.atlas_texture_for(layer), slot, &image.data);
@@ -787,5 +930,93 @@ mod tests {
         // the .notdef glyph — but the call must not panic and must
         // return without producing two-cell-overlapping glyphs.
         let _ = rasterizer.shape_line(&queue, "❤\u{FE0F}", true);
+    }
+
+    /// Regression: a char known to receive contextual GSUB substitution
+    /// in this font must force its containing line through the slow
+    /// path. Without this, Fira Code-style ligatures (where each char
+    /// in `!=` keeps its single-char cluster but swaps to a
+    /// half-ligature glyph) would poison `char_cache` with the wrong
+    /// shape and every later standalone `=` would render as `≠`.
+    #[test]
+    fn fast_path_bails_on_uncacheable_chars() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        // Warm the cache with plain ASCII so it would otherwise hit
+        // the fast path.
+        rasterizer.shape_line(&queue, "ab=", false);
+        assert!(rasterizer.try_shape_line_fast("ab=").is_some());
+
+        // Simulate the slow path having observed `=` shaping to a
+        // contextual variant (the half-ligature case). Future fast-
+        // path attempts on any line containing `=` must bail.
+        rasterizer.uncacheable_chars.insert('=');
+        rasterizer.char_cache.remove(&'=');
+
+        assert!(
+            rasterizer.try_shape_line_fast("ab=").is_none(),
+            "fast path must bail when the line contains a char marked uncacheable",
+        );
+        // Lines that don't contain the uncacheable char still take the
+        // fast path.
+        assert!(rasterizer.try_shape_line_fast("ab").is_some());
+    }
+
+    /// `standalone_glyph_id_of` returns a stable id for ASCII chars in
+    /// any reasonable monospace font and caches the result for repeat
+    /// lookups. Smoke check — also exercises the `isolation_buffer`
+    /// machinery so a regression in buffer setup surfaces here.
+    #[test]
+    fn standalone_glyph_id_caches_ascii_lookups() {
+        let (_device, _queue, mut rasterizer) = make_rasterizer();
+        let first = rasterizer.standalone_glyph_id_of('a');
+        assert!(first.is_some(), "Fira Mono must have a glyph for 'a'");
+        // Second call hits the cache; we can't observe that directly
+        // but we *can* observe the result is stable and that the
+        // standalone_glyph_ids map now contains the entry.
+        let second = rasterizer.standalone_glyph_id_of('a');
+        assert_eq!(first, second);
+        assert!(rasterizer.standalone_glyph_ids.contains_key(&'a'));
+    }
+
+    /// Regression: shaping a multi-char cluster (any ligature) must not
+    /// silently mark the non-leading chars of the cluster as cache
+    /// misses. Previously, `produced_chars` only stored the cluster's
+    /// first char, so e.g. `!=` shaped as a ligature glyph (cluster
+    /// chars `['!', '=']`, `p.ch == '!'`) caused `=` to land in
+    /// `char_cache_misses` — after which every future `=` rendered as
+    /// transparent because the fast path's miss check at line 341
+    /// silently `continue`s. Whether or not the bundled font actually
+    /// ligates these sequences, no ASCII char in the input may ever be
+    /// marked as a miss: each has a real glyph in any reasonable font.
+    #[test]
+    fn ligature_partners_are_not_marked_as_cache_misses() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+
+        // Sequences that ligate in popular programming fonts (Fira Code,
+        // JetBrains Mono, Cascadia, etc). Fira Mono Medium ships without
+        // programming ligatures but does keep typographic ligatures
+        // (`fi`, `fl`, `ffi`, `ffl`) — those are the case that bites
+        // users on a fresh terminal printing `printf` or `'before:'`.
+        for line in [
+            "fi", "fl", "ffi", "ffl", "==", "!=", ">=", "<=", "=>", "->",
+            "<-", ":=", "===", "!==", "<==>", "fi==", "if x != y:",
+        ] {
+            rasterizer.shape_line(&queue, line, false);
+        }
+
+        // Every ASCII char that appeared in the shaped lines must be
+        // either rendered (in `char_cache`) or silently produced via a
+        // ligature — but NEVER a "miss" that would suppress future
+        // renders.
+        let all_chars: std::collections::HashSet<char> =
+            "filfffi==!><=->:if xy".chars().collect();
+        for ch in all_chars {
+            assert!(
+                !rasterizer.char_cache_misses.contains(&ch),
+                "ASCII char {ch:?} (U+{:04X}) was wrongly marked as a cache miss; \
+                 ligature partners must not poison the fast path",
+                ch as u32,
+            );
+        }
     }
 }
