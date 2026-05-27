@@ -4,6 +4,7 @@
 //! effect. Implements `toastty_parser::Perform` so the parser can drive it
 //! directly.
 
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use unicode_width::UnicodeWidthChar;
@@ -1631,7 +1632,22 @@ impl Term {
                 }
             }
 
-            _ => {}
+            _ => {
+                if debug_logging_enabled() {
+                    // Collect params eagerly so the `{:?}` printout
+                    // is readable rather than a vte internal type.
+                    let params_vec: Vec<Vec<u16>> = params
+                        .iter()
+                        .map(|sub| sub.iter().copied().collect())
+                        .collect();
+                    tracing::warn!(
+                        target: "toastty_term::csi",
+                        "unhandled CSI: action={action:?} priv={:?} intermediates={:?} params={params_vec:?}",
+                        priv_marker.map(char::from),
+                        std::str::from_utf8(intermediates).unwrap_or("<non-utf8>"),
+                    );
+                }
+            }
         }
     }
 
@@ -2035,6 +2051,16 @@ impl Term {
             self.image_revision = self.image_revision.wrapping_add(1);
         }
     }
+}
+
+/// True when the `TOASTTY_DEBUG` env var is set. Used to gate the
+/// `tracing::warn!` in [`Term::handle_csi`]'s fallthrough arm so
+/// unhandled CSI sequences surface in logs during development —
+/// without spamming production. Read once and cached; the env can't
+/// change mid-process.
+fn debug_logging_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TOASTTY_DEBUG").is_some())
 }
 
 fn first_param(params: &Params, default: u16) -> u16 {
