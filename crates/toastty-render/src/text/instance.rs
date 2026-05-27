@@ -547,13 +547,26 @@ pub fn build_instances_into<F, S>(
             let (fg, bg) = resolve_cell_colors(cell, theme, ext_palette);
             let bg = if selected { theme.selection_bg } else { bg };
 
+            // Width-2 (CJK) primaries: widen the bg quad to span both
+            // columns so the continuation half isn't left showing the
+            // previous frame / default bg.
+            let bg_w = if row
+                .cells
+                .get(c as usize + 1)
+                .is_some_and(|next| next.is_continuation)
+            {
+                2.0 * cell_w
+            } else {
+                cell_w
+            };
+
             // Always emit a cell-sized background quad. The glyph (if
             // present) is rendered as a separate, glyph-sized quad on
             // top of it — so a narrow `l` does not stretch to fill the
             // whole cell.
             out.push(CellInstance {
                 pos,
-                size: [cell_w, cell_h],
+                size: [bg_w, cell_h],
                 uv_min: [0.0, 0.0],
                 uv_max: [0.0, 0.0],
                 fg,
@@ -599,10 +612,9 @@ pub fn build_instances_into<F, S>(
             // primaries underline the FULL cluster (both columns), not
             // just the primary column. Without this, hyperlinked CJK
             // text underlined only the leading half of every wide
-            // glyph. (We do the same in `build_dirty_instances_into`;
-            // the bg quad path stays single-column for now, matching
-            // the existing pre-fix behavior the reviewer called out as
-            // out of scope.)
+            // glyph. (We do the same in `build_dirty_instances_into`,
+            // and the bg quad above uses the same widening so the
+            // continuation half is covered.)
             if cell.style.flags.underline || cell.hyperlink_id.is_some() {
                 let strip_w = if row
                     .cells
@@ -766,12 +778,25 @@ pub fn build_dirty_instances_into<F, S>(
             let (fg, bg) = resolve_cell_colors(cell, theme, ext_palette);
             let bg = if selected { theme.selection_bg } else { bg };
 
+            // Width-2 (CJK) primaries: widen the bg quad to span both
+            // columns so the continuation half isn't left showing the
+            // previous frame / default bg.
+            let bg_w = if row
+                .cells
+                .get(c as usize + 1)
+                .is_some_and(|next| next.is_continuation)
+            {
+                2.0 * cell_w
+            } else {
+                cell_w
+            };
+
             // Always emit a background quad — even for blank cells —
             // under LoadOp::Load, so old glyphs / cursor blocks get
             // overpainted.
             out.push(CellInstance {
                 pos,
-                size: [cell_w, cell_h],
+                size: [bg_w, cell_h],
                 uv_min: [0.0, 0.0],
                 uv_max: [0.0, 0.0],
                 fg,
