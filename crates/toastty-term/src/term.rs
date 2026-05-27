@@ -1508,6 +1508,21 @@ impl Term {
             }
             'J' => self.erase_display(first_param(params, 0)),
             'K' => self.erase_line(first_param(params, 0)),
+            // ICH — Insert Character. Default count is 1.
+            '@' => self.insert_char(first_param(params, 1).max(1)),
+            // IL — Insert Line.
+            'L' => self.insert_line(first_param(params, 1).max(1)),
+            // DL — Delete Line.
+            'M' => self.delete_line(first_param(params, 1).max(1)),
+            // DCH — Delete Character. The DEL-fix that motivated this:
+            // zsh sends `BS DCH CUF SP CUB` for every backspace; without
+            // a working DCH the deletion appears to land at the end of
+            // the line instead of at the cursor.
+            'P' => self.delete_char(first_param(params, 1).max(1)),
+            // ECH — Erase Character (no shift).
+            'X' => self.erase_char(first_param(params, 1).max(1)),
+            // VPA — Vertical Position Absolute (same column).
+            'd' => self.vertical_position_absolute(first_param(params, 1).max(1)),
             // SGR proper has no private marker. `CSI > Ps ; Ps m` is
             // xterm's XTMODKEYS (modifyOtherKeys); we don't implement
             // it — apps negotiate the kitty keyboard protocol via the
@@ -1822,6 +1837,191 @@ impl Term {
         };
         row.erase(start, end, style);
         self.mark_cells(cur_row, start, end);
+    }
+
+    /// DCH — Delete Character. `CSI Ps P` removes `n` cells at the
+    /// cursor column, shifts the rest of the row left, and fills the
+    /// vacated rightmost `n` cells with blanks under the current SGR.
+    /// Cursor doesn't move.
+    ///
+    /// Without this, zsh's DEL handling appears to "delete from the end
+    /// of the line": the shell sends `BS DCH CUF SP CUB`, and a dropped
+    /// DCH leaves only the trailing space writeback visible.
+    fn delete_char(&mut self, n: u16) {
+        let cur_row = self.cursor.row;
+        let cur_col = self.cursor.col;
+        let cols = self.cols;
+        if cur_col >= cols || n == 0 {
+            return;
+        }
+        let style = self.cursor.style;
+        let n = u16::min(n, cols - cur_col);
+        let row = self.active_grid_mut().row_mut(cur_row);
+        let cols_u = cols as usize;
+        let col_u = cur_col as usize;
+        let n_u = n as usize;
+        if row.cells.len() < cols_u {
+            row.resize_cols(cols);
+        }
+        // Shift left. `cells` are `Copy`, so a plain copy_within is
+        // both correct and overlap-safe.
+        row.cells.copy_within((col_u + n_u)..cols_u, col_u);
+        // Blank the vacated tail under the current SGR (matches xterm /
+        // ECMA-48 — the deleted-from-the-right slots use the active
+        // attribute set, not Style::RESET).
+        let blank = Cell {
+            ch: ' ',
+            style,
+            is_continuation: false,
+            hyperlink_id: None,
+        };
+        for c in &mut row.cells[(cols_u - n_u)..cols_u] {
+            *c = blank;
+        }
+        self.mark_cells(cur_row, cur_col, cols);
+    }
+
+    /// ICH — Insert Character. `CSI Ps @` inserts `n` blank cells at
+    /// the cursor column, shifting the rest of the row right. Cells
+    /// pushed past the right edge are lost. Cursor doesn't move.
+    fn insert_char(&mut self, n: u16) {
+        let cur_row = self.cursor.row;
+        let cur_col = self.cursor.col;
+        let cols = self.cols;
+        if cur_col >= cols || n == 0 {
+            return;
+        }
+        let style = self.cursor.style;
+        let n = u16::min(n, cols - cur_col);
+        let row = self.active_grid_mut().row_mut(cur_row);
+        let cols_u = cols as usize;
+        let col_u = cur_col as usize;
+        let n_u = n as usize;
+        if row.cells.len() < cols_u {
+            row.resize_cols(cols);
+        }
+        // Shift right. copy_within handles overlap correctly even
+        // when src/dst overlap.
+        row.cells.copy_within(col_u..(cols_u - n_u), col_u + n_u);
+        let blank = Cell {
+            ch: ' ',
+            style,
+            is_continuation: false,
+            hyperlink_id: None,
+        };
+        for c in &mut row.cells[col_u..(col_u + n_u)] {
+            *c = blank;
+        }
+        self.mark_cells(cur_row, cur_col, cols);
+    }
+
+    /// ECH — Erase Character. `CSI Ps X` writes `n` blanks at the
+    /// cursor without shifting; the rest of the row is untouched.
+    /// Cursor doesn't move.
+    fn erase_char(&mut self, n: u16) {
+        let cur_row = self.cursor.row;
+        let cur_col = self.cursor.col;
+        let cols = self.cols;
+        if cur_col >= cols || n == 0 {
+            return;
+        }
+        let n = u16::min(n, cols - cur_col);
+        let style = self.cursor.style;
+        let row = self.active_grid_mut().row_mut(cur_row);
+        row.erase(cur_col, cur_col + n, style);
+        self.mark_cells(cur_row, cur_col, cur_col + n);
+    }
+
+    /// IL — Insert Line. `CSI Ps L` inserts `n` blank lines at the
+    /// cursor row, scrolling the lines below it down. Lines pushed
+    /// past the bottom of the screen are lost.
+    ///
+    /// Without a DECSTBM scroll region (not yet implemented), the
+    /// "below" range is the cursor row through the last visible row.
+    fn insert_line(&mut self, n: u16) {
+        let cur_row = self.cursor.row;
+        let rows = self.rows;
+        if cur_row >= rows || n == 0 {
+            return;
+        }
+        let n = u16::min(n, rows - cur_row);
+        let style = self.cursor.style;
+        let cols = self.cols;
+        let grid = self.active_grid_mut();
+        // Shift rows [cur_row..rows-n] down to [cur_row+n..rows].
+        // Iterate top-down from the bottom to avoid overwriting our
+        // source rows before they're copied.
+        let n_us = n as usize;
+        for r in (cur_row as usize + n_us..rows as usize).rev() {
+            // SmallVec<[Cell;16]> clones are O(cols); IL/DL aren't
+            // hot. mem::take + restore keeps us off the heap for
+            // inlined rows.
+            let src = std::mem::take(grid.row_mut((r - n_us) as u16));
+            *grid.row_mut(r as u16) = src;
+        }
+        // Blank the n freshly-inserted rows under the current SGR.
+        let blank = Cell {
+            ch: ' ',
+            style,
+            is_continuation: false,
+            hyperlink_id: None,
+        };
+        for r in cur_row..(cur_row + n) {
+            let row = grid.row_mut(r);
+            row.resize_cols(cols);
+            for c in &mut row.cells {
+                *c = blank;
+            }
+            row.soft_wrap = false;
+        }
+        for r in cur_row..rows {
+            self.mark_row(r);
+        }
+    }
+
+    /// DL — Delete Line. `CSI Ps M` removes `n` lines at the cursor
+    /// row, scrolling the lines below it up. The bottom `n` rows
+    /// become blank.
+    fn delete_line(&mut self, n: u16) {
+        let cur_row = self.cursor.row;
+        let rows = self.rows;
+        if cur_row >= rows || n == 0 {
+            return;
+        }
+        let n = u16::min(n, rows - cur_row);
+        let style = self.cursor.style;
+        let cols = self.cols;
+        let grid = self.active_grid_mut();
+        let n_us = n as usize;
+        // Shift rows [cur_row+n..rows] up to [cur_row..rows-n].
+        for r in cur_row as usize..(rows as usize - n_us) {
+            let src = std::mem::take(grid.row_mut((r + n_us) as u16));
+            *grid.row_mut(r as u16) = src;
+        }
+        let blank = Cell {
+            ch: ' ',
+            style,
+            is_continuation: false,
+            hyperlink_id: None,
+        };
+        for r in (rows - n)..rows {
+            let row = grid.row_mut(r);
+            row.resize_cols(cols);
+            for c in &mut row.cells {
+                *c = blank;
+            }
+            row.soft_wrap = false;
+        }
+        for r in cur_row..rows {
+            self.mark_row(r);
+        }
+    }
+
+    /// VPA — Vertical Position Absolute. `CSI Ps d` moves the cursor
+    /// to row `Ps` (1-based) on the same column.
+    fn vertical_position_absolute(&mut self, row_1based: u16) {
+        let new_row = row_1based.saturating_sub(1);
+        self.move_cursor(new_row, self.cursor.col);
     }
 
     fn apply_sgr(&mut self, params: &Params) {
@@ -5598,5 +5798,90 @@ mod tests {
         feed(&mut t, b"\x1b8");
         assert_eq!(t.cursor.row, 0);
         assert_eq!(t.cursor.col, 0);
+    }
+
+    /// Regression for the zsh "DEL deletes from end of line" bug.
+    /// zsh's response to one DEL keypress is `BS DCH CUF SP CUB`;
+    /// before DCH was implemented the in-place deletion was dropped
+    /// and only the trailing-space writeback was visible, so each
+    /// DEL appeared to eat a char off the right end of the line.
+    #[test]
+    fn dch_shifts_cells_left_and_blanks_tail() {
+        let mut t = Term::new(2, 10, 0);
+        feed(&mut t, b"printf hel");
+        // Move cursor under 't' (position 4) and send DCH.
+        feed(&mut t, b"\x1b[1;5H\x1b[P");
+        assert_eq!(row_text(&t, 0), "prinf hel");
+        // Cursor must not move.
+        assert_eq!(t.cursor().col, 4);
+    }
+
+    #[test]
+    fn dch_default_count_is_one() {
+        let mut t = Term::new(1, 6, 0);
+        feed(&mut t, b"abcdef\x1b[1;2H\x1b[P");
+        assert_eq!(row_text(&t, 0), "acdef");
+    }
+
+    #[test]
+    fn dch_count_larger_than_remaining_clamps() {
+        let mut t = Term::new(1, 6, 0);
+        feed(&mut t, b"abcdef\x1b[1;4H\x1b[99P");
+        // From col 3 onward (`def`) is consumed; everything to the
+        // left of the cursor is untouched.
+        assert_eq!(row_text(&t, 0), "abc");
+    }
+
+    #[test]
+    fn ich_shifts_cells_right_and_inserts_blanks() {
+        // Fill the row so we can observe cells falling off the right
+        // edge (the doc-comment guarantee).
+        let mut t = Term::new(1, 8, 0);
+        feed(&mut t, b"abcdefgh\x1b[1;3H\x1b[2@");
+        // `ab` stays, two blanks inserted at col 2, `cdef` shifted
+        // right to cols 4..8. `gh` falls off the right edge.
+        assert_eq!(row_text(&t, 0), "ab  cdef");
+    }
+
+    #[test]
+    fn ech_writes_blanks_without_shifting() {
+        let mut t = Term::new(1, 8, 0);
+        feed(&mut t, b"abcdef\x1b[1;3H\x1b[2X");
+        // ECH replaces 2 chars at the cursor with blanks; nothing
+        // shifts so `ef` stays in place.
+        assert_eq!(row_text(&t, 0), "ab  ef");
+    }
+
+    #[test]
+    fn dl_scrolls_lines_below_up() {
+        let mut t = Term::new(4, 4, 0);
+        feed(&mut t, b"aaaa\r\nbbbb\r\ncccc\r\ndddd");
+        // Cursor home, then delete 1 line.
+        feed(&mut t, b"\x1b[H\x1b[M");
+        assert_eq!(row_text(&t, 0), "bbbb");
+        assert_eq!(row_text(&t, 1), "cccc");
+        assert_eq!(row_text(&t, 2), "dddd");
+        assert_eq!(row_text(&t, 3), "");
+    }
+
+    #[test]
+    fn il_scrolls_lines_below_down() {
+        let mut t = Term::new(4, 4, 0);
+        feed(&mut t, b"aaaa\r\nbbbb\r\ncccc\r\ndddd");
+        // Cursor to row 2, then insert 1 line.
+        feed(&mut t, b"\x1b[2;1H\x1b[L");
+        assert_eq!(row_text(&t, 0), "aaaa");
+        assert_eq!(row_text(&t, 1), "");
+        assert_eq!(row_text(&t, 2), "bbbb");
+        assert_eq!(row_text(&t, 3), "cccc");
+        // "dddd" fell off the bottom.
+    }
+
+    #[test]
+    fn vpa_moves_to_row_keeping_column() {
+        let mut t = Term::new(5, 5, 0);
+        feed(&mut t, b"\x1b[1;3H\x1b[4d");
+        assert_eq!(t.cursor().row, 3);
+        assert_eq!(t.cursor().col, 2);
     }
 }
