@@ -4,4 +4,5 @@
 -[ ] path traversal for asset loading in rgp could be unsafe
 -[ ] animate=1 in rgp does not work
 -[ ] cannot click and drag
--[ ] cannot press up arrow when atuin is active
+-[x] cannot press up arrow when atuin is active
+-[ ] when selecting and copying text from inside zellij, it doesn't actually pass through to the clipboard

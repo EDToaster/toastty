@@ -296,6 +296,22 @@ pub struct Term {
     /// highlighting the evicted rows). Cleared on resize, alt-screen
     /// flip, and most "screen contents fundamentally changed" paths.
     selection: Option<crate::selection::Selection>,
+    /// DECSTBM top/bottom margins (0-indexed, inclusive). Default spans
+    /// the full visible region: `(0, rows - 1)`. `CSI Ps;Ps r` updates
+    /// these; resize and RIS reset to the full region. Only LF / RI /
+    /// IL / DL consult these — bare cursor moves and direct CUP can
+    /// still leave the region (xterm behavior without DECOM).
+    scroll_top: u16,
+    scroll_bot: u16,
+    /// XTMODKEYS (`CSI > 4 ; Pv m`) — modifyOtherKeys level.
+    ///   0 = disabled (legacy encoding)
+    ///   1 = enabled for non-printable Ctrl combos only
+    ///   2 = enabled for all modified keys (full disambiguation)
+    /// Stored so apps that probe / set it don't spam unhandled-CSI
+    /// logs. Key-encoding paths still emit kitty-protocol sequences;
+    /// honoring this level for the legacy `CSI 27 ; mods ; code ~`
+    /// reporting is future work.
+    modify_other_keys: u8,
 }
 
 /// In-progress run of Kitty Unicode placeholder cells.
@@ -456,6 +472,9 @@ impl Term {
             rgp_handler: RgpHandler::new(),
             rgp_scene: RgpScene::new(),
             selection: None,
+            scroll_top: 0,
+            scroll_bot: rows - 1,
+            modify_other_keys: 0,
         }
     }
 
@@ -1346,6 +1365,11 @@ impl Term {
         self.alt.resize(rows, cols, rows as usize);
         self.rows = rows;
         self.cols = cols;
+        // Resize collapses any prior DECSTBM region: xterm resets the
+        // scrolling margins to the full new screen so a smaller window
+        // can't leave an out-of-range region pinned.
+        self.scroll_top = 0;
+        self.scroll_bot = rows - 1;
         self.clamp_cursor();
         // Resize invalidates every cached shaped line — re-shape all.
         self.damage.resize(rows);
@@ -1391,25 +1415,16 @@ impl Term {
 
     /// Reverse Index (RI, `ESC M`): symmetric counterpart to `linefeed`.
     /// Move cursor up one; at the top of the scroll region, scroll the
-    /// screen *down* by one (open a blank row at the top, drop the
-    /// bottom row). Less, vim, fzf and friends rely on this for the
-    /// "paint lines into the top" path (e.g. `b`/`u` paging up).
+    /// scroll region *down* by one (open a blank row at the top, drop
+    /// the bottom row of the region). Less, vim, fzf and friends rely
+    /// on this for the "paint lines into the top" path (e.g. `b`/`u`
+    /// paging up).
     fn reverse_index(&mut self) {
-        if self.cursor.row == 0 {
-            // At top: scroll down by one, cursor stays at row 0.
-            self.active_grid_mut().scroll_down();
-            // Primary grid's history shrank by 1 (saturating) — clamp
-            // the viewport so the user doesn't end up viewing past the
-            // oldest retained line.
-            if !self.alt_active {
-                self.viewport.clamp_to(self.primary.history_lines());
-            }
-            self.mark_all_dirty();
-            let dropped = self.image_grid.shift_rows_down(1, 0, self.rows);
-            if !dropped.is_empty() {
-                self.image_revision = self.image_revision.wrapping_add(1);
-            }
-        } else {
+        if self.cursor.row == self.scroll_top {
+            // At top of region: scroll region down by one, cursor
+            // stays put. Partial regions don't touch scrollback.
+            self.region_scroll_down();
+        } else if self.cursor.row > 0 {
             let old_row = self.cursor.row;
             self.cursor.row -= 1;
             let new_row = self.cursor.row;
@@ -1417,30 +1432,17 @@ impl Term {
             self.mark_cell(old_row, col);
             self.mark_cell(new_row, col);
         }
+        // At absolute row 0 but above scroll_top (cursor outside
+        // region) — RI has no effect, matching xterm.
     }
 
     fn linefeed(&mut self) {
-        if self.cursor.row + 1 >= self.rows {
-            // At bottom: scroll up by one and stay on the last row.
-            self.active_grid_mut().scroll_up();
-            // Sticky-bottom: if the user is in scrollback (offset > 0)
-            // bump the viewport by 1 so the content they're viewing
-            // stays put even as the bottom advances. At offset 0 this
-            // is a no-op — they remain pinned to the live bottom.
-            if !self.alt_active {
-                self.viewport.on_grid_scroll_up(self.primary.history_lines());
-            }
-            // Every visible row's content shifted up; the cached shape
-            // for each row no longer matches its position. Force a
-            // re-shape of all rows.
-            self.mark_all_dirty();
-            // Slide image placements up by 1 row (alt screen has no
-            // image placements but the call is cheap).
-            let dropped = self.image_grid.shift_rows_up(1, 0);
-            if !dropped.is_empty() {
-                self.image_revision = self.image_revision.wrapping_add(1);
-            }
-        } else {
+        if self.cursor.row == self.scroll_bot {
+            // At bottom of region: scroll region up by one, cursor
+            // stays at scroll_bot. Full-region case preserves
+            // scrollback semantics; partial regions don't.
+            self.region_scroll_up();
+        } else if self.cursor.row + 1 < self.rows {
             // Followup C3: a mid-screen LF moves the cursor without
             // touching any cell content. Under partial redraw, the
             // dirty-instance builder would see an empty damage set
@@ -1458,6 +1460,126 @@ impl Term {
             self.mark_cell(old_row, col);
             self.mark_cell(new_row, col);
         }
+        // Cursor below scroll_bot but at absolute screen bottom: per
+        // xterm, LF does nothing here — the region's scroll is gated
+        // on the cursor being *on* the bottom margin.
+    }
+
+    /// Scroll the current DECSTBM region up by one row.
+    ///
+    /// Full-region (top == 0 && bot == rows - 1) takes the fast path
+    /// that delegates to `grid.scroll_up()` so the displaced top row
+    /// rotates into scrollback (primary grid only), viewport offsets
+    /// follow, and image placements slide up. A partial region shifts
+    /// rows in place within `[top..=bot]`: the top row is dropped
+    /// (no scrollback), rows below shift up, and `bot` is blanked.
+    fn region_scroll_up(&mut self) {
+        let top = self.scroll_top;
+        let bot = self.scroll_bot.min(self.rows.saturating_sub(1));
+        if top == 0 && bot == self.rows.saturating_sub(1) {
+            self.active_grid_mut().scroll_up();
+            if !self.alt_active {
+                self.viewport
+                    .on_grid_scroll_up(self.primary.history_lines());
+            }
+            self.mark_all_dirty();
+            let dropped = self.image_grid.shift_rows_up(1, 0);
+            if !dropped.is_empty() {
+                self.image_revision = self.image_revision.wrapping_add(1);
+            }
+            return;
+        }
+        if top >= bot {
+            return;
+        }
+        let style = self.cursor.style;
+        let cols = self.cols;
+        let grid = self.active_grid_mut();
+        for r in top..bot {
+            let src = std::mem::take(grid.row_mut(r + 1));
+            *grid.row_mut(r) = src;
+        }
+        let blank = Cell {
+            ch: ' ',
+            style,
+            is_continuation: false,
+            hyperlink_id: None,
+        };
+        let row = grid.row_mut(bot);
+        row.resize_cols(cols);
+        for c in &mut row.cells {
+            *c = blank;
+        }
+        row.soft_wrap = false;
+        for r in top..=bot {
+            self.mark_row(r);
+        }
+    }
+
+    /// Symmetric to `region_scroll_up`: scroll the current DECSTBM
+    /// region down by one row. Partial regions drop the bottom row
+    /// (not preserved as scroll-back-forward) and blank the top.
+    fn region_scroll_down(&mut self) {
+        let top = self.scroll_top;
+        let bot = self.scroll_bot.min(self.rows.saturating_sub(1));
+        if top == 0 && bot == self.rows.saturating_sub(1) {
+            self.active_grid_mut().scroll_down();
+            if !self.alt_active {
+                self.viewport.clamp_to(self.primary.history_lines());
+            }
+            self.mark_all_dirty();
+            let dropped = self.image_grid.shift_rows_down(1, 0, self.rows);
+            if !dropped.is_empty() {
+                self.image_revision = self.image_revision.wrapping_add(1);
+            }
+            return;
+        }
+        if top >= bot {
+            return;
+        }
+        let style = self.cursor.style;
+        let cols = self.cols;
+        let grid = self.active_grid_mut();
+        for r in (top + 1..=bot).rev() {
+            let src = std::mem::take(grid.row_mut(r - 1));
+            *grid.row_mut(r) = src;
+        }
+        let blank = Cell {
+            ch: ' ',
+            style,
+            is_continuation: false,
+            hyperlink_id: None,
+        };
+        let row = grid.row_mut(top);
+        row.resize_cols(cols);
+        for c in &mut row.cells {
+            *c = blank;
+        }
+        row.soft_wrap = false;
+        for r in top..=bot {
+            self.mark_row(r);
+        }
+    }
+
+    /// DECSTBM — `CSI Ps ; Ps r`. Set the top/bottom scrolling margins
+    /// (1-based, inclusive). Empty or `0` params default to row 1 and
+    /// the last row respectively; a non-strictly-decreasing pair
+    /// (e.g. `5;3`) is rejected and the region is left untouched, per
+    /// xterm. On success, the cursor is moved to home (1,1) — the spec
+    /// mandates this so apps can chain DECSTBM with a CUP.
+    fn set_scrolling_region(&mut self, top_1: u16, bot_1: u16) {
+        if self.rows == 0 {
+            return;
+        }
+        let last = self.rows - 1;
+        let top0 = top_1.saturating_sub(1).min(last);
+        let bot0 = bot_1.saturating_sub(1).min(last);
+        if bot0 <= top0 {
+            return;
+        }
+        self.scroll_top = top0;
+        self.scroll_bot = bot0;
+        self.cursor_position(1, 1);
     }
 
     /// Cell-width lookup for a single codepoint.
@@ -1737,8 +1859,52 @@ impl Term {
             // form was being applied as SGR 4 (underline) + SGR 2
             // (dim), making every subsequent cell render underlined.
             'm' if priv_marker.is_none() => self.apply_sgr(params),
+            // XTMODKEYS — `CSI > Pp ; Pv m`. `Pp = 4` selects the
+            // modifyOtherKeys resource. Apps (vim, neovim, fish) emit
+            // `>4;2m` to enable level-2 reporting at startup and `>4m`
+            // to disable on exit. Toastty negotiates richer keys via
+            // the kitty keyboard protocol stack instead, so we only
+            // record the level — useful later if we add a legacy
+            // `CSI 27 ; mods ; code ~` encoder fallback. Accepting the
+            // sequence here keeps the warning log quiet.
+            'm' if priv_marker == Some(b'>') => {
+                let pp = first_param(params, 0);
+                if pp == 4 {
+                    let pv = nth_param(params, 1, 0);
+                    self.modify_other_keys = (pv & 0xff) as u8;
+                }
+            }
             'h' if priv_marker == Some(b'?') => self.apply_decset(params, true),
             'l' if priv_marker == Some(b'?') => self.apply_decset(params, false),
+            // DECRQM — `CSI ? Ps $ p`. The app asks whether DEC private
+            // mode `Ps` is currently set; we reply with DECRPM:
+            // `CSI ? Ps ; Pm $ y`. `Pm` values per VT-spec:
+            //   0 — not recognized
+            //   1 — set
+            //   2 — reset
+            //   3 — permanently set
+            //   4 — permanently reset
+            // Apps (notably neovim, helix, kitty's own probes) gate
+            // BSU/ESU (mode 2026) on this reply: if we don't answer,
+            // they fall back to "not supported" after a short timeout
+            // and never emit the optimization. Mode 2026 is therefore
+            // the load-bearing case, but we answer the full set of
+            // modes we already track in `apply_decset` for symmetry.
+            'p' if priv_marker == Some(b'?') && intermediates == b"$" => {
+                let ps = first_param(params, 0);
+                let pm = self.decrqm_status(ps);
+                let reply = format!("\x1b[?{ps};{pm}$y");
+                self.pty_replies.extend_from_slice(reply.as_bytes());
+            }
+            // DECSTBM — `CSI Ps ; Ps r`. Set top/bottom scrolling
+            // margins (1-based, inclusive). Default top is row 1,
+            // default bottom is the last row, so a bare `CSI r` or
+            // `CSI 0 r` resets the region to the full screen.
+            'r' if priv_marker.is_none() => {
+                let top = first_param(params, 1);
+                let bot = nth_param(params, 1, self.rows);
+                self.set_scrolling_region(top, bot);
+            }
             // DECSCUSR: `CSI Ps SP q` — runtime cursor shape + blink.
             // vte exposes the SP intermediate as `intermediates = b" "`.
             'q' if intermediates == b" " => self.apply_decscusr(first_param(params, 0)),
@@ -2140,26 +2306,27 @@ impl Term {
     }
 
     /// IL — Insert Line. `CSI Ps L` inserts `n` blank lines at the
-    /// cursor row, scrolling the lines below it down. Lines pushed
-    /// past the bottom of the screen are lost.
-    ///
-    /// Without a DECSTBM scroll region (not yet implemented), the
-    /// "below" range is the cursor row through the last visible row.
+    /// cursor row, scrolling the lines below it down within the
+    /// active DECSTBM scrolling region. Lines pushed past the bottom
+    /// margin are lost. Per xterm, IL is a no-op when the cursor is
+    /// outside the region.
     fn insert_line(&mut self, n: u16) {
         let cur_row = self.cursor.row;
-        let rows = self.rows;
-        if cur_row >= rows || n == 0 {
+        let top = self.scroll_top;
+        let bot = self.scroll_bot.min(self.rows.saturating_sub(1));
+        if n == 0 || cur_row < top || cur_row > bot {
             return;
         }
-        let n = u16::min(n, rows - cur_row);
+        let region_end = bot + 1; // exclusive
+        let n = u16::min(n, region_end - cur_row);
         let style = self.cursor.style;
         let cols = self.cols;
         let grid = self.active_grid_mut();
-        // Shift rows [cur_row..rows-n] down to [cur_row+n..rows].
+        // Shift rows [cur_row..region_end-n] down to [cur_row+n..region_end].
         // Iterate top-down from the bottom to avoid overwriting our
         // source rows before they're copied.
         let n_us = n as usize;
-        for r in (cur_row as usize + n_us..rows as usize).rev() {
+        for r in (cur_row as usize + n_us..region_end as usize).rev() {
             // SmallVec<[Cell;16]> clones are O(cols); IL/DL aren't
             // hot. mem::take + restore keeps us off the heap for
             // inlined rows.
@@ -2181,27 +2348,30 @@ impl Term {
             }
             row.soft_wrap = false;
         }
-        for r in cur_row..rows {
+        for r in cur_row..region_end {
             self.mark_row(r);
         }
     }
 
     /// DL — Delete Line. `CSI Ps M` removes `n` lines at the cursor
-    /// row, scrolling the lines below it up. The bottom `n` rows
-    /// become blank.
+    /// row, scrolling the lines below it up within the active DECSTBM
+    /// region. The bottom `n` rows of the region become blank. No-op
+    /// when the cursor is outside the region.
     fn delete_line(&mut self, n: u16) {
         let cur_row = self.cursor.row;
-        let rows = self.rows;
-        if cur_row >= rows || n == 0 {
+        let top = self.scroll_top;
+        let bot = self.scroll_bot.min(self.rows.saturating_sub(1));
+        if n == 0 || cur_row < top || cur_row > bot {
             return;
         }
-        let n = u16::min(n, rows - cur_row);
+        let region_end = bot + 1; // exclusive
+        let n = u16::min(n, region_end - cur_row);
         let style = self.cursor.style;
         let cols = self.cols;
         let grid = self.active_grid_mut();
         let n_us = n as usize;
-        // Shift rows [cur_row+n..rows] up to [cur_row..rows-n].
-        for r in cur_row as usize..(rows as usize - n_us) {
+        // Shift rows [cur_row+n..region_end] up to [cur_row..region_end-n].
+        for r in cur_row as usize..(region_end as usize - n_us) {
             let src = std::mem::take(grid.row_mut((r + n_us) as u16));
             *grid.row_mut(r as u16) = src;
         }
@@ -2211,7 +2381,7 @@ impl Term {
             is_continuation: false,
             hyperlink_id: None,
         };
-        for r in (rows - n)..rows {
+        for r in (region_end - n)..region_end {
             let row = grid.row_mut(r);
             row.resize_cols(cols);
             for c in &mut row.cells {
@@ -2219,7 +2389,7 @@ impl Term {
             }
             row.soft_wrap = false;
         }
-        for r in cur_row..rows {
+        for r in cur_row..region_end {
             self.mark_row(r);
         }
     }
@@ -2328,6 +2498,30 @@ impl Term {
             100..=107 => style.bg = ansi_color(v - 100, true),
             _ => {}
         }
+    }
+
+    /// Resolve the DECRPM status for a private mode `ps`. Returns one
+    /// of the VT-spec codes documented at the `CSI ? Ps $ p` handler:
+    /// 0 (unknown), 1 (set), 2 (reset). Modes we model but don't have
+    /// a runtime toggle for (e.g. always-on/always-off behaviors) are
+    /// not advertised as `3`/`4` because we may want to wire toggles
+    /// later — `1`/`2` is the more forgiving answer.
+    fn decrqm_status(&self, ps: u16) -> u16 {
+        let is_set = match ps {
+            25 => self.cursor_visible,
+            1000 => matches!(self.mouse_mode.protocol, MouseProtocol::X10),
+            1002 => matches!(self.mouse_mode.protocol, MouseProtocol::ButtonMotion),
+            1003 => matches!(self.mouse_mode.protocol, MouseProtocol::AnyMotion),
+            1004 => self.report_focus,
+            1006 => self.mouse_mode.sgr_encoding,
+            1049 => self.alt_active,
+            2004 => self.bracketed_paste,
+            2026 => self.sync_output.active,
+            2027 => self.grapheme_cluster_mode,
+            2048 => self.inband_resize_mode,
+            _ => return 0,
+        };
+        if is_set { 1 } else { 2 }
     }
 
     fn apply_decset(&mut self, params: &Params, enable: bool) {
