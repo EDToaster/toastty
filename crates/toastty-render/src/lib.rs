@@ -70,6 +70,7 @@ fn build_term_instances_into(
             let lg = row_glyphs.get(row as usize)?.as_ref()?;
             lg.get(col, ch)
         },
+        |line_id, col| term.is_cell_selected(line_id, col),
     );
 }
 
@@ -97,6 +98,7 @@ fn build_term_dirty_instances_into(
             let lg = row_glyphs.get(row as usize)?.as_ref()?;
             lg.get(col, ch)
         },
+        |line_id, col| term.is_cell_selected(line_id, col),
     );
 }
 
@@ -1970,6 +1972,7 @@ mod tests {
             None,
             false, // cursor_visible == OFF frame
             |_, _, _, _| None,
+            |_, _| false,
         );
 
         // No cursor instance must be present (visible=false).

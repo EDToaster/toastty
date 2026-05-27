@@ -105,6 +105,24 @@ pub struct Grid {
     /// region. Grows on `scroll_up`, capped at `cap - visible_rows`.
     /// For the alt grid (`cap == visible_rows`) this is always 0.
     history_lines: u32,
+    /// Monotonic id of the current live bottom row. Incremented on
+    /// `scroll_up`, saturating-decremented on `scroll_down`. Each
+    /// retained row (visible or scrollback) has a stable id derived
+    /// from this counter, so callers (e.g. mouse selection) can pin
+    /// to a row across scrolls and eviction. The absolute value of
+    /// `bottom_id` is unimportant — only the deltas between retained
+    /// rows are.
+    bottom_id: u64,
+}
+
+/// Where a given `line_id` currently sits in the grid, if it's still
+/// retained. Returned by [`Grid::locate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLocation {
+    /// Row is on-screen at visible index `0..visible_rows` (0 = top).
+    Visible(u16),
+    /// Row is in scrollback at index `n` (0 = most recent above visible).
+    Scrollback(u32),
 }
 
 impl Grid {
@@ -126,6 +144,12 @@ impl Grid {
             cols,
             visible_rows,
             history_lines: 0,
+            // Live bottom row's id at construction. We start non-zero
+            // so the visible region's top row (id `bottom_id -
+            // (visible_rows - 1)`) doesn't underflow — callers do
+            // straight subtraction to translate a visible-row index
+            // into a `line_id`.
+            bottom_id: u64::from(visible_rows.saturating_sub(1)),
         }
     }
 
@@ -146,6 +170,48 @@ impl Grid {
     /// read them.
     pub fn history_lines(&self) -> u32 {
         self.history_lines
+    }
+
+    /// Monotonic id of the live bottom row. See [`Grid::bottom_id`] docs
+    /// on the field.
+    pub fn bottom_id(&self) -> u64 {
+        self.bottom_id
+    }
+
+    /// id of the oldest row still retained (top of scrollback if any,
+    /// else the visible top). All retained `line_id`s fall in
+    /// `oldest_retained_id..=bottom_id`.
+    pub fn oldest_retained_id(&self) -> u64 {
+        let above_bottom = u64::from(self.history_lines)
+            + u64::from(self.visible_rows.saturating_sub(1));
+        self.bottom_id.saturating_sub(above_bottom)
+    }
+
+    /// Map a `line_id` to where the row currently sits, if it's still
+    /// retained. Returns `None` when the row has scrolled out of the
+    /// retained window (newer than the live bottom or older than the
+    /// oldest scrollback slot).
+    pub fn locate(&self, line_id: u64) -> Option<RowLocation> {
+        if line_id > self.bottom_id {
+            return None;
+        }
+        let delta = self.bottom_id - line_id;
+        let vis = u64::from(self.visible_rows);
+        if delta < vis {
+            // The live bottom is at row `visible_rows - 1`; delta=0
+            // maps there, delta=1 to one row above, …
+            #[allow(clippy::cast_possible_truncation)]
+            let row = (self.visible_rows - 1) - (delta as u16);
+            Some(RowLocation::Visible(row))
+        } else {
+            let n = delta - vis;
+            if n < u64::from(self.history_lines) {
+                #[allow(clippy::cast_possible_truncation)]
+                Some(RowLocation::Scrollback(n as u32))
+            } else {
+                None
+            }
+        }
     }
 
     fn slot(&self, idx: u16) -> usize {
@@ -202,6 +268,7 @@ impl Grid {
         }
         // When max_history == 0 (alt grid, cap == visible) the field
         // stays at 0 — the cleared slot is just the rotated-around top.
+        self.bottom_id = self.bottom_id.wrapping_add(1);
     }
 
     /// Scroll down by one: a fresh blank row appears at the top, the
@@ -228,6 +295,7 @@ impl Grid {
             self.head - 1
         };
         self.history_lines = self.history_lines.saturating_sub(1);
+        self.bottom_id = self.bottom_id.saturating_sub(1);
     }
 
     /// Clear every visible row. Scrollback is left untouched (used by the
@@ -260,6 +328,7 @@ impl Grid {
         // decisions/scrollback.md. For M3 we resize widths and reallocate
         // the ring if `cap` changed.
         let cap = cap.max(visible_rows as usize).max(1);
+        let old_visible_rows = self.visible_rows;
         if cap == self.rows.len() {
             for r in &mut self.rows {
                 r.resize_cols(cols);
@@ -289,6 +358,28 @@ impl Grid {
         let max_history = (cap as u32).saturating_sub(u32::from(self.visible_rows));
         if self.history_lines > max_history {
             self.history_lines = max_history;
+        }
+        // Keep `bottom_id` consistent with the new visible region. The
+        // invariant is that visible row `i` has line_id
+        // `bottom_id - (visible_rows - 1 - i)`. We want preserved rows
+        // (which stay at the top of the new ring under both same-cap and
+        // different-cap paths) to keep the same line_id; that requires
+        // `bottom_id += new_visible_rows - old_visible_rows`. When growing
+        // it bumps `bottom_id` so the freshly-exposed blank bottom rows
+        // get fresh ids; when shrinking it pulls `bottom_id` down to track
+        // the new (smaller) bottom. Without this, after a window grow the
+        // top viewport rows would compute a negative line_id and saturate
+        // to 0 — selection above the original top would all collapse onto
+        // the same row.
+        let delta = i64::from(visible_rows) - i64::from(old_visible_rows);
+        if delta >= 0 {
+            #[allow(clippy::cast_sign_loss)]
+            let d = delta as u64;
+            self.bottom_id = self.bottom_id.wrapping_add(d);
+        } else {
+            #[allow(clippy::cast_sign_loss)]
+            let d = (-delta) as u64;
+            self.bottom_id = self.bottom_id.saturating_sub(d);
         }
     }
 }
@@ -714,6 +805,112 @@ mod tests {
         assert_eq!(g.history_lines(), 1);
         g.resize(2, 3, 2);
         assert_eq!(g.history_lines(), 0);
+    }
+
+    // ---------- bottom_id / locate ----------
+
+    #[test]
+    fn bottom_id_increments_on_scroll_up() {
+        let mut g = Grid::new(2, 3, 4);
+        let start = g.bottom_id();
+        g.scroll_up();
+        g.scroll_up();
+        g.scroll_up();
+        assert_eq!(g.bottom_id(), start + 3);
+    }
+
+    #[test]
+    fn bottom_id_decrements_on_scroll_down_saturating() {
+        let mut g = Grid::new(2, 3, 4);
+        g.scroll_up();
+        g.scroll_up();
+        let mid = g.bottom_id();
+        g.scroll_down();
+        assert_eq!(g.bottom_id(), mid - 1);
+        // Walk past 0 — must saturate, not underflow.
+        for _ in 0..20 {
+            g.scroll_down();
+        }
+        assert_eq!(g.bottom_id(), 0);
+    }
+
+    #[test]
+    fn locate_maps_visible_and_scrollback() {
+        // vis=2, cap=4 → 2 rows of history budget.
+        let mut g = Grid::new(2, 3, 4);
+        // Scroll enough times to give us a non-zero bottom_id with
+        // headroom on either side for the assertions below.
+        for _ in 0..10 {
+            g.scroll_up();
+        }
+        let b = g.bottom_id();
+        // bottom row (delta 0) = visible row 1
+        assert_eq!(g.locate(b), Some(RowLocation::Visible(1)));
+        // one above bottom (delta 1) = visible row 0
+        assert_eq!(g.locate(b - 1), Some(RowLocation::Visible(0)));
+        // two above (delta 2) = scrollback 0 (most recent)
+        assert_eq!(g.locate(b - 2), Some(RowLocation::Scrollback(0)));
+        // three above (delta 3) = scrollback 1
+        assert_eq!(g.locate(b - 3), Some(RowLocation::Scrollback(1)));
+        // older than retained → None
+        assert_eq!(g.locate(b - 4), None);
+        // newer than bottom → None
+        assert_eq!(g.locate(b + 1), None);
+    }
+
+    #[test]
+    fn locate_after_eviction_returns_none_for_evicted() {
+        // cap=3, vis=1 → 2 rows of history budget.
+        let mut g = Grid::new(1, 3, 3);
+        let first_bottom = g.bottom_id();
+        // Scroll up four times — three rows get assigned ids
+        // first_bottom..=first_bottom+3, but only the most recent two
+        // can be retained as scrollback (history budget = 2).
+        g.scroll_up();
+        g.scroll_up();
+        g.scroll_up();
+        g.scroll_up();
+        let b = g.bottom_id();
+        assert_eq!(b, first_bottom + 4);
+        // The very oldest scrollback we can reach:
+        assert_eq!(g.oldest_retained_id(), b - 2);
+        // Visible + 2 scrollback rows are accessible:
+        assert!(g.locate(b).is_some());
+        assert!(g.locate(b - 1).is_some());
+        assert!(g.locate(b - 2).is_some());
+        // Anything older has been evicted from the ring.
+        assert_eq!(g.locate(b - 3), None);
+        assert_eq!(g.locate(first_bottom), None);
+    }
+
+    #[test]
+    fn resize_keeps_top_row_line_id_stable() {
+        // Regression: before the bottom_id fixup in `resize`, a window
+        // grow from 24 → 31 rows left `bottom_id` at the old value
+        // (23). Under the new (larger) visible_rows, the top rows'
+        // computed line_ids underflowed, saturated to 0, and every
+        // click above row 8 collapsed to the same line — selection
+        // appeared frozen on the old top-row boundary.
+        let mut g = Grid::new(24, 80, 24 + 100);
+        let initial_top_id = g.bottom_id() - 23; // visible row 0
+        // Grow visible region (same-cap path).
+        g.resize(31, 80, 24 + 100);
+        // Visible row 0 must still have the same line_id; row 30 (the
+        // new live bottom) gets a fresh id beyond the old bottom.
+        let new_bottom = g.bottom_id();
+        let new_top = new_bottom - 30;
+        assert_eq!(new_top, initial_top_id, "top row line_id drifted on grow");
+        // Shrink back; live bottom moves down accordingly.
+        g.resize(20, 80, 24 + 100);
+        let after_shrink_top = g.bottom_id() - 19;
+        assert_eq!(after_shrink_top, initial_top_id, "top row line_id drifted on shrink");
+    }
+
+    #[test]
+    fn oldest_retained_id_with_empty_history() {
+        let g = Grid::new(3, 3, 5);
+        // history_lines == 0, visible == 3 → oldest retained is 2 above bottom.
+        assert_eq!(g.oldest_retained_id(), 0); // bottom_id starts at 0; saturates.
     }
 
     #[test]

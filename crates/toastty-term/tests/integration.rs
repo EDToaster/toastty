@@ -282,3 +282,131 @@ proptest! {
         prop_assert!(cur.col <= c, "col {} > cols {}", cur.col, c);
     }
 }
+
+mod selection {
+    use super::*;
+    use toastty_term::{Pos, Selection, SelectionMode};
+
+    /// Build a fresh Term, write some lines, and return it. Lines are
+    /// terminated by CRLF so the cursor advances and wraps naturally.
+    fn term_with_lines(rows: u16, cols: u16, lines: &[&str]) -> Term {
+        let mut t = Term::new(rows, cols, 64);
+        let mut p = Parser::new();
+        for (i, line) in lines.iter().enumerate() {
+            p.advance(&mut t, line.as_bytes());
+            if i + 1 < lines.len() {
+                p.advance(&mut t, b"\r\n");
+            }
+        }
+        t
+    }
+
+    fn pos_for(t: &Term, row: u16, col: u16) -> Pos {
+        // Translate visible-row index to live line_id.
+        let (rows, _) = t.size();
+        let bottom = t.bottom_id();
+        let delta = u64::from(rows.saturating_sub(1) - row);
+        Pos::new(bottom - delta, col)
+    }
+
+    #[test]
+    fn extract_char_single_row() {
+        let t = term_with_lines(4, 16, &["hello world"]);
+        // "hello world" is on visible row 0 because the writes happen
+        // before any LF — cursor sits on row 0 throughout.
+        let mut sel =
+            Selection::new(pos_for(&t, 0, 0), SelectionMode::Char);
+        sel.set_active(pos_for(&t, 0, 4));
+        let mut t = t;
+        t.set_selection(sel);
+        assert_eq!(t.extract_selection_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn extract_char_multi_row_joins_with_newline() {
+        let t = term_with_lines(4, 16, &["foo", "bar", "baz"]);
+        let mut sel =
+            Selection::new(pos_for(&t, 0, 0), SelectionMode::Char);
+        sel.set_active(pos_for(&t, 2, 2));
+        let mut t = t;
+        t.set_selection(sel);
+        assert_eq!(
+            t.extract_selection_text().as_deref(),
+            Some("foo\nbar\nbaz"),
+        );
+    }
+
+    #[test]
+    fn extract_strips_trailing_whitespace_per_row() {
+        // Each row gets padded with blanks out to `cols`; the extractor
+        // must strip them.
+        let t = term_with_lines(4, 16, &["hi", "world"]);
+        let mut sel =
+            Selection::new(pos_for(&t, 0, 0), SelectionMode::Char);
+        sel.set_active(pos_for(&t, 1, 15));
+        let mut t = t;
+        t.set_selection(sel);
+        assert_eq!(t.extract_selection_text().as_deref(), Some("hi\nworld"));
+    }
+
+    #[test]
+    fn extract_block_rectangle() {
+        let t = term_with_lines(4, 16, &["abcdefgh", "ijklmnop", "qrstuvwx"]);
+        let mut sel =
+            Selection::new(pos_for(&t, 0, 2), SelectionMode::Block);
+        sel.set_active(pos_for(&t, 2, 4));
+        let mut t = t;
+        t.set_selection(sel);
+        // Block: cols [2..=4] on each of rows 0..=2.
+        assert_eq!(
+            t.extract_selection_text().as_deref(),
+            Some("cde\nklm\nstu"),
+        );
+    }
+
+    #[test]
+    fn extract_soft_wrap_joins_without_newline() {
+        // Cols = 4 so "hello world" wraps as "hell" + "o wo" + "rld".
+        // First two rows should soft_wrap = true; we expect the joined
+        // text to be the original string for char-mode selection.
+        let mut t = Term::new(4, 4, 32);
+        let mut p = Parser::new();
+        p.advance(&mut t, b"hello world");
+        let mut sel =
+            Selection::new(pos_for(&t, 0, 0), SelectionMode::Char);
+        sel.set_active(pos_for(&t, 2, 3));
+        t.set_selection(sel);
+        assert_eq!(
+            t.extract_selection_text().as_deref(),
+            Some("hello world"),
+        );
+    }
+
+    #[test]
+    fn selection_clears_on_resize() {
+        let mut t = term_with_lines(4, 16, &["hello"]);
+        let sel = Selection::new(pos_for(&t, 0, 0), SelectionMode::Char);
+        t.set_selection(sel);
+        assert!(t.selection().is_some());
+        t.resize(5, 16);
+        assert!(t.selection().is_none());
+    }
+
+    #[test]
+    fn is_cell_selected_returns_false_on_alt_screen() {
+        let mut t = term_with_lines(4, 16, &["hi"]);
+        let sel = Selection::new(pos_for(&t, 0, 0), SelectionMode::Char);
+        t.set_selection(sel);
+        // Drive an alt-screen enter via CSI ?1049h.
+        let mut p = Parser::new();
+        p.advance(&mut t, b"\x1b[?1049h");
+        assert!(t.is_alt_active());
+        // Selection got cleared on alt enter; explicit selection set
+        // while on alt is a no-op.
+        assert!(t.selection().is_none());
+        let sel = Selection::new(Pos::new(0, 0), SelectionMode::Char);
+        t.set_selection(sel);
+        assert!(t.selection().is_none());
+        assert!(!t.is_cell_selected(0, 0));
+    }
+}

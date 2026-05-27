@@ -181,6 +181,11 @@ pub struct Theme {
     pub bg: [f32; 4],
     pub cursor: [f32; 4],
     pub palette: [[f32; 4]; 16],
+    /// Background tint applied to selected cells. The cell's own `fg`
+    /// stays so text remains legible on the tint. Callers can set this
+    /// explicitly; [`Theme::with_default_selection_bg`] derives a
+    /// reasonable default by mixing `bg` toward `fg`.
+    pub selection_bg: [f32; 4],
 }
 
 impl Theme {
@@ -192,7 +197,20 @@ impl Theme {
             bg: [0.07, 0.07, 0.09, 1.0],
             cursor: [0.95, 0.85, 0.30, 1.0],
             palette: DEFAULT_PALETTE_LINEAR,
+            selection_bg: derive_selection_bg(
+                [0.07, 0.07, 0.09, 1.0],
+                [0.85, 0.85, 0.85, 1.0],
+            ),
         }
+    }
+
+    /// Recompute `selection_bg` from the current `fg`/`bg` by mixing
+    /// the bg toward the fg. Idempotent — call after mutating the
+    /// theme's fg/bg to refresh the derived selection tint.
+    #[must_use]
+    pub fn with_default_selection_bg(mut self) -> Self {
+        self.selection_bg = derive_selection_bg(self.bg, self.fg);
+        self
     }
 
     #[must_use]
@@ -258,6 +276,19 @@ impl Theme {
 
 /// xterm 6×6×6 cube levels in sRGB (8-bit). Same on every common implementation.
 const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+/// Mix the background toward the foreground by ~35% to produce a
+/// "selection tint" that reads as a highlight on both light and dark
+/// themes. Alpha is preserved from `bg`.
+fn derive_selection_bg(bg: [f32; 4], fg: [f32; 4]) -> [f32; 4] {
+    const MIX: f32 = 0.35;
+    [
+        bg[0] * (1.0 - MIX) + fg[0] * MIX,
+        bg[1] * (1.0 - MIX) + fg[1] * MIX,
+        bg[2] * (1.0 - MIX) + fg[2] * MIX,
+        bg[3],
+    ]
+}
 
 /// Convert one sRGB byte channel to linear-light float.
 pub(crate) fn srgb_channel_to_linear(v: u8) -> f32 {
@@ -413,22 +444,52 @@ where
 {
     let (rows, cols) = term.size();
     let mut out: Vec<CellInstance> = Vec::with_capacity(usize::from(rows) * usize::from(cols));
-    build_instances_into(&mut out, term, cell_size, theme, ext_palette, locate_glyph);
+    build_instances_into(
+        &mut out,
+        term,
+        cell_size,
+        theme,
+        ext_palette,
+        locate_glyph,
+        |_, _| false,
+    );
     out
+}
+
+/// Translate a render-loop row `r` (0-based, top of viewport) into the
+/// stable `line_id` of the row at that position. Encapsulates the
+/// `bottom_id - shift - (rows - 1 - r)` math and returns `None` when
+/// the computed id would underflow (a defensive guard — under normal
+/// operation `bottom_id` is initialized so this never happens).
+fn line_id_for_render_row(
+    bottom_id: u64,
+    rows_total: u16,
+    view_offset_lines: u32,
+    pixel_extra: u16,
+    r: u16,
+) -> Option<u64> {
+    // line_id = bottom_id - (visible_rows - 1 - r + pixel_extra + view_offset_lines)
+    let above_bottom = u64::from(rows_total.saturating_sub(1))
+        .saturating_sub(u64::from(r))
+        .checked_add(u64::from(pixel_extra))?
+        .checked_add(u64::from(view_offset_lines))?;
+    bottom_id.checked_sub(above_bottom)
 }
 
 /// Same as [`build_instances`] but appends into a caller-provided
 /// `Vec` (which is `clear()`ed first). Reusing the buffer across frames
 /// avoids per-frame allocations on the hot render path.
-pub fn build_instances_into<F>(
+pub fn build_instances_into<F, S>(
     out: &mut Vec<CellInstance>,
     term: &Term,
     cell_size: (f32, f32),
     theme: &Theme,
     ext_palette: Option<&[[f32; 4]; 256]>,
     mut locate_glyph: F,
+    mut is_selected: S,
 ) where
     F: FnMut(u16, u16, char, &Style) -> Option<GlyphSlot>,
+    S: FnMut(u64, u16) -> bool,
 {
     out.clear();
     let (rows, cols) = term.size();
@@ -449,6 +510,8 @@ pub fn build_instances_into<F>(
         0.0
     };
 
+    let bottom_id = term.bottom_id();
+    let view_offset_lines = term.view_offset_lines();
     let needed = usize::from(rows_rendered) * usize::from(cols);
     if out.capacity() < needed {
         out.reserve(needed - out.capacity());
@@ -456,6 +519,12 @@ pub fn build_instances_into<F>(
 
     for r in 0..rows_rendered {
         let row = term.view_row(r);
+        // Compute the stable line id for this rendered row once. None
+        // means "this row's id would underflow" — only happens at the
+        // very top of an unscrolled tiny grid; the cell still renders
+        // but selection is treated as off.
+        let line_id =
+            line_id_for_render_row(bottom_id, rows, view_offset_lines, pixel_extra, r);
         for c in 0..cols {
             let Some(cell) = row.cells.get(c as usize) else {
                 continue;
@@ -469,12 +538,14 @@ pub fn build_instances_into<F>(
                 continue;
             }
 
-            if is_blank_for_render(cell) {
+            let selected = line_id.is_some_and(|l| is_selected(l, c));
+            if !selected && is_blank_for_render(cell) {
                 continue;
             }
 
             let pos = [f32::from(c) * cell_w, f32::from(r) * cell_h + y_translate];
             let (fg, bg) = resolve_cell_colors(cell, theme, ext_palette);
+            let bg = if selected { theme.selection_bg } else { bg };
 
             // Always emit a cell-sized background quad. The glyph (if
             // present) is rendered as a separate, glyph-sized quad on
@@ -606,7 +677,7 @@ impl<'a> Iterator for DirtyCols<'a> {
 }
 
 #[allow(clippy::too_many_arguments)] // mirrors build_instances_into + adds damage/visibility/ext_palette
-pub fn build_dirty_instances_into<F>(
+pub fn build_dirty_instances_into<F, S>(
     out: &mut Vec<CellInstance>,
     term: &Term,
     damage: &Damage,
@@ -615,14 +686,24 @@ pub fn build_dirty_instances_into<F>(
     ext_palette: Option<&[[f32; 4]; 256]>,
     cursor_visible: bool,
     mut locate_glyph: F,
+    mut is_selected: S,
 ) where
     F: FnMut(u16, u16, char, &Style) -> Option<GlyphSlot>,
+    S: FnMut(u64, u16) -> bool,
 {
     // damage.all → fall back to the full-build path. Same instance
     // count as a full frame, and the renderer's `needs_full_clear` is
     // already set to true for this frame.
     if damage.all {
-        build_instances_into(out, term, cell_size, theme, ext_palette, locate_glyph);
+        build_instances_into(
+            out,
+            term,
+            cell_size,
+            theme,
+            ext_palette,
+            locate_glyph,
+            is_selected,
+        );
         if !cursor_visible {
             // Drop the trailing cursor instance the full builder
             // unconditionally appends.
@@ -653,9 +734,13 @@ pub fn build_dirty_instances_into<F>(
     } else {
         0.0
     };
+    let bottom_id = term.bottom_id();
+    let view_offset_lines = term.view_offset_lines();
 
     for (r, row_damage) in damage.iter_rows() {
         let row = term.view_row(r);
+        let line_id =
+            line_id_for_render_row(bottom_id, rows, view_offset_lines, pixel_extra, r);
         // Stack-allocated iter enum instead of `Box<dyn Iterator>`:
         // boxing was a per-dirty-row heap allocation on the render
         // hot path. Same `all_cols` vs sparse-list dispatch as before.
@@ -676,8 +761,10 @@ pub fn build_dirty_instances_into<F>(
                 continue;
             }
 
+            let selected = line_id.is_some_and(|l| is_selected(l, c));
             let pos = [f32::from(c) * cell_w, f32::from(r) * cell_h + y_translate];
             let (fg, bg) = resolve_cell_colors(cell, theme, ext_palette);
+            let bg = if selected { theme.selection_bg } else { bg };
 
             // Always emit a background quad — even for blank cells —
             // under LoadOp::Load, so old glyphs / cursor blocks get
@@ -1298,6 +1385,7 @@ mod tests {
                 assert_ne!(ch, PLACEHOLDER, "locator must NOT be called for placeholder");
                 None
             },
+            |_, _| false,
         );
         // One bg quad for the placeholder cell + cursor.
         let non_cursor: Vec<_> = out.iter().filter(|i| i.flags & FLAG_CURSOR == 0).collect();
@@ -1373,6 +1461,7 @@ mod tests {
             None,
             true,
             |_, _, _, _| None,
+            |_, _| false,
         );
         // No dirty cells, cursor visible: only the cursor instance.
         assert_eq!(out.len(), 1);
@@ -1394,6 +1483,7 @@ mod tests {
             None,
             true,
             |_, _, _, _| None,
+            |_, _| false,
         );
         // 1 bg quad + cursor.
         assert_eq!(out.len(), 2);
@@ -1423,6 +1513,7 @@ mod tests {
             None,
             true,
             |_, _, _, _| None,
+            |_, _| false,
         );
         // 1 bg quad (even though the cell is blank) + cursor.
         let bgs: Vec<_> = out.iter().filter(|i| i.flags & FLAG_CURSOR == 0).collect();
@@ -1445,6 +1536,7 @@ mod tests {
             &Theme::default_dark(),
             None,
             |_, _, _, _| None,
+            |_, _| false,
         );
         let mut dirty = Vec::new();
         super::build_dirty_instances_into(
@@ -1456,6 +1548,7 @@ mod tests {
             None,
             true,
             |_, _, _, _| None,
+            |_, _| false,
         );
         // Same instance count (cursor + per-cell quads).
         assert_eq!(full.len(), dirty.len());
@@ -1478,6 +1571,7 @@ mod tests {
             None,
             true,
             |_, _, _, _| None,
+            |_, _| false,
         );
         // Only one non-cursor instance: the primary cell's bg quad
         // (continuation skipped).
@@ -1500,6 +1594,7 @@ mod tests {
             None,
             false, // cursor hidden (mid-blink off-phase)
             |_, _, _, _| None,
+            |_, _| false,
         );
         // No cursor instance.
         assert!(out.iter().all(|i| i.flags & FLAG_CURSOR == 0));
@@ -1523,6 +1618,7 @@ mod tests {
             None,
             false,
             |_, _, _, _| None,
+            |_, _| false,
         );
         // No cursor instance.
         assert!(out.iter().all(|i| i.flags & FLAG_CURSOR == 0));
@@ -1703,6 +1799,7 @@ mod tests {
             None,
             true,
             |_, _, _, _| None,
+            |_, _| false,
         );
         let underline = out
             .iter()

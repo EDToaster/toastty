@@ -191,6 +191,7 @@ impl Harness {
                 let lg = line_cache_ref.get(row as usize)?.as_ref()?;
                 lg.get(col, ch)
             },
+            |_, _| false,
         );
         let instances = &self.instances;
 
@@ -330,6 +331,7 @@ impl Harness {
                 let lg = line_cache_ref.get(row as usize)?.as_ref()?;
                 lg.get(col, ch)
             },
+            |_, _| false,
         );
         let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
         let n_instances = self.instances.len();

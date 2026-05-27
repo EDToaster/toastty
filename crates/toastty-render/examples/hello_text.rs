@@ -51,7 +51,9 @@ fn theme_from_config(cfg: &ThemeConfig) -> Theme {
         bg: cfg.bg.as_array(),
         cursor: cfg.cursor.as_array(),
         palette,
+        selection_bg: [0.0; 4],
     }
+    .with_default_selection_bg()
 }
 
 struct Demo {

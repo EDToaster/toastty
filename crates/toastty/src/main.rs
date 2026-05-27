@@ -23,7 +23,7 @@ use toastty_protocols::resize_inband::encode_resize_report;
 use toastty_protocols::synchronized::{BSU_TIMEOUT, should_force_flush};
 use toastty_pty::{Pty, PtySpec, WinSize};
 use toastty_render::{RenderOutcome, Renderer};
-use toastty_term::{ClipboardRequest, SecurityFlags, Smoothing, Term};
+use toastty_term::{ClipboardRequest, Pos, SecurityFlags, Selection, SelectionMode, Smoothing, Term};
 use toastty_window::{
     App, ControlSignal, Event, KeyState, LogicalKey, Modifiers, MouseButton, ToasttyWindow,
     WindowHandle, WindowOptions, run,
@@ -39,6 +39,7 @@ use toastty::geometry::grid_dims_from_pixels;
 use toastty::keyboard::encode_key;
 use toastty::mouse::{
     MouseEventKind, classify_button_event, encode_mouse, pixel_to_cell, protocol_wants_event,
+    word_bounds_in_row,
 };
 use toastty::paste::wrap_for_paste;
 use toastty::pty_log::{Direction, PtyLogger};
@@ -71,6 +72,25 @@ const SCROLL_STREAM_LULL: Duration = Duration::from_millis(150);
 /// almost certainly a fresh gesture and the swallow flag can be
 /// cleared faster than waiting out the full [`SCROLL_STREAM_LULL`].
 const FRESH_STARTED_GAP: Duration = Duration::from_millis(50);
+
+/// Maximum time between consecutive left-clicks for them to count as a
+/// multi-click (double = 2, triple = 3). 350 ms is a sweet spot — fast
+/// enough that an intentional double-click is reliable, slow enough to
+/// be forgiving for a relaxed triple-click.
+const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(350);
+
+/// In-progress drag-select. Persisted between `handle_mouse` press and
+/// `handle_mouse_motion` so motion knows which mode/anchor to extend.
+#[derive(Debug, Clone, Copy)]
+struct DragState {
+    /// Selection mode the drag is operating in.
+    mode: SelectionMode,
+    /// The original press position. For `Char`/`Block` this is the
+    /// selection anchor directly. For `Word`/`Line` the visible
+    /// selection extends from the word/line *containing* this point;
+    /// motion expands by re-evaluating boundaries against the new cell.
+    origin: Pos,
+}
 
 /// Convert a config `SmoothingFunction` into the per-frame easing
 /// the term consumes. Tuning constants are local to the binary so
@@ -270,6 +290,21 @@ struct Toastty {
     /// — i.e., when the stream genuinely ends — so the next
     /// deliberate gesture goes through.
     swallow_pixel_stream: bool,
+    /// In-progress mouse drag-select state. `Some` between press and
+    /// release of the left button while local selection is active.
+    /// `None` otherwise, including while a mouse-tracking app owns
+    /// the click stream.
+    selecting: Option<DragState>,
+    /// Timestamp of the most recent left-button press, for multi-click
+    /// detection (double = word, triple = line).
+    last_click_at: Option<Instant>,
+    /// Cell of the most recent left-button press in selection
+    /// coordinates `(line_id, col)`. A subsequent press lands the
+    /// same cell only if both match.
+    last_click_pos: Option<Pos>,
+    /// Number of clicks in the current multi-click streak: 0 between
+    /// streaks, 1/2/3 within one. Wrapping above 3 cycles back to 1.
+    click_count: u8,
 }
 
 impl Toastty {
@@ -319,6 +354,10 @@ impl Toastty {
             pending_load_error: load_err,
             last_pixel_scroll_at: None,
             swallow_pixel_stream: false,
+            selecting: None,
+            last_click_at: None,
+            last_click_pos: None,
+            click_count: 0,
         }
     }
 
@@ -446,6 +485,91 @@ impl Toastty {
             .map_or((1.0_f32, 1.0_f32), Renderer::cell_size);
         let (rows, cols) = self.term.size();
         pixel_to_cell(self.mouse_pos, cell_size, (rows, cols))
+    }
+
+    /// Translate the current pointer position into a stable selection
+    /// position `(line_id, col)`. Uses `bottom_id` plus the current
+    /// scrollback offset to pick the right primary-grid row regardless
+    /// of where the user has scrolled.
+    fn current_selection_pos(&self) -> Pos {
+        // pixel_to_cell returns 1-based (col, row); convert to 0-based.
+        let (col1, row1) = self.current_cell();
+        let row = row1.saturating_sub(1);
+        let col = col1.saturating_sub(1);
+        let (rows, _) = self.term.size();
+        let bottom = self.term.bottom_id();
+        // visible_row → above_bottom delta.
+        let above_bottom = u64::from(rows.saturating_sub(1).saturating_sub(row));
+        let scroll = u64::from(self.term.view_offset_lines());
+        let line_id = bottom.saturating_sub(above_bottom + scroll);
+        Pos::new(line_id, col)
+    }
+
+    /// True when a fresh left-button press should be considered a
+    /// continuation of the prior click for multi-click detection. The
+    /// previous click must have occurred within
+    /// [`MULTI_CLICK_WINDOW`] AND landed on the same cell.
+    fn is_multiclick_continuation(&self, now: Instant, here: Pos) -> bool {
+        let Some(at) = self.last_click_at else {
+            return false;
+        };
+        if now.duration_since(at) > MULTI_CLICK_WINDOW {
+            return false;
+        }
+        self.last_click_pos == Some(here)
+    }
+
+    /// Build the [`Selection`] for a fresh left-button press, given
+    /// the current click count (1/2/3) and modifier set. Word/line
+    /// boundaries are computed against the cell under the cursor; if
+    /// the row is in scrollback, we walk via the scrollback-row
+    /// accessor.
+    fn selection_from_press(
+        &self,
+        origin: Pos,
+        click_count: u8,
+        modifiers: Modifiers,
+    ) -> Selection {
+        let (_, cols) = self.term.size();
+        // Alt+drag → block selection (only meaningful for an initial
+        // single click; double/triple-click + alt also drops back to
+        // block, matching iTerm2 / kitty).
+        if modifiers.contains(Modifiers::ALT) {
+            return Selection::new(origin, SelectionMode::Block);
+        }
+        match click_count {
+            2 => {
+                // Word: expand origin to word boundaries.
+                let (lo, hi) = self
+                    .word_bounds_at(origin.line_id, origin.col)
+                    .unwrap_or((origin.col, origin.col));
+                let mut sel = Selection::new(
+                    Pos::new(origin.line_id, lo),
+                    SelectionMode::Word,
+                );
+                sel.set_active(Pos::new(origin.line_id, hi));
+                sel
+            }
+            3 => {
+                // Line: full row.
+                let end = cols.saturating_sub(1);
+                let mut sel = Selection::new(
+                    Pos::new(origin.line_id, 0),
+                    SelectionMode::Line,
+                );
+                sel.set_active(Pos::new(origin.line_id, end));
+                sel
+            }
+            _ => Selection::new(origin, SelectionMode::Char),
+        }
+    }
+
+    /// Look up the visible word-boundary range given a `line_id`,
+    /// falling back to `None` for evicted rows. Used by both
+    /// press-time word expansion and drag-time word extension.
+    fn word_bounds_at(&self, line_id: u64, col: u16) -> Option<(u16, u16)> {
+        let row = self.term.primary_row_by_line_id(line_id)?;
+        Some(word_bounds_in_row(row, col))
     }
 
     /// Recompute the cell grid from the current pixel size and apply it
@@ -824,6 +948,16 @@ impl Toastty {
             self.paste();
             return ControlSignal::RedrawIn(Duration::ZERO);
         }
+        // Copy current selection (if any) to the clipboard. Eats the
+        // keypress so the foreground app doesn't also see it.
+        if state == KeyState::Pressed && is_copy_binding(logical, modifiers) {
+            if let Some(text) = self.term.extract_selection_text()
+                && !text.is_empty()
+            {
+                self.write_clipboard(text);
+            }
+            return ControlSignal::RedrawIn(Duration::ZERO);
+        }
         // Don't forward synthetic events — winit fires those on focus loss
         // to clear modifier state; reporting them to the PTY would desync
         // the app.
@@ -839,6 +973,12 @@ impl Toastty {
             repeat,
         ) {
             self.write_pty(&bytes);
+            // Typing into the PTY clears any visible selection — the
+            // user wouldn't expect old highlight to persist over
+            // freshly-typed prompt characters.
+            if state == KeyState::Pressed {
+                self.term.clear_selection();
+            }
             // Typing snaps the view back to the live bottom so the
             // user lands on the prompt, not on whatever scrollback
             // they were reading. Press-only — releases shouldn't
@@ -861,6 +1001,15 @@ impl Toastty {
         modifiers: Modifiers,
     ) -> ControlSignal {
         self.mouse_pos = position;
+        // Local drag-select first: when we've started a selection,
+        // every motion event extends it, even if the foreground app
+        // would otherwise want the motion. (The selection only starts
+        // in the first place when `mouse_mode().is_on()` was false, so
+        // there's no conflict.)
+        if self.selecting.is_some() {
+            self.extend_selection_to_cursor();
+            return ControlSignal::RedrawIn(Duration::ZERO);
+        }
         let mode = self.term.mouse_mode();
         let kind = MouseEventKind::Motion {
             held: self.mouse_held,
@@ -909,8 +1058,19 @@ impl Toastty {
             }
             return ControlSignal::Continue;
         }
-        let kind = classify_button_event(button, state);
+        // Local text selection takes priority over PTY forwarding when
+        // the foreground app hasn't opted into mouse tracking. Only
+        // the left button drives selection; other buttons fall through
+        // to the existing encoder.
         let mode = self.term.mouse_mode();
+        if !mode.is_on() && button == MouseButton::Left {
+            match state {
+                KeyState::Pressed => self.begin_or_extend_selection(modifiers),
+                KeyState::Released => self.finish_selection_drag(),
+            }
+            return ControlSignal::RedrawIn(Duration::ZERO);
+        }
+        let kind = classify_button_event(button, state);
         if protocol_wants_event(mode, &kind) {
             let cell = self.current_cell();
             if let Some(bytes) = encode_mouse(kind, cell, modifiers, mode) {
@@ -918,6 +1078,124 @@ impl Toastty {
             }
         }
         ControlSignal::Continue
+    }
+
+    /// Start a fresh selection (or step the multi-click counter) at
+    /// the current cursor position. Called from `handle_mouse` on a
+    /// left-button press when the foreground app isn't tracking the
+    /// mouse.
+    fn begin_or_extend_selection(&mut self, modifiers: Modifiers) {
+        let origin = self.current_selection_pos();
+        let now = Instant::now();
+        // Multi-click cycle: 1 → 2 → 3 → 1 within MULTI_CLICK_WINDOW
+        // on the same cell. Otherwise restart at 1.
+        let next_count = if self.is_multiclick_continuation(now, origin) {
+            // Cycle 1→2→3 then back to 1 on the 4th — matches iTerm2.
+            (self.click_count % 3) + 1
+        } else {
+            1
+        };
+        self.click_count = next_count;
+        self.last_click_at = Some(now);
+        self.last_click_pos = Some(origin);
+        let sel = self.selection_from_press(origin, next_count, modifiers);
+        // For Alt+drag, selection mode is Block — capture the chosen
+        // mode and the original origin so motion can extend correctly.
+        let mode = sel.mode;
+        self.selecting = Some(DragState { mode, origin });
+        self.term.set_selection(sel);
+    }
+
+    /// Extend the in-flight selection to whichever cell the pointer
+    /// currently sits over. Called from `handle_mouse_motion` while a
+    /// drag is active.
+    fn extend_selection_to_cursor(&mut self) {
+        let Some(drag) = self.selecting else {
+            return;
+        };
+        let here = self.current_selection_pos();
+        match drag.mode {
+            SelectionMode::Char | SelectionMode::Block => {
+                self.term.update_selection_active(here);
+            }
+            SelectionMode::Word => {
+                // Snap `here` to the word containing it, then extend
+                // anchor → active to the far edge so the selection
+                // grows by whole words on each side.
+                let (lo_here, hi_here) =
+                    self.word_bounds_at(here.line_id, here.col).unwrap_or((here.col, here.col));
+                let (lo_origin, hi_origin) = self
+                    .word_bounds_at(drag.origin.line_id, drag.origin.col)
+                    .unwrap_or((drag.origin.col, drag.origin.col));
+                // Build a Selection with anchor at the further-from-here
+                // edge of the origin word, active at the further-from-
+                // origin edge of the here word.
+                let dragging_forward = (here.line_id, here.col)
+                    >= (drag.origin.line_id, drag.origin.col);
+                let (anchor_col, active_col) = if dragging_forward {
+                    (lo_origin, hi_here)
+                } else {
+                    (hi_origin, lo_here)
+                };
+                let mut sel = Selection::new(
+                    Pos::new(drag.origin.line_id, anchor_col),
+                    SelectionMode::Word,
+                );
+                sel.set_active(Pos::new(here.line_id, active_col));
+                self.term.set_selection(sel);
+            }
+            SelectionMode::Line => {
+                // Anchor at origin row col 0, active at here row col
+                // cols-1 (or vice versa).
+                let (_, cols) = self.term.size();
+                let end = cols.saturating_sub(1);
+                let dragging_forward = here.line_id >= drag.origin.line_id;
+                let mut sel = Selection::new(
+                    Pos::new(drag.origin.line_id, if dragging_forward { 0 } else { end }),
+                    SelectionMode::Line,
+                );
+                sel.set_active(Pos::new(
+                    here.line_id,
+                    if dragging_forward { end } else { 0 },
+                ));
+                self.term.set_selection(sel);
+            }
+        }
+    }
+
+    /// Wrap up the drag on left-release: copy the selected text to the
+    /// system clipboard if non-empty, then drop the visible highlight
+    /// — the user signalled "I'm done picking" by releasing the
+    /// button, and the highlight lingering past that is visual noise.
+    fn finish_selection_drag(&mut self) {
+        if self.selecting.take().is_none() {
+            return;
+        }
+        if let Some(text) = self.term.extract_selection_text()
+            && !text.is_empty()
+        {
+            self.write_clipboard(text);
+        }
+        self.term.clear_selection();
+    }
+
+    /// Lazy-init `self.clipboard` and write `text`. Mirrors the
+    /// paste-path init in `Self::paste`.
+    fn write_clipboard(&mut self, text: String) {
+        if self.clipboard.is_none() {
+            match arboard::Clipboard::new() {
+                Ok(c) => self.clipboard = Some(c),
+                Err(e) => {
+                    warn!("clipboard init failed: {e}");
+                    return;
+                }
+            }
+        }
+        if let Some(cb) = self.clipboard.as_mut()
+            && let Err(e) = cb.set_text(text)
+        {
+            warn!("clipboard write failed: {e}");
+        }
     }
 
     /// Look up the OSC 8 hyperlink URL at pixel `(x, y)`, if any.
@@ -1483,6 +1761,31 @@ fn is_open_link_binding(button: MouseButton, modifiers: Modifiers) -> bool {
     }
 }
 
+/// True when `(logical, modifiers)` is a "copy selection" binding.
+///
+/// Mirrors `is_paste_binding`: we accept both `Cmd+C` (macOS) and
+/// `Ctrl+Shift+C` (Linux) regardless of host. Bare `Ctrl+C` is *not*
+/// a copy — it's SIGINT and must always reach the foreground app.
+fn is_copy_binding(logical: &LogicalKey, modifiers: Modifiers) -> bool {
+    let LogicalKey::Character(s) = logical else {
+        return false;
+    };
+    if !s.eq_ignore_ascii_case("c") {
+        return false;
+    }
+    // Cmd+C — superset OK as long as Ctrl isn't also held (otherwise
+    // a user with caps-lock + Ctrl+Cmd+C would be ambiguous). The
+    // common cases (bare Cmd+C, Cmd+Shift+C) both pass.
+    if modifiers.contains(Modifiers::SUPER) && !modifiers.contains(Modifiers::CONTROL) {
+        return true;
+    }
+    // Ctrl+Shift+C (Linux). Both must be present.
+    if modifiers.contains(Modifiers::CONTROL) && modifiers.contains(Modifiers::SHIFT) {
+        return true;
+    }
+    false
+}
+
 /// True when `(logical, modifiers)` is a "paste from clipboard" binding.
 ///
 /// We accept both the macOS-canonical `Cmd+V` and the Linux-canonical
@@ -1533,6 +1836,37 @@ mod tests {
     #[test]
     fn plain_v_is_not_paste() {
         assert!(!is_paste_binding(&ch("v"), Modifiers::empty()));
+    }
+
+    #[test]
+    fn cmd_c_is_copy_on_any_platform() {
+        assert!(is_copy_binding(&ch("c"), Modifiers::SUPER));
+        assert!(is_copy_binding(&ch("C"), Modifiers::SUPER));
+        // Cmd+Shift+C is also copy — the menu-bar accelerator some
+        // users have muscle memory for.
+        assert!(is_copy_binding(
+            &ch("c"),
+            Modifiers::SUPER | Modifiers::SHIFT
+        ));
+    }
+
+    #[test]
+    fn ctrl_shift_c_is_copy() {
+        assert!(is_copy_binding(
+            &ch("c"),
+            Modifiers::CONTROL | Modifiers::SHIFT
+        ));
+    }
+
+    #[test]
+    fn bare_ctrl_c_is_not_copy() {
+        // Ctrl+C must remain SIGINT.
+        assert!(!is_copy_binding(&ch("c"), Modifiers::CONTROL));
+    }
+
+    #[test]
+    fn plain_c_is_not_copy() {
+        assert!(!is_copy_binding(&ch("c"), Modifiers::empty()));
     }
 
     #[test]

@@ -290,6 +290,12 @@ pub struct Term {
     /// Accessor-only API; the renderer pulls from `Term::rgp_scene`
     /// on revision advance, mirrors the M11a image-registry pattern.
     rgp_scene: RgpScene,
+    /// Active mouse text selection, if any. Endpoints are pinned to
+    /// `line_id` so the selection survives `scroll_up`/`scroll_down`
+    /// and survives scrollback eviction (the renderer just stops
+    /// highlighting the evicted rows). Cleared on resize, alt-screen
+    /// flip, and most "screen contents fundamentally changed" paths.
+    selection: Option<crate::selection::Selection>,
 }
 
 /// In-progress run of Kitty Unicode placeholder cells.
@@ -449,6 +455,7 @@ impl Term {
             blank_row: crate::grid::Row::blank(cols),
             rgp_handler: RgpHandler::new(),
             rgp_scene: RgpScene::new(),
+            selection: None,
         }
     }
 
@@ -1131,6 +1138,201 @@ impl Term {
         }
     }
 
+    // ----- mouse text selection -----
+
+    /// Current selection, if any.
+    #[must_use]
+    pub fn selection(&self) -> Option<&crate::selection::Selection> {
+        self.selection.as_ref()
+    }
+
+    /// Monotonic id of the live bottom row on the primary grid. See
+    /// [`Grid::bottom_id`] for the model — the binary uses this to
+    /// pin selection endpoints to a stable line id.
+    #[must_use]
+    pub fn bottom_id(&self) -> u64 {
+        self.primary.bottom_id()
+    }
+
+    /// Replace the active selection, dirty-marking every visible row
+    /// the old and new selections touch so the renderer re-paints both
+    /// the freshly-selected cells and the cells that were just
+    /// deselected. No-op on the alt screen (selection clears on alt
+    /// entry).
+    pub fn set_selection(&mut self, sel: crate::selection::Selection) {
+        if self.alt_active {
+            return;
+        }
+        let prev = self.selection;
+        self.dirty_selection_rows(prev);
+        self.selection = Some(sel);
+        self.dirty_selection_rows(Some(sel));
+    }
+
+    /// Update the `active` endpoint of the current selection (drag
+    /// extension). No-op if there is no selection. For `Word` / `Line`
+    /// modes the caller is expected to have already snapped `active`
+    /// to the word/line boundary.
+    pub fn update_selection_active(&mut self, active: crate::selection::Pos) {
+        let Some(mut sel) = self.selection else {
+            return;
+        };
+        let old = sel;
+        sel.set_active(active);
+        self.selection = Some(sel);
+        // Dirty union of old and new selections so cells that left the
+        // selection get repainted with their base bg.
+        self.dirty_selection_rows(Some(old));
+        self.dirty_selection_rows(Some(sel));
+    }
+
+    /// Drop any active selection. Marks the rows it covered dirty so
+    /// the renderer repaints them without the selection tint.
+    pub fn clear_selection(&mut self) {
+        let prev = self.selection;
+        if prev.is_none() {
+            return;
+        }
+        self.selection = None;
+        self.dirty_selection_rows(prev);
+    }
+
+    /// True iff `(line_id, col)` is currently selected. Cheap — a
+    /// short-circuit on the `Option` and then a few comparisons. The
+    /// renderer calls this once per cell per frame.
+    ///
+    /// Selection is always treated as empty on the alt screen — the
+    /// alt grid has its own coordinate system and the binary clears
+    /// selection on alt entry anyway.
+    #[must_use]
+    pub fn is_cell_selected(&self, line_id: u64, col: u16) -> bool {
+        if self.alt_active {
+            return false;
+        }
+        self.selection
+            .as_ref()
+            .is_some_and(|s| s.contains(line_id, col))
+    }
+
+    /// Mark every viewport row that's touched by the given selection
+    /// dirty. Damage is indexed by *viewport* row (what the renderer
+    /// iterates via `view_row(r)`), not by primary-grid visible row —
+    /// under scrollback the two diverge, and a scrollback-only
+    /// selection would otherwise leave damage empty and the renderer
+    /// would skip the frame so no highlight ever appears.
+    ///
+    /// Walks the visible rows (`O(visible_rows)`) rather than the
+    /// selection's `rows_touched()` range, so dragging a selection
+    /// across thousands of scrollback rows stays cheap.
+    fn dirty_selection_rows(&mut self, sel: Option<crate::selection::Selection>) {
+        let Some(sel) = sel else { return };
+        let cols = self.cols;
+        let rows = self.rows;
+        let scroll = u64::from(self.viewport.current_lines);
+        let bottom = self.primary.bottom_id();
+        for vr in 0..rows {
+            // viewport row vr → line_id of the row currently rendered
+            // there. Same math as `line_id_for_render_row` in the
+            // render crate (with pixel_extra = 0 for damage purposes).
+            let above_bottom = u64::from(rows - 1 - vr) + scroll;
+            let Some(line_id) = bottom.checked_sub(above_bottom) else {
+                continue;
+            };
+            if sel.rows_touched().contains(&line_id) {
+                self.mark_cells(vr, 0, cols);
+            }
+        }
+    }
+
+    /// Extract the selected text. Returns `None` when there's no
+    /// selection. Joins across rows with `\n`, except that
+    /// soft-wrapped rows (where `row.soft_wrap == true`) join without
+    /// the newline so the user gets the logical line back as one
+    /// piece. Trailing whitespace is stripped per visual row. Block
+    /// selections produce one line per row, hard-truncated at the
+    /// selection's column bounds.
+    #[must_use]
+    pub fn extract_selection_text(&self) -> Option<String> {
+        use crate::selection::SelectionMode;
+        let sel = self.selection.as_ref()?;
+        let (first, last) = sel.ordered();
+        let cols = self.cols;
+        let mut out = String::new();
+        for line_id in first.line_id..=last.line_id {
+            let row = self.primary_row_by_line_id(line_id)?;
+            // Determine column range for this row given selection mode.
+            let (start_col, end_col) = match sel.mode {
+                SelectionMode::Block => {
+                    let (a, b) = (first.col, last.col);
+                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                    (lo, hi.saturating_add(1).min(cols))
+                }
+                _ => {
+                    let s = if line_id == first.line_id {
+                        first.col
+                    } else {
+                        0
+                    };
+                    let e_inclusive = if line_id == last.line_id {
+                        last.col
+                    } else {
+                        cols.saturating_sub(1)
+                    };
+                    (s, e_inclusive.saturating_add(1).min(cols))
+                }
+            };
+            // Collect chars in [start_col, end_col), skipping continuation
+            // cells (they're the trailing half of a width-2 cluster — the
+            // primary cell already carries the char).
+            let mut line_buf = String::new();
+            for col in start_col..end_col {
+                let Some(cell) = row.cells.get(col as usize) else {
+                    break;
+                };
+                if cell.is_continuation {
+                    continue;
+                }
+                // Treat NUL (the `Cell::default()` ch) as space; rows
+                // shorter than `cols` get padded with NUL cells.
+                let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
+                line_buf.push(ch);
+            }
+            // Strip trailing whitespace — conventional terminal-copy
+            // behaviour and matches every common terminal emulator.
+            while matches!(line_buf.chars().last(), Some(c) if c.is_whitespace()) {
+                line_buf.pop();
+            }
+            out.push_str(&line_buf);
+            // Row separator: hard newline between rows, except that
+            // soft-wrapped rows in char/word/line mode are joined
+            // without a newline (the soft wrap is a presentational
+            // line break, not a logical one). Block mode always
+            // separates rows with `\n`.
+            let is_last_row = line_id == last.line_id;
+            if !is_last_row {
+                let join_soft =
+                    !matches!(sel.mode, SelectionMode::Block) && row.soft_wrap;
+                if !join_soft {
+                    out.push('\n');
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Look up the primary-grid `Row` whose live `line_id` matches.
+    /// Walks via `Grid::locate` so we transparently hit either the
+    /// visible region or scrollback. Returns `None` for an evicted
+    /// line id. Used by the binary to look up word boundaries during
+    /// drag selection and by the extractor to walk selection rows.
+    #[must_use]
+    pub fn primary_row_by_line_id(&self, line_id: u64) -> Option<&crate::grid::Row> {
+        match self.primary.locate(line_id)? {
+            crate::grid::RowLocation::Visible(r) => Some(self.primary.row(r)),
+            crate::grid::RowLocation::Scrollback(n) => self.primary.scrollback_row(n),
+        }
+    }
+
     /// Resize the visible viewport. **Does not reflow** — that's a
     /// decision #6 / scrollback.md follow-up. The cursor is clamped to the
     /// new dimensions.
@@ -1152,6 +1354,11 @@ impl Term {
         // The primary grid may have lost history on a cap change; clamp
         // the viewport so it doesn't reference rows past the new limit.
         self.viewport.clamp_to(self.primary.history_lines());
+        // Selection coordinates only stay meaningful when row layout
+        // doesn't move under them. Resize moves rows around (and
+        // potentially drops history); clear so we don't paint stale
+        // highlights at the wrong (line_id, col).
+        self.selection = None;
     }
 
     fn active_grid(&self) -> &Grid {
@@ -2209,6 +2416,11 @@ impl Term {
         if self.alt_active {
             return;
         }
+        // Drop any selection from the primary grid — once we're on
+        // alt, the user can't see the primary content anyway, and
+        // selection state would resurface as a phantom highlight on
+        // exit if the primary's rows are then overwritten.
+        self.selection = None;
         self.saved_cursor = self.cursor;
         self.alt_active = true;
         self.alt.clear_visible(Style::RESET);

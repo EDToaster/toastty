@@ -23,13 +23,15 @@ mod cell;
 mod cursor;
 mod damage;
 mod grid;
+mod selection;
 mod term;
 mod viewport;
 
 pub use cell::{Cell, Color, HyperlinkId, Style, StyleFlags};
 pub use cursor::Cursor;
 pub use damage::{Damage, RowDamage};
-pub use grid::{Grid, Row};
+pub use grid::{Grid, Row, RowLocation};
+pub use selection::{Pos, Selection, SelectionMode};
 pub use term::{
     ClipboardRequest, KITTY_FLAG_DISAMBIGUATE, KITTY_FLAG_REPORT_ALL_AS_ESC,
     KITTY_FLAG_REPORT_ALTERNATE, KITTY_FLAG_REPORT_EVENTS, KITTY_FLAG_REPORT_TEXT, MouseMode,
