@@ -246,6 +246,15 @@ struct Toastty {
     /// pixel deltas; we accumulate them here and emit one ↑/↓ arrow
     /// once the magnitude crosses one cell height.
     alt_scroll_pixel_accum: f64,
+    /// Sub-row pixel accumulators for the SGR mouse-mode forwarding
+    /// path (apps like zellij, btop, neovim with `set mouse=a`).
+    /// macOS delivers many small pixel events per gesture; the
+    /// encoder converts each one to a discrete scroll notch
+    /// regardless of magnitude, which made trackpad scrolling inside
+    /// zellij feel runaway-sensitive. We accumulate here and emit
+    /// one notch per ~2 cells of finger motion.
+    mouse_scroll_accum_y: f64,
+    mouse_scroll_accum_x: f64,
     /// Sub-row pixel accumulator for the primary-grid scrollback path
     /// when `smooth_scrolling = false`. Trackpad pixel deltas pile up
     /// here; we apply whole-row deltas only, leaving the residual
@@ -343,6 +352,8 @@ impl Toastty {
             clipboard: None,
             pty_log: PtyLogger::from_env(),
             alt_scroll_pixel_accum: 0.0,
+            mouse_scroll_accum_y: 0.0,
+            mouse_scroll_accum_x: 0.0,
             scroll_pixel_residual: 0.0,
             last_viewport_tick: None,
             debug_enabled: std::env::var_os("TOASTTY_DEBUG").is_some(),
@@ -1264,30 +1275,87 @@ impl Toastty {
             self.last_pixel_scroll_at = Some(now);
         }
 
-        // Priority 1: app has mouse-tracking on. Forward the wheel
-        // event verbatim — apps like btop/htop/neovim consume scroll
-        // as input, and they always win over the local scrollback
-        // view.
-        let mode = self.term.mouse_mode();
-        let kind = MouseEventKind::Scroll {
-            dx: delta_x,
-            dy: delta_y,
-        };
-        if protocol_wants_event(mode, &kind) {
-            let cell = self.current_cell();
-            if let Some(bytes) = encode_mouse(kind, cell, Modifiers::empty(), mode) {
-                self.write_pty(&bytes);
-            }
-            return ControlSignal::Continue;
-        }
-
-        // We need the cell height for both the pixel-accumulator
-        // (alt-screen path) and the viewport (primary path). Without a
-        // renderer we can't size anything, so drop the event.
+        // We need the cell height for the pixel→notch accumulator in
+        // the mouse-mode forwarding path, the alt-screen path, and the
+        // viewport (primary path). Without a renderer we can't size
+        // anything, so drop the event.
         let Some(cell_h) = self.renderer.as_ref().map(|r| r.cell_size().1) else {
             return ControlSignal::Continue;
         };
         if cell_h <= 0.0 {
+            return ControlSignal::Continue;
+        }
+
+        // Priority 1: app has mouse-tracking on. Forward the wheel
+        // event — apps like zellij/btop/htop/neovim consume scroll
+        // as input, and they always win over the local scrollback
+        // view.
+        //
+        // For `Lines` (wheel notch) the event is intentional and
+        // passes through 1:1. For `Pixels` (trackpad) the encoder
+        // would otherwise emit one notch per pixel event, which on
+        // macOS produces 60+ notches per gesture — apps feel
+        // runaway-sensitive. Accumulate into the mouse-scroll
+        // accumulators and emit one notch per ~2 cells of finger
+        // motion. Two cells (rather than one) lands the perceived
+        // speed roughly halfway between today's flood and a strict
+        // one-notch-per-cell rate.
+        let mode = self.term.mouse_mode();
+        let pre_kind = MouseEventKind::Scroll {
+            dx: delta_x,
+            dy: delta_y,
+        };
+        if protocol_wants_event(mode, &pre_kind) {
+            let cell = self.current_cell();
+            let (notches_y, notches_x): (i32, i32) = match scroll_kind {
+                toastty_window::ScrollKind::Lines => {
+                    // Reset pixel accumulators when a wheel notch
+                    // arrives — mixing notch + trackpad mid-stream
+                    // shouldn't carry partial trackpad pixels into
+                    // the notch path.
+                    self.mouse_scroll_accum_y = 0.0;
+                    self.mouse_scroll_accum_x = 0.0;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let ny = delta_y.signum() as i32 * (delta_y.abs() > f64::EPSILON) as i32;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let nx = delta_x.signum() as i32 * (delta_x.abs() > f64::EPSILON) as i32;
+                    (ny, nx)
+                }
+                toastty_window::ScrollKind::Pixels => {
+                    let threshold = 2.0 * f64::from(cell_h);
+                    self.mouse_scroll_accum_y += delta_y;
+                    self.mouse_scroll_accum_x += delta_x;
+                    let cy = (self.mouse_scroll_accum_y / threshold).trunc();
+                    let cx = (self.mouse_scroll_accum_x / threshold).trunc();
+                    self.mouse_scroll_accum_y -= cy * threshold;
+                    self.mouse_scroll_accum_x -= cx * threshold;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let r = (cy as i32, cx as i32);
+                    r
+                }
+            };
+            if notches_y != 0 {
+                let kind_y = MouseEventKind::Scroll {
+                    dx: 0.0,
+                    dy: f64::from(notches_y.signum()),
+                };
+                if let Some(bytes) = encode_mouse(kind_y, cell, Modifiers::empty(), mode) {
+                    for _ in 0..notches_y.unsigned_abs() {
+                        self.write_pty(&bytes);
+                    }
+                }
+            }
+            if notches_x != 0 {
+                let kind_x = MouseEventKind::Scroll {
+                    dx: f64::from(notches_x.signum()),
+                    dy: 0.0,
+                };
+                if let Some(bytes) = encode_mouse(kind_x, cell, Modifiers::empty(), mode) {
+                    for _ in 0..notches_x.unsigned_abs() {
+                        self.write_pty(&bytes);
+                    }
+                }
+            }
             return ControlSignal::Continue;
         }
 
