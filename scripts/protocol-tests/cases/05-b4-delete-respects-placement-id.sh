@@ -9,10 +9,12 @@ expected="Two placements of image 1 sit side by side: p=1 on the left, p=2 on th
 run() {
     transmit_solid 1 48 200 60 200       # purple, registered but not placed
 
+    # a=p can't auto-derive natural size (handler.rs:495 → 1x1 without c/r),
+    # so give an explicit 3x3-cell span to make each placement visible.
     cursor_to 12 4
-    place_image 1 1                       # left: placement_id 1
+    place_image 1 1 "c=3,r=3"             # left: placement_id 1
     cursor_to 12 30
-    place_image 1 2                       # right: placement_id 2
+    place_image 1 2 "c=3,r=3"             # right: placement_id 2
     cursor_to 16 1
     printf 'Left = p=1     Right = p=2\n'
 

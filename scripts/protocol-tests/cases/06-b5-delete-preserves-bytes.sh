@@ -9,10 +9,12 @@ expected="Two placements of image 1 are shown. Press 'd' → d=I,i=1,p=1 (delete
 run() {
     transmit_solid 1 48 80 180 255       # cyan
 
+    # a=p can't auto-derive natural size (handler.rs:495 → 1x1 without c/r),
+    # so give an explicit 3x3-cell span to make each placement visible.
     cursor_to 12 4
-    place_image 1 1
+    place_image 1 1 "c=3,r=3"
     cursor_to 12 30
-    place_image 1 2
+    place_image 1 2 "c=3,r=3"
     cursor_to 16 1
     printf 'Left = p=1     Right = p=2\n'
 
@@ -24,7 +26,7 @@ run() {
         printf 'Now press SPACE for stage 2.\n'
         wait_space
         cursor_to 12 60
-        place_image 1 3                   # re-place as p=3 on the far right
+        place_image 1 3 "c=3,r=3"         # re-place as p=3 on the far right
         cursor_to 21 1
         printf 'Spec: cyan square reappears at far right (bytes were retained).\n'
         printf 'Buggy: nothing new appears — bytes were freed despite p=2 surviving.\n'

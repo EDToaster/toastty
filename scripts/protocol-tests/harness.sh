@@ -78,9 +78,10 @@ print_section() {
 print_footer() {
     local idx="$1" total="$2"
     printf '\n%s%s%s\n' "$dim" "$(hr ─)" "$reset_sgr"
-    printf '  %s[n]%sext  %s[p]%srev  %s[r]%serun  %s[q]%suit' \
+    printf '  %s[n]%sext  %s[p]%srev  %s[r]%serun  %s[m]%senu  %s[q]%suit' \
         "$bold" "$reset_sgr" "$bold" "$reset_sgr" \
-        "$bold" "$reset_sgr" "$bold" "$reset_sgr"
+        "$bold" "$reset_sgr" "$bold" "$reset_sgr" \
+        "$bold" "$reset_sgr"
     printf '%s[%d/%d]%s\n' "$dim" "$idx" "$total" "$reset_sgr"
 }
 
@@ -94,6 +95,19 @@ if [[ $total -eq 0 ]]; then
     printf 'No test cases found in %s\n' "$CASES_DIR" >&2
     exit 1
 fi
+
+# Cache each case's title by sourcing it in a subshell (run() is not
+# invoked, so this has no side effects on the terminal).
+titles=()
+for f in "${cases[@]}"; do
+    t=$(
+        title="(no title)"
+        # shellcheck disable=SC1090
+        source "$f" >/dev/null 2>&1
+        printf '%s' "$title"
+    )
+    titles+=("$t")
+done
 
 # ---- render one page ----
 
@@ -128,28 +142,77 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ---- menu ----
+
+# Render the selection menu and read a choice. Sets the global MENU_CHOICE
+# to the chosen 0-based index, or "q" to quit. Re-prompts on invalid input.
+# Chrome is printed straight to the terminal (no command substitution, so
+# stdout isn't captured).
+show_menu() {
+    reset_terminal
+    printf '%s%s%s\n' "$cyan" "$(hr ═)" "$reset_sgr"
+    printf '  %s%skitty graphics protocol — test harness%s\n' "$bold" "$underline" "$reset_sgr"
+    printf '%s%s%s\n\n' "$cyan" "$(hr ═)" "$reset_sgr"
+    print_section "Select a test:"
+    printf '\n'
+    local i
+    for i in "${!cases[@]}"; do
+        printf '  %s%2d%s  %s\n' "$bold" "$((i + 1))" "$reset_sgr" "${titles[$i]}"
+    done
+    printf '\n%s%s%s\n' "$dim" "$(hr ─)" "$reset_sgr"
+    while true; do
+        printf '  Enter number %s[1-%d]%s, or %s[q]%suit: ' \
+            "$bold" "$total" "$reset_sgr" "$bold" "$reset_sgr"
+        local sel
+        IFS= read -r sel || { MENU_CHOICE="q"; return; }
+        case "$sel" in
+            q|Q) MENU_CHOICE="q"; return ;;
+            ''|*[!0-9]*) : ;;  # non-numeric → re-prompt
+            *)
+                if ((sel >= 1 && sel <= total)); then
+                    MENU_CHOICE="$((sel - 1))"
+                    return
+                fi
+                ;;
+        esac
+    done
+}
+
 # ---- main loop ----
 
-idx=0
 while true; do
-    show_case "$idx"
-    IFS= read -r -s -n 1 key || key="q"
-    case "$key" in
-        n|N|' '|'')
-            ((idx < total - 1)) && idx=$((idx + 1))
-            ;;
-        p|P|b|B)
-            ((idx > 0)) && idx=$((idx - 1))
-            ;;
-        r|R)
-            : # redraw current page
-            ;;
-        q|Q)
-            exit 0
-            ;;
-        $'\e')
-            # Drop any remaining bytes from an arrow / escape sequence.
-            IFS= read -r -s -t 0.05 -n 2 _ || true
-            ;;
-    esac
+    # Start at the menu; selection sets the active page.
+    show_menu
+    [[ "$MENU_CHOICE" == "q" ]] && exit 0
+    idx="$MENU_CHOICE"
+
+    # Page view for the chosen test; navigate or return to the menu.
+    to_menu=0
+    while true; do
+        show_case "$idx"
+        IFS= read -r -s -n 1 key || key="q"
+        case "$key" in
+            n|N|' '|'')
+                ((idx < total - 1)) && idx=$((idx + 1))
+                ;;
+            p|P|b|B)
+                ((idx > 0)) && idx=$((idx - 1))
+                ;;
+            r|R)
+                : # redraw current page
+                ;;
+            m|M)
+                to_menu=1
+                break
+                ;;
+            q|Q)
+                exit 0
+                ;;
+            $'\e')
+                # Drop any remaining bytes from an arrow / escape sequence.
+                IFS= read -r -s -t 0.05 -n 2 _ || true
+                ;;
+        esac
+    done
+    ((to_menu)) && continue
 done

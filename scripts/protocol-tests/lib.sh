@@ -166,6 +166,29 @@ send_and_capture() {
 }
 
 # ---------------------------------------------------------------------------
+# Cell pixel size (CSI 16t)
+# ---------------------------------------------------------------------------
+
+# Query the terminal's cell pixel size and set globals CELL_PW / CELL_PH.
+# Reply format: ESC [ 6 ; <height> ; <width> t. Falls back to 10x20.
+query_cell_px() {
+    CELL_PW=10
+    CELL_PH=20
+    drain_input
+    printf '%s[16t' "$esc"
+    local resp="" c
+    while IFS= read -r -s -t 1 -n 1 c; do
+        resp+="$c"
+        [[ "$c" == "t" ]] && break
+    done
+    local re='\[6;([0-9]+);([0-9]+)t'
+    if [[ "$resp" =~ $re ]]; then
+        CELL_PH="${BASH_REMATCH[1]}"
+        CELL_PW="${BASH_REMATCH[2]}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Unicode placeholders
 # ---------------------------------------------------------------------------
 
@@ -173,14 +196,18 @@ send_and_capture() {
 # args: row col [msb]
 placeholder_cell() {
     local row="$1" col="$2" msb="${3:-}"
-    python3 <<PYEOF
+    # Pass values via argv (and a quoted heredoc) so an empty msb can't
+    # interpolate into `diacritics[]` and produce a Python syntax error.
+    python3 - "$row" "$col" "$msb" <<'PYEOF'
 import sys
 diacritics = [
     0x0305, 0x030D, 0x030E, 0x0310, 0x0312, 0x033D, 0x033E, 0x033F, 0x0346, 0x034A,
     0x034B, 0x034C, 0x0350, 0x0351, 0x0352, 0x0357, 0x035B, 0x0363, 0x0364, 0x0365,
 ]
-s = chr(0x10EEEE) + chr(diacritics[$row]) + chr(diacritics[$col])
-if "$msb": s += chr(diacritics[$msb])
+row, col, msb = sys.argv[1], sys.argv[2], sys.argv[3]
+s = chr(0x10EEEE) + chr(diacritics[int(row)]) + chr(diacritics[int(col)])
+if msb != "":
+    s += chr(diacritics[int(msb)])
 sys.stdout.write(s)
 PYEOF
 }
