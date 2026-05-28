@@ -480,6 +480,12 @@ impl Renderer {
             })
             .await
             .map_err(|_| RenderError::NoAdapter)?;
+        let info = adapter.get_info();
+        tracing::info!(
+            target: "render_trace",
+            "wgpu adapter: name={:?} backend={:?} device_type={:?} vendor=0x{:04x} device=0x{:04x}",
+            info.name, info.backend, info.device_type, info.vendor, info.device,
+        );
 
         let (device, queue) = adapter
             .request_device(&DeviceDescriptor {
