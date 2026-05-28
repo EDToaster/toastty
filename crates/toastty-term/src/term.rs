@@ -234,8 +234,15 @@ pub struct Term {
     image_handler: KittyHandler,
     /// Cache of decoded image bytes keyed by Kitty image id.
     image_registry: ImageRegistry,
-    /// Parallel layer of placements over the cell grid.
+    /// Parallel layer of placements over the cell grid. Always refers
+    /// to the *active* screen's images.
     image_grid: ImageGrid,
+    /// Images belonging to the *inactive* screen. The primary and alt
+    /// screens maintain independent image lists (per the kitty graphics
+    /// protocol), so when we switch screens we stash the departing
+    /// screen's grid here and install a fresh one as `image_grid`.
+    /// `None` while on the primary screen (nothing stashed).
+    stashed_image_grid: Option<ImageGrid>,
     /// Monotonic counter bumped whenever the registry or grid mutates.
     /// The renderer compares against its cached value to decide when
     /// to re-sync GPU textures (and force a full clear of the frame).
@@ -458,6 +465,7 @@ impl Term {
             // binary can shrink via `Term::set_image_cap`.
             image_registry: ImageRegistry::new(256 * 1024 * 1024),
             image_grid: ImageGrid::new(),
+            stashed_image_grid: None,
             image_revision: 0,
             cursor_underline_color: None,
             placeholder_run: None,
@@ -2625,12 +2633,12 @@ impl Term {
         self.viewport = crate::viewport::Viewport::new();
         // Switching screens invalidates every cached shaped line.
         self.mark_all_dirty();
-        // Alt screen has no image placements in M11a — clear so apps
-        // can't accidentally see stale images from the primary screen.
-        let dropped = self.image_grid.clear();
-        if !dropped.is_empty() {
-            self.image_revision = self.image_revision.wrapping_add(1);
-        }
+        // Primary and alt screens maintain independent image lists.
+        // Stash the primary grid and install a fresh empty one as the
+        // active grid so the alt screen starts blank and the primary's
+        // images survive the round trip.
+        self.stashed_image_grid = Some(std::mem::take(&mut self.image_grid));
+        self.image_revision = self.image_revision.wrapping_add(1);
     }
 
     fn exit_alt_screen(&mut self) {
@@ -2646,13 +2654,11 @@ impl Term {
         self.viewport = crate::viewport::Viewport::new();
         // Switching back: re-shape the primary screen contents.
         self.mark_all_dirty();
-        // Same policy on exit: clear image placements (the primary
-        // screen's images were not preserved across the alt-screen
-        // switch in M11a).
-        let dropped = self.image_grid.clear();
-        if !dropped.is_empty() {
-            self.image_revision = self.image_revision.wrapping_add(1);
-        }
+        // Drop the alt screen's images and restore the stashed primary
+        // grid, so the primary screen's images reappear exactly as they
+        // were before we entered the alt screen.
+        self.image_grid = self.stashed_image_grid.take().unwrap_or_default();
+        self.image_revision = self.image_revision.wrapping_add(1);
     }
 }
 
@@ -6276,5 +6282,104 @@ mod tests {
         feed(&mut t, b"\x1b[1;3H\x1b[4d");
         assert_eq!(t.cursor().row, 3);
         assert_eq!(t.cursor().col, 2);
+    }
+}
+
+#[cfg(test)]
+mod blocker_altscreen_tests {
+    use super::*;
+    use toastty_parser::Parser;
+
+    fn feed(t: &mut Term, bytes: &[u8]) {
+        let mut p = Parser::new();
+        p.advance(t, bytes);
+    }
+
+    fn b64_red_1x1() -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .encode([255u8, 0, 0, 255])
+            .into_bytes()
+    }
+
+    /// Place a 1x1 image with the given kitty image id at the cursor.
+    fn place_image(t: &mut Term, id: u32) {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(
+            format!("\x1b_Ga=T,f=32,s=1,v=1,i={id},c=1,r=1;").as_bytes(),
+        );
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(t, &payload);
+    }
+
+    #[test]
+    fn alt_screen_preserves_primary_images() {
+        let mut t = Term::new(8, 8, 0);
+
+        // Primary screen: place one image.
+        place_image(&mut t, 1);
+        assert_eq!(t.image_grid().len(), 1);
+        assert!(!t.is_alt_active());
+
+        // Enter alt screen: active grid must be empty, alt active.
+        feed(&mut t, b"\x1b[?1049h");
+        assert!(t.is_alt_active());
+        assert_eq!(
+            t.image_grid().len(),
+            0,
+            "alt screen must start with an empty image grid"
+        );
+
+        // Place an image on the alt screen.
+        place_image(&mut t, 2);
+        assert_eq!(t.image_grid().len(), 1);
+
+        // Exit alt screen: the primary image must be restored, the alt
+        // image gone.
+        feed(&mut t, b"\x1b[?1049l");
+        assert!(!t.is_alt_active());
+        assert_eq!(
+            t.image_grid().len(),
+            1,
+            "primary-screen image must survive the alt-screen round trip"
+        );
+        // The restored placement must be the primary one (id 1), not the
+        // alt one (id 2).
+        let id = t.image_grid().iter().next().unwrap().image_id;
+        assert_eq!(id, 1, "restored image must be the primary screen's image");
+    }
+
+    #[test]
+    fn alt_and_primary_image_lists_are_independent() {
+        let mut t = Term::new(8, 8, 0);
+
+        // Primary image.
+        place_image(&mut t, 10);
+        assert_eq!(t.image_grid().len(), 1);
+
+        // Enter alt; primary image must not leak onto alt.
+        feed(&mut t, b"\x1b[?1049h");
+        assert_eq!(t.image_grid().len(), 0);
+
+        // Two images on alt.
+        place_image(&mut t, 20);
+        place_image(&mut t, 21);
+        assert_eq!(t.image_grid().len(), 2);
+
+        // Back to primary: exactly the one primary image, none from alt.
+        feed(&mut t, b"\x1b[?1049l");
+        assert_eq!(t.image_grid().len(), 1);
+        let id = t.image_grid().iter().next().unwrap().image_id;
+        assert_eq!(id, 10, "alt images must not leak onto the primary screen");
+
+        // Re-enter alt: it starts fresh again (alt images were dropped on
+        // exit, not retained).
+        feed(&mut t, b"\x1b[?1049h");
+        assert_eq!(
+            t.image_grid().len(),
+            0,
+            "alt screen images must not persist across visits"
+        );
     }
 }
