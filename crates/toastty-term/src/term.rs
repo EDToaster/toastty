@@ -7511,54 +7511,63 @@ mod major_delete_tests {
     // ---- M10: d=a / d=A scope to placements VISIBLE on screen ----
 
     #[test]
-    fn m10_delete_a_removes_only_visible_placements() {
-        // 8 rows. Place id=1 at row 0 (visible) and id=2 at row 6.
+    fn m10_delete_a_scopes_to_the_active_screen() {
+        // In toastty's model the image grid only ever holds placements on
+        // visible rows: scrolling drops those past the top, and resize
+        // (M9) clips/drops those past the bottom, so an "off-screen but
+        // present" placement cannot occur within a single screen. The
+        // visible-scoping that genuinely matters for d=a is primary-vs-alt:
+        // d=a must touch only the ACTIVE screen's grid (the inactive
+        // screen's placements are stashed by the alt-screen split, B2).
         let mut t = Term::new(8, 8, 0);
-        transmit_place_at(&mut t, 0, 0, 1, 0, 0);
-        transmit_place_at(&mut t, 6, 0, 2, 0, 0);
-        assert_eq!(t.image_grid().len(), 2);
-        // Shrink to 4 rows: id=2's placement (row 6) is now OFF-SCREEN
-        // (>= rows). resize() doesn't touch the image grid, so the
-        // placement stays put at row 6.
-        t.resize(4, 8);
-        // d=a deletes only placements intersecting the visible 0..4.
-        feed(&mut t, b"\x1b_Ga=d,d=a\x1b\\");
-        assert!(
-            !has_placement_for(&t, 1),
-            "visible placement should be removed"
-        );
-        assert!(
-            has_placement_for(&t, 2),
-            "off-screen placement should survive d=a"
-        );
+        transmit_place_at(&mut t, 0, 0, 1, 0, 0); // primary image id=1
         assert_eq!(t.image_grid().len(), 1);
+        // Enter the alt screen: primary's grid is stashed, alt starts empty.
+        feed(&mut t, b"\x1b[?1049h");
+        assert!(t.is_alt_active());
+        assert_eq!(t.image_grid().len(), 0);
+        transmit_place_at(&mut t, 0, 0, 2, 0, 0); // alt image id=2
+        assert_eq!(t.image_grid().len(), 1);
+        // d=a on the alt screen removes only the alt placement.
+        feed(&mut t, b"\x1b_Ga=d,d=a\x1b\\");
+        assert_eq!(t.image_grid().len(), 0, "alt placement removed");
+        // Back on primary: its placement was never touched.
+        feed(&mut t, b"\x1b[?1049l");
+        assert!(!t.is_alt_active());
+        assert!(
+            has_placement_for(&t, 1),
+            "primary placement survives d=a issued on the alt screen"
+        );
     }
 
     #[test]
-    fn m10_delete_uppercase_a_frees_bytes_only_when_no_placement_remains() {
-        // One image (id=1) with TWO placements: one visible (row 0),
-        // one off-screen after resize (row 6).
+    fn m10_uppercase_a_frees_bytes_lowercase_keeps_them() {
+        // d=a (lowercase) removes the visible placement but RETAINS the
+        // image bytes; d=A (uppercase) also frees the bytes once no
+        // placement remains. (Cross-screen byte survival — freeing only
+        // when a placement remains elsewhere — is exercised by the i/I
+        // selector tests; d=A removes every visible placement, so within a
+        // single screen the "free only when none remains" branch reduces
+        // to "free".)
         let mut t = Term::new(8, 8, 0);
-        transmit_place_at(&mut t, 0, 0, 1, 0, 0); // placement A (visible)
-        place_again_at(&mut t, 6, 0, 1, 2); // placement B (will be off-screen)
-        assert_eq!(t.image_grid().len(), 2);
-        t.resize(4, 8);
-        // d=A removes the visible placement; image 1 still has the
-        // off-screen placement, so its bytes must SURVIVE.
-        feed(&mut t, b"\x1b_Ga=d,d=A\x1b\\");
-        assert_eq!(t.image_grid().len(), 1, "off-screen placement survives");
+        transmit_place_at(&mut t, 0, 0, 1, 0, 0);
+        assert_eq!(t.image_grid().len(), 1);
+        // lowercase d=a: placement gone, bytes kept.
+        feed(&mut t, b"\x1b_Ga=d,d=a\x1b\\");
+        assert_eq!(t.image_grid().len(), 0);
         assert!(
             t.image_registry().contains(1),
-            "bytes kept while a placement survives"
+            "lowercase d=a keeps image bytes"
         );
-        // Now grow back so the surviving placement is visible, then d=A
-        // again: no placement remains anywhere → bytes freed.
-        t.resize(8, 8);
+        // Re-place the (still-registered) image, then uppercase d=A:
+        // placement gone AND bytes freed.
+        place_again_at(&mut t, 0, 0, 1, 0);
+        assert_eq!(t.image_grid().len(), 1);
         feed(&mut t, b"\x1b_Ga=d,d=A\x1b\\");
         assert_eq!(t.image_grid().len(), 0);
         assert!(
             !t.image_registry().contains(1),
-            "bytes freed once no placement remains"
+            "uppercase d=A frees bytes once no placement remains"
         );
     }
 
