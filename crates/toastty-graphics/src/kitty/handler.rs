@@ -38,10 +38,13 @@ pub trait KittySink {
     /// Insert (or replace) decoded `data` into the host's registry.
     ///
     /// `id_request` is the client-supplied id (`i=` key); `0` means the
-    /// host should assign one. Returns the *final* id, or `None` if the
-    /// host could not accept the image. The handler maps `None` to
-    /// [`ErrorCode::Efbig`].
-    fn register_image(&mut self, id_request: u32, data: ImageData) -> Option<u32>;
+    /// host should assign one. `image_number` is the client-supplied
+    /// image *number* (`I=` key; `0` when absent) — the host records a
+    /// number→most-recent-id mapping so `d=n`/`d=N` can resolve it.
+    /// Returns the *final* id, or `None` if the host could not accept the
+    /// image. The handler maps `None` to [`ErrorCode::Efbig`].
+    fn register_image(&mut self, id_request: u32, image_number: u32, data: ImageData)
+    -> Option<u32>;
 
     /// Insert a placement onto the cell grid.
     fn place_image(&mut self, placement: Placement);
@@ -440,7 +443,7 @@ impl KittyHandler {
         // Hand off to the host. Capture dimensions BEFORE the move so
         // we can build the placement after the borrow ends.
         let (img_w, img_h) = (img.width, img.height);
-        let Some(final_id) = sink.register_image(header.image_id, img) else {
+        let Some(final_id) = sink.register_image(header.image_id, header.image_number, img) else {
             reply_error_if_verbose(&header, sink, ErrorCode::Efbig, "registry full");
             return;
         };
@@ -770,7 +773,12 @@ mod tests {
     }
 
     impl KittySink for MockSink {
-        fn register_image(&mut self, id_request: u32, data: ImageData) -> Option<u32> {
+        fn register_image(
+            &mut self,
+            id_request: u32,
+            _image_number: u32,
+            data: ImageData,
+        ) -> Option<u32> {
             let id = if id_request == 0 {
                 let assigned = self.assign_next;
                 self.assign_next += 1;
@@ -1341,7 +1349,12 @@ mod blocker_graphics_tests {
     }
 
     impl KittySink for RecordingSink {
-        fn register_image(&mut self, id_request: u32, data: ImageData) -> Option<u32> {
+        fn register_image(
+            &mut self,
+            id_request: u32,
+            _image_number: u32,
+            data: ImageData,
+        ) -> Option<u32> {
             let id = if id_request == 0 {
                 let assigned = self.assign_next;
                 self.assign_next += 1;

@@ -243,6 +243,12 @@ pub struct Term {
     /// screen's grid here and install a fresh one as `image_grid`.
     /// `None` while on the primary screen (nothing stashed).
     stashed_image_grid: Option<ImageGrid>,
+    /// Image *number* (`I=`) → most-recently-registered image *id* map.
+    /// The kitty spec lets a client refer to "the most recent image with
+    /// this number" via `d=n`/`d=N`. Updated on every registration that
+    /// carried a non-zero `I=`; pruned when the target id leaves the
+    /// registry (delete / eviction).
+    image_number_to_id: std::collections::HashMap<u32, u32>,
     /// Monotonic counter bumped whenever the registry or grid mutates.
     /// The renderer compares against its cached value to decide when
     /// to re-sync GPU textures (and force a full clear of the frame).
@@ -470,6 +476,7 @@ impl Term {
             image_registry: ImageRegistry::new(256 * 1024 * 1024),
             image_grid: ImageGrid::new(),
             stashed_image_grid: None,
+            image_number_to_id: std::collections::HashMap::new(),
             image_revision: 0,
             cursor_underline_color: None,
             placeholder_run: None,
@@ -3202,13 +3209,50 @@ impl Perform for Term {
     }
 }
 
+// ---- Kitty delete helpers (M10/M11/M12) ----
+
+impl Term {
+    /// Remove `id`'s decoded bytes from the registry and prune any
+    /// image-number→id entries pointing at it. Used by every by-id /
+    /// byte-freeing delete path so the `d=n`/`d=N` map never points at
+    /// a freed id.
+    fn remove_image_bytes(&mut self, id: u32) {
+        self.image_registry.remove(id);
+        self.image_number_to_id.retain(|_, v| *v != id);
+    }
+
+    /// Free image bytes for every image that just lost its last
+    /// placement: for each distinct image id among `dropped`, if the
+    /// grid no longer holds ANY placement for that id, remove its bytes
+    /// (and prune the number→id map). Shared by the uppercase
+    /// area/selector deletes (`A`, `P`, `C`, `Q`, `X`, `Y`, `Z`).
+    fn free_orphaned_image_bytes(&mut self, dropped: &[Placement]) {
+        let mut seen: Vec<u32> = Vec::new();
+        for p in dropped {
+            if seen.contains(&p.image_id) {
+                continue;
+            }
+            seen.push(p.image_id);
+            if !self.image_grid.iter().any(|q| q.image_id == p.image_id) {
+                self.remove_image_bytes(p.image_id);
+            }
+        }
+    }
+}
+
 // ---- M11a: KittySink ----
 
 impl KittySink for Term {
-    fn register_image(&mut self, id_request: u32, data: ImageData) -> Option<u32> {
+    fn register_image(
+        &mut self,
+        id_request: u32,
+        image_number: u32,
+        data: ImageData,
+    ) -> Option<u32> {
         tracing::info!(
             target: "kitty",
             id_request,
+            image_number,
             width = data.width, height = data.height,
             bytes_len = data.pixels.len(),
             "kitty: register_image (payload)",
@@ -3218,16 +3262,24 @@ impl KittySink for Term {
                 tracing::info!(
                     target: "kitty",
                     id = inserted.id,
+                    image_number,
                     evicted = ?inserted.evicted,
                     "kitty: register_image ok",
                 );
                 // Evicted ids no longer exist in the registry; drop their
-                // placements + mark cells dirty.
+                // placements + mark cells dirty, and prune number→id
+                // entries pointing at them.
                 for evicted in &inserted.evicted {
                     let dropped = self.image_grid.remove_image(*evicted);
                     for p in dropped {
                         mark_placement_dirty(self, &p);
                     }
+                    self.image_number_to_id.retain(|_, id| id != evicted);
+                }
+                // Record this id as the most-recent for its image number
+                // (M11: `d=n`/`d=N` resolution).
+                if image_number != 0 {
+                    self.image_number_to_id.insert(image_number, inserted.id);
                 }
                 self.image_revision = self.image_revision.wrapping_add(1);
                 Some(inserted.id)
@@ -3349,17 +3401,30 @@ impl KittySink for Term {
             cell_y = header.cell_y,
             "kitty: delete_image",
         );
+        // Cell/selector keys carry 1-based coordinates in the lowercase
+        // `x=`/`y=` keys (header.src_x / src_y) per spec; convert to the
+        // grid's 0-based rows/cols (the B6 convention). `z=` carries the
+        // z-index for q/z.
+        let sel_col = header.src_x.saturating_sub(1) as u16;
+        let sel_row = header.src_y.saturating_sub(1) as u16;
+        let sel_z = header.z;
+        // For uppercase selectors that don't free bytes inline, this
+        // flag drives a post-removal survivor sweep (free bytes for
+        // images left with no placement). Set false by arms that do
+        // their own byte handling.
+        let mut needs_survivor_sweep = drop_bytes;
         match spec_byte {
-            // `a` / `A` — delete all visible placements (and bytes if
-            // uppercase).
+            // `a` / `A` — delete all placements *visible on screen* (the
+            // active screen's rows `0..self.rows`). M10: this is NOT
+            // "everything"; only placements intersecting the viewport.
+            // Uppercase `A` frees bytes for images left without any
+            // surviving placement (survivor sweep below).
             b'a' | b'A' => {
-                dropped_placements.extend(self.image_grid.clear());
-                if drop_bytes {
-                    let ids: Vec<u32> = self.image_registry.ids().collect();
-                    for id in ids {
-                        self.image_registry.remove(id);
-                    }
-                }
+                let rows = self.rows;
+                dropped_placements.extend(
+                    self.image_grid
+                        .remove_where(|p| p.row_range.start < rows && p.row_range.end > 0),
+                );
             }
             // `i` / `I` — by image id (provided via `i=`). When `p=` is
             // also given (non-zero), scope to that single placement;
@@ -3378,39 +3443,38 @@ impl KittySink for Term {
                     // Uppercase frees the bytes, but only when no
                     // placement of this image survives. (B5)
                     if drop_bytes && !self.image_grid.iter().any(|p| p.image_id == img) {
-                        self.image_registry.remove(img);
+                        self.remove_image_bytes(img);
                     }
+                    needs_survivor_sweep = false;
                 }
             }
-            // `n` / `N` — by image *number* (provided via `I=`). We
-            // don't track image-number→id mapping yet; fall through as
-            // a no-op.
+            // `n` / `N` — by image *number* (provided via `I=`).
+            // Resolve the number to the most-recently-registered id
+            // (M11), then delete its placements; `N` also frees bytes
+            // when no placement of that image survives.
+            b'n' | b'N' => {
+                if header.image_number != 0 {
+                    if let Some(&img) = self.image_number_to_id.get(&header.image_number) {
+                        dropped_placements.extend(self.image_grid.remove_image(img));
+                        if drop_bytes && !self.image_grid.iter().any(|p| p.image_id == img) {
+                            self.remove_image_bytes(img);
+                        }
+                    }
+                }
+                needs_survivor_sweep = false;
+            }
             // `p` / `P` — by CELL coordinates. The cell is specified via
             // the lowercase `x=` / `y=` keys (parsed into `src_x` /
             // `src_y`), 1-based per the spec ("x=1,y=1 is the top left
             // cell"). Internal `col_range` / `row_range` are 0-based, so
             // convert by subtracting 1. (B6)
             b'p' | b'P' => {
-                // Convert 1-based cell coords to 0-based; treat 0 (the
-                // "unset" default) as referring to the top-left cell.
-                let col = header.src_x.saturating_sub(1) as u16;
-                let row = header.src_y.saturating_sub(1) as u16;
                 dropped_placements.extend(self.image_grid.remove_where(|p| {
-                    p.col_range.contains(&col) && p.row_range.contains(&row)
+                    p.col_range.contains(&sel_col) && p.row_range.contains(&sel_row)
                 }));
                 // Uppercase `P` frees bytes for any image that lost its
-                // last placement. (B6, same rule as B5)
-                if drop_bytes {
-                    let lost: Vec<u32> = dropped_placements
-                        .iter()
-                        .map(|p| p.image_id)
-                        .collect();
-                    for img in lost {
-                        if !self.image_grid.iter().any(|p| p.image_id == img) {
-                            self.image_registry.remove(img);
-                        }
-                    }
-                }
+                // last placement. (B6, same rule as B5) — handled by the
+                // shared survivor sweep below.
             }
             // `r` / `R` — by image-id RANGE (kitty 0.33+). Delete all
             // images whose id is in `[x, y]` inclusive, where the
@@ -3431,14 +3495,56 @@ impl KittySink for Term {
                             .filter(|id| (lo..=hi).contains(id))
                             .collect();
                         for id in ids {
-                            self.image_registry.remove(id);
+                            self.remove_image_bytes(id);
                         }
                     }
+                    needs_survivor_sweep = false;
                 }
             }
-            // Other specs (`c` cell, `x`/`y` columns/rows, `z` by z, `q`
-            // by ranges, ...) are deferred for M11a follow-ups.
+            // `c` / `C` — placements intersecting the CURRENT CURSOR cell.
+            b'c' | b'C' => {
+                let row = self.cursor.row;
+                let col = self.cursor.col.min(self.cols.saturating_sub(1));
+                dropped_placements.extend(self.image_grid.remove_where(|p| {
+                    p.row_range.contains(&row) && p.col_range.contains(&col)
+                }));
+            }
+            // `q` / `Q` — placements intersecting cell (sel_col, sel_row)
+            // AND having z-index == `z=`.
+            b'q' | b'Q' => {
+                dropped_placements.extend(self.image_grid.remove_where(|p| {
+                    p.row_range.contains(&sel_row)
+                        && p.col_range.contains(&sel_col)
+                        && p.z == sel_z
+                }));
+            }
+            // `x` / `X` — placements intersecting COLUMN sel_col.
+            b'x' | b'X' => {
+                dropped_placements.extend(
+                    self.image_grid
+                        .remove_where(|p| p.col_range.contains(&sel_col)),
+                );
+            }
+            // `y` / `Y` — placements intersecting ROW sel_row. The real
+            // "delete by row" selector (B7 moved `r/R` to id-range).
+            b'y' | b'Y' => {
+                dropped_placements.extend(
+                    self.image_grid
+                        .remove_where(|p| p.row_range.contains(&sel_row)),
+                );
+            }
+            // `z` / `Z` — placements with z-index == `z=`.
+            b'z' | b'Z' => {
+                dropped_placements
+                    .extend(self.image_grid.remove_where(|p| p.z == sel_z));
+            }
             _ => {}
+        }
+        // Uppercase area/selector deletes (`A`, `P`, `C`, `Q`, `X`, `Y`,
+        // `Z`) free image bytes for any image left with no surviving
+        // placement after the removals above (mirrors the B5 rule).
+        if needs_survivor_sweep {
+            self.free_orphaned_image_bytes(&dropped_placements);
         }
         tracing::info!(
             target: "kitty",
@@ -7228,5 +7334,259 @@ mod major_place_tests {
         feed(&mut t, b"\x1b[7;10H");
         transmit_and_place(&mut t, 1, 2, 2, "");
         assert_eq!(t.image_grid().len(), 2, "unnamed (p=0) placements accumulate");
+    }
+}
+
+// ===== M10/M11/M12: kitty graphics delete selectors =====
+#[cfg(test)]
+mod major_delete_tests {
+    use super::*;
+    use toastty_parser::Parser;
+
+    /// Feed `bytes` through a fresh parser into `t`.
+    fn feed(t: &mut Term, bytes: &[u8]) {
+        let mut p = Parser::new();
+        p.advance(t, bytes);
+    }
+
+    /// 1x1 red RGBA pixel, base64-encoded (matches the `f=32,s=1,v=1`
+    /// header below).
+    fn red_pixel_b64() -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .encode([255u8, 0, 0, 255])
+            .into_bytes()
+    }
+
+    /// Move the cursor to 0-based (row, col) via CUP (1-based wire form).
+    fn cup(t: &mut Term, row: u16, col: u16) {
+        let seq = format!("\x1b[{};{}H", row + 1, col + 1);
+        feed(t, seq.as_bytes());
+    }
+
+    /// Transmit-and-place image `id` (number `num`, z-index `z`) as a
+    /// single-cell placement at the current cursor. `num`/`z` may be 0.
+    fn transmit_place_at(t: &mut Term, row: u16, col: u16, id: u32, num: u32, z: i32) {
+        cup(t, row, col);
+        let header = format!("\x1b_Ga=T,f=32,s=1,v=1,i={id},I={num},z={z},c=1,r=1;");
+        let mut payload = header.into_bytes();
+        payload.extend_from_slice(&red_pixel_b64());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(t, &payload);
+    }
+
+    /// Transmit-and-place an image by image-NUMBER only (no `i=`, which
+    /// the B8 rule forbids alongside `I=`). The terminal assigns the id;
+    /// auto-assign hands out the lowest free id (1, 2, ...). Returns that
+    /// assigned id (read back from the registry as the only fresh entry).
+    fn transmit_place_numbered(t: &mut Term, row: u16, col: u16, num: u32) {
+        cup(t, row, col);
+        let header = format!("\x1b_Ga=T,f=32,s=1,v=1,I={num},c=1,r=1;");
+        let mut payload = header.into_bytes();
+        payload.extend_from_slice(&red_pixel_b64());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(t, &payload);
+    }
+
+    /// Add a SECOND placement (`a=p`) of an already-transmitted image
+    /// `id` with placement id `pid` at (row, col), single cell.
+    fn place_again_at(t: &mut Term, row: u16, col: u16, id: u32, pid: u32) {
+        cup(t, row, col);
+        let seq = format!("\x1b_Ga=p,i={id},p={pid},c=1,r=1\x1b\\");
+        feed(t, seq.as_bytes());
+    }
+
+    /// Does the grid hold any placement for image `id`?
+    fn has_placement_for(t: &Term, id: u32) -> bool {
+        t.image_grid().iter().any(|p| p.image_id == id)
+    }
+
+    // ---- M10: d=a / d=A scope to placements VISIBLE on screen ----
+
+    #[test]
+    fn m10_delete_a_removes_only_visible_placements() {
+        // 8 rows. Place id=1 at row 0 (visible) and id=2 at row 6.
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_at(&mut t, 0, 0, 1, 0, 0);
+        transmit_place_at(&mut t, 6, 0, 2, 0, 0);
+        assert_eq!(t.image_grid().len(), 2);
+        // Shrink to 4 rows: id=2's placement (row 6) is now OFF-SCREEN
+        // (>= rows). resize() doesn't touch the image grid, so the
+        // placement stays put at row 6.
+        t.resize(4, 8);
+        // d=a deletes only placements intersecting the visible 0..4.
+        feed(&mut t, b"\x1b_Ga=d,d=a\x1b\\");
+        assert!(
+            !has_placement_for(&t, 1),
+            "visible placement should be removed"
+        );
+        assert!(
+            has_placement_for(&t, 2),
+            "off-screen placement should survive d=a"
+        );
+        assert_eq!(t.image_grid().len(), 1);
+    }
+
+    #[test]
+    fn m10_delete_uppercase_a_frees_bytes_only_when_no_placement_remains() {
+        // One image (id=1) with TWO placements: one visible (row 0),
+        // one off-screen after resize (row 6).
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_at(&mut t, 0, 0, 1, 0, 0); // placement A (visible)
+        place_again_at(&mut t, 6, 0, 1, 2); // placement B (will be off-screen)
+        assert_eq!(t.image_grid().len(), 2);
+        t.resize(4, 8);
+        // d=A removes the visible placement; image 1 still has the
+        // off-screen placement, so its bytes must SURVIVE.
+        feed(&mut t, b"\x1b_Ga=d,d=A\x1b\\");
+        assert_eq!(t.image_grid().len(), 1, "off-screen placement survives");
+        assert!(
+            t.image_registry().contains(1),
+            "bytes kept while a placement survives"
+        );
+        // Now grow back so the surviving placement is visible, then d=A
+        // again: no placement remains anywhere → bytes freed.
+        t.resize(8, 8);
+        feed(&mut t, b"\x1b_Ga=d,d=A\x1b\\");
+        assert_eq!(t.image_grid().len(), 0);
+        assert!(
+            !t.image_registry().contains(1),
+            "bytes freed once no placement remains"
+        );
+    }
+
+    // ---- M11: d=n / d=N by image NUMBER ----
+
+    #[test]
+    fn m11_delete_n_targets_newest_image_with_number() {
+        // Two images share image-number I=7. Per the B8 rule a transmit
+        // can't carry both `i=` and `I=`, so the terminal assigns ids:
+        // auto-assign yields id 1 (older) then id 2 (newer).
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_numbered(&mut t, 0, 0, 7); // assigned id 1 (older)
+        transmit_place_numbered(&mut t, 2, 0, 7); // assigned id 2 (newer → wins)
+        assert!(t.image_registry().contains(1));
+        assert!(t.image_registry().contains(2));
+        assert_eq!(t.image_grid().len(), 2);
+        // d=n,I=7 deletes the NEWEST (id=2) placement; bytes kept (n).
+        feed(&mut t, b"\x1b_Ga=d,d=n,I=7\x1b\\");
+        assert!(
+            has_placement_for(&t, 1),
+            "older image placement untouched"
+        );
+        assert!(
+            !has_placement_for(&t, 2),
+            "newest image placement removed"
+        );
+        assert!(t.image_registry().contains(2), "lowercase n keeps bytes");
+    }
+
+    #[test]
+    fn m11_delete_uppercase_n_frees_newest_bytes() {
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_numbered(&mut t, 0, 0, 7); // id 1 (older)
+        transmit_place_numbered(&mut t, 2, 0, 7); // id 2 (newer)
+        // d=N,I=7 deletes the newest (id=2) AND frees its bytes.
+        feed(&mut t, b"\x1b_Ga=d,d=N,I=7\x1b\\");
+        assert!(!has_placement_for(&t, 2));
+        assert!(!t.image_registry().contains(2), "N frees newest bytes");
+        assert!(t.image_registry().contains(1), "older image untouched");
+    }
+
+    // ---- M12: d=c/C, q/Q, x/X, y/Y, z/Z ----
+
+    #[test]
+    fn m12_delete_c_removes_placement_under_cursor() {
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_at(&mut t, 1, 2, 1, 0, 0); // at (row1,col2)
+        transmit_place_at(&mut t, 4, 4, 2, 0, 0); // at (row4,col4)
+        // Park cursor on image 1's cell, then d=c.
+        cup(&mut t, 1, 2);
+        feed(&mut t, b"\x1b_Ga=d,d=c\x1b\\");
+        assert!(!has_placement_for(&t, 1), "cursor-cell placement removed");
+        assert!(has_placement_for(&t, 2), "other placement kept");
+    }
+
+    #[test]
+    fn m12_delete_q_removes_placement_at_cell_with_zindex() {
+        let mut t = Term::new(8, 8, 0);
+        // Two placements share cell (row2,col3) but differ in z.
+        transmit_place_at(&mut t, 2, 3, 1, 0, 5); // z=5
+        transmit_place_at(&mut t, 2, 3, 2, 0, 9); // z=9
+        // d=q at cell x=4,y=3 (1-based → col3,row2) with z=9 hits id=2.
+        feed(&mut t, b"\x1b_Ga=d,d=q,x=4,y=3,z=9\x1b\\");
+        assert!(has_placement_for(&t, 1), "z=5 placement kept");
+        assert!(!has_placement_for(&t, 2), "z=9 placement at cell removed");
+    }
+
+    #[test]
+    fn m12_delete_x_removes_placements_in_column() {
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_at(&mut t, 0, 3, 1, 0, 0); // col 3
+        transmit_place_at(&mut t, 5, 6, 2, 0, 0); // col 6
+        // d=x,x=4 (1-based col 4 → 0-based col 3) hits image 1.
+        feed(&mut t, b"\x1b_Ga=d,d=x,x=4\x1b\\");
+        assert!(!has_placement_for(&t, 1), "column-3 placement removed");
+        assert!(has_placement_for(&t, 2), "column-6 placement kept");
+    }
+
+    #[test]
+    fn m12_delete_y_removes_placements_in_row() {
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_at(&mut t, 2, 0, 1, 0, 0); // row 2
+        transmit_place_at(&mut t, 5, 0, 2, 0, 0); // row 5
+        // d=y,y=3 (1-based row 3 → 0-based row 2) hits image 1.
+        feed(&mut t, b"\x1b_Ga=d,d=y,y=3\x1b\\");
+        assert!(!has_placement_for(&t, 1), "row-2 placement removed");
+        assert!(has_placement_for(&t, 2), "row-5 placement kept");
+    }
+
+    #[test]
+    fn m12_delete_z_removes_placements_with_zindex() {
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_at(&mut t, 0, 0, 1, 0, 4); // z=4
+        transmit_place_at(&mut t, 3, 0, 2, 0, 4); // z=4
+        transmit_place_at(&mut t, 6, 0, 3, 0, 7); // z=7
+        // d=z,z=4 removes both z=4 placements regardless of position.
+        feed(&mut t, b"\x1b_Ga=d,d=z,z=4\x1b\\");
+        assert!(!has_placement_for(&t, 1), "z=4 removed");
+        assert!(!has_placement_for(&t, 2), "z=4 removed");
+        assert!(has_placement_for(&t, 3), "z=7 kept");
+    }
+
+    #[test]
+    fn m12_uppercase_selector_frees_orphaned_bytes() {
+        // Two single-placement images on different rows. Uppercase Y
+        // deletes image 1's only placement → its bytes are freed, while
+        // image 2 is untouched (placement and bytes intact).
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_at(&mut t, 2, 0, 1, 0, 0); // row 2
+        transmit_place_at(&mut t, 5, 0, 2, 0, 0); // row 5
+        assert!(t.image_registry().contains(1));
+        feed(&mut t, b"\x1b_Ga=d,d=Y,y=3\x1b\\"); // row 2 (1-based 3)
+        assert!(!has_placement_for(&t, 1));
+        assert!(
+            !t.image_registry().contains(1),
+            "Y frees bytes for image with no surviving placement"
+        );
+        assert!(has_placement_for(&t, 2), "row-5 placement kept");
+        assert!(t.image_registry().contains(2), "untouched image keeps bytes");
+    }
+
+    #[test]
+    fn m12_uppercase_selector_keeps_bytes_with_surviving_placement() {
+        // One image (id=1) with two placements on different rows. Y
+        // removes the row-2 placement; the row-5 placement survives so
+        // bytes are kept.
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_at(&mut t, 2, 0, 1, 0, 0); // placement A, row 2
+        place_again_at(&mut t, 5, 0, 1, 2); // placement B, row 5
+        assert_eq!(t.image_grid().len(), 2);
+        feed(&mut t, b"\x1b_Ga=d,d=Y,y=3\x1b\\");
+        assert_eq!(t.image_grid().len(), 1, "only row-2 placement removed");
+        assert!(
+            t.image_registry().contains(1),
+            "bytes kept while another placement survives"
+        );
     }
 }
