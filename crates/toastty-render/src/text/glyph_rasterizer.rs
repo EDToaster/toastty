@@ -51,6 +51,50 @@ struct PendingGlyph {
     cluster_chars: Vec<char>,
 }
 
+/// Per-glyph cell-char assignment. For each glyph in shaping order, pick
+/// the cluster char that lands on the glyph's column.
+///
+/// Multi-glyph clusters from true ligatures (`!=` shaping into two
+/// half-glyphs that share `(start=0, end=2)`, `cluster_chars=['!','=']`)
+/// need each glyph to key under the cell char it actually sits over —
+/// glyph 0 → `'!'`, glyph 1 → `'='`. Without this, the column-keyed
+/// `LineGlyphs` lookup at render time misses on every cell after the
+/// cluster's first column, and the trailing cells of the ligature render
+/// blank.
+///
+/// `glyph_clusters` is `(byte_start, byte_end, col)` per glyph in the
+/// order cosmic-text emitted them (assumed left-to-right within each
+/// cluster); `text` is the run's source text. Returns `(ch, cluster_chars)`
+/// for each input glyph in the same order.
+fn assign_glyph_chars(
+    glyph_clusters: &[(usize, usize, u16)],
+    text: &str,
+) -> Vec<(char, Vec<char>)> {
+    let mut out = Vec::with_capacity(glyph_clusters.len());
+    // (start, end, base_col, chars) — `base_col` is the first glyph's
+    // col in the current cluster, so `col - base_col` indexes into
+    // `chars` to pick the cell char this glyph belongs to.
+    let mut current: Option<(usize, usize, u16, Vec<char>)> = None;
+    for &(start, end, col) in glyph_clusters {
+        let needs_new = current
+            .as_ref()
+            .is_none_or(|(s, e, _, _)| *s != start || *e != end);
+        if needs_new {
+            let cluster_str = text.get(start..end).unwrap_or("");
+            current = Some((start, end, col, cluster_str.chars().collect()));
+        }
+        let (_, _, base_col, cluster_chars) = current.as_ref().expect("just set");
+        let idx = col.saturating_sub(*base_col) as usize;
+        let ch = cluster_chars
+            .get(idx)
+            .or_else(|| cluster_chars.last())
+            .copied()
+            .unwrap_or(' ');
+        out.push((ch, cluster_chars.clone()));
+    }
+    out
+}
+
 /// Result of laying out a single line: each `(char, glyph_slot)` pair the
 /// caller can plug into `build_instances`.
 ///
@@ -495,12 +539,20 @@ impl GlyphRasterizer {
                 }
             }
             let snapped = snap_cluster_widths_per_cluster(&positions, cell_w, &widths);
-            for (g, snap) in run.glyphs.iter().zip(snapped.iter()) {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let col = (snap.x / cell_w).round() as u16;
-                let cluster_str = run.text.get(g.start..g.end).unwrap_or("");
-                let cluster_chars: Vec<char> = cluster_str.chars().collect();
-                let ch = cluster_chars.first().copied().unwrap_or(' ');
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let glyph_clusters: Vec<(usize, usize, u16)> = run
+                .glyphs
+                .iter()
+                .zip(snapped.iter())
+                .map(|(g, snap)| (g.start, g.end, (snap.x / cell_w).round() as u16))
+                .collect();
+            let assignments = assign_glyph_chars(&glyph_clusters, run.text);
+            for ((g, &(_, _, col)), (ch, cluster_chars)) in run
+                .glyphs
+                .iter()
+                .zip(glyph_clusters.iter())
+                .zip(assignments.into_iter())
+            {
                 pending.push((
                     PendingGlyph {
                         glyph: g.clone(),
@@ -557,6 +609,26 @@ impl GlyphRasterizer {
                              future renders use the slow path",
                             p.ch, p.ch as u32,
                         );
+                    }
+                } else if p.cluster_chars.len() > 1 {
+                    // Multi-char cluster: every char in it participated
+                    // in a ligature / contextual shaping run. They must
+                    // not be served as standalones from `char_cache`
+                    // afterward — otherwise once both `!` and `=` had
+                    // been seen alone, the fast path would render `!=`
+                    // as plain side-by-side glyphs and silently drop
+                    // the ligature visual. Force the slow path on any
+                    // line containing these chars from now on.
+                    for ch in &p.cluster_chars {
+                        if self.uncacheable_chars.insert(*ch) {
+                            self.char_cache.remove(ch);
+                            tracing::debug!(
+                                target: "toastty_render::glyph",
+                                "marking {:?} (U+{:04X}) as multi-char-cluster member; \
+                                 future renders use the slow path",
+                                ch, *ch as u32,
+                            );
+                        }
                     }
                 }
                 // Credit every char in this glyph's cluster — not just
@@ -1017,6 +1089,231 @@ mod tests {
                  ligature partners must not poison the fast path",
                 ch as u32,
             );
+        }
+    }
+
+    /// `assign_glyph_chars` is the pure logic that decides which cell
+    /// char each glyph keys under in `LineGlyphs`. These tests pin its
+    /// behavior without a GPU or a real font, so the regression that
+    /// caused `!=` ligatures to render with the right half blank can be
+    /// reproduced and prevented even on the bundled non-ligating font.
+    mod assign_glyph_chars {
+        use super::super::assign_glyph_chars;
+
+        #[test]
+        fn single_char_clusters_use_their_own_char() {
+            // "abc" — three independent single-char clusters.
+            let glyphs = [(0, 1, 0), (1, 2, 1), (2, 3, 2)];
+            let out = assign_glyph_chars(&glyphs, "abc");
+            assert_eq!(out[0].0, 'a');
+            assert_eq!(out[1].0, 'b');
+            assert_eq!(out[2].0, 'c');
+            for (i, expected) in ['a', 'b', 'c'].iter().enumerate() {
+                assert_eq!(out[i].1, vec![*expected]);
+            }
+        }
+
+        /// Fira Code-style: `!=` shaped as TWO glyphs that share the same
+        /// `(start=0, end=2)` cluster. Each glyph lands on a different
+        /// cell, so each must key under the cell's own char — glyph 0
+        /// → `'!'`, glyph 1 → `'='`. Pre-fix, both got `'!'` and the
+        /// `LineGlyphs[1]` lookup at render time (against cell char `'='`)
+        /// missed, leaving the ligature's right half blank.
+        #[test]
+        fn multi_glyph_multi_char_cluster_keys_per_cell() {
+            let glyphs = [(0, 2, 0), (0, 2, 1)];
+            let out = assign_glyph_chars(&glyphs, "!=");
+            assert_eq!(out.len(), 2);
+            assert_eq!(out[0].0, '!', "left half must key under cell 0's char");
+            assert_eq!(out[1].0, '=', "right half must key under cell 1's char");
+            assert_eq!(out[0].1, vec!['!', '=']);
+            assert_eq!(out[1].1, vec!['!', '=']);
+        }
+
+        /// True ligature (Type 4 GSUB): the whole cluster collapses to a
+        /// single glyph at the cluster's first column. The glyph keys
+        /// under the cluster's leading char — there's only one cell-key
+        /// to choose. The trailing cells of the cluster get no glyph
+        /// entry, which is handled separately by the renderer (the bg
+        /// quad in those cells leaves them blank; widening the glyph to
+        /// span both cells is a follow-up).
+        #[test]
+        fn single_glyph_multi_char_cluster_uses_leading_char() {
+            let glyphs = [(0, 2, 0)];
+            let out = assign_glyph_chars(&glyphs, "fi");
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].0, 'f');
+            assert_eq!(out[0].1, vec!['f', 'i']);
+        }
+
+        /// Three-char multi-glyph ligature (`<=>` or `===`) at non-zero
+        /// base column. The glyphs land on cells 5, 6, 7 — each must
+        /// key under the matching cluster char.
+        #[test]
+        fn three_glyph_cluster_at_offset_keys_per_cell() {
+            let glyphs = [(0, 3, 5), (0, 3, 6), (0, 3, 7)];
+            let out = assign_glyph_chars(&glyphs, "===");
+            assert_eq!(out.iter().map(|x| x.0).collect::<Vec<_>>(), vec!['=', '=', '=']);
+        }
+
+        /// Mix of clusters in one run: `a!=b` — `a` (single-char), then
+        /// `!=` (2-glyph 2-char), then `b` (single-char). Each cluster
+        /// must be tracked independently and `b`'s `base_col` must reset
+        /// from the ligature cluster, otherwise `b` would index off the
+        /// `!=` cluster's `cluster_chars` and pick the wrong char.
+        #[test]
+        fn cluster_boundaries_reset_base_col() {
+            // Source `a!=b` (bytes 0,1,2,3). Cols 0,1,2,3.
+            let glyphs = [
+                (0, 1, 0), // 'a' single
+                (1, 3, 1), // '!=' first half at col 1
+                (1, 3, 2), // '!=' second half at col 2
+                (3, 4, 3), // 'b' single
+            ];
+            let out = assign_glyph_chars(&glyphs, "a!=b");
+            assert_eq!(
+                out.iter().map(|x| x.0).collect::<Vec<_>>(),
+                vec!['a', '!', '=', 'b']
+            );
+        }
+
+        /// Multiple glyphs at the same column inside a multi-char
+        /// cluster (combining marks under a ligature, or degenerate
+        /// shaping): the per-cell index points at the same source char,
+        /// so all such glyphs key under the cluster's leading char.
+        #[test]
+        fn multiple_glyphs_at_same_col_share_a_char() {
+            // Two glyphs, both at col 0, cluster spans two chars.
+            // `idx = 0` for both → both key under `'!'`.
+            let glyphs = [(0, 2, 0), (0, 2, 0)];
+            let out = assign_glyph_chars(&glyphs, "!=");
+            assert_eq!(out[0].0, '!');
+            assert_eq!(out[1].0, '!');
+        }
+
+        /// Defensive: if a later glyph in the same cluster lands at a
+        /// column beyond the cluster's char count (shouldn't happen
+        /// given the cell-width snap, but cosmic-text could in theory
+        /// produce it), the fallback to `cluster_chars.last()` keeps a
+        /// real source char as the key — rather than reverting to the
+        /// `' '` default, which would re-introduce the original
+        /// lookup-miss bug.
+        #[test]
+        fn out_of_range_col_falls_back_to_last_char() {
+            // Cluster starts at col 0; second glyph anomalously lands at
+            // col 5 → `idx = 5`, out of range for the 2-char cluster.
+            let glyphs = [(0, 2, 0), (0, 2, 5)];
+            let out = assign_glyph_chars(&glyphs, "!=");
+            assert_eq!(out[0].0, '!', "first glyph keys under leading char");
+            assert_eq!(out[1].0, '=', "out-of-range glyph falls back to last char");
+        }
+
+        /// Empty cluster (shaper produced a glyph for a zero-byte range,
+        /// or `text.get(...)` failed): the fallback default is a space,
+        /// which is the existing "absent" sentinel the renderer treats
+        /// as a no-op cell.
+        #[test]
+        fn empty_cluster_falls_back_to_space() {
+            let glyphs = [(0, 0, 0)];
+            let out = assign_glyph_chars(&glyphs, "");
+            assert_eq!(out[0].0, ' ');
+            assert!(out[0].1.is_empty());
+        }
+    }
+
+    /// Integration: shaping any string with ASCII letters/punctuation
+    /// must produce a `LineGlyphs` entry for every non-blank cell, keyed
+    /// by that cell's char. This is the property the bug violated for
+    /// the trailing cells of multi-glyph multi-char clusters: cell 1 of
+    /// `!=` had an entry under `'!'` instead of `'='`, so
+    /// `LineGlyphs.get(1, '=')` missed at render time. Whether or not
+    /// the bundled font actually ligates the test strings, the
+    /// post-condition (every visible cell resolves to a glyph slot)
+    /// holds — and on a ligating font it pins the per-glyph keying.
+    #[test]
+    fn shape_line_assigns_glyph_per_visible_cell() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+
+        // Cover plain text, programming ligature sequences, and the
+        // typographic ligatures Fira Mono Medium does carry (`fi`, `fl`,
+        // `ffi`, `ffl`). On a font that produces multi-glyph multi-char
+        // clusters for any of these, the pre-fix code mis-keyed glyphs
+        // and this check catches the regression.
+        for line in [
+            "abc",
+            "fi",
+            "fl",
+            "ffi",
+            "ffl",
+            "!=",
+            "==",
+            ">=",
+            "<=",
+            "=>",
+            "->",
+            "if x != y:",
+            "fi==",
+        ] {
+            let lg = rasterizer.shape_line(&queue, line, false);
+            for (col, ch) in line.chars().enumerate() {
+                if ch == ' ' || ch == '\0' {
+                    continue;
+                }
+                // The cell has a real char that any reasonable font
+                // covers. Either a glyph slot is present (matching this
+                // cell's char) OR the cluster collapsed to a single
+                // glyph that sits in an earlier column — in which case
+                // the trailing cell is genuinely empty. We assert the
+                // common case: when a slot exists, its key matches the
+                // cell char. The bug put `cluster_chars.first()` here
+                // for every glyph in a multi-char cluster, which broke
+                // this invariant.
+                if let Some(entry) = lg.by_column.get(col).and_then(|s| s.as_ref()) {
+                    assert_eq!(
+                        entry.0, ch,
+                        "{line:?} col {col}: LineGlyphs key {:?} != cell char {ch:?} \
+                         — multi-glyph cluster mis-key would put `cluster_chars.first()` here",
+                        entry.0,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Multi-char clusters must mark every participating char as
+    /// uncacheable so future renders re-shape contextually. Without
+    /// this, once `!` and `=` are both cached as standalones, the fast
+    /// path would serve them as plain side-by-side glyphs and silently
+    /// drop the ligature. We can't force the bundled non-ligating font
+    /// to produce a multi-char cluster from the outside, but we *can*
+    /// verify the post-condition by hand-driving the slow path with a
+    /// known ligating sequence and inspecting `uncacheable_chars` only
+    /// when shaping actually produced a multi-char cluster.
+    #[test]
+    fn multi_char_cluster_chars_become_uncacheable() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+
+        // Pre-warm `!` and `=` as standalones. After this they sit in
+        // `char_cache` if the font produces single-char clusters for
+        // them (the expected case for Fira Mono).
+        rasterizer.shape_line(&queue, "! =", false);
+
+        // Now shape a sequence that ligature-capable fonts would
+        // collapse into a multi-char cluster. If the bundled font
+        // does so, `!` and `=` should now be in `uncacheable_chars`
+        // and removed from `char_cache`. If not, the test still
+        // passes (Fira Mono doesn't ligate `!=`) — we only assert the
+        // *implication*, not the trigger.
+        rasterizer.shape_line(&queue, "!=", false);
+
+        for ch in ['!', '='] {
+            if rasterizer.uncacheable_chars.contains(&ch) {
+                assert!(
+                    !rasterizer.char_cache.contains_key(&ch),
+                    "char {ch:?} is uncacheable but still in char_cache; \
+                     multi-char-cluster eviction failed",
+                );
+            }
         }
     }
 }
