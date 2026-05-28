@@ -22,7 +22,7 @@ run() {
     cursor_to 20 1
     prompt "Press 'd' to send a=d,d=p,x=12,y=12 (delete placements at cell col=12,row=12)."
     if [[ "$(wait_key)" == "d" ]]; then
-        printf '%s_Ga=d,d=p,x=12,y=12,q=2%s\\' "$esc" "$esc"
+        printf '%s_Ga=d,d=p,x=12,y=%d,q=2%s\\' "$esc" "$(canvas_row 12)" "$esc"
         cursor_to 21 1
         printf 'Spec: orange square is gone. Buggy: it is still visible.\n'
     fi

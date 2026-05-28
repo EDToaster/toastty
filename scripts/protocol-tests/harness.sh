@@ -111,6 +111,23 @@ done
 
 # ---- render one page ----
 
+# Query the cursor's current row via DSR (ESC [ 6 n → ESC [ row;col R).
+# Falls back to 12 if the terminal doesn't answer.
+query_cursor_row() {
+    local resp="" c
+    printf '%s[6n' "$esc"
+    while IFS= read -r -s -t 0.5 -n 1 c; do
+        resp+="$c"
+        [[ "$c" == "R" ]] && break
+    done
+    local re='\[([0-9]+);[0-9]+R'
+    if [[ "$resp" =~ $re ]]; then
+        printf '%d' "${BASH_REMATCH[1]}"
+    else
+        printf '12'
+    fi
+}
+
 show_case() {
     local idx="$1"
     local file="${cases[$idx]}"
@@ -124,15 +141,25 @@ show_case() {
         # shellcheck disable=SC1090
         source "$file"
 
+        # Header band: title + the blurbs the case is about. Printed first
+        # so they're readable before any keypress.
         print_header "$((idx + 1))" "$total" "$title"
         print_section "Description:"
         printf '  %s\n\n' "$description"
+        print_section "Expected:"
+        printf '  %s\n\n' "$expected"
         print_section "Test:"
         printf '\n'
+        # The test canvas starts at the current row. Cases position with
+        # cursor_to (relative to HARNESS_CANVAS_TOP), so their output always
+        # lands below this header regardless of how far the blurbs wrapped.
+        export HARNESS_CANVAS_TOP
+        HARNESS_CANVAS_TOP="$(query_cursor_row)"
         run
-        printf '\n'
-        print_section "Expected:"
-        printf '  %s\n' "$expected"
+        # Pin the nav footer to the bottom so case output can't shift it.
+        local screen_rows
+        screen_rows=$(tput lines 2>/dev/null || echo 40)
+        printf '%s[%d;1H' "$esc" "$((screen_rows - 2))"
         print_footer "$((idx + 1))" "$total"
     )
 }

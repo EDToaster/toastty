@@ -58,7 +58,7 @@ run() {
             printf 'Two squares stacked at cols 6-8, rows 10-12 (z=5 and z=9).\n'
             prompt "Press SPACE → a=d,d=q,x=6,y=10,z=9 (cell col6/row10, z=9)."
             wait_space
-            printf '%s_Ga=d,d=q,x=6,y=10,z=9,q=2%s\\' "$esc" "$esc"
+            printf '%s_Ga=d,d=q,x=6,y=%d,z=9,q=2%s\\' "$esc" "$(canvas_row 10)" "$esc"
             cursor_to 16 1
             printf 'Spec: only the z=9 placement at that cell is removed; z=5 remains.\n'
             ;;
@@ -82,7 +82,7 @@ run() {
             printf 'Two squares on rows 10-12, one on rows 18-20.\n'
             prompt "Press SPACE → a=d,d=y,y=10 (delete row 10)."
             wait_space
-            printf '%s_Ga=d,d=y,y=10,q=2%s\\' "$esc" "$esc"
+            printf '%s_Ga=d,d=y,y=%d,q=2%s\\' "$esc" "$(canvas_row 10)" "$esc"
             cursor_to 23 1
             printf 'Spec: both rows-10-12 squares gone; the rows-18-20 square stays.\n'
             ;;
