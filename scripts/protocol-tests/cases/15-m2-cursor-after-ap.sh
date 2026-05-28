@@ -4,7 +4,7 @@ title="M2 — standalone a=p moves the cursor (unless C=1)"
 
 description="Spec: a placement with a=p and C=0 (default) moves the cursor by (cols, rows-1), exactly like a=T. The old toastty never advanced the cursor on a=p. Press 'a' to run the default-C=0 case, then 'c' to run the C=1 case."
 
-expected="Default (C=0): an already-transmitted image is placed c=4,r=3 at row 6,col 8; 'X' is printed at the cursor and must land at row 8, col 12. With C=1: the image is placed but the cursor must NOT move — 'Y' prints right where it started (row 14, col 8)."
+expected="Default (C=0): an already-transmitted image is placed c=4,r=3 at row 6,col 8; 'X' prints at the cursor and must land just to the RIGHT of the square (row 8, col 12 — moved by cols=4, rows-1=2), so it is VISIBLE. With C=1: the cursor must NOT move, so it stays at the image's top-left (row 14, col 8); 'Y' is therefore drawn AT that covered cell and is HIDDEN BEHIND the square — which is correct, because a default z=0 image renders in front of text. If C=1 were broken and the cursor moved, 'Y' would instead appear to the right of the square."
 
 run() {
     # Pre-transmit two images (no display yet).
@@ -28,7 +28,9 @@ run() {
     printf 'Y'
 
     cursor_to 20 1
-    printf 'Spec C=0: "X" lands at row 8, col 12 (moved by cols=4, rows-1=2).\n'
-    printf 'Spec C=1: "Y" stays at row 14, col 8 (no cursor motion).\n'
-    printf 'Buggy-old: a=p never moved the cursor, so "X" stayed at row 6, col 8.\n'
+    printf 'Spec C=0: "X" lands at row 8, col 12 — just RIGHT of the square,\n'
+    printf '          so it is visible (cursor moved by cols=4, rows-1=2).\n'
+    printf 'Spec C=1: cursor stays at the square top-left (row 14, col 8), so "Y"\n'
+    printf '          is HIDDEN BEHIND the square (z=0 images draw over text).\n'
+    printf 'Buggy-old: a=p never moved the cursor, so "X" would also stay top-left.\n'
 }

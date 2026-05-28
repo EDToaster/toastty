@@ -3771,6 +3771,10 @@ impl KittySink for Term {
         self.image_registry.contains(id)
     }
 
+    fn image_dimensions(&self, id: u32) -> Option<(u32, u32)> {
+        self.image_registry.get(id).map(|img| (img.width, img.height))
+    }
+
     fn cursor_col(&self) -> u16 {
         self.cursor.col.min(self.cols.saturating_sub(1))
     }
@@ -7367,6 +7371,47 @@ mod major_place_tests {
         payload.extend_from_slice(&b64_red_1x1());
         payload.extend_from_slice(b"\x1b\\");
         feed(t, &payload);
+    }
+
+    // ---- M4 (a=p path): aspect ratio uses the registered image's dims ----
+
+    #[test]
+    fn m4_ap_derives_aspect_ratio_from_registered_image() {
+        // Regression: `a=p` (place an already-transmitted image) must look
+        // up the image's real pixel dimensions so M4's aspect-ratio
+        // derivation runs. Before, handle_place passed 0×0, so `a=p,c=10`
+        // on a 200×100 (2:1) image fell back to ceil(img_h/cell) rows
+        // (a tall, squished band) instead of the aspect-correct wide band.
+        let mut t = Term::new(40, 60, 0);
+        let (cell_pw, cell_ph) = t.cell_pixel_size();
+        let cpw = u32::from(cell_pw.max(1));
+        let cph = u32::from(cell_ph.max(1));
+
+        // Transmit a 200×100 RGBA image (id=1), no display.
+        let mut raw = Vec::with_capacity(200 * 100 * 4);
+        for _ in 0..(200 * 100) {
+            raw.extend_from_slice(&[0u8, 0, 0, 255]);
+        }
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+        let mut payload = b"\x1b_Ga=t,f=32,s=200,v=100,i=1;".to_vec();
+        payload.extend_from_slice(b64.as_bytes());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+
+        // Place with ONLY c=10 via a=p; rows must come from the 2:1 aspect.
+        feed(&mut t, b"\x1b[2;2H");
+        feed(&mut t, b"\x1b_Ga=p,i=1,p=1,c=10\x1b\\");
+
+        let p = t.image_grid().iter().next().expect("placement created");
+        let cols = p.col_range.end - p.col_range.start;
+        let rows = p.row_range.end - p.row_range.start;
+        let expected_rows =
+            (((10u32 * cpw * 100) + (200 * cph) - 1) / (200 * cph)).max(1) as u16;
+        assert_eq!(cols, 10, "c=10 honored");
+        assert_eq!(
+            rows, expected_rows,
+            "a=p rows must be aspect-derived (cell {cpw}x{cph}), not img_h/cell"
+        );
     }
 
     // ---- M1: cursor end position after a=T ----

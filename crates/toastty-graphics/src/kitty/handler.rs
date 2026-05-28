@@ -116,6 +116,16 @@ pub trait KittySink {
         false
     }
 
+    /// Pixel dimensions `(width, height)` of a registered image, or `None`
+    /// if not registered. Consulted by `a=p` (`handle_place`) so a
+    /// standalone placement of an already-transmitted image can derive its
+    /// natural cell span and aspect-ratio fit (M4) — the image's bytes
+    /// aren't in hand at that call site the way they are for `a=T`. Default
+    /// `None` keeps simple test sinks on the old 1×1 fallback.
+    fn image_dimensions(&self, _id: u32) -> Option<(u32, u32)> {
+        None
+    }
+
     /// Host's cell size in pixels. The handler uses this to derive the
     /// cell span when the client omits `r=`/`c=` — kitty spec says the
     /// image then occupies `ceil(img_dim / cell_dim)` cells. Default
@@ -627,8 +637,15 @@ impl KittyHandler {
                 return;
             }
             let (cell_pw, cell_ph) = sink.cell_pixel_size();
-            let mut placement =
-                default_placement_from_header(&header, header.image_id, 0, 0, cell_pw, cell_ph);
+            let (img_w, img_h) = sink.image_dimensions(header.image_id).unwrap_or((0, 0));
+            let mut placement = default_placement_from_header(
+                &header,
+                header.image_id,
+                img_w,
+                img_h,
+                cell_pw,
+                cell_ph,
+            );
             placement.parent = Some((header.parent_image, header.parent_placement));
             placement.rel_offset = (header.h_offset, header.v_offset);
             match sink.place_relative(placement) {
@@ -645,12 +662,15 @@ impl KittyHandler {
             // Relative placements never move the cursor.
             return;
         }
-        // Standalone `a=p` doesn't carry img dims at this call site; we
-        // pass zeroes so the auto-derive falls back to 1×1 when `c=`/`r=`
-        // are unset (preserving the pre-fix behavior for this path).
+        // Standalone `a=p`: look up the already-transmitted image's pixel
+        // dimensions so the placement can derive its natural cell span and
+        // aspect-ratio fit (M4) — e.g. `a=p,c=10` on a 200×100 image yields
+        // 3 rows, not the 1×1/`ceil(img_h/cell)` fallbacks. Falls back to
+        // 0×0 (→ 1×1) only if the image isn't registered.
         let (cell_pw, cell_ph) = sink.cell_pixel_size();
+        let (img_w, img_h) = sink.image_dimensions(header.image_id).unwrap_or((0, 0));
         let placement =
-            default_placement_from_header(&header, header.image_id, 0, 0, cell_pw, cell_ph);
+            default_placement_from_header(&header, header.image_id, img_w, img_h, cell_pw, cell_ph);
         let rows_span = placement.row_range.end - placement.row_range.start;
         let cols_span = placement.col_range.end - placement.col_range.start;
         // M2: capture the start column BEFORE place_image consumes the
