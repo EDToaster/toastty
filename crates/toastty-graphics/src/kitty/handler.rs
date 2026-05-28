@@ -170,7 +170,27 @@ impl KittyHandler {
         body: &[u8],
         sink: &mut S,
     ) -> Result<(), HandlerError> {
-        let header = super::header::parse(header_bytes).map_err(HandlerError::BadHeader)?;
+        let header = match super::header::parse(header_bytes) {
+            Ok(h) => h,
+            Err(e) => {
+                // B9: a malformed header must produce an EINVAL reply
+                // (subject to quiet), not be silently swallowed. The
+                // parse failed so we don't have a `Header` to read the
+                // id from — best-effort recover `i=`/`I=` by scanning
+                // the raw header for those keys (kitty parses all keys
+                // then validates, echoing the id in the EINVAL reply).
+                // If no id is recoverable the reply stays silent, in
+                // line with the "anonymous requests get no reply" rule.
+                emit_bad_header_einval(header_bytes, sink);
+                return Err(HandlerError::BadHeader(e));
+            }
+        };
+        // B8: specifying both `i=` and `I=` in any command is an error.
+        // Reply EINVAL (respecting quiet) and perform no action.
+        if header.image_id != 0 && header.image_number != 0 {
+            reply_error_if_verbose(&header, sink, ErrorCode::Einval, "both i= and I= specified");
+            return Ok(());
+        }
         self.dispatch(header, body, sink);
         Ok(())
     }
@@ -426,7 +446,14 @@ impl KittyHandler {
         // If the action also says "place", emit a default placement at
         // the cursor. The host's adapter uses the cursor's current
         // (row, col) and the configured cell dims to size the rect.
-        if matches!(header.action, Action::TransmitAndPlace) {
+        //
+        // B12: `U=1` requests a VIRTUAL placement — the image is
+        // registered (done above) but NOT displayed at the cursor, and
+        // the cursor must NOT advance. The visible references come from
+        // subsequent U+10EEEE placeholder cells (handled elsewhere). So
+        // for `U=1` we skip both the visible placement and the cursor
+        // advance, but still reply OK.
+        if matches!(header.action, Action::TransmitAndPlace) && !header.unicode_placeholder {
             let (cell_pw, cell_ph) = sink.cell_pixel_size();
             let placement =
                 default_placement_from_header(&header, final_id, img_w, img_h, cell_pw, cell_ph);
@@ -454,6 +481,15 @@ impl KittyHandler {
     fn handle_place<S: KittySink>(&mut self, header: Header, sink: &mut S) {
         if header.image_id == 0 {
             reply_error_if_verbose(&header, sink, ErrorCode::Einval, "place requires i=");
+            return;
+        }
+        // B12: `U=1` is a virtual placement — register-only, no visible
+        // placement at the cursor and no cursor motion. The image was
+        // already transmitted; the placeholder pipeline (handled
+        // elsewhere) provides the visible references. Reply OK and
+        // return without calling `place_image`.
+        if header.unicode_placeholder {
+            reply_ok_if_verbose_with_id(&header, sink, header.image_id);
             return;
         }
         // Standalone `a=p` doesn't carry img dims at this call site; we
@@ -573,6 +609,57 @@ fn default_placement_from_header(
         src_rect: src,
         z: header.z,
     }
+}
+
+/// Emit an EINVAL reply for a header that failed to parse (B9).
+///
+/// Because parsing failed we have no [`Header`]; recover the `i=` /
+/// `I=` identifiers by scanning the raw header bytes for those keys so
+/// the reply can echo them (matching reference kitty, which parses all
+/// keys then validates and replies EINVAL with the id). If neither is
+/// recoverable there is nothing to correlate a reply against, so we
+/// stay silent — consistent with the anonymous-no-reply rule.
+///
+/// `q=` cannot be honored reliably from a malformed header, so we only
+/// suppress when an explicit `q=2` (Silent) is recoverable; otherwise
+/// we reply. A best-effort scan keeps this simple and robust.
+fn emit_bad_header_einval<S: KittySink>(header_bytes: &[u8], sink: &mut S) {
+    let s = match std::str::from_utf8(header_bytes) {
+        Ok(s) => s.strip_prefix('G').unwrap_or(s),
+        Err(_) => return,
+    };
+    let mut image_id = 0u32;
+    let mut image_number = 0u32;
+    let mut quiet = Quiet::Verbose;
+    for pair in s.split(',') {
+        if let Some((key, value)) = pair.split_once('=') {
+            match key.trim() {
+                "i" => image_id = value.trim().parse().unwrap_or(image_id),
+                "I" => image_number = value.trim().parse().unwrap_or(image_number),
+                "q" => {
+                    quiet = match value.trim() {
+                        "2" => Quiet::Silent,
+                        "1" => Quiet::NoOk,
+                        _ => Quiet::Verbose,
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+    if matches!(quiet, Quiet::Silent) {
+        return;
+    }
+    // Anonymous request (no id to echo) → no reply.
+    if image_id == 0 && image_number == 0 {
+        return;
+    }
+    sink.queue_reply(&encode_error(
+        image_id,
+        image_number,
+        ErrorCode::Einval,
+        "malformed header",
+    ));
 }
 
 fn reply_ok_if_verbose<S: KittySink>(header: &Header, sink: &mut S) {
@@ -1185,5 +1272,187 @@ mod tests {
             std::str::from_utf8(r).is_ok_and(|s| s.contains("EFBIG"))
         }));
         assert_eq!(h.pending_uploads(), 0);
+    }
+}
+
+#[cfg(test)]
+mod blocker_graphics_tests {
+    use super::*;
+
+    /// Sink that records registrations, placements, replies, and the
+    /// number of cursor-advance signals so the B12 virtual-placement
+    /// behavior can be asserted at the handler level.
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        registered: Vec<(u32, ImageData)>,
+        placements: Vec<Placement>,
+        replies: Vec<Vec<u8>>,
+        cursor_advances: usize,
+        assign_next: u32,
+    }
+
+    impl RecordingSink {
+        fn new() -> Self {
+            Self {
+                assign_next: 1,
+                ..Self::default()
+            }
+        }
+
+        fn joined_replies(&self) -> String {
+            self.replies
+                .iter()
+                .map(|r| String::from_utf8_lossy(r).into_owned())
+                .collect()
+        }
+    }
+
+    impl KittySink for RecordingSink {
+        fn register_image(&mut self, id_request: u32, data: ImageData) -> Option<u32> {
+            let id = if id_request == 0 {
+                let assigned = self.assign_next;
+                self.assign_next += 1;
+                assigned
+            } else {
+                id_request
+            };
+            self.registered.push((id, data));
+            Some(id)
+        }
+        fn place_image(&mut self, placement: Placement) {
+            self.placements.push(placement);
+        }
+        fn delete_image(&mut self, _delete: DeleteSpec, _header: &Header) {}
+        fn queue_reply(&mut self, bytes: &[u8]) {
+            self.replies.push(bytes.to_vec());
+        }
+        fn advance_cursor_after_placement(&mut self, _rows: u16, _cols: u16, _start_col: u16) {
+            self.cursor_advances += 1;
+        }
+    }
+
+    fn b64_red_pixel() -> String {
+        base64::engine::general_purpose::STANDARD.encode([255u8, 0, 0, 255])
+    }
+
+    // ----- B8: i= and I= together is EINVAL -----
+
+    #[test]
+    fn b8_both_i_and_image_number_replies_einval_and_does_not_register() {
+        let mut h = KittyHandler::new();
+        let mut sink = RecordingSink::new();
+        // Valid in every other respect; only the i= + I= conflict.
+        h.process(
+            b"Ga=t,f=32,s=1,v=1,i=1,I=2",
+            b64_red_pixel().as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
+        let joined = sink.joined_replies();
+        assert!(joined.contains("EINVAL"), "expected EINVAL, got {joined:?}");
+        assert!(
+            sink.registered.is_empty(),
+            "i=+I= conflict must not register an image"
+        );
+        // The reply should echo both identifiers.
+        assert!(joined.contains("i=1"), "reply should echo i=, got {joined:?}");
+        assert!(joined.contains("I=2"), "reply should echo I=, got {joined:?}");
+    }
+
+    // ----- B9: malformed header replies EINVAL (id recoverable) -----
+
+    #[test]
+    fn b9_malformed_header_with_id_replies_einval() {
+        let mut h = KittyHandler::new();
+        let mut sink = RecordingSink::new();
+        // `f=999` is not a valid format enum → BadEnum on parse.
+        let err = h
+            .process(b"Ga=t,i=1,f=999,s=1,v=1", b64_red_pixel().as_bytes(), &mut sink)
+            .unwrap_err();
+        assert!(matches!(err, HandlerError::BadHeader(_)));
+        let joined = sink.joined_replies();
+        assert!(joined.contains("EINVAL"), "expected EINVAL, got {joined:?}");
+        // Best-effort id recovery: the reply echoes the scanned i=1.
+        assert!(joined.contains("i=1"), "reply should echo recovered i=, got {joined:?}");
+        assert!(sink.registered.is_empty(), "malformed header must not register");
+    }
+
+    #[test]
+    fn b9_malformed_header_with_image_number_replies_einval() {
+        let mut h = KittyHandler::new();
+        let mut sink = RecordingSink::new();
+        // `a=X` is an invalid action enum.
+        h.process(b"Ga=X,I=7", b"", &mut sink).unwrap_err();
+        let joined = sink.joined_replies();
+        assert!(joined.contains("EINVAL"), "expected EINVAL, got {joined:?}");
+        assert!(joined.contains("I=7"), "reply should echo recovered I=, got {joined:?}");
+    }
+
+    #[test]
+    fn b9_malformed_header_without_id_is_silent() {
+        let mut h = KittyHandler::new();
+        let mut sink = RecordingSink::new();
+        // Invalid action and no recoverable i=/I=.
+        h.process(b"Ga=X,f=999", b"", &mut sink).unwrap_err();
+        assert!(
+            sink.replies.is_empty(),
+            "malformed header with no id must stay silent, got {:?}",
+            sink.joined_replies()
+        );
+    }
+
+    #[test]
+    fn b9_malformed_header_silenced_by_q2() {
+        let mut h = KittyHandler::new();
+        let mut sink = RecordingSink::new();
+        // Has a recoverable id but q=2 (Silent) suppresses the reply.
+        h.process(b"Ga=X,i=3,q=2", b"", &mut sink).unwrap_err();
+        assert!(
+            sink.replies.is_empty(),
+            "q=2 must silence the EINVAL reply, got {:?}",
+            sink.joined_replies()
+        );
+    }
+
+    // ----- B12: U=1 virtual placement -----
+
+    #[test]
+    fn b12_transmit_and_place_with_u1_is_virtual() {
+        let mut h = KittyHandler::new();
+        let mut sink = RecordingSink::new();
+        h.process(
+            b"Ga=T,f=32,s=1,v=1,i=5,c=2,r=2,U=1",
+            b64_red_pixel().as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
+        // Image IS registered.
+        assert_eq!(sink.registered.len(), 1, "U=1 must still register the image");
+        assert_eq!(sink.registered[0].0, 5);
+        // No visible placement, no cursor advance.
+        assert!(
+            sink.placements.is_empty(),
+            "U=1 must not create a visible placement"
+        );
+        assert_eq!(
+            sink.cursor_advances, 0,
+            "U=1 must not advance the cursor"
+        );
+        // Still replies OK (id present).
+        assert!(sink.joined_replies().contains(";OK"));
+    }
+
+    #[test]
+    fn b12_place_with_u1_is_virtual() {
+        let mut h = KittyHandler::new();
+        let mut sink = RecordingSink::new();
+        // a=p with U=1 — no visible placement, no cursor advance.
+        h.process(b"Ga=p,i=5,U=1", b"", &mut sink).unwrap();
+        assert!(
+            sink.placements.is_empty(),
+            "a=p,U=1 must not create a visible placement"
+        );
+        assert_eq!(sink.cursor_advances, 0, "a=p,U=1 must not advance cursor");
+        assert!(sink.joined_replies().contains(";OK"));
     }
 }

@@ -3160,9 +3160,12 @@ impl Perform for Term {
                 None => (&payload[..], &[]),
             };
             let mut handler = std::mem::take(&mut self.image_handler);
-            // Swallow the Result — header errors do not reach the
-            // sink so there's no reply to emit. (A future
-            // enhancement could push a synthetic error reply here.)
+            // B9: a malformed header now produces an EINVAL reply
+            // (subject to quiet / recoverable id) which `process`
+            // queues via the sink (`queue_reply` → `pty_replies`),
+            // the same path as successful replies. The returned
+            // `Err(BadHeader)` is purely informational at this point —
+            // the reply has already been emitted — so we drop it.
             let _ = handler.process(header_bytes, body, self);
             self.image_handler = handler;
         } else if payload.starts_with(RGP_PREFIX) {
@@ -6748,5 +6751,76 @@ mod blocker_screenops_tests {
             5..7,
             "image shifted down by 2 within the region"
         );
+    }
+}
+
+#[cfg(test)]
+mod blocker_graphics_term_tests {
+    use super::*;
+    use toastty_parser::Parser;
+
+    fn feed(t: &mut Term, bytes: &[u8]) {
+        let mut p = Parser::new();
+        p.advance(t, bytes);
+    }
+
+    fn b64_red_1x1() -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .encode([255u8, 0, 0, 255])
+            .into_bytes()
+    }
+
+    /// B12 end-to-end: `a=T,...,U=1` registers the image but creates no
+    /// visible placement and does not move the cursor (the visible
+    /// references come from U+10EEEE placeholder cells handled
+    /// elsewhere).
+    #[test]
+    fn b12_unicode_placeholder_transmit_is_virtual() {
+        let mut t = Term::new(8, 8, 0);
+        // Move cursor to a known, non-origin position (row=2, col=3).
+        feed(&mut t, b"\x1b[3;4H");
+        let before = t.cursor();
+        assert_eq!(before.row, 2);
+        assert_eq!(before.col, 3);
+        let registry_before = t.image_registry().len();
+        let grid_before = t.image_grid().len();
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=2,r=2,U=1;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+
+        // Image registered.
+        assert!(t.image_registry().contains(1), "U=1 must register the image");
+        assert_eq!(
+            t.image_registry().len(),
+            registry_before + 1,
+            "registry must grow by one"
+        );
+        // No visible placement created.
+        assert_eq!(
+            t.image_grid().len(),
+            grid_before,
+            "U=1 must not create a visible placement"
+        );
+        // Cursor unchanged.
+        let after = t.cursor();
+        assert_eq!(after.row, before.row, "U=1 must not move cursor row");
+        assert_eq!(after.col, before.col, "U=1 must not move cursor col");
+    }
+
+    /// B9 end-to-end: a malformed header carrying `i=1` must produce an
+    /// EINVAL reply queued to the pty.
+    #[test]
+    fn b9_malformed_header_replies_einval_to_pty() {
+        let mut t = Term::new(8, 8, 0);
+        // `f=999` is not a valid format → header parse error.
+        feed(&mut t, b"\x1b_Ga=t,i=1,f=999,s=1,v=1;AAAA\x1b\\");
+        let replies = t.drain_pty_replies();
+        let s = String::from_utf8_lossy(&replies);
+        assert!(s.contains("EINVAL"), "expected EINVAL reply, got {s:?}");
+        assert!(s.contains("i=1"), "reply should echo recovered i=, got {s:?}");
     }
 }
