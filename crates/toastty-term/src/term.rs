@@ -3294,32 +3294,79 @@ impl KittySink for Term {
                     }
                 }
             }
-            // `i` / `I` — by image id (provided via `i=`).
+            // `i` / `I` — by image id (provided via `i=`). When `p=` is
+            // also given (non-zero), scope to that single placement;
+            // otherwise drop every placement of the image. (B4)
             b'i' | b'I' => {
                 if header.image_id != 0 {
-                    dropped_placements.extend(self.image_grid.remove_image(header.image_id));
-                    if drop_bytes {
-                        self.image_registry.remove(header.image_id);
+                    let img = header.image_id;
+                    let pid = header.placement_id;
+                    if pid != 0 {
+                        dropped_placements.extend(self.image_grid.remove_where(|p| {
+                            p.image_id == img && p.placement_id == pid
+                        }));
+                    } else {
+                        dropped_placements.extend(self.image_grid.remove_image(img));
+                    }
+                    // Uppercase frees the bytes, but only when no
+                    // placement of this image survives. (B5)
+                    if drop_bytes && !self.image_grid.iter().any(|p| p.image_id == img) {
+                        self.image_registry.remove(img);
                     }
                 }
             }
             // `n` / `N` — by image *number* (provided via `I=`). We
             // don't track image-number→id mapping yet; fall through as
             // a no-op.
-            // `p` / `P` — by (image id, placement id). The grid filter
-            // matches both fields.
+            // `p` / `P` — by CELL coordinates. The cell is specified via
+            // the lowercase `x=` / `y=` keys (parsed into `src_x` /
+            // `src_y`), 1-based per the spec ("x=1,y=1 is the top left
+            // cell"). Internal `col_range` / `row_range` are 0-based, so
+            // convert by subtracting 1. (B6)
             b'p' | b'P' => {
-                let img = header.image_id;
-                let pid = header.placement_id;
+                // Convert 1-based cell coords to 0-based; treat 0 (the
+                // "unset" default) as referring to the top-left cell.
+                let col = header.src_x.saturating_sub(1) as u16;
+                let row = header.src_y.saturating_sub(1) as u16;
                 dropped_placements.extend(self.image_grid.remove_where(|p| {
-                    p.image_id == img && p.placement_id == pid
+                    p.col_range.contains(&col) && p.row_range.contains(&row)
                 }));
+                // Uppercase `P` frees bytes for any image that lost its
+                // last placement. (B6, same rule as B5)
+                if drop_bytes {
+                    let lost: Vec<u32> = dropped_placements
+                        .iter()
+                        .map(|p| p.image_id)
+                        .collect();
+                    for img in lost {
+                        if !self.image_grid.iter().any(|p| p.image_id == img) {
+                            self.image_registry.remove(img);
+                        }
+                    }
+                }
             }
-            // `r` / `R` — by row.
+            // `r` / `R` — by image-id RANGE (kitty 0.33+). Delete all
+            // images whose id is in `[x, y]` inclusive, where the
+            // lowercase `x=` / `y=` keys carry the id bounds (parsed into
+            // `src_x` / `src_y`). Lowercase removes placements; uppercase
+            // `R` additionally frees image bytes. (B7)
             b'r' | b'R' => {
-                if header.cell_y < u32::from(self.rows) {
-                    let row = header.cell_y as u16;
-                    dropped_placements.extend(self.image_grid.clear_row(row));
+                let lo = header.src_x;
+                let hi = header.src_y;
+                if lo <= hi {
+                    dropped_placements.extend(self.image_grid.remove_where(|p| {
+                        (lo..=hi).contains(&p.image_id)
+                    }));
+                    if drop_bytes {
+                        let ids: Vec<u32> = self
+                            .image_registry
+                            .ids()
+                            .filter(|id| (lo..=hi).contains(id))
+                            .collect();
+                        for id in ids {
+                            self.image_registry.remove(id);
+                        }
+                    }
                 }
             }
             // Other specs (`c` cell, `x`/`y` columns/rows, `z` by z, `q`
@@ -6381,5 +6428,155 @@ mod blocker_altscreen_tests {
             0,
             "alt screen images must not persist across visits"
         );
+    }
+}
+
+/// Tests for the kitty graphics delete-selector blockers B4-B7.
+/// Kept in a dedicated module to avoid merge conflicts with the main
+/// `mod tests` while other workers edit `term.rs`.
+#[cfg(test)]
+mod blocker_delete_tests {
+    use super::*;
+    use toastty_parser::Parser;
+
+    /// Feed `bytes` through a fresh parser into `t`.
+    fn feed(t: &mut Term, bytes: &[u8]) {
+        let mut p = Parser::new();
+        p.advance(t, bytes);
+    }
+
+    /// Base64 of a 1x1 opaque red RGBA pixel.
+    fn b64_red() -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .encode([255u8, 0, 0, 255])
+            .into_bytes()
+    }
+
+    /// Transmit (register, no placement) image `id` as a 1x1 red pixel.
+    fn transmit(t: &mut Term, id: u32) {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(format!("\x1b_Ga=t,f=32,s=1,v=1,i={id};").as_bytes());
+        payload.extend_from_slice(&b64_red());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(t, &payload);
+    }
+
+    /// Place already-transmitted image `id` at the current cursor with a
+    /// `cols x rows` cell span and placement id `pid`.
+    fn place(t: &mut Term, id: u32, pid: u32, cols: u16, rows: u16) {
+        feed(
+            t,
+            format!("\x1b_Ga=p,i={id},p={pid},c={cols},r={rows},q=2\x1b\\").as_bytes(),
+        );
+    }
+
+    // ---- B4: d=i must honor p= ----
+    #[test]
+    fn b4_delete_by_id_with_placement_id_removes_only_that_placement() {
+        let mut t = Term::new(40, 40, 0);
+        transmit(&mut t, 1);
+        // Two placements of image 1: p=1 and p=2.
+        feed(&mut t, b"\x1b[12;4H");
+        place(&mut t, 1, 1, 1, 1);
+        feed(&mut t, b"\x1b[12;30H");
+        place(&mut t, 1, 2, 1, 1);
+        assert_eq!(t.image_grid().len(), 2);
+
+        // Delete only the p=1 placement.
+        feed(&mut t, b"\x1b_Ga=d,d=i,i=1,p=1,q=2\x1b\\");
+
+        let remaining: Vec<u32> = t.image_grid().iter().map(|p| p.placement_id).collect();
+        assert_eq!(remaining, vec![2], "p=1 removed, p=2 survives");
+        assert!(t.image_registry().contains(1), "lowercase keeps bytes");
+    }
+
+    // ---- B5: d=I frees bytes only when no placements remain ----
+    #[test]
+    fn b5_uppercase_delete_frees_bytes_only_after_last_placement() {
+        let mut t = Term::new(40, 40, 0);
+        transmit(&mut t, 1);
+        feed(&mut t, b"\x1b[12;4H");
+        place(&mut t, 1, 1, 1, 1);
+        feed(&mut t, b"\x1b[12;30H");
+        place(&mut t, 1, 2, 1, 1);
+        assert_eq!(t.image_grid().len(), 2);
+        assert!(t.image_registry().contains(1));
+
+        // Delete the p=1 placement with uppercase I. p=2 still
+        // references image 1, so bytes must be retained.
+        feed(&mut t, b"\x1b_Ga=d,d=I,i=1,p=1,q=2\x1b\\");
+        assert_eq!(t.image_grid().len(), 1);
+        assert!(
+            t.image_registry().contains(1),
+            "bytes retained while p=2 still references image 1"
+        );
+
+        // Delete the last (p=2) placement with uppercase I — now bytes
+        // are freed.
+        feed(&mut t, b"\x1b_Ga=d,d=I,i=1,p=2,q=2\x1b\\");
+        assert_eq!(t.image_grid().len(), 0);
+        assert!(
+            !t.image_registry().contains(1),
+            "bytes freed once last placement is gone"
+        );
+        assert_eq!(t.image_registry().len(), 0);
+    }
+
+    // ---- B6: d=p deletes by cell coords (x=,y=) ----
+    #[test]
+    fn b6_delete_by_cell_inside_removes_and_outside_keeps() {
+        // Place a 3x3-cell image at 1-based cursor (row 12, col 10) ->
+        // internal row 11, col 9. col_range = 9..12, row_range = 11..14.
+        let setup = || {
+            let mut t = Term::new(40, 40, 0);
+            transmit(&mut t, 7);
+            feed(&mut t, b"\x1b[12;10H");
+            place(&mut t, 7, 0, 3, 3);
+            assert_eq!(t.image_grid().len(), 1);
+            t
+        };
+
+        // Cell (1-based) col 12, row 12 is inside the placement.
+        let mut t = setup();
+        feed(&mut t, b"\x1b_Ga=d,d=p,x=12,y=12,q=2\x1b\\");
+        assert_eq!(t.image_grid().len(), 0, "cell inside the image deletes it");
+
+        // Cell (1-based) col 1, row 1 is outside the placement.
+        let mut t = setup();
+        feed(&mut t, b"\x1b_Ga=d,d=p,x=1,y=1,q=2\x1b\\");
+        assert_eq!(t.image_grid().len(), 1, "cell outside leaves the image");
+    }
+
+    // ---- B7: d=r / d=R delete by image-id range ----
+    #[test]
+    fn b7_delete_by_id_range_removes_in_range_and_uppercase_frees_bytes() {
+        let mut t = Term::new(40, 40, 0);
+        for id in [5u32, 8, 12] {
+            transmit(&mut t, id);
+        }
+        feed(&mut t, b"\x1b[12;4H");
+        place(&mut t, 5, 0, 1, 1);
+        feed(&mut t, b"\x1b[12;22H");
+        place(&mut t, 8, 0, 1, 1);
+        feed(&mut t, b"\x1b[12;40H");
+        place(&mut t, 12, 0, 1, 1);
+        assert_eq!(t.image_grid().len(), 3);
+
+        // Lowercase r: ids in [4, 10] -> 5 and 8 placements removed; 12
+        // survives. Bytes are NOT freed by lowercase.
+        feed(&mut t, b"\x1b_Ga=d,d=r,x=4,y=10,q=2\x1b\\");
+        let remaining: Vec<u32> = t.image_grid().iter().map(|p| p.image_id).collect();
+        assert_eq!(remaining, vec![12], "only id 12 placement survives");
+        assert!(t.image_registry().contains(5), "lowercase r keeps bytes");
+        assert!(t.image_registry().contains(8), "lowercase r keeps bytes");
+        assert!(t.image_registry().contains(12));
+
+        // Uppercase R over the same range frees the (already
+        // placement-less) image bytes for 5 and 8.
+        feed(&mut t, b"\x1b_Ga=d,d=R,x=4,y=10,q=2\x1b\\");
+        assert!(!t.image_registry().contains(5), "uppercase R frees bytes for id 5");
+        assert!(!t.image_registry().contains(8), "uppercase R frees bytes for id 8");
+        assert!(t.image_registry().contains(12), "id 12 outside range untouched");
     }
 }
