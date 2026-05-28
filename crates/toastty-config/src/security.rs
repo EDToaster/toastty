@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SecurityConfig {
-    /// Allow OSC 52 reads (`OSC 52 ; c ; ? ST`). Off by default —
+    /// Allow OSC 52 reads (`OSC 52 ; c ; ? ST`). On by default —
     /// any PTY program could exfiltrate the clipboard contents.
     pub osc_52_read: bool,
-    /// Allow OSC 52 writes (`OSC 52 ; c ; <base64> ST`). Off by
+    /// Allow OSC 52 writes (`OSC 52 ; c ; <base64> ST`). On by
     /// default — a malicious program could replace the user's
     /// clipboard with attacker-controlled text right before they
     /// paste into another window.
@@ -27,8 +27,8 @@ impl SecurityConfig {
     #[must_use]
     pub fn defaults() -> Self {
         Self {
-            osc_52_read: false,
-            osc_52_write: false,
+            osc_52_read: true,
+            osc_52_write: true,
         }
     }
 }
