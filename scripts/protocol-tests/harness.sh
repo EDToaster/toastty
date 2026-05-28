@@ -111,9 +111,14 @@ done
 
 # ---- render one page ----
 
-# Query the cursor's current row via DSR (ESC [ 6 n → ESC [ row;col R).
-# Falls back to 12 if the terminal doesn't answer.
+# Query the cursor's current row via DSR (ESC [ 6 n → ESC [ row;col R) and
+# store it in the global HARNESS_CURSOR_ROW. MUST set a global rather than
+# echo: the DSR query has to go to the real terminal, so it can't run inside
+# a command substitution (that would capture the query bytes instead of
+# sending them, polluting the result). Falls back to 12 if no answer.
+HARNESS_CURSOR_ROW=12
 query_cursor_row() {
+    HARNESS_CURSOR_ROW=12
     local resp="" c
     printf '%s[6n' "$esc"
     while IFS= read -r -s -t 0.5 -n 1 c; do
@@ -121,11 +126,7 @@ query_cursor_row() {
         [[ "$c" == "R" ]] && break
     done
     local re='\[([0-9]+);[0-9]+R'
-    if [[ "$resp" =~ $re ]]; then
-        printf '%d' "${BASH_REMATCH[1]}"
-    else
-        printf '12'
-    fi
+    [[ "$resp" =~ $re ]] && HARNESS_CURSOR_ROW="${BASH_REMATCH[1]}"
 }
 
 show_case() {
@@ -153,8 +154,10 @@ show_case() {
         # The test canvas starts at the current row. Cases position with
         # cursor_to (relative to HARNESS_CANVAS_TOP), so their output always
         # lands below this header regardless of how far the blurbs wrapped.
-        export HARNESS_CANVAS_TOP
-        HARNESS_CANVAS_TOP="$(query_cursor_row)"
+        # query_cursor_row sets a global (no command substitution — the DSR
+        # query must reach the terminal, not be captured).
+        query_cursor_row
+        export HARNESS_CANVAS_TOP="$HARNESS_CURSOR_ROW"
         run
         # Pin the nav footer to the bottom so case output can't shift it.
         local screen_rows

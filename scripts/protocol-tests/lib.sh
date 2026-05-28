@@ -24,11 +24,18 @@ note() { printf '%s[2m  %s%s[0m\n' "$esc" "$1" "$esc"; }
 # which the harness sets per page. It defaults to 1, so a case run on its
 # own (no harness) behaves exactly as plain absolute positioning. The
 # COLUMN is always absolute.
-cursor_to() { printf '%s[%d;%dH' "$esc" "$(( ${HARNESS_CANVAS_TOP:-1} + $1 - 1 ))" "$2"; }
+# Sanitize HARNESS_CANVAS_TOP to a positive integer (strip any stray
+# control/escape bytes that might have leaked in), defaulting to 1.
+_canvas_top() {
+    local b=${HARNESS_CANVAS_TOP:-1}
+    b=${b//[^0-9]/}
+    printf '%d' "${b:-1}"
+}
+cursor_to() { printf '%s[%d;%dH' "$esc" "$(( $(_canvas_top) + $1 - 1 ))" "$2"; }
 # Absolute screen row for canvas row N. Use this inside kitty escape
 # coordinates (delete-by-row/cell `y=`, scroll-region margins, …) that must
 # line up with a `cursor_to`-positioned image. Mirrors cursor_to's mapping.
-canvas_row() { printf '%d' "$(( ${HARNESS_CANVAS_TOP:-1} + $1 - 1 ))"; }
+canvas_row() { printf '%d' "$(( $(_canvas_top) + $1 - 1 ))"; }
 cursor_save()     { printf '%s7' "$esc"; }
 cursor_restore()  { printf '%s8' "$esc"; }
 
