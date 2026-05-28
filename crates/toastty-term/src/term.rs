@@ -7911,3 +7911,58 @@ mod major_screen_tests {
         assert_ne!(t.image_revision(), rev_before);
     }
 }
+
+/// M6 end-to-end: drive a real `Term` through the parser with a `t=f`
+/// (file) transmission followed by an `a=p` placement and confirm the
+/// image lands in the registry. Lives in its own module to minimize
+/// merge friction with the main `tests` module.
+#[cfg(test)]
+mod major_medium_term_tests {
+    use super::*;
+    use base64::Engine;
+    use toastty_parser::Parser;
+
+    fn feed(t: &mut Term, bytes: &[u8]) {
+        let mut p = Parser::new();
+        p.advance(t, bytes);
+    }
+
+    #[test]
+    fn kitty_t_f_file_transmission_registers_and_places() {
+        // 2x2 RGBA image written to a temp file.
+        let raw: Vec<u8> = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("toastty-term-medium-{pid}.rgba"));
+        std::fs::write(&path, &raw).unwrap();
+
+        let mut t = Term::new(8, 8, 0);
+        let before = t.image_registry().len();
+
+        // Transmit via file medium: payload is the base64-encoded path.
+        let b64_path = base64::engine::general_purpose::STANDARD
+            .encode(path.to_str().unwrap().as_bytes());
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=t,f=32,s=2,v=2,i=314,t=f;");
+        payload.extend_from_slice(b64_path.as_bytes());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+
+        // The image must now be in the registry.
+        assert_eq!(
+            t.image_registry().len(),
+            before + 1,
+            "t=f transmit must register one image"
+        );
+        assert!(t.image_registry().contains(314));
+
+        // Place it with an explicit cell span.
+        feed(&mut t, b"\x1b_Ga=p,i=314,c=2,r=2\x1b\\");
+        assert_eq!(t.image_grid().len(), 1, "a=p must produce a placement");
+
+        // `t=f` must NOT delete the source file.
+        assert!(path.exists(), "t=f must leave the file intact");
+        std::fs::remove_file(&path).ok();
+    }
+}

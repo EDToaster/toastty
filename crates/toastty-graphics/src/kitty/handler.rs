@@ -294,9 +294,16 @@ impl KittyHandler {
     }
 
     fn handle_transmit<S: KittySink>(&mut self, header: Header, body: &[u8], sink: &mut S) {
-        // Only direct base64 transmission is supported in M11a.
+        // M6: Non-direct mediums (`t=f`, `t=t`, `t=s`) carry a
+        // base64-encoded PATH (or shm name) in the body rather than the
+        // image data itself. They are inherently single-shot — the file
+        // holds the whole payload — so they never participate in the
+        // chunked (`m=1`) reassembly machinery below. Acquire the bytes
+        // from the medium, then run them through the SAME
+        // compression/format decode-and-place tail as direct
+        // transmission via `finalize_decoded`.
         if !matches!(header.transmission, Transmission::Direct) {
-            reply_error_if_verbose(&header, sink, ErrorCode::Enotsup, "transmission medium");
+            self.handle_medium_transmit(header, body, sink);
             return;
         }
 
@@ -408,7 +415,100 @@ impl KittyHandler {
                 return;
             }
         };
+        // After base64 decode, direct and medium transmissions converge:
+        // `decoded` is the raw (still possibly zlib-compressed) payload.
+        self.finalize_decoded(header, decoded, sink);
+    }
 
+    /// M6: non-direct transmission mediums — `t=f` (file), `t=t` (temp
+    /// file), `t=s` (POSIX shared memory).
+    ///
+    /// For `t=f`/`t=t` the body is a base64-encoded filesystem PATH; we
+    /// read its bytes (honoring `O=` offset and `S=` size) and feed them
+    /// into the same decode tail as direct transmission. `t=t` also
+    /// deletes the file afterwards, but only when the path is under a
+    /// system temp dir (or carries kitty's `tty-graphics-protocol`
+    /// marker). `t=s` is ENOTSUP — see the match arm.
+    #[allow(clippy::needless_pass_by_value)]
+    fn handle_medium_transmit<S: KittySink>(&mut self, header: Header, body: &[u8], sink: &mut S) {
+        match header.transmission {
+            Transmission::Direct => unreachable!("direct handled by caller"),
+            Transmission::File | Transmission::TempFile => {
+                // The body is a base64-encoded path. Decode it, read the
+                // file, optionally delete (temp), then run the decode tail.
+                let path_bytes = match decode_base64(body) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        reply_error_if_verbose(
+                            &header,
+                            sink,
+                            ErrorCode::Einval,
+                            &format!("bad base64 path: {e}"),
+                        );
+                        return;
+                    }
+                };
+                let path = match std::str::from_utf8(&path_bytes) {
+                    Ok(p) => std::path::PathBuf::from(p),
+                    Err(e) => {
+                        reply_error_if_verbose(
+                            &header,
+                            sink,
+                            ErrorCode::Einval,
+                            &format!("non-utf8 path: {e}"),
+                        );
+                        return;
+                    }
+                };
+                let raw = match read_file_range(&path, header.offset, header.size) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        // File missing / unreadable → EBADF, matching
+                        // reference kitty's reply for an unusable file.
+                        reply_error_if_verbose(
+                            &header,
+                            sink,
+                            ErrorCode::Ebadf,
+                            &format!("file read: {e}"),
+                        );
+                        return;
+                    }
+                };
+                // Temp-file medium: delete after reading, but only when
+                // the path lives under a system temp directory. Reference
+                // kitty restricts temp-file deletion this way (paths under
+                // the temp dir or a `tty-graphics-protocol` marker) so a
+                // hostile client can't trick the terminal into unlinking
+                // an arbitrary file. Best-effort: ignore unlink errors.
+                if matches!(header.transmission, Transmission::TempFile) && is_under_temp_dir(&path) {
+                    let _ = std::fs::remove_file(&path);
+                }
+                self.finalize_decoded(header, raw, sink);
+            }
+            Transmission::Shared => {
+                // POSIX shared memory (`shm_open`/`mmap`/`shm_unlink`)
+                // needs a libc binding. `toastty-graphics` deliberately
+                // does NOT depend on `libc`, and we avoid pulling a heavy
+                // new dependency just for this medium. Reply ENOTSUP for
+                // now; `t=f`/`t=t` cover the common large-image transfer
+                // case (`kitten icat --transfer-mode=file`).
+                reply_error_if_verbose(
+                    &header,
+                    sink,
+                    ErrorCode::Enotsup,
+                    "shared-memory transmission medium",
+                );
+            }
+        }
+    }
+
+    /// Decode tail shared by all transmission mediums: take the raw
+    /// (post-base64 for direct, post-file-read for mediums) bytes,
+    /// optionally zlib-inflate, decode per `f=`, register, and place.
+    /// Preserves the B12 `U=1` virtual-placement guard and the M1–M5
+    /// cursor-advance / pixel-offset / aspect-ratio placement behavior.
+    #[allow(clippy::needless_pass_by_value, clippy::unused_self)]
+    fn finalize_decoded<S: KittySink>(&mut self, header: Header, decoded: Vec<u8>, sink: &mut S) {
         // Optional zlib decompression.
         let raw = match header.compression {
             Compression::None => decoded,
@@ -566,6 +666,77 @@ fn inflate_zlib(input: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Read `[offset, offset+size)` bytes from `path`. `size == 0` means
+/// "read to EOF" (per the kitty `S=` convention for file transfers).
+///
+/// SECURITY: this opens exactly the path the client gave us with the
+/// terminal process's own privileges. That is the intended model — the
+/// terminal is reading the user's own files on the user's behalf (this
+/// is how `kitten icat --transfer-mode=file` ships large images). We do
+/// not resolve symlinks specially or apply any allow-list; the OS
+/// permission check is the boundary.
+fn read_file_range(path: &std::path::Path, offset: u32, size: u32) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    if offset > 0 {
+        f.seek(SeekFrom::Start(u64::from(offset)))?;
+    }
+    if size == 0 {
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        Ok(buf)
+    } else {
+        let mut buf = vec![0u8; size as usize];
+        // The file may be shorter than `S=` claims; read what we can and
+        // truncate. `read_exact` would error on a short file, which is
+        // harsher than the reference (it reads min(S, remaining)).
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            match f.read(&mut buf[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        buf.truncate(filled);
+        Ok(buf)
+    }
+}
+
+/// True iff `path` lives under a system temporary directory. Used to
+/// gate `t=t` (temp-file) deletion: reference kitty only unlinks
+/// temp-transfer files that sit under the temp dir (or carry a
+/// `tty-graphics-protocol` marker), so a malicious client can't coax
+/// the terminal into deleting an arbitrary file via `t=t`.
+fn is_under_temp_dir(path: &std::path::Path) -> bool {
+    // Compare against the canonicalized temp dir AND the raw temp dir.
+    // Many clients write to `$TMPDIR/...` without resolving symlinks
+    // (on macOS `/tmp` -> `/private/tmp`, and `$TMPDIR` is a long
+    // `/var/folders/...` path), so we accept either form.
+    let candidates = [
+        std::env::temp_dir(),
+        std::path::PathBuf::from("/tmp"),
+        std::path::PathBuf::from("/var/tmp"),
+        std::path::PathBuf::from("/dev/shm"),
+    ];
+    let canon = std::fs::canonicalize(path).ok();
+    for base in candidates {
+        if path.starts_with(&base) {
+            return true;
+        }
+        if let Some(canon) = &canon
+            && let Ok(canon_base) = std::fs::canonicalize(&base)
+            && canon.starts_with(&canon_base)
+        {
+            return true;
+        }
+    }
+    // Reference kitty also honors a `tty-graphics-protocol` filename
+    // marker regardless of directory. Mirror that escape hatch.
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains("tty-graphics-protocol"))
+}
+
 fn default_placement_from_header(
     header: &Header,
     id: u32,
@@ -718,6 +889,14 @@ fn reply_error_if_verbose<S: KittySink>(
     code: ErrorCode,
     detail: &str,
 ) {
+    // M16: `q=2` (`Quiet::Silent`) suppresses ALL replies — including
+    // errors — NOT just successes. This intentionally diverges from the
+    // literal spec text (which reads as "q=2 suppresses failures"). We
+    // match reference kitty, whose `graphics.c` gate is effectively
+    //   `if (g->quiet) { if (is_ok_response || g->quiet > 1) return; }`
+    // i.e. `q>=2` returns no response of any kind. Do NOT "fix" this to
+    // the literal spec — real clients (and kitty's own test suite)
+    // expect total silence at q=2.
     if matches!(header.quiet, Quiet::Silent) {
         return;
     }
@@ -1314,6 +1493,18 @@ mod tests {
         }));
         assert_eq!(h.pending_uploads(), 0);
     }
+
+    #[test]
+    fn medium_query_still_enotsup() {
+        // M6: Query (`a=q`) with a non-direct medium remains ENOTSUP —
+        // only transmit (`a=t`/`a=T`) gained file/temp support.
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        h.process(b"Ga=q,t=f,i=1", b"L3RtcC94", &mut sink).unwrap();
+        assert!(sink.replies.iter().any(|r| {
+            std::str::from_utf8(r).is_ok_and(|s| s.contains("ENOTSUP"))
+        }));
+    }
 }
 
 #[cfg(test)]
@@ -1581,5 +1772,159 @@ mod major_place_handler_tests {
         assert_eq!(p.pix_offset, (3, 4));
         assert_eq!(p.col_range, base.col_range, "X must not shift the cell range");
         assert_eq!(p.row_range, base.row_range, "Y must not shift the cell range");
+    }
+}
+
+/// M6: file (`t=f`), temp-file (`t=t`), and shared-memory (`t=s`)
+/// transmission mediums. Exercised through the public `process` entry
+/// point with a mock sink so we can inspect the registered image and
+/// emitted replies without a real `Term`.
+#[cfg(test)]
+mod major_medium_tests {
+    use super::*;
+
+    /// Minimal sink: records registrations, placements, and replies.
+    /// The cursor/cell/budget methods fall back to trait defaults.
+    #[derive(Debug, Default)]
+    struct MockSink {
+        registered: Vec<(u32, ImageData)>,
+        placements: Vec<Placement>,
+        replies: Vec<Vec<u8>>,
+    }
+
+    impl KittySink for MockSink {
+        fn register_image(&mut self, id_request: u32, data: ImageData) -> Option<u32> {
+            let id = if id_request == 0 { 1 } else { id_request };
+            self.registered.push((id, data));
+            Some(id)
+        }
+        fn place_image(&mut self, placement: Placement) {
+            self.placements.push(placement);
+        }
+        fn delete_image(&mut self, _delete: DeleteSpec, _header: &Header) {}
+        fn queue_reply(&mut self, bytes: &[u8]) {
+            self.replies.push(bytes.to_vec());
+        }
+    }
+
+    fn replies_joined(sink: &MockSink) -> String {
+        sink.replies
+            .iter()
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .collect()
+    }
+
+    /// Unique temp path under the system temp dir (so `t=t` deletion is
+    /// allowed). Includes the pid + a counter to avoid collisions across
+    /// concurrent test threads.
+    fn unique_temp_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("toastty-medium-{tag}-{pid}-{n}.rgba"))
+    }
+
+    fn b64_path(path: &std::path::Path) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .encode(path.to_str().unwrap().as_bytes())
+            .into_bytes()
+    }
+
+    #[test]
+    fn t_f_reads_file_and_registers_image() {
+        // 2x2 RGBA: red, green, blue, white.
+        let raw: Vec<u8> = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        let path = unique_temp_path("tf");
+        std::fs::write(&path, &raw).unwrap();
+
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::default();
+        h.process(b"Ga=t,f=32,s=2,v=2,i=77,t=f", &b64_path(&path), &mut sink)
+            .unwrap();
+
+        assert_eq!(sink.registered.len(), 1, "replies={:?}", replies_joined(&sink));
+        assert_eq!(sink.registered[0].0, 77);
+        assert_eq!(sink.registered[0].1.width, 2);
+        assert_eq!(sink.registered[0].1.height, 2);
+        assert_eq!(sink.registered[0].1.pixels, raw);
+        // File must NOT be deleted for `t=f`.
+        assert!(path.exists(), "t=f must not delete the source file");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn t_t_reads_file_then_deletes_it() {
+        let raw: Vec<u8> = vec![1, 2, 3, 255, 4, 5, 6, 255]; // 2x1 RGBA.
+        let path = unique_temp_path("tt");
+        std::fs::write(&path, &raw).unwrap();
+        assert!(path.exists());
+
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::default();
+        h.process(b"Ga=t,f=32,s=2,v=1,i=88,t=t", &b64_path(&path), &mut sink)
+            .unwrap();
+
+        assert_eq!(sink.registered.len(), 1, "replies={:?}", replies_joined(&sink));
+        assert_eq!(sink.registered[0].1.pixels, raw);
+        // Temp file under the temp dir must be deleted after reading.
+        assert!(!path.exists(), "t=t must delete the temp file after reading");
+    }
+
+    #[test]
+    fn t_f_honors_offset_and_size() {
+        // Write 4 RGBA pixels; read the middle 2 via O=4, S=8.
+        let raw: Vec<u8> = vec![
+            10, 10, 10, 255, // pixel 0 (skipped)
+            20, 20, 20, 255, // pixel 1 (read)
+            30, 30, 30, 255, // pixel 2 (read)
+            40, 40, 40, 255, // pixel 3 (skipped)
+        ];
+        let path = unique_temp_path("tfoff");
+        std::fs::write(&path, &raw).unwrap();
+
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::default();
+        // 2x1 image, offset 4 bytes, size 8 bytes.
+        h.process(b"Ga=t,f=32,s=2,v=1,i=5,t=f,O=4,S=8", &b64_path(&path), &mut sink)
+            .unwrap();
+
+        assert_eq!(sink.registered.len(), 1, "replies={:?}", replies_joined(&sink));
+        assert_eq!(sink.registered[0].1.pixels, raw[4..12]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn t_f_nonexistent_path_replies_ebadf_no_image() {
+        let path = unique_temp_path("missing");
+        // Do NOT create it.
+        assert!(!path.exists());
+
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::default();
+        h.process(b"Ga=t,f=32,s=2,v=2,i=9,t=f", &b64_path(&path), &mut sink)
+            .unwrap();
+
+        assert!(sink.registered.is_empty(), "no image must register on read failure");
+        let joined = replies_joined(&sink);
+        assert!(
+            joined.contains("EBADF") || joined.contains("ENOENT"),
+            "expected EBADF/ENOENT, got {joined:?}"
+        );
+    }
+
+    #[test]
+    fn t_s_replies_enotsup() {
+        // Shared memory is intentionally unimplemented (no libc dep in
+        // toastty-graphics). It must reply ENOTSUP, not silently succeed.
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::default();
+        h.process(b"Ga=t,f=32,s=1,v=1,i=3,t=s", b"L215c2htb2Jq", &mut sink)
+            .unwrap();
+        assert!(sink.registered.is_empty());
+        let joined = replies_joined(&sink);
+        assert!(joined.contains("ENOTSUP"), "got {joined:?}");
     }
 }
