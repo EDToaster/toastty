@@ -339,6 +339,37 @@ impl ImageGrid {
         removed
     }
 
+    /// Clip every placement to the new geometry `rows` x `cols` after a
+    /// resize. Ranges are trimmed to `[0, rows)` / `[0, cols)`; any
+    /// placement whose row or column range starts past the new edge (it
+    /// has no visible cells) is dropped. The placement's `pix_offset` is
+    /// preserved untouched — only the cell ranges are clipped. Returns
+    /// `true` if anything changed.
+    pub fn clip_to(&mut self, rows: u16, cols: u16) -> bool {
+        let mut changed = false;
+        let mut i = 0;
+        while i < self.placements.len() {
+            let p = &mut self.placements[i].1;
+            // A placement that begins at/after the new edge has no
+            // visible cells — drop it entirely.
+            if p.row_range.start >= rows || p.col_range.start >= cols {
+                self.placements.remove(i);
+                changed = true;
+                continue;
+            }
+            if p.row_range.end > rows {
+                p.row_range.end = rows;
+                changed = true;
+            }
+            if p.col_range.end > cols {
+                p.col_range.end = cols;
+                changed = true;
+            }
+            i += 1;
+        }
+        changed
+    }
+
     /// Returns true iff any placement covers cell `(row, col)`.
     #[must_use]
     pub fn covers(&self, row: u16, col: u16) -> bool {

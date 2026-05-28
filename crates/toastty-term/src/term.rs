@@ -1401,6 +1401,13 @@ impl Term {
         // potentially drops history); clear so we don't paint stale
         // highlights at the wrong (line_id, col).
         self.selection = None;
+        // Image placements anchored past the new geometry become
+        // phantoms (kitty clips placements on resize). Trim each to the
+        // new rows/cols and drop any that no longer have any visible
+        // cells. `pix_offset` is preserved by `clip_to`.
+        if self.image_grid.clip_to(rows, cols) {
+            self.image_revision = self.image_revision.wrapping_add(1);
+        }
     }
 
     fn active_grid(&self) -> &Grid {
@@ -1869,6 +1876,7 @@ impl Term {
         self.image_revision = self.image_revision.wrapping_add(1);
     }
 
+    #[allow(clippy::too_many_lines)] // one arm per CSI final byte; the table is wide.
     fn handle_csi(&mut self, params: &Params, intermediates: &[u8], action: char) {
         let priv_marker = intermediates.first().copied();
         match action {
@@ -1897,6 +1905,29 @@ impl Term {
             'L' => self.insert_line(first_param(params, 1).max(1)),
             // DL — Delete Line.
             'M' => self.delete_line(first_param(params, 1).max(1)),
+            // SU — Scroll Up. `CSI Ps S` scrolls the scroll region up
+            // `Ps` lines (content moves up, blanks open at the bottom
+            // margin). Default 1. The `CSI ? ... S` form is XTSMGRAPHICS
+            // (sixel/ReGIS geometry query) — guard on the private marker
+            // so we don't scroll on a graphics probe.
+            'S' if priv_marker.is_none() => {
+                let n = first_param(params, 1).max(1);
+                for _ in 0..n {
+                    self.region_scroll_up();
+                }
+            }
+            // SD — Scroll Down. `CSI Ps T` scrolls the scroll region down
+            // `Ps` lines (content moves down, blanks open at the top
+            // margin). Default 1. The 5-parameter form
+            // (`CSI Ps;Ps;Ps;Ps;Ps T`) is highlight mouse tracking — only
+            // treat the single-param form as SD; anything with more params
+            // falls through to the catch-all.
+            'T' if priv_marker.is_none() && params.len() <= 1 => {
+                let n = first_param(params, 1).max(1);
+                for _ in 0..n {
+                    self.region_scroll_down();
+                }
+            }
             // DCH — Delete Character. The DEL-fix that motivated this:
             // zsh sends `BS DCH CUF SP CUB` for every backspace; without
             // a working DCH the deletion appears to land at the end of
@@ -2411,6 +2442,21 @@ impl Term {
         for r in cur_row..region_end {
             self.mark_row(r);
         }
+        // Mirror the text shift on the image layer: placements in
+        // [cur_row, region_end) slide down by `n`, those pushed past the
+        // bottom margin are dropped (kitty shifts images on IL). Any
+        // placement whose start is in that band moves, so bump the
+        // revision when one exists (shift_rows_down_within mutates ranges
+        // in place; its return only lists dropped placements).
+        let affected = self
+            .image_grid
+            .iter()
+            .any(|p| p.row_range.start >= cur_row && p.row_range.start < region_end);
+        self.image_grid
+            .shift_rows_down_within(n, cur_row, region_end);
+        if affected {
+            self.image_revision = self.image_revision.wrapping_add(1);
+        }
     }
 
     /// DL — Delete Line. `CSI Ps M` removes `n` lines at the cursor
@@ -2451,6 +2497,17 @@ impl Term {
         }
         for r in cur_row..region_end {
             self.mark_row(r);
+        }
+        // Mirror the text shift on the image layer: placements in
+        // [cur_row, region_end) slide up by `n`, those scrolled entirely
+        // above the cursor row are dropped (kitty shifts images on DL).
+        let affected = self
+            .image_grid
+            .iter()
+            .any(|p| p.row_range.start >= cur_row && p.row_range.start < region_end);
+        self.image_grid.shift_rows_up_within(n, cur_row, region_end);
+        if affected {
+            self.image_revision = self.image_revision.wrapping_add(1);
         }
     }
 
@@ -2715,6 +2772,54 @@ impl Term {
         self.image_grid = self.stashed_image_grid.take().unwrap_or_default();
         self.image_revision = self.image_revision.wrapping_add(1);
     }
+
+    /// RIS — Reset to Initial State (`ESC c`). A hard reset: return to
+    /// the primary screen, home the cursor, reset the pen/SGR, reset the
+    /// scroll region to the full screen, restore relevant private modes
+    /// to their power-on defaults, clear the screen *and* scrollback, and
+    /// (the kitty hard requirement) clear all image placements. RIS
+    /// clears what's *on screen*, matching kitty, which drops placements.
+    fn ris(&mut self) {
+        // Leave the alt screen first so the reset lands on the primary
+        // grid the user will see.
+        if self.alt_active {
+            self.exit_alt_screen();
+        }
+        // Fresh primary + alt grids: cleanest way to wipe both the
+        // visible region and the entire scrollback ring.
+        let primary_cap = self.rows as usize + self.scrollback as usize;
+        self.primary = Grid::new(self.rows, self.cols, primary_cap);
+        self.alt = Grid::new(self.rows, self.cols, self.rows as usize);
+        // Cursor home + default pen.
+        self.cursor = Cursor::default();
+        self.saved_cursor = Cursor::default();
+        self.decsc_saved = None;
+        self.cursor_underline_color = None;
+        self.current_hyperlink = None;
+        // Scroll region back to the full screen.
+        self.scroll_top = 0;
+        self.scroll_bot = self.rows.saturating_sub(1);
+        // Private modes back to power-on defaults.
+        self.cursor_visible = true;
+        self.bracketed_paste = false;
+        self.report_focus = false;
+        self.mouse_mode = MouseMode::default();
+        self.grapheme_cluster_mode = false;
+        self.inband_resize_mode = false;
+        self.kitty_keyboard_stack.clear();
+        self.modify_other_keys = 0;
+        // Snap the viewport back to the live bottom.
+        self.viewport = crate::viewport::Viewport::new();
+        // Clear any in-progress placeholder run.
+        self.placeholder_run = None;
+        // Clear image placements (kitty hard requirement for RIS).
+        self.image_grid.clear();
+        self.image_revision = self.image_revision.wrapping_add(1);
+        // Drop any selection and re-shape everything.
+        self.selection = None;
+        self.damage.resize(self.rows);
+        self.mark_all_dirty();
+    }
 }
 
 fn first_param(params: &Params, default: u16) -> u16 {
@@ -2904,6 +3009,8 @@ impl Perform for Term {
             return;
         }
         match byte {
+            // RIS (`ESC c`) — Reset to Initial State. Full hard reset.
+            b'c' => self.ris(),
             // RI (Reverse Index) — symmetric to LF: cursor up one row,
             // scroll down at the top of the scroll region.
             b'M' => self.reverse_index(),
@@ -7588,5 +7695,210 @@ mod major_delete_tests {
             t.image_registry().contains(1),
             "bytes kept while another placement survives"
         );
+    }
+}
+
+/// Spec-compliance coverage for M7 (RIS), M8 (CSI S/T scroll), M9
+/// (resize clips placements), and M15 (IL/DL shift images). Self-contained
+/// helpers so this module doesn't depend on the older `mod tests`.
+#[cfg(test)]
+mod major_screen_tests {
+    use super::*;
+    use toastty_parser::Parser;
+
+    fn feed(t: &mut Term, bytes: &[u8]) {
+        let mut p = Parser::new();
+        p.advance(t, bytes);
+    }
+
+    /// Base64 of a 1x1 red RGBA pixel.
+    fn b64_red_1x1() -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .encode([255u8, 0, 0, 255])
+            .into_bytes()
+    }
+
+    /// Place a 1-column, `rows`-row image (id `i`) at the current cursor
+    /// using `a=T`.
+    fn place_image(t: &mut Term, id: u32, rows: u16) {
+        let mut payload = Vec::new();
+        let hdr = format!("\x1b_Ga=T,f=32,s=1,v=1,i={id},c=1,r={rows};");
+        payload.extend_from_slice(hdr.as_bytes());
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(t, &payload);
+    }
+
+    fn first_row_range(t: &Term) -> std::ops::Range<u16> {
+        t.image_grid().iter().next().unwrap().row_range.clone()
+    }
+
+    // ---- M7: RIS ---------------------------------------------------
+
+    #[test]
+    fn ris_clears_images_text_and_homes_cursor() {
+        let mut t = Term::new(8, 8, 16);
+        place_image(&mut t, 1, 2);
+        feed(&mut t, b"hello world");
+        assert_eq!(t.image_grid().len(), 1);
+        assert_ne!(t.cursor().row, 0);
+        let rev_before = t.image_revision();
+
+        feed(&mut t, b"\x1bc");
+
+        assert!(t.image_grid().is_empty(), "RIS must clear image_grid");
+        assert!(t.image_revision() != rev_before, "image_revision must bump");
+        assert_eq!(t.cursor().row, 0);
+        assert_eq!(t.cursor().col, 0);
+        assert_eq!(t.cursor().style, Style::RESET);
+        let row0 = t.view_row(0);
+        assert!(
+            row0.cells.iter().all(|c| c.ch == ' '),
+            "RIS must clear the screen"
+        );
+        assert_eq!(t.scroll_top, 0);
+        assert_eq!(t.scroll_bot, t.rows - 1);
+    }
+
+    #[test]
+    fn ris_resets_scroll_region_and_modes() {
+        let mut t = Term::new(8, 8, 0);
+        feed(&mut t, b"\x1b[3;6r"); // DECSTBM 3..6
+        feed(&mut t, b"\x1b[?2004h"); // bracketed paste on
+        feed(&mut t, b"\x1b[?25l"); // hide cursor
+        feed(&mut t, b"\x1bc");
+        assert_eq!(t.scroll_top, 0);
+        assert_eq!(t.scroll_bot, 7);
+        assert!(!t.bracketed_paste);
+        assert!(t.cursor_visible);
+    }
+
+    // ---- M8: CSI S (SU) / CSI T (SD) -------------------------------
+
+    #[test]
+    fn su_scrolls_text_and_images_up() {
+        let mut t = Term::new(8, 8, 0);
+        feed(&mut t, b"\x1b[4;1H");
+        place_image(&mut t, 1, 2); // rows 3..5
+        feed(&mut t, b"\x1b[6;1HMARK");
+        assert_eq!(first_row_range(&t), 3..5);
+
+        feed(&mut t, b"\x1b[2S"); // SU 2
+
+        assert_eq!(first_row_range(&t), 1..3, "SU must shift placement up by 2");
+        let row3: String = t.view_row(3).cells.iter().map(|c| c.ch).collect();
+        assert!(row3.starts_with("MARK"), "SU must scroll text up; row3={row3:?}");
+    }
+
+    #[test]
+    fn sd_scrolls_text_and_images_down() {
+        let mut t = Term::new(8, 8, 0);
+        feed(&mut t, b"\x1b[2;1H");
+        place_image(&mut t, 1, 2); // rows 1..3
+        feed(&mut t, b"\x1b[1;1HTOP");
+        assert_eq!(first_row_range(&t), 1..3);
+
+        feed(&mut t, b"\x1b[2T"); // SD 2
+
+        assert_eq!(first_row_range(&t), 3..5, "SD must shift placement down by 2");
+        let row2: String = t.view_row(2).cells.iter().map(|c| c.ch).collect();
+        assert!(row2.starts_with("TOP"), "SD must scroll text down; row2={row2:?}");
+    }
+
+    #[test]
+    fn xtsmgraphics_is_not_treated_as_su() {
+        let mut t = Term::new(8, 8, 0);
+        feed(&mut t, b"\x1b[2;1H");
+        place_image(&mut t, 1, 2); // rows 1..3
+        let before = first_row_range(&t);
+        feed(&mut t, b"\x1b[?2;1;0S"); // XTSMGRAPHICS — must NOT scroll
+        assert_eq!(
+            first_row_range(&t),
+            before,
+            "CSI ? ... S (XTSMGRAPHICS) must not scroll"
+        );
+    }
+
+    #[test]
+    fn five_param_t_is_not_treated_as_sd() {
+        let mut t = Term::new(8, 8, 0);
+        feed(&mut t, b"\x1b[2;1H");
+        place_image(&mut t, 1, 2); // rows 1..3
+        let before = first_row_range(&t);
+        feed(&mut t, b"\x1b[1;2;3;4;5T"); // highlight mouse — must NOT scroll
+        assert_eq!(
+            first_row_range(&t),
+            before,
+            "5-param CSI T (highlight mouse) must not scroll"
+        );
+    }
+
+    // ---- M9: resize clips placements -------------------------------
+
+    #[test]
+    fn resize_drops_placement_past_new_bottom() {
+        let mut t = Term::new(20, 8, 0);
+        feed(&mut t, b"\x1b[18;1H");
+        place_image(&mut t, 1, 2); // rows 17..19
+        assert_eq!(first_row_range(&t), 17..19);
+        let rev_before = t.image_revision();
+
+        t.resize(5, 8); // start 17 >= 5 → dropped
+
+        assert!(
+            t.image_grid().iter().all(|p| p.row_range.start < 5),
+            "no placement may start past the new bottom"
+        );
+        assert!(t.image_grid().is_empty(), "out-of-bounds placement dropped");
+        assert_ne!(t.image_revision(), rev_before, "image_revision must bump");
+    }
+
+    #[test]
+    fn resize_clips_straddling_placement_preserving_pix_offset() {
+        let mut t = Term::new(20, 8, 0);
+        feed(&mut t, b"\x1b[4;1H");
+        // Place via a=T with a Y pixel offset so we can assert it survives.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=1,r=4,Y=7;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        assert_eq!(first_row_range(&t), 3..7);
+        let pix_before = t.image_grid().iter().next().unwrap().pix_offset;
+
+        t.resize(5, 8); // start 3 < 5 stays; end clipped to 5
+
+        assert_eq!(first_row_range(&t), 3..5, "straddling placement clipped");
+        let pix_after = t.image_grid().iter().next().unwrap().pix_offset;
+        assert_eq!(pix_before, pix_after, "clip_to must preserve pix_offset");
+    }
+
+    // ---- M15: IL / DL shift images ---------------------------------
+
+    #[test]
+    fn il_shifts_images_down() {
+        let mut t = Term::new(10, 8, 0);
+        feed(&mut t, b"\x1b[5;1H");
+        place_image(&mut t, 1, 2); // rows 4..6
+        assert_eq!(first_row_range(&t), 4..6);
+        feed(&mut t, b"\x1b[3;1H"); // cursor row 2
+        let rev_before = t.image_revision();
+        feed(&mut t, b"\x1b[2L"); // IL 2
+        assert_eq!(first_row_range(&t), 6..8, "IL must shift placement down by 2");
+        assert_ne!(t.image_revision(), rev_before);
+    }
+
+    #[test]
+    fn dl_shifts_images_up() {
+        let mut t = Term::new(10, 8, 0);
+        feed(&mut t, b"\x1b[5;1H");
+        place_image(&mut t, 1, 2); // rows 4..6
+        assert_eq!(first_row_range(&t), 4..6);
+        feed(&mut t, b"\x1b[3;1H"); // cursor row 2
+        let rev_before = t.image_revision();
+        feed(&mut t, b"\x1b[2M"); // DL 2
+        assert_eq!(first_row_range(&t), 2..4, "DL must shift placement up by 2");
+        assert_ne!(t.image_revision(), rev_before);
     }
 }
