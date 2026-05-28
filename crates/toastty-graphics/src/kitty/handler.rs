@@ -580,9 +580,13 @@ fn reply_ok_if_verbose<S: KittySink>(header: &Header, sink: &mut S) {
 }
 
 fn reply_ok_if_verbose_with_id<S: KittySink>(header: &Header, sink: &mut S, image_id: u32) {
-    if matches!(header.quiet, Quiet::Verbose) {
-        sink.queue_reply(&encode_ok(image_id, header.image_number));
+    if !matches!(header.quiet, Quiet::Verbose) {
+        return;
     }
+    if !client_wants_reply(header) {
+        return;
+    }
+    sink.queue_reply(&encode_ok(image_id, header.image_number));
 }
 
 fn reply_error_if_verbose<S: KittySink>(
@@ -594,12 +598,30 @@ fn reply_error_if_verbose<S: KittySink>(
     if matches!(header.quiet, Quiet::Silent) {
         return;
     }
+    if !client_wants_reply(header) {
+        return;
+    }
     sink.queue_reply(&encode_error(
         header.image_id,
         header.image_number,
         code,
         detail,
     ));
+}
+
+/// True iff the client gave us something to echo back in the reply.
+///
+/// Mirrors reference kitty (`graphics.c` `finish_command_response`,
+/// gated on `g->id || g->image_number`): if the client provided
+/// neither `i=` nor `I=`, they have no identifier to correlate a
+/// reply with, so we don't send one. Beyond the spec angle, this
+/// prevents the APC reply leaking into the shell when the upstream
+/// client exits without draining its replies (bannerfetch and other
+/// fire-and-forget tools) — bash's readline treats the `ESC _`
+/// prefix as `M-_` (yank-last-arg) and the rest of the reply lands
+/// on the prompt as literal text.
+fn client_wants_reply(header: &Header) -> bool {
+    header.image_id != 0 || header.image_number != 0
 }
 
 #[cfg(test)]
@@ -823,6 +845,86 @@ mod tests {
         assert_eq!(h.pending_uploads(), 0, "pending state must drain");
     }
 
+    /// Reply policy: a fully anonymous successful upload (no `i=`, no
+    /// `I=`) gets no acknowledgement. This matches reference kitty's
+    /// `graphics.c` gate (`if (g->id || g->image_number)`) and stops
+    /// the OK reply from leaking into the shell when the client exits
+    /// without draining stdin — bash's readline reads the `ESC _`
+    /// prefix as `M-_` (yank-last-arg) and the rest of the reply
+    /// lands on the prompt as literal text.
+    #[test]
+    fn anonymous_successful_upload_emits_no_reply() {
+        use base64::Engine;
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        let rgb = vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255];
+        let body = base64::engine::general_purpose::STANDARD.encode(&rgb);
+        let half = body.len() / 2;
+        let (a, b) = body.split_at(half);
+
+        h.process(b"Gf=24,s=2,v=2,c=2,r=2,a=T,m=1", a.as_bytes(), &mut sink).unwrap();
+        h.process(b"Gm=0", b.as_bytes(), &mut sink).unwrap();
+
+        assert_eq!(sink.registered.len(), 1, "image must still register");
+        assert!(
+            sink.replies.is_empty(),
+            "anonymous upload must not reply, got {:?}",
+            sink.replies
+                .iter()
+                .map(|r| String::from_utf8_lossy(r).into_owned())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn anonymous_failed_upload_emits_no_reply() {
+        // Errors are suppressed under the same gate — the client has
+        // no identifier to correlate the failure against. Trigger a
+        // bad-base64 error to exercise the error path.
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        h.process(b"Ga=t,f=32,s=1,v=1", b"!!!", &mut sink).unwrap();
+        assert!(
+            sink.replies.is_empty(),
+            "anonymous error path must not reply, got {:?}",
+            sink.replies
+        );
+    }
+
+    #[test]
+    fn upload_with_explicit_id_still_replies_ok() {
+        // Sanity: the new gate must not regress the i=N case. yazi,
+        // helix, btop etc. all rely on the `OK` reply being delivered.
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        h.process(b"Ga=t,f=32,s=1,v=1,i=7", b64_red_pixel().as_bytes(), &mut sink).unwrap();
+        let joined: String = sink
+            .replies
+            .iter()
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .collect();
+        assert!(joined.contains("i=7"), "must echo client id, got {joined:?}");
+        assert!(joined.contains(";OK"), "must reply OK, got {joined:?}");
+    }
+
+    #[test]
+    fn upload_with_image_number_only_replies_with_assigned_id() {
+        // Per spec, when the client passes `I=M`, the terminal must
+        // include the newly-assigned `i=` alongside `I=M` in the
+        // reply. The new gate must still let this through.
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        h.process(b"Ga=t,f=32,s=1,v=1,I=11", b64_red_pixel().as_bytes(), &mut sink).unwrap();
+        let joined: String = sink
+            .replies
+            .iter()
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .collect();
+        assert!(joined.contains("I=11"), "must echo I=, got {joined:?}");
+        assert!(joined.contains("i="), "must include assigned i=, got {joined:?}");
+        assert!(joined.contains(";OK"), "must reply OK, got {joined:?}");
+    }
+
     #[test]
     fn chunked_header_mismatch_is_einval() {
         let mut h = KittyHandler::new();
@@ -885,10 +987,34 @@ mod tests {
     }
 
     #[test]
-    fn place_without_id_is_einval() {
+    fn place_without_id_is_silently_dropped() {
+        // `a=p` with neither `i=` nor `I=` is malformed, but per kitty
+        // reference behaviour we have nothing to attach a reply to:
+        // the client gave us no identifier to correlate a reply
+        // against. The placement is dropped (no `sink.place_image`
+        // call) and we emit nothing on the wire.
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
         h.process(b"Ga=p", b"", &mut sink).unwrap();
+        assert!(
+            sink.placements.is_empty(),
+            "malformed place must not produce a placement"
+        );
+        assert!(
+            sink.replies.is_empty(),
+            "anonymous a=p must not emit a reply: {:?}",
+            sink.replies
+        );
+    }
+
+    #[test]
+    fn place_without_id_but_with_image_number_still_replies_einval() {
+        // Sanity: when the client did give us an identifier (`I=`),
+        // the reply suppression doesn't apply — they get to know
+        // their place command was rejected.
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        h.process(b"Ga=p,I=9", b"", &mut sink).unwrap();
         assert!(sink.replies.iter().any(|r| {
             std::str::from_utf8(r).is_ok_and(|s| s.contains("EINVAL"))
         }));
