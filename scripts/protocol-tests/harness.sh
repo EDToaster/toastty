@@ -217,29 +217,41 @@ while true; do
     to_menu=0
     while true; do
         show_case "$idx"
-        IFS= read -r -s -n 1 key || key="q"
-        case "$key" in
-            n|N|' '|'')
-                ((idx < total - 1)) && idx=$((idx + 1))
-                ;;
-            p|P|b|B)
-                ((idx > 0)) && idx=$((idx - 1))
-                ;;
-            r|R)
-                : # redraw current page
-                ;;
-            m|M)
-                to_menu=1
-                break
-                ;;
-            q|Q)
-                exit 0
-                ;;
-            $'\e')
-                # Drop any remaining bytes from an arrow / escape sequence.
-                IFS= read -r -s -t 0.05 -n 2 _ || true
-                ;;
-        esac
+        # Inner key loop: ONLY navigation keys break out to trigger a
+        # re-render. Stray bytes — leftover DSR/CSI query replies (e.g. the
+        # cell-size or cursor-position responses) — are drained and ignored
+        # WITHOUT breaking, so they can't cause a re-render that would
+        # re-issue those queries and spin forever.
+        while true; do
+            IFS= read -r -s -n 1 key || key="q"
+            case "$key" in
+                n|N|' '|'')
+                    ((idx < total - 1)) && idx=$((idx + 1))
+                    break
+                    ;;
+                p|P|b|B)
+                    ((idx > 0)) && idx=$((idx - 1))
+                    break
+                    ;;
+                r|R)
+                    break # redraw current page
+                    ;;
+                m|M)
+                    to_menu=1
+                    break
+                    ;;
+                q|Q)
+                    exit 0
+                    ;;
+                $'\e')
+                    # Drain the rest of an escape/CSI/DSR sequence and ignore.
+                    while IFS= read -r -s -t 0.05 -n 1 _; do :; done
+                    ;;
+                *)
+                    : # unknown / stray reply byte — ignore, keep reading
+                    ;;
+            esac
+        done
+        ((to_menu)) && break
     done
-    ((to_menu)) && continue
 done
