@@ -1793,7 +1793,12 @@ mod major_medium_tests {
     }
 
     impl KittySink for MockSink {
-        fn register_image(&mut self, id_request: u32, data: ImageData) -> Option<u32> {
+        fn register_image(
+            &mut self,
+            id_request: u32,
+            _image_number: u32,
+            data: ImageData,
+        ) -> Option<u32> {
             let id = if id_request == 0 { 1 } else { id_request };
             self.registered.push((id, data));
             Some(id)
