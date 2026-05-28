@@ -154,6 +154,51 @@ fn cursor_bar_thickness(cell_w: f32) -> f32 {
     scaled.clamp(2.0, 3.0)
 }
 
+/// Pixel-space cursor rect `[x_min, y_min, x_max, y_max]` for `term`.
+///
+/// Built from the same position math as the cursor instance appended by
+/// [`build_instances_into`] / [`build_dirty_instances_into`], so the
+/// shader's per-pixel "am I inside the cursor?" check agrees with the
+/// cursor block actually painted in the bg pass.
+///
+/// The renderer plumbs this into the `Globals` UBO so the glyph pass can
+/// invert the glyph color where it overlaps the cursor. When the cursor
+/// is hidden the renderer passes an all-zero rect (degenerate) — the
+/// shader's strict-inside test then never matches.
+#[must_use]
+pub fn cursor_pixel_rect(term: &Term, cell_size: (f32, f32)) -> [f32; 4] {
+    let (rows, cols) = term.size();
+    let cell_w = cell_size.0;
+    let cell_h = cell_size.1;
+    let view_pixel = term.view_offset_pixel();
+    let pixel_extra: u16 = if view_pixel > 0.0 { 1 } else { 0 };
+    let y_translate: f32 = if pixel_extra > 0 {
+        view_pixel - cell_h
+    } else {
+        0.0
+    };
+    let cur = term.cursor();
+    let cur_col = u16::min(cur.col, cols.saturating_sub(1));
+    let cur_row = u16::min(cur.row, rows.saturating_sub(1));
+    let cell_pos = [
+        f32::from(cur_col) * cell_w,
+        f32::from(cur_row) * cell_h + y_translate,
+    ];
+    let (pos, size) = match term.cursor_shape() {
+        CursorShape::Block => (cell_pos, [cell_w, cell_h]),
+        CursorShape::Bar => {
+            let thickness = cursor_bar_thickness(cell_w);
+            (cell_pos, [thickness, cell_h])
+        }
+        CursorShape::Underline => {
+            let thickness = cursor_bar_thickness(cell_w);
+            let y = cell_pos[1] + cell_h - thickness;
+            ([cell_pos[0], y], [cell_w, thickness])
+        }
+    };
+    [pos[0], pos[1], pos[0] + size[0], pos[1] + size[1]]
+}
+
 /// A glyph located in the atlas, ready to plug into a `CellInstance`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GlyphSlot {

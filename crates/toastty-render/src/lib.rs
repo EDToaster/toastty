@@ -1412,6 +1412,16 @@ impl Renderer {
                 label: Some("toastty-render encoder (term)"),
             });
 
+        // Cursor rect + color travel via the Globals UBO so the glyph
+        // fragment shader can recolor any glyph pixel that overlaps the
+        // cursor block. When the cursor is hidden we pass an all-zero
+        // rect (degenerate) so the shader's strict-inside test never
+        // matches — the glyph keeps its normal fg.
+        let cursor_rect = if cursor_visible {
+            crate::text::instance::cursor_pixel_rect(term, cell_size)
+        } else {
+            [0.0; 4]
+        };
         #[allow(clippy::cast_precision_loss)] // viewport/atlas sizes fit comfortably in 24 bits.
         let globals = GlobalsUbo {
             viewport_and_atlas: [
@@ -1420,6 +1430,8 @@ impl Renderer {
                 atlas_dims.0 as f32,
                 atlas_dims.1 as f32,
             ],
+            cursor_rect,
+            cursor_color: self.theme.cursor,
         };
 
         // damage.all is the M8 corrective-flush path: cascade it into

@@ -190,6 +190,8 @@ pub(crate) fn render_term_offscreen(term: &Term, width: u32, height: u32) -> Rgb
                 atlas_dims.0 as f32,
                 atlas_dims.1 as f32,
             ],
+            cursor_rect: toastty_render::text::instance::cursor_pixel_rect(term, cell_size),
+            cursor_color: theme.cursor,
         };
 
         text_pipeline.upload(&device, &queue, globals, &instances);

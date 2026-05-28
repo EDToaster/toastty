@@ -25,6 +25,14 @@ use crate::text::instance::CellInstance;
 pub struct GlobalsUbo {
     /// `[viewport_width_px, viewport_height_px, atlas_width_px, atlas_height_px]`.
     pub viewport_and_atlas: [f32; 4],
+    /// Pixel-space cursor bounds `[x_min, y_min, x_max, y_max]`. Set to
+    /// all-zeros (degenerate rect) when the cursor is hidden — the shader
+    /// uses a strict-inside test so a zero-area rect never matches.
+    pub cursor_rect: [f32; 4],
+    /// Linear-light cursor color. The glyph pass outputs `1 - cursor_color`
+    /// for any glyph pixel inside `cursor_rect`, so a glyph at the cursor
+    /// cell remains legible no matter what its original fg was.
+    pub cursor_color: [f32; 4],
 }
 
 /// The text/cell pipeline plus its bind-group skeleton.

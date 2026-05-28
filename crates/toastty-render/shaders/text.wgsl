@@ -24,6 +24,16 @@
 struct Globals {
     // (viewport_width_px, viewport_height_px, atlas_width_px, atlas_height_px)
     viewport_and_atlas: vec4<f32>,
+    // Pixel-space cursor bounds (x_min, y_min, x_max, y_max). Degenerate
+    // (x_min == x_max or y_min == y_max) when the cursor is hidden, so the
+    // `in_cursor` test below never matches and the glyph pass keeps its
+    // normal foreground color.
+    cursor_rect: vec4<f32>,
+    // Linear-light cursor color. The glyph pass picks a black-or-white
+    // contrast color from this (Rec. 709 luminance) for any glyph pixel
+    // inside `cursor_rect`, so the glyph stays maximally legible
+    // against the cursor block.
+    cursor_color: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -103,14 +113,18 @@ fn vs_main(
     return out;
 }
 
-// Background pass. Paints only cell-sized bg quads (FLAG_NO_GLYPH
-// instances that aren't cursors or underline strips). Output is
+// Background pass. Paints cell bgs AND the cursor block. Output is
 // straight-alpha; the pipeline uses SrcAlpha/OneMinusSrcAlpha blend.
+//
+// The cursor moved to the bg pass so glyphs render *over* the cursor
+// instead of being obscured by it. The glyph pass then inverts the
+// glyph color where it overlaps `cursor_rect`, keeping the glyph
+// visible against the cursor.
 @fragment
 fn fs_bg(in: VsOut) -> @location(0) vec4<f32> {
-    // Cursor + underline are foreground decorations — they render in
-    // the glyph pass at z=0.5 so 3D can occlude them.
-    if ((in.flags & (FLAG_CURSOR | FLAG_UNDERLINE)) != 0u) {
+    // Underline is still a foreground decoration — it renders in the
+    // glyph pass at z=0.5 so 3D can occlude it.
+    if ((in.flags & FLAG_UNDERLINE) != 0u) {
         discard;
     }
     // Glyph-shaped instances would only paint a glyph-sized rect, not
@@ -119,17 +133,44 @@ fn fs_bg(in: VsOut) -> @location(0) vec4<f32> {
     if (in.has_glyph >= 0.5) {
         discard;
     }
+    // For both ordinary cell bg quads and the cursor instance, the
+    // color we want to paint is in `bg` (cursor color for the cursor
+    // instance — see CellInstance::cursor_for_shape).
     return in.bg;
 }
 
-// Glyph pass. Paints glyphs, cursor blocks, and underline strips. Output
-// is premultiplied alpha; the pipeline uses One/OneMinusSrcAlpha blend.
+// Test whether the current framebuffer pixel is inside the cursor's
+// pixel-space rect. Degenerate rects (zero size) never match, which is
+// the contract used when the cursor is hidden.
+fn pixel_in_cursor(px: vec2<f32>) -> bool {
+    let r = globals.cursor_rect;
+    return px.x >= r.x && px.x < r.z && px.y >= r.y && px.y < r.w;
+}
+
+// Maximum-contrast foreground for a glyph sitting on the cursor block:
+// pick black or white based on the cursor's perceived luminance. Naive
+// `1 - cursor_color` looks dim because mid-tone cursors invert to other
+// mid-tones; this gives clean visibility for any cursor color.
+//
+// Uses Rec. 709 luminance weights against the linear-light cursor color
+// (the cursor color in `globals` is already linear). The 0.5 threshold
+// is in linear-light space, which biases slightly toward "use black" —
+// good for the common warm/bright cursor case.
+fn cursor_contrast_color() -> vec3<f32> {
+    let c = globals.cursor_color.rgb;
+    let lum = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    return select(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(0.0, 0.0, 0.0), lum > 0.5);
+}
+
+// Glyph pass. Paints glyphs and underline strips. The cursor block is
+// rendered in the bg pass; here we only invert the glyph color where it
+// overlaps the cursor so the glyph stays legible. Output is
+// premultiplied alpha; the pipeline uses One/OneMinusSrcAlpha blend.
 @fragment
 fn fs_glyph(in: VsOut) -> @location(0) vec4<f32> {
-    // Cursor: solid block. The cursor color lives in `bg` (see
-    // CellInstance::cursor_for_shape). Emit premultiplied.
+    // Cursor block already painted in the bg pass — drop it here.
     if ((in.flags & FLAG_CURSOR) != 0u) {
-        return vec4<f32>(in.bg.rgb * in.bg.a, in.bg.a);
+        discard;
     }
 
     // Underline strip: SGR underline / OSC 8 hyperlink. The color is
@@ -144,10 +185,23 @@ fn fs_glyph(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
 
+    // If this fragment lands inside the cursor rect, recolor the glyph
+    // to a luminance-based black or white so it always contrasts
+    // strongly against the cursor block underneath. Applies to both
+    // mono and color glyphs.
+    let on_cursor = pixel_in_cursor(in.clip.xy);
+    let contrast_rgb = cursor_contrast_color();
+
     let is_color = (in.flags & FLAG_COLOR_GLYPH) != 0u;
     if (is_color) {
         // Color atlas is already premultiplied.
-        return textureSampleLevel(color_atlas, atlas_sampler, in.uv, 0.0);
+        let sampled = textureSampleLevel(color_atlas, atlas_sampler, in.uv, 0.0);
+        if (on_cursor) {
+            // Preserve the emoji silhouette via `sampled.a`, but recolor
+            // to the contrast color so it stays readable.
+            return vec4<f32>(contrast_rgb * sampled.a, sampled.a);
+        }
+        return sampled;
     }
 
     // Monochrome glyph: mask in R channel, modulated by fg color.
@@ -155,5 +209,6 @@ fn fs_glyph(in: VsOut) -> @location(0) vec4<f32> {
     // pass / RGP pass laid down.
     let mask = textureSampleLevel(mask_atlas, atlas_sampler, in.uv, 0.0).r;
     let a = mask * in.fg.a;
-    return vec4<f32>(in.fg.rgb * a, a);
+    let rgb = select(in.fg.rgb, contrast_rgb, on_cursor);
+    return vec4<f32>(rgb * a, a);
 }

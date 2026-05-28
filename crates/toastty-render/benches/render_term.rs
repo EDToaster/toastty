@@ -209,6 +209,8 @@ impl Harness {
                 atlas_dims.0 as f32,
                 atlas_dims.1 as f32,
             ],
+            cursor_rect: toastty_render::text::instance::cursor_pixel_rect(term, cell_size),
+            cursor_color: theme.cursor,
         };
 
         {
@@ -353,6 +355,8 @@ impl Harness {
                 atlas_dims.0 as f32,
                 atlas_dims.1 as f32,
             ],
+            cursor_rect: toastty_render::text::instance::cursor_pixel_rect(term, cell_size),
+            cursor_color: theme.cursor,
         };
         {
             let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
