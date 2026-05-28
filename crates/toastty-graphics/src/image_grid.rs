@@ -37,6 +37,15 @@ pub struct Placement {
     /// Z order. `z >= 0` renders above text; `z < 0` renders below.
     /// Ties broken by insertion order.
     pub z: i32,
+    /// M3: intra-cell pixel offset `(x, y)` within the FIRST cell at
+    /// which to start displaying the image. Kitty's `X=` / `Y=` keys:
+    /// "the x/y offset within the first cell at which to start
+    /// displaying the image" (must be smaller than the cell size). This
+    /// is a sub-cell pixel shift applied at render time on top of the
+    /// cell-aligned position derived from `col_range` / `row_range`. It
+    /// does NOT change which cells the placement occupies. Defaults to
+    /// `(0, 0)`.
+    pub pix_offset: (u32, u32),
 }
 
 /// Pixel rectangle on the source image, in image pixels.
@@ -359,6 +368,7 @@ mod tests {
             col_range: cols,
             src_rect: SrcRect::FULL,
             z,
+            pix_offset: (0, 0),
         }
     }
 

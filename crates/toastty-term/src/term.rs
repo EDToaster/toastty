@@ -1849,6 +1849,7 @@ impl Term {
                     h: sh,
                 },
                 z: 0,
+                pix_offset: (0, 0),
             });
         }
         if placements.is_empty() {
@@ -3311,6 +3312,22 @@ impl KittySink for Term {
         if placement.col_range.end > self.cols {
             placement.col_range.end = self.cols;
         }
+        // M5: re-emitting the same `(image_id, placement_id)` must
+        // REPLACE the prior placement, not stack on top of it. Per spec:
+        // "If you send two placements with the same image id and
+        // placement id the second one will replace the first." Only
+        // applies when BOTH ids are non-zero (a named placement);
+        // unnamed (`p=0`) placements always accumulate.
+        if placement.image_id != 0 && placement.placement_id != 0 {
+            let img = placement.image_id;
+            let pid = placement.placement_id;
+            for old in self
+                .image_grid
+                .remove_where(|p| p.image_id == img && p.placement_id == pid)
+            {
+                mark_placement_dirty(self, &old);
+            }
+        }
         // Mark dirty BEFORE consuming `placement` into the grid.
         mark_placement_dirty(self, &placement);
         self.image_grid.add(placement);
@@ -3450,26 +3467,33 @@ impl KittySink for Term {
             .saturating_sub(used_buf)
     }
 
-    fn advance_cursor_after_placement(&mut self, rows: u16, _cols: u16, start_col: u16) {
-        // Kitty spec: after T, the cursor moves to (start_row + rows,
-        // start_col) — i.e. the cell directly below the image's
-        // bottom-left. `place_image` already scrolled the screen when
-        // the image didn't fit below the cursor, so we don't issue
-        // additional linefeeds here — each linefeed at the bottom
-        // calls `image_grid.shift_rows_up`, which would shift the
-        // image we just placed UP by one cell per linefeed. With
-        // `row_span` linefeeds the image would shrink to a one-row
-        // band at the top (the M11a "1 cell tall" regression).
+    fn advance_cursor_after_placement(&mut self, rows: u16, cols: u16, start_col: u16) {
+        // Kitty spec / reference C impl: after a cursor-moving
+        // placement, `c->x += cols; c->y += rows - 1;` — the cursor
+        // lands on the image's LAST row, one column past its right
+        // edge:
+        //   row = start_row + (rows - 1)
+        //   col = start_col + cols
         //
-        // M11a-followup.N6: cursor.col follows start_col so mid-line
-        // placements don't snap back to column 0.
+        // `place_image` already scrolled the screen when the image
+        // didn't fit below the cursor, so we don't issue additional
+        // linefeeds here — each linefeed at the bottom calls
+        // `image_grid.shift_rows_up`, which would shift the image we
+        // just placed UP by one cell per linefeed. With `row_span`
+        // linefeeds the image would shrink to a one-row band at the top
+        // (the M11a "1 cell tall" regression).
+        //
+        // M1: row advances by `rows - 1` (not `rows`); col advances by
+        // `cols` from `start_col` (the placement's starting column).
         let target_row = self
             .cursor
             .row
-            .saturating_add(rows)
+            .saturating_add(rows.saturating_sub(1))
             .min(self.rows.saturating_sub(1));
         self.cursor.row = target_row;
-        self.cursor.col = start_col.min(self.cols.saturating_sub(1));
+        self.cursor.col = start_col
+            .saturating_add(cols)
+            .min(self.cols.saturating_sub(1));
     }
 
     fn image_exists(&self, id: u32) -> bool {
@@ -5913,36 +5937,38 @@ mod tests {
         // Image placed.
         assert!(t.image_registry().contains(1));
         assert_eq!(t.image_grid().len(), 1);
-        // Cursor advanced by `r=2` rows; column preserved at the
-        // start_col (cursor started at col 0).
+        // M1: after a cursor-moving placement the reference kitty does
+        // `c->x += cols; c->y += rows - 1;`. Cursor started at (0, 0),
+        // c=2,r=2 => row = 0 + (2 - 1) = 1; col = 0 + 2 = 2.
         let cur = t.cursor();
-        assert_eq!(cur.row, 2);
-        assert_eq!(cur.col, 0);
+        assert_eq!(cur.row, 1, "row += rows - 1");
+        assert_eq!(cur.col, 2, "col += cols");
     }
 
     #[test]
     fn apc_kitty_transmit_and_place_lands_cursor_at_start_col() {
-        // M11a-followup.N6: after `a=T`, the cursor must land at
-        // (start_row + r, start_col), NOT (start_row + r, 0). Apps
-        // that place images mid-line (e.g. inline emoji icons inside
-        // a sentence) rely on this.
+        // M1: after `a=T`, the cursor lands at
+        // (start_col + cols, start_row + rows - 1) per reference kitty
+        // (`c->x += cols; c->y += rows - 1;`). Apps that place images
+        // mid-line (e.g. inline emoji icons inside a sentence) rely on
+        // the column advancing from start_col rather than resetting.
         let mut t = Term::new(8, 16, 0);
         // Move the cursor to (row=1, col=5) — 1-based 2;6.
         feed(&mut t, b"\x1b[2;6H");
         assert_eq!(t.cursor().col, 5);
         assert_eq!(t.cursor().row, 1);
-        // Place a 1x1 red pixel as a 1x2 cell placement spanning 2
-        // rows, default C=0 (cursor MOVES after).
+        // Place a 1x1 red pixel as a 1-col x 2-row placement,
+        // default C=0 (cursor MOVES after).
         let mut payload = Vec::new();
         payload.extend_from_slice(b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=1,r=2;");
         payload.extend_from_slice(&b64_red_1x1());
         payload.extend_from_slice(b"\x1b\\");
         feed(&mut t, &payload);
         let cur = t.cursor();
-        // Row advanced by 2 (the r= value).
-        assert_eq!(cur.row, 1 + 2, "cursor row should advance by r=2");
-        // Column preserved at start_col=5 — the M11a-followup.N6 fix.
-        assert_eq!(cur.col, 5, "cursor col must preserve start_col=5, not reset to 0");
+        // Row advanced by rows - 1 = 1: 1 + 1 = 2.
+        assert_eq!(cur.row, 1 + 1, "cursor row should advance by rows - 1");
+        // Column advanced by cols = 1 from start_col=5: 5 + 1 = 6.
+        assert_eq!(cur.col, 5 + 1, "cursor col should advance by cols from start_col");
     }
 
     #[test]
@@ -7030,5 +7056,177 @@ mod blocker_placeholder_tests {
         // Second cell: row=3 from its own diacritic, col=2 inherited+1.
         assert_eq!(ps[1].src_rect.y, 3 * u32::from(cell_ph));
         assert_eq!(ps[1].src_rect.x, 2 * u32::from(cell_pw));
+    }
+}
+
+/// Tests for spec-compliance "Major" fixes M1-M5 in the kitty graphics
+/// placement subsystem:
+///   M1 — cursor end position after `a=T` is `(start_col + cols,
+///        start_row + rows - 1)`.
+///   M2 — standalone `a=p` moves the cursor (unless `C=1`/`U=1`).
+///   M3 — `X=`/`Y=` are intra-cell PIXEL offsets, not cell offsets.
+///   M4 — aspect ratio preserved when only one of `c=`/`r=` is given.
+///   M5 — re-emitting `(image_id, placement_id)` REPLACES, not stacks.
+#[cfg(test)]
+mod major_place_tests {
+    use super::*;
+    use base64::Engine;
+    use toastty_parser::Parser;
+
+    fn feed(t: &mut Term, bytes: &[u8]) {
+        let mut p = Parser::new();
+        p.advance(t, bytes);
+    }
+
+    /// base64 of a single RGBA pixel (red). Used with `s=1,v=1` so the
+    /// transmitted image is 1x1 regardless of the requested cell span.
+    fn b64_red_1x1() -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .encode([255u8, 0, 0, 255])
+            .into_bytes()
+    }
+
+    /// `a=T` transmit-and-place a 1x1 image over `cols`x`rows` cells at
+    /// the current cursor, with optional extra header keys.
+    fn transmit_and_place(t: &mut Term, id: u32, cols: u16, rows: u16, extra: &str) {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(
+            format!("\x1b_Ga=T,f=32,s=1,v=1,i={id},c={cols},r={rows}{extra};").as_bytes(),
+        );
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(t, &payload);
+    }
+
+    // ---- M1: cursor end position after a=T ----
+
+    #[test]
+    fn m1_cursor_lands_on_last_row_one_past_right_edge() {
+        // 40x40 grid so a 4x3 image fits without scrolling.
+        let mut t = Term::new(40, 40, 0);
+        // Park the cursor at a known, non-origin position (row 5, col 7).
+        feed(&mut t, b"\x1b[6;8H");
+        assert_eq!(t.cursor().row, 5);
+        assert_eq!(t.cursor().col, 7);
+
+        // Place a 4-cols x 3-rows image (N=4, M=3).
+        transmit_and_place(&mut t, 1, 4, 3, "");
+
+        // Reference kitty: c->x += cols; c->y += rows - 1.
+        // row: 5 + (3 - 1) = 7 ; col: 7 + 4 = 11.
+        assert_eq!(t.cursor().row, 7, "row += rows - 1");
+        assert_eq!(t.cursor().col, 11, "col += cols (from start_col)");
+    }
+
+    #[test]
+    fn m1_cursor_no_move_with_capital_c() {
+        let mut t = Term::new(40, 40, 0);
+        feed(&mut t, b"\x1b[6;8H");
+        transmit_and_place(&mut t, 1, 4, 3, ",C=1");
+        // C=1 suppresses cursor motion.
+        assert_eq!(t.cursor().row, 5);
+        assert_eq!(t.cursor().col, 7);
+    }
+
+    // ---- M2: standalone a=p moves the cursor ----
+
+    #[test]
+    fn m2_place_moves_cursor_by_cols_and_rows_minus_one() {
+        let mut t = Term::new(40, 40, 0);
+        // First transmit-only (a=t) so the image exists but no placement
+        // and no cursor motion happens yet.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=t,f=32,s=1,v=1,i=7;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        assert_eq!(t.image_grid().len(), 0, "a=t does not place");
+
+        // Move cursor to a known spot, then standalone a=p.
+        feed(&mut t, b"\x1b[6;8H");
+        assert_eq!((t.cursor().row, t.cursor().col), (5, 7));
+        feed(&mut t, b"\x1b_Ga=p,i=7,c=4,r=3\x1b\\");
+
+        assert_eq!(t.image_grid().len(), 1, "a=p places");
+        // Same math as a=T: row += rows-1, col += cols.
+        assert_eq!(t.cursor().row, 7, "a=p row += rows - 1");
+        assert_eq!(t.cursor().col, 11, "a=p col += cols");
+    }
+
+    #[test]
+    fn m2_place_with_capital_c_does_not_move_cursor() {
+        let mut t = Term::new(40, 40, 0);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b_Ga=t,f=32,s=1,v=1,i=7;");
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+
+        feed(&mut t, b"\x1b[6;8H");
+        feed(&mut t, b"\x1b_Ga=p,i=7,c=4,r=3,C=1\x1b\\");
+        assert_eq!(t.image_grid().len(), 1);
+        assert_eq!(t.cursor().row, 5, "C=1 a=p must not move row");
+        assert_eq!(t.cursor().col, 7, "C=1 a=p must not move col");
+    }
+
+    // ---- M3: X=/Y= are intra-cell pixel offsets ----
+
+    #[test]
+    fn m3_xy_are_pixel_offsets_not_cell_offsets() {
+        // Baseline: X=Y=0 placement.
+        let mut t0 = Term::new(40, 40, 0);
+        feed(&mut t0, b"\x1b[3;5H");
+        transmit_and_place(&mut t0, 1, 2, 2, "");
+        let base = t0.image_grid().iter().next().unwrap().clone();
+        assert_eq!(base.pix_offset, (0, 0));
+
+        // Same placement but with X=3, Y=4 (< default cell 8x16).
+        let mut t = Term::new(40, 40, 0);
+        feed(&mut t, b"\x1b[3;5H");
+        transmit_and_place(&mut t, 1, 2, 2, ",X=3,Y=4");
+        let p = t.image_grid().iter().next().unwrap().clone();
+
+        // Pixel offset is recorded as (3, 4).
+        assert_eq!(p.pix_offset, (3, 4), "X/Y stored as intra-cell pixel offset");
+        // Cell ranges are UNCHANGED relative to the X=Y=0 case.
+        assert_eq!(p.col_range, base.col_range, "X must not move the starting cell");
+        assert_eq!(p.row_range, base.row_range, "Y must not move the starting cell");
+    }
+
+    // ---- M5: re-emitting (image_id, placement_id) replaces ----
+
+    #[test]
+    fn m5_reemit_same_id_pair_replaces() {
+        let mut t = Term::new(40, 40, 0);
+        // Place i=1,p=1 at row 2, col 3.
+        feed(&mut t, b"\x1b[3;4H");
+        transmit_and_place(&mut t, 1, 2, 2, ",p=1");
+        assert_eq!(t.image_grid().len(), 1);
+        let first = t.image_grid().iter().next().unwrap().clone();
+        assert_eq!(first.col_range.start, 3);
+        assert_eq!(first.row_range.start, 2);
+
+        // Re-place i=1,p=1 at a DIFFERENT cell (row 6, col 9).
+        feed(&mut t, b"\x1b[7;10H");
+        transmit_and_place(&mut t, 1, 2, 2, ",p=1");
+
+        // Exactly ONE placement, at the new location.
+        assert_eq!(t.image_grid().len(), 1, "re-emit must replace, not stack");
+        let p = t.image_grid().iter().next().unwrap().clone();
+        assert_eq!(p.image_id, 1);
+        assert_eq!(p.placement_id, 1);
+        assert_eq!(p.col_range.start, 9, "new column");
+        assert_eq!(p.row_range.start, 6, "new row");
+    }
+
+    #[test]
+    fn m5_unnamed_placements_still_stack() {
+        // p=0 (unnamed) placements must NOT be deduplicated.
+        let mut t = Term::new(40, 40, 0);
+        feed(&mut t, b"\x1b[3;4H");
+        transmit_and_place(&mut t, 1, 2, 2, "");
+        feed(&mut t, b"\x1b[7;10H");
+        transmit_and_place(&mut t, 1, 2, 2, "");
+        assert_eq!(t.image_grid().len(), 2, "unnamed (p=0) placements accumulate");
     }
 }

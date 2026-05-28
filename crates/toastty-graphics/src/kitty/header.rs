@@ -48,9 +48,17 @@ pub struct Header {
     pub src_w: u32,
     /// `h=` clipped height in source pixels (0 = full).
     pub src_h: u32,
-    /// `X=` X cell offset on the grid (0..cols).
+    /// `X=` intra-cell pixel x-offset within the FIRST cell at which to
+    /// start displaying the image (must be smaller than the cell width).
+    /// This is a sub-cell pixel offset applied at render time — it does
+    /// NOT change which cell the placement starts at (that comes from
+    /// the cursor). Field name kept as `cell_x` for compatibility; the
+    /// semantics are pixels-in-cell (M3).
     pub cell_x: u32,
-    /// `Y=` Y cell offset on the grid (0..rows).
+    /// `Y=` intra-cell pixel y-offset within the FIRST cell at which to
+    /// start displaying the image (must be smaller than the cell
+    /// height). Sub-cell pixel offset applied at render time; does NOT
+    /// change the starting cell (M3).
     pub cell_y: u32,
     /// `c=` width in cells, or 0 to derive from source.
     pub cols: u32,

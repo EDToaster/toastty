@@ -102,8 +102,12 @@ pub fn build_image_instances(
         if cols == 0 || rows == 0 {
             continue;
         }
-        let pos_x = f32::from(placement.col_range.start) * cell_size.0;
-        let pos_y = f32::from(placement.row_range.start) * cell_size.1;
+        // M3: `X=`/`Y=` are intra-cell pixel offsets within the first
+        // cell. Add them on top of the cell-aligned position.
+        let pos_x =
+            f32::from(placement.col_range.start) * cell_size.0 + placement.pix_offset.0 as f32;
+        let pos_y =
+            f32::from(placement.row_range.start) * cell_size.1 + placement.pix_offset.1 as f32;
         let size_x = f32::from(cols) * cell_size.0;
         let size_y = f32::from(rows) * cell_size.1;
         let (uv_min, uv_max) = if placement.src_rect.is_full() {
@@ -170,6 +174,7 @@ mod tests {
             col_range: cols,
             src_rect: SrcRect::FULL,
             z,
+            pix_offset: (0, 0),
         }
     }
 
@@ -290,6 +295,7 @@ mod tests {
                 h: 2,
             },
             z: 0,
+            pix_offset: (0, 0),
         });
         let mut reg = ImageRegistry::new(4096);
         reg.insert(1, red_pixel(4, 4)).unwrap();

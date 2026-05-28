@@ -70,10 +70,12 @@ pub trait KittySink {
     /// motion. Default is a no-op so simple test sinks don't need to
     /// care about cursor state.
     ///
-    /// `start_col` is the column the placement started at — kitty
-    /// spec says the cursor lands at `(start_row + rows, start_col)`,
-    /// NOT at column 0. The handler captures this via
-    /// [`KittySink::cursor_col`] before the placement is consumed.
+    /// `start_col` is the column the placement started at. M1: the
+    /// reference kitty does `c->x += cols; c->y += rows - 1;`, so the
+    /// cursor lands at `(start_col + cols, start_row + rows - 1)` — the
+    /// image's LAST row, one column past its right edge. The handler
+    /// captures `start_col` via [`KittySink::cursor_col`] before the
+    /// placement is consumed.
     fn advance_cursor_after_placement(&mut self, _rows: u16, _cols: u16, _start_col: u16) {}
 
     /// Current cursor column. Consulted by the handler so it can
@@ -459,10 +461,9 @@ impl KittyHandler {
                 default_placement_from_header(&header, final_id, img_w, img_h, cell_pw, cell_ph);
             let rows_span = placement.row_range.end - placement.row_range.start;
             let cols_span = placement.col_range.end - placement.col_range.start;
-            // M11a-followup.N6: capture the cursor's start_col BEFORE
-            // place_image consumes the placement. Kitty spec says the
-            // cursor lands at (start_row + rows, start_col), not at
-            // column 0.
+            // M1: capture the cursor's start_col BEFORE place_image
+            // consumes the placement. The cursor lands at
+            // (start_col + cols, start_row + rows - 1).
             let start_col = sink.cursor_col();
             sink.place_image(placement);
             // Kitty spec: T advances the cursor by the placement size
@@ -496,14 +497,21 @@ impl KittyHandler {
         // pass zeroes so the auto-derive falls back to 1×1 when `c=`/`r=`
         // are unset (preserving the pre-fix behavior for this path).
         let (cell_pw, cell_ph) = sink.cell_pixel_size();
-        sink.place_image(default_placement_from_header(
-            &header,
-            header.image_id,
-            0,
-            0,
-            cell_pw,
-            cell_ph,
-        ));
+        let placement =
+            default_placement_from_header(&header, header.image_id, 0, 0, cell_pw, cell_ph);
+        let rows_span = placement.row_range.end - placement.row_range.start;
+        let cols_span = placement.col_range.end - placement.col_range.start;
+        // M2: capture the start column BEFORE place_image consumes the
+        // placement, so the cursor lands one column past the image's
+        // right edge (start_col + cols).
+        let start_col = sink.cursor_col();
+        sink.place_image(placement);
+        // M2: a standalone `a=p` moves the cursor by `(cols, rows-1)`
+        // just like `a=T`, unless `C=1` (cursor_no_move) or `U=1`
+        // (unicode_placeholder — handled by the early return above).
+        if !header.cursor_no_move {
+            sink.advance_cursor_after_placement(rows_span, cols_span, start_col);
+        }
         reply_ok_if_verbose_with_id(&header, sink, header.image_id);
     }
 
@@ -580,34 +588,59 @@ fn default_placement_from_header(
     // cells. Falling through to 1×1 (the old behavior) made
     // unannotated transmits — e.g. Ratty's widget demo — render as a
     // single cell band.
+    //
+    // M4: when ONLY ONE of `c=`/`r=` is given, the other axis is
+    // derived from the source aspect ratio in PIXEL space, not from the
+    // image's natural cell count. Per spec, the image is scaled to fit
+    // the given axis preserving aspect ratio:
+    //   cols * cell_pw : rows * cell_ph == img_w : img_h
+    // So when only `c=` is set:
+    //   rows = ceil(cols * cell_pw * img_h / (img_w * cell_ph))
+    // and symmetrically when only `r=` is set:
+    //   cols = ceil(rows * cell_ph * img_w / (img_h * cell_pw))
+    // Both-zero keeps the natural-size derivation; both-set is verbatim.
     let cell_pw = u32::from(cell_pw.max(1));
     let cell_ph = u32::from(cell_ph.max(1));
     let derived_cols = (img_w + cell_pw - 1) / cell_pw;
     let derived_rows = (img_h + cell_ph - 1) / cell_ph;
-    let cols = if header.cols == 0 {
-        derived_cols.max(1) as u16
-    } else {
-        header.cols as u16
-    };
-    let rows = if header.rows == 0 {
-        derived_rows.max(1) as u16
-    } else {
-        header.rows as u16
+    let img_w_eff = img_w.max(1);
+    let img_h_eff = img_h.max(1);
+    let (cols, rows) = match (header.cols, header.rows) {
+        // Both set: use verbatim.
+        (c, r) if c != 0 && r != 0 => (c as u16, r as u16),
+        // Only `c=`: derive rows from the source aspect ratio.
+        (c, 0) if c != 0 => {
+            let num = c * cell_pw * img_h_eff;
+            let den = img_w_eff * cell_ph;
+            let r = ((num + den - 1) / den).max(1);
+            (c as u16, r as u16)
+        }
+        // Only `r=`: derive cols from the source aspect ratio.
+        (0, r) if r != 0 => {
+            let num = r * cell_ph * img_w_eff;
+            let den = img_h_eff * cell_pw;
+            let c = ((num + den - 1) / den).max(1);
+            (c as u16, r as u16)
+        }
+        // Neither set: natural cell count.
+        _ => (derived_cols.max(1) as u16, derived_rows.max(1) as u16),
     };
     Placement {
         image_id: id,
         placement_id: header.placement_id,
-        // Host will translate (cell_x, cell_y) + (cols, rows) into
-        // absolute cell ranges based on the current cursor. We carry
-        // the hint here; the sink's adapter applies its policy. For
-        // now we store a relative-style range and let the sink
-        // rebase.
-        row_range: u16::try_from(header.cell_y).unwrap_or(0)
-            ..u16::try_from(header.cell_y).unwrap_or(0).saturating_add(rows),
-        col_range: u16::try_from(header.cell_x).unwrap_or(0)
-            ..u16::try_from(header.cell_x).unwrap_or(0).saturating_add(cols),
+        // The host rebases these ranges against the current cursor (see
+        // `Term::place_image`); we carry only the SPAN here, anchored at
+        // the origin. M3: `X=`/`Y=` are NOT cell offsets — they are
+        // intra-cell pixel offsets, threaded via `pix_offset` below, so
+        // they must NOT shift the cell range.
+        row_range: 0..rows,
+        col_range: 0..cols,
         src_rect: src,
         z: header.z,
+        // M3: `X=` / `Y=` are sub-cell pixel offsets within the first
+        // cell, applied at render time. They do not move the placement's
+        // cells. (Header field names kept as `cell_x`/`cell_y` for now.)
+        pix_offset: (header.cell_x, header.cell_y),
     }
 }
 
@@ -1454,5 +1487,86 @@ mod blocker_graphics_tests {
         );
         assert_eq!(sink.cursor_advances, 0, "a=p,U=1 must not advance cursor");
         assert!(sink.joined_replies().contains(";OK"));
+    }
+}
+
+/// M4: aspect-ratio derivation in `default_placement_from_header` when
+/// only one of `c=` / `r=` is supplied. Also covers the M3 invariant
+/// that `X=`/`Y=` (stored in `cell_x`/`cell_y`) become `pix_offset` and
+/// do NOT shift the placement's cell ranges.
+#[cfg(test)]
+mod major_place_handler_tests {
+    use super::*;
+
+    // ---- M4: only one axis given => derive the other from aspect ----
+
+    #[test]
+    fn m4_only_cols_given_derives_rows_from_aspect() {
+        // 200x100 image, 10x20 cell, c=10.
+        // rows = ceil(c * cell_pw * img_h / (img_w * cell_ph))
+        //      = ceil(10 * 10 * 100 / (200 * 20))
+        //      = ceil(10000 / 4000) = ceil(2.5) = 3.
+        // (NOT the natural-size value ceil(100/20) = 5.)
+        let header = Header {
+            cols: 10,
+            rows: 0,
+            ..Header::default()
+        };
+        let p = default_placement_from_header(&header, 1, 200, 100, 10, 20);
+        assert_eq!(p.col_range, 0..10);
+        assert_eq!(p.row_range, 0..3, "rows derived from aspect, not natural cell count");
+    }
+
+    #[test]
+    fn m4_only_rows_given_derives_cols_from_aspect() {
+        // 200x100 image, 10x20 cell, r=4.
+        // cols = ceil(r * cell_ph * img_w / (img_h * cell_pw))
+        //      = ceil(4 * 20 * 200 / (100 * 10))
+        //      = ceil(16000 / 1000) = 16.
+        let header = Header {
+            cols: 0,
+            rows: 4,
+            ..Header::default()
+        };
+        let p = default_placement_from_header(&header, 1, 200, 100, 10, 20);
+        assert_eq!(p.row_range, 0..4);
+        assert_eq!(p.col_range, 0..16, "cols derived from aspect, not natural cell count");
+    }
+
+    #[test]
+    fn m4_both_zero_uses_natural_cell_count() {
+        // 200x100 image, 10x20 cell: natural = (20 cols, 5 rows).
+        let header = Header::default();
+        let p = default_placement_from_header(&header, 1, 200, 100, 10, 20);
+        assert_eq!(p.col_range, 0..20);
+        assert_eq!(p.row_range, 0..5);
+    }
+
+    #[test]
+    fn m4_both_set_used_verbatim() {
+        let header = Header {
+            cols: 7,
+            rows: 9,
+            ..Header::default()
+        };
+        let p = default_placement_from_header(&header, 1, 200, 100, 10, 20);
+        assert_eq!(p.col_range, 0..7);
+        assert_eq!(p.row_range, 0..9);
+    }
+
+    // ---- M3: X=/Y= map to pix_offset, leave cell ranges alone ----
+
+    #[test]
+    fn m3_xy_become_pixel_offset_not_cell_range() {
+        let base = default_placement_from_header(&Header::default(), 1, 16, 16, 8, 8);
+        let header = Header {
+            cell_x: 3,
+            cell_y: 4,
+            ..Header::default()
+        };
+        let p = default_placement_from_header(&header, 1, 16, 16, 8, 8);
+        assert_eq!(p.pix_offset, (3, 4));
+        assert_eq!(p.col_range, base.col_range, "X must not shift the cell range");
+        assert_eq!(p.row_range, base.row_range, "Y must not shift the cell range");
     }
 }
