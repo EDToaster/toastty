@@ -175,6 +175,8 @@ mod tests {
             src_rect: SrcRect::FULL,
             z,
             pix_offset: (0, 0),
+            parent: None,
+            rel_offset: (0, 0),
         }
     }
 
@@ -296,6 +298,8 @@ mod tests {
             },
             z: 0,
             pix_offset: (0, 0),
+            parent: None,
+            rel_offset: (0, 0),
         });
         let mut reg = ImageRegistry::new(4096);
         reg.insert(1, red_pixel(4, 4)).unwrap();

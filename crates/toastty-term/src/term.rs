@@ -1509,6 +1509,8 @@ impl Term {
             }
             self.mark_all_dirty();
             let dropped = self.image_grid.shift_rows_up(1, 0);
+            // M13: relative-placement children follow their parent.
+            self.image_grid.resolve_relative_positions();
             if !dropped.is_empty() {
                 self.image_revision = self.image_revision.wrapping_add(1);
             }
@@ -1546,6 +1548,7 @@ impl Term {
         let dropped = self
             .image_grid
             .shift_rows_up_within(1, top, bot.saturating_add(1));
+        self.image_grid.resolve_relative_positions();
         if !dropped.is_empty() {
             self.image_revision = self.image_revision.wrapping_add(1);
         }
@@ -1564,6 +1567,7 @@ impl Term {
             }
             self.mark_all_dirty();
             let dropped = self.image_grid.shift_rows_down(1, 0, self.rows);
+            self.image_grid.resolve_relative_positions();
             if !dropped.is_empty() {
                 self.image_revision = self.image_revision.wrapping_add(1);
             }
@@ -1599,6 +1603,7 @@ impl Term {
         let dropped = self
             .image_grid
             .shift_rows_down_within(1, top, bot.saturating_add(1));
+        self.image_grid.resolve_relative_positions();
         if !dropped.is_empty() {
             self.image_revision = self.image_revision.wrapping_add(1);
         }
@@ -1864,6 +1869,8 @@ impl Term {
                 },
                 z: 0,
                 pix_offset: (0, 0),
+                parent: None,
+                rel_offset: (0, 0),
             });
         }
         if placements.is_empty() {
@@ -2454,6 +2461,7 @@ impl Term {
             .any(|p| p.row_range.start >= cur_row && p.row_range.start < region_end);
         self.image_grid
             .shift_rows_down_within(n, cur_row, region_end);
+        self.image_grid.resolve_relative_positions();
         if affected {
             self.image_revision = self.image_revision.wrapping_add(1);
         }
@@ -2506,6 +2514,7 @@ impl Term {
             .iter()
             .any(|p| p.row_range.start >= cur_row && p.row_range.start < region_end);
         self.image_grid.shift_rows_up_within(n, cur_row, region_end);
+        self.image_grid.resolve_relative_positions();
         if affected {
             self.image_revision = self.image_revision.wrapping_add(1);
         }
@@ -3458,6 +3467,9 @@ impl KittySink for Term {
                 }
                 self.image_grid.shift_rows_up(1, 0);
             }
+            // M13: keep relative children anchored to their parents after
+            // the scroll that made room for this placement.
+            self.image_grid.resolve_relative_positions();
             self.mark_all_dirty();
         }
         let start_row = cur_row.saturating_sub(scroll_n);
@@ -3491,6 +3503,52 @@ impl KittySink for Term {
         mark_placement_dirty(self, &placement);
         self.image_grid.add(placement);
         self.image_revision = self.image_revision.wrapping_add(1);
+    }
+
+    fn place_relative(
+        &mut self,
+        placement: Placement,
+    ) -> Result<(), toastty_graphics::image_grid::RelativeError> {
+        tracing::info!(
+            target: "kitty",
+            image_id = placement.image_id,
+            placement_id = placement.placement_id,
+            parent = ?placement.parent,
+            rel_offset = ?placement.rel_offset,
+            "kitty: place_relative",
+        );
+        // M5 replace rule: a named (image_id, placement_id) re-emission
+        // replaces the prior placement of the same pair.
+        if placement.image_id != 0 && placement.placement_id != 0 {
+            let img = placement.image_id;
+            let pid = placement.placement_id;
+            for old in self
+                .image_grid
+                .remove_where(|p| p.image_id == img && p.placement_id == pid)
+            {
+                mark_placement_dirty(self, &old);
+            }
+        }
+        // `add_relative` validates the parent ref and rebases the child's
+        // cell ranges onto the parent origin + (H, V). On error nothing is
+        // inserted.
+        match self.image_grid.add_relative(placement) {
+            Ok(handle) => {
+                // The placement was rebased inside `add_relative`; re-read
+                // it to mark the resolved cells dirty.
+                let resolved = self
+                    .image_grid
+                    .iter_with_handles()
+                    .find(|(h, _)| *h == handle)
+                    .map(|(_, p)| p.clone());
+                if let Some(p) = resolved {
+                    mark_placement_dirty(self, &p);
+                }
+                self.image_revision = self.image_revision.wrapping_add(1);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn delete_image(&mut self, delete: DeleteSpec, header: &toastty_graphics::kitty::header::Header) {
@@ -7964,5 +8022,116 @@ mod major_medium_term_tests {
         // `t=f` must NOT delete the source file.
         assert!(path.exists(), "t=f must leave the file intact");
         std::fs::remove_file(&path).ok();
+    }
+}
+
+/// M13: relative placements (`P=`/`Q=`/`H=`/`V=`) driven end-to-end
+/// through `Term::feed`. Covers parent-relative positioning, the
+/// no-cursor-move rule, follow-on-scroll, and the ENOPARENT error path.
+#[cfg(test)]
+mod major_relative_tests {
+    use super::*;
+    use base64::Engine;
+    use toastty_parser::Parser;
+
+    fn feed(t: &mut Term, bytes: &[u8]) {
+        let mut p = Parser::new();
+        p.advance(t, bytes);
+    }
+
+    /// Register a `w`x`h` all-red RGBA image under `id`.
+    fn register_image(t: &mut Term, id: u32, w: u32, h: u32) {
+        let raw = vec![255u8; (w * h * 4) as usize];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(format!("\x1b_Ga=t,f=32,s={w},v={h},i={id};").as_bytes());
+        payload.extend_from_slice(b64.as_bytes());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(t, &payload);
+        assert!(t.image_registry().contains(id), "image {id} should register");
+    }
+
+    /// Place an already-transmitted image as a NAMED (absolute) parent at
+    /// the current cursor.
+    fn place_parent(t: &mut Term, id: u32, pid: u32, cols: u16, rows: u16) {
+        feed(
+            t,
+            format!("\x1b_Ga=p,i={id},p={pid},c={cols},r={rows}\x1b\\").as_bytes(),
+        );
+    }
+
+    #[test]
+    fn child_resolves_to_parent_origin_plus_offset_and_cursor_unmoved() {
+        let mut t = Term::new(20, 40, 0);
+        register_image(&mut t, 1, 16, 16);
+        register_image(&mut t, 2, 16, 16);
+        // Move cursor somewhere deterministic, then place the parent.
+        feed(&mut t, b"\x1b[6;4H"); // row 5, col 3 (1-based -> 0-based)
+        place_parent(&mut t, 1, 10, 3, 2);
+        let parent = t.image_grid().find(1, 10).expect("parent placement");
+        let (prow, pcol) = (parent.row_range.start, parent.col_range.start);
+        assert_eq!((prow, pcol), (5, 3), "parent at cursor origin");
+
+        // Record cursor, then place the child relative: H=2 cols, V=1 row.
+        let cur_before = t.cursor();
+        feed(&mut t, b"\x1b_Ga=p,i=2,p=20,P=1,Q=10,H=2,V=1\x1b\\");
+        let cur_after = t.cursor();
+
+        let child = t.image_grid().find(2, 20).expect("child placement created");
+        assert_eq!(child.row_range.start, prow + 1, "child row = parent + V");
+        assert_eq!(child.col_range.start, pcol + 2, "child col = parent + H");
+        assert_eq!(child.parent, Some((1, 10)));
+        assert_eq!(child.rel_offset, (2, 1));
+        assert_eq!(
+            (cur_after.row, cur_after.col),
+            (cur_before.row, cur_before.col),
+            "relative placement must NOT move the cursor",
+        );
+    }
+
+    #[test]
+    fn enoparent_when_parent_missing_and_no_placement_created() {
+        let mut t = Term::new(20, 40, 0);
+        register_image(&mut t, 2, 16, 16);
+        let _ = t.drain_pty_replies();
+        feed(&mut t, b"\x1b_Ga=p,i=2,p=20,P=99,Q=99,H=1,V=1\x1b\\");
+        assert!(
+            t.image_grid().find(2, 20).is_none(),
+            "no placement on ENOPARENT"
+        );
+        let replies = String::from_utf8_lossy(&t.drain_pty_replies()).into_owned();
+        assert!(replies.contains("ENOPARENT"), "got {replies:?}");
+    }
+
+    #[test]
+    fn child_follows_parent_on_scroll() {
+        let mut t = Term::new(10, 40, 0);
+        register_image(&mut t, 1, 16, 16);
+        register_image(&mut t, 2, 16, 16);
+        // Parent near the top so a scroll keeps it on-screen.
+        feed(&mut t, b"\x1b[4;3H"); // row 3, col 2 (0-based)
+        place_parent(&mut t, 1, 10, 2, 2);
+        feed(&mut t, b"\x1b_Ga=p,i=2,p=20,P=1,Q=10,H=1,V=1\x1b\\");
+        let parent0 = t.image_grid().find(1, 10).unwrap();
+        let (prow0, pcol0) = (parent0.row_range.start, parent0.col_range.start);
+        let child0 = t.image_grid().find(2, 20).unwrap();
+        assert_eq!(child0.row_range.start, prow0 + 1);
+        assert_eq!(child0.col_range.start, pcol0 + 1);
+
+        // Scroll the whole screen up by 1 (full-screen region scroll via
+        // reverse-index is awkward; use IND/linefeed-style index by
+        // moving to the bottom and emitting a newline that scrolls).
+        feed(&mut t, b"\x1b[10;1H\n"); // cursor to last row, LF scrolls.
+
+        let parent1 = t.image_grid().find(1, 10).expect("parent still present");
+        let (prow1, pcol1) = (parent1.row_range.start, parent1.col_range.start);
+        assert_eq!(prow1, prow0 - 1, "parent scrolled up by 1");
+        let child1 = t.image_grid().find(2, 20).expect("child still present");
+        assert_eq!(
+            child1.row_range.start,
+            prow1 + 1,
+            "child followed parent up"
+        );
+        assert_eq!(child1.col_range.start, pcol1 + 1);
     }
 }

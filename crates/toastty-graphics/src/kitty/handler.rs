@@ -22,7 +22,7 @@ use base64::Engine;
 use super::decode::{DecodeError, decode};
 use super::header::{Action, Compression, DeleteSpec, Header, Quiet, Transmission};
 use super::reply::{ErrorCode, encode_error, encode_ok};
-use crate::image_grid::{Placement, SrcRect};
+use crate::image_grid::{Placement, RelativeError, SrcRect};
 use crate::registry::ImageData;
 
 /// Maximum pending-upload buffer size in bytes. Larger uploads are
@@ -48,6 +48,21 @@ pub trait KittySink {
 
     /// Insert a placement onto the cell grid.
     fn place_image(&mut self, placement: Placement);
+
+    /// Insert a *relative* placement (M13). `placement.parent` is
+    /// `Some((parent_image, parent_placement))` and `placement.rel_offset`
+    /// the `(H, V)` cell offset. The host validates the parent reference
+    /// (existence, cycles, depth) and, on success, rebases the
+    /// placement's cell ranges onto the parent's origin plus the offset.
+    /// Returns the resolution error otherwise; the handler maps it onto
+    /// the appropriate protocol error code.
+    ///
+    /// The default implementation rejects with [`RelativeError::NoParent`]
+    /// so sinks that don't track a placement grid (simple test sinks) get
+    /// a sane answer without overriding.
+    fn place_relative(&mut self, _placement: Placement) -> Result<(), RelativeError> {
+        Err(RelativeError::NoParent)
+    }
 
     /// Delete by spec. Receives both the header (for `i=` / `I=` /
     /// `delete` fields) and the resolved id (or `0` for "no specific
@@ -596,6 +611,40 @@ impl KittyHandler {
             reply_ok_if_verbose_with_id(&header, sink, header.image_id);
             return;
         }
+        // M13: relative placement. Taken when BOTH `P=` (parent image)
+        // and `Q=` (parent placement) are set. The child is positioned at
+        // the parent placement's origin plus `(H, V)` cells and the
+        // cursor NEVER moves (regardless of `C=`). If only one of `P`/`Q`
+        // is set the reference is incomplete → EINVAL.
+        if header.parent_image != 0 || header.parent_placement != 0 {
+            if header.parent_image == 0 || header.parent_placement == 0 {
+                reply_error_if_verbose(
+                    &header,
+                    sink,
+                    ErrorCode::Einval,
+                    "relative placement requires both P= and Q=",
+                );
+                return;
+            }
+            let (cell_pw, cell_ph) = sink.cell_pixel_size();
+            let mut placement =
+                default_placement_from_header(&header, header.image_id, 0, 0, cell_pw, cell_ph);
+            placement.parent = Some((header.parent_image, header.parent_placement));
+            placement.rel_offset = (header.h_offset, header.v_offset);
+            match sink.place_relative(placement) {
+                Ok(()) => reply_ok_if_verbose_with_id(&header, sink, header.image_id),
+                Err(e) => {
+                    let code = match e {
+                        RelativeError::NoParent => ErrorCode::Enoparent,
+                        RelativeError::Cycle => ErrorCode::Ecycle,
+                        RelativeError::TooDeep => ErrorCode::Etoodeep,
+                    };
+                    reply_error_if_verbose(&header, sink, code, "relative placement");
+                }
+            }
+            // Relative placements never move the cursor.
+            return;
+        }
         // Standalone `a=p` doesn't carry img dims at this call site; we
         // pass zeroes so the auto-derive falls back to 1×1 when `c=`/`r=`
         // are unset (preserving the pre-fix behavior for this path).
@@ -815,6 +864,10 @@ fn default_placement_from_header(
         // cell, applied at render time. They do not move the placement's
         // cells. (Header field names kept as `cell_x`/`cell_y` for now.)
         pix_offset: (header.cell_x, header.cell_y),
+        // Non-relative by default; the relative branch in `handle_place`
+        // overrides these for `a=p` with `P=`/`Q=` set (M13).
+        parent: None,
+        rel_offset: (0, 0),
     }
 }
 
@@ -1931,5 +1984,184 @@ mod major_medium_tests {
         assert!(sink.registered.is_empty());
         let joined = replies_joined(&sink);
         assert!(joined.contains("ENOTSUP"), "got {joined:?}");
+    }
+}
+
+/// M13: handler-level tests for relative placements (`P=`/`Q=`/`H=`/`V=`)
+/// and the `ENOPARENT` / `ECYCLE` / `ETOODEEP` error codes. Uses a sink
+/// backed by a real [`crate::image_grid::ImageGrid`] so the parent
+/// resolution + validation logic exercises the production code path.
+#[cfg(test)]
+mod major_relative_handler_tests {
+    use super::*;
+    use crate::image_grid::ImageGrid;
+
+    /// Sink backed by an `ImageGrid`, so `place_relative` runs real
+    /// validation. `place_image` adds at the placement's span anchored at
+    /// origin (good enough for these tests; the real `Term` rebases on the
+    /// cursor).
+    #[derive(Default)]
+    struct GridSink {
+        grid: ImageGrid,
+        registered: Vec<u32>,
+        replies: Vec<Vec<u8>>,
+    }
+
+    impl KittySink for GridSink {
+        fn register_image(&mut self, id: u32, _num: u32, _data: ImageData) -> Option<u32> {
+            self.registered.push(id);
+            Some(id)
+        }
+        fn image_exists(&self, id: u32) -> bool {
+            self.registered.contains(&id)
+        }
+        fn place_image(&mut self, placement: Placement) {
+            self.grid.add(placement);
+        }
+        fn place_relative(&mut self, placement: Placement) -> Result<(), RelativeError> {
+            self.grid.add_relative(placement).map(|_| ())
+        }
+        fn delete_image(&mut self, _delete: DeleteSpec, _header: &Header) {}
+        fn queue_reply(&mut self, bytes: &[u8]) {
+            self.replies.push(bytes.to_vec());
+        }
+    }
+
+    impl GridSink {
+        fn replies_joined(&self) -> String {
+            self.replies
+                .iter()
+                .map(|r| String::from_utf8_lossy(r).into_owned())
+                .collect::<Vec<_>>()
+                .join("|")
+        }
+    }
+
+    /// Seed a parent placement (image 1, placement 10) at the origin.
+    fn seed_parent(sink: &mut GridSink) {
+        sink.registered.push(1);
+        sink.grid.add(Placement {
+            image_id: 1,
+            placement_id: 10,
+            row_range: 5..7,
+            col_range: 3..6,
+            src_rect: SrcRect::FULL,
+            z: 0,
+            pix_offset: (0, 0),
+            parent: None,
+            rel_offset: (0, 0),
+        });
+    }
+
+    #[test]
+    fn relative_placement_resolves_and_replies_ok() {
+        let mut h = KittyHandler::new();
+        let mut sink = GridSink::default();
+        seed_parent(&mut sink);
+        sink.registered.push(2);
+        // Child image 2 placement 20, parent (1,10), H=2 cols, V=1 row.
+        h.process(b"Ga=p,i=2,p=20,P=1,Q=10,H=2,V=1", b"", &mut sink)
+            .unwrap();
+        let child = sink.grid.find(2, 20).expect("child placement created");
+        assert_eq!(child.row_range.start, 6); // parent row 5 + V=1
+        assert_eq!(child.col_range.start, 5); // parent col 3 + H=2
+        assert!(sink.replies_joined().contains("OK"));
+    }
+
+    #[test]
+    fn relative_placement_missing_parent_replies_enoparent() {
+        let mut h = KittyHandler::new();
+        let mut sink = GridSink::default();
+        sink.registered.push(2);
+        h.process(b"Ga=p,i=2,p=20,P=99,Q=99,H=1,V=1", b"", &mut sink)
+            .unwrap();
+        assert!(sink.grid.find(2, 20).is_none());
+        assert!(
+            sink.replies_joined().contains("ENOPARENT"),
+            "got {:?}",
+            sink.replies_joined()
+        );
+    }
+
+    #[test]
+    fn relative_placement_cycle_replies_ecycle() {
+        let mut h = KittyHandler::new();
+        let mut sink = GridSink::default();
+        // Seed (1,10) whose parent is (2,20).
+        sink.registered.push(1);
+        sink.registered.push(2);
+        sink.grid.add(Placement {
+            image_id: 1,
+            placement_id: 10,
+            row_range: 0..1,
+            col_range: 0..1,
+            src_rect: SrcRect::FULL,
+            z: 0,
+            pix_offset: (0, 0),
+            parent: Some((2, 20)),
+            rel_offset: (0, 0),
+        });
+        // Now add (2,20) parented to (1,10) — closes the loop.
+        h.process(b"Ga=p,i=2,p=20,P=1,Q=10,H=1,V=1", b"", &mut sink)
+            .unwrap();
+        assert!(sink.grid.find(2, 20).is_none());
+        assert!(
+            sink.replies_joined().contains("ECYCLE"),
+            "got {:?}",
+            sink.replies_joined()
+        );
+    }
+
+    #[test]
+    fn relative_placement_too_deep_replies_etoodeep() {
+        use crate::image_grid::MAX_RELATIVE_DEPTH;
+        let mut h = KittyHandler::new();
+        let mut sink = GridSink::default();
+        sink.registered.push(1);
+        // Root (1,1), no parent.
+        sink.grid.add(Placement {
+            image_id: 1,
+            placement_id: 1,
+            row_range: 0..1,
+            col_range: 0..1,
+            src_rect: SrcRect::FULL,
+            z: 0,
+            pix_offset: (0, 0),
+            parent: None,
+            rel_offset: (0, 0),
+        });
+        // Build the deepest allowed chain (place=(MAX+1) has MAX ancestors).
+        for i in 2..=MAX_RELATIVE_DEPTH as u32 + 1 {
+            let hdr = format!("Ga=p,i=1,p={i},P=1,Q={},H=1,V=0", i - 1);
+            h.process(hdr.as_bytes(), b"", &mut sink).unwrap();
+        }
+        // One more exceeds the cap.
+        let last = MAX_RELATIVE_DEPTH as u32 + 1;
+        let pid = last + 1;
+        let hdr = format!("Ga=p,i=1,p={pid},P=1,Q={last},H=1,V=0");
+        h.process(hdr.as_bytes(), b"", &mut sink).unwrap();
+        assert!(sink.grid.find(1, pid).is_none());
+        assert!(
+            sink.replies_joined().contains("ETOODEEP"),
+            "got {:?}",
+            sink.replies_joined()
+        );
+    }
+
+    #[test]
+    fn relative_placement_partial_ref_replies_einval() {
+        // Only P= set, no Q= → incomplete reference → EINVAL.
+        let mut h = KittyHandler::new();
+        let mut sink = GridSink::default();
+        seed_parent(&mut sink);
+        sink.registered.push(2);
+        h.process(b"Ga=p,i=2,p=20,P=1,H=1,V=1", b"", &mut sink)
+            .unwrap();
+        assert!(sink.grid.find(2, 20).is_none());
+        assert!(
+            sink.replies_joined().contains("EINVAL"),
+            "got {:?}",
+            sink.replies_joined()
+        );
     }
 }

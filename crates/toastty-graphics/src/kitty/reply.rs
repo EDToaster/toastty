@@ -23,6 +23,13 @@ pub enum ErrorCode {
     Enotsup,
     /// Image too large to fit under the memory cap.
     Efbig,
+    /// Relative placement references a parent image/placement that does
+    /// not exist.
+    Enoparent,
+    /// Relative placement would create a cycle in the parent chain.
+    Ecycle,
+    /// Relative placement chain exceeds the maximum allowed depth.
+    Etoodeep,
 }
 
 impl ErrorCode {
@@ -35,6 +42,9 @@ impl ErrorCode {
             ErrorCode::Enoent => "ENOENT",
             ErrorCode::Enotsup => "ENOTSUP",
             ErrorCode::Efbig => "EFBIG",
+            ErrorCode::Enoparent => "ENOPARENT",
+            ErrorCode::Ecycle => "ECYCLE",
+            ErrorCode::Etoodeep => "ETOODEEP",
         }
     }
 }
@@ -152,5 +162,8 @@ mod tests {
         assert_eq!(ErrorCode::Enoent.as_str(), "ENOENT");
         assert_eq!(ErrorCode::Enotsup.as_str(), "ENOTSUP");
         assert_eq!(ErrorCode::Efbig.as_str(), "EFBIG");
+        assert_eq!(ErrorCode::Enoparent.as_str(), "ENOPARENT");
+        assert_eq!(ErrorCode::Ecycle.as_str(), "ECYCLE");
+        assert_eq!(ErrorCode::Etoodeep.as_str(), "ETOODEEP");
     }
 }

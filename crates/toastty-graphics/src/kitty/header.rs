@@ -75,10 +75,18 @@ pub struct Header {
     /// `U=` unicode-placeholder mode. When true, ops target the
     /// placeholder pipeline rather than the cursor.
     pub unicode_placeholder: bool,
-    /// `P=`, `Q=` — image parent (composition / chained transmits).
-    /// Kept for forwards-compat but not acted on.
+    /// `P=`, `Q=` — relative-placement parent reference (M13). `P=` is
+    /// the parent image id, `Q=` the parent placement id. When both are
+    /// non-zero on an `a=p`, the new placement is positioned relative to
+    /// the referenced parent placement at `(h_offset, v_offset)` cells.
     pub parent_image: u32,
     pub parent_placement: u32,
+    /// `H=` — horizontal (column) cell offset of a relative placement
+    /// from its parent's origin. Signed. M13.
+    pub h_offset: i32,
+    /// `V=` — vertical (row) cell offset of a relative placement from
+    /// its parent's origin. Signed. M13.
+    pub v_offset: i32,
 }
 
 /// Default `a=` action.
@@ -372,6 +380,8 @@ fn apply(h: &mut Header, key: &str, value: &str) -> Result<(), KittyHeaderError>
         }
         "P" => h.parent_image = parse_u32(key, value)?,
         "Q" => h.parent_placement = parse_u32(key, value)?,
+        "H" => h.h_offset = parse_i32(key, value)?,
+        "V" => h.v_offset = parse_i32(key, value)?,
         // Unknown keys are tolerated for forwards compat. Future kitty
         // versions may add fields; we want existing terminals to keep
         // working with them.
@@ -505,6 +515,22 @@ mod tests {
         let h = parse(b"GP=7,Q=3").unwrap();
         assert_eq!(h.parent_image, 7);
         assert_eq!(h.parent_placement, 3);
+    }
+
+    #[test]
+    fn relative_offset_keys_parse() {
+        let h = parse(b"Ga=p,i=2,P=7,Q=3,H=2,V=1").unwrap();
+        assert_eq!(h.parent_image, 7);
+        assert_eq!(h.parent_placement, 3);
+        assert_eq!(h.h_offset, 2);
+        assert_eq!(h.v_offset, 1);
+    }
+
+    #[test]
+    fn relative_offset_keys_accept_negative() {
+        let h = parse(b"Ga=p,i=2,P=7,Q=3,H=-4,V=-2").unwrap();
+        assert_eq!(h.h_offset, -4);
+        assert_eq!(h.v_offset, -2);
     }
 
     #[test]

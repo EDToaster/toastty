@@ -46,6 +46,17 @@ pub struct Placement {
     /// does NOT change which cells the placement occupies. Defaults to
     /// `(0, 0)`.
     pub pix_offset: (u32, u32),
+    /// M13: parent linkage for a *relative placement*. `Some((image_id,
+    /// placement_id))` when this placement is positioned relative to
+    /// another placement (kitty's `P=`/`Q=` keys); `None` for an
+    /// ordinary absolute placement. When set, this placement's
+    /// `row_range`/`col_range` are resolved from the parent's origin plus
+    /// [`Self::rel_offset`], and re-resolved whenever the parent moves.
+    pub parent: Option<(u32, u32)>,
+    /// M13: `(cols, rows)` cell offset from the parent placement's origin
+    /// (kitty's `H=`/`V=`). Only meaningful when [`Self::parent`] is
+    /// `Some`. Signed. Defaults to `(0, 0)`.
+    pub rel_offset: (i32, i32),
 }
 
 /// Pixel rectangle on the source image, in image pixels.
@@ -81,6 +92,23 @@ impl SrcRect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PlacementHandle(pub u32);
 
+/// Maximum depth of a relative-placement parent chain (M13). Reference
+/// kitty caps the chain at a small depth to bound resolution work;
+/// exceeding it yields `ETOODEEP`.
+pub const MAX_RELATIVE_DEPTH: usize = 8;
+
+/// Why a relative placement could not be created (M13). Mapped by the
+/// kitty handler onto the corresponding protocol error code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelativeError {
+    /// The referenced parent image/placement does not exist → `ENOPARENT`.
+    NoParent,
+    /// Linking to the parent would create a cycle → `ECYCLE`.
+    Cycle,
+    /// The parent chain is deeper than [`MAX_RELATIVE_DEPTH`] → `ETOODEEP`.
+    TooDeep,
+}
+
 /// Parallel image placement layer for a `Term` grid.
 #[derive(Debug, Default)]
 pub struct ImageGrid {
@@ -101,6 +129,122 @@ impl ImageGrid {
         self.next_handle = self.next_handle.wrapping_add(1);
         self.placements.push((handle, p));
         handle
+    }
+
+    /// Find the placement matching `(image_id, placement_id)`, if any.
+    /// Used to resolve relative-placement parents (M13). When several
+    /// match (only possible for the unnamed `placement_id == 0` case),
+    /// the most recently added is returned.
+    #[must_use]
+    pub fn find(&self, image_id: u32, placement_id: u32) -> Option<&Placement> {
+        self.placements
+            .iter()
+            .rev()
+            .map(|(_, p)| p)
+            .find(|p| p.image_id == image_id && p.placement_id == placement_id)
+    }
+
+    /// Create a relative placement (M13).
+    ///
+    /// `child` carries the resolved geometry SPANS in its `row_range` /
+    /// `col_range` (anchored at origin, like `add`); its `parent` and
+    /// `rel_offset` fields drive positioning. The parent referenced by
+    /// `child.parent` must already exist (else [`RelativeError::NoParent`]).
+    /// Linking is rejected if it would form a cycle
+    /// ([`RelativeError::Cycle`]) or push the chain past
+    /// [`MAX_RELATIVE_DEPTH`] ([`RelativeError::TooDeep`]).
+    ///
+    /// On success the child's `row_range`/`col_range` are rebased onto
+    /// the parent's current origin plus `rel_offset`, the child is
+    /// inserted, and its handle is returned.
+    pub fn add_relative(&mut self, mut child: Placement) -> Result<PlacementHandle, RelativeError> {
+        let (pimg, pplace) = child.parent.ok_or(RelativeError::NoParent)?;
+        // A placement cannot be its own parent.
+        if pimg == child.image_id && pplace == child.placement_id {
+            return Err(RelativeError::Cycle);
+        }
+        // Parent must exist.
+        let parent = self.find(pimg, pplace).ok_or(RelativeError::NoParent)?;
+        let parent_origin = (parent.row_range.start, parent.col_range.start);
+        // Walk the parent chain from the parent upward: detect a cycle
+        // back to the child, and enforce the depth cap. Depth counts the
+        // number of ancestors (parent = depth 1).
+        let mut depth = 1usize;
+        let mut cursor = parent.parent;
+        while let Some((aimg, aplace)) = cursor {
+            if aimg == child.image_id && aplace == child.placement_id {
+                return Err(RelativeError::Cycle);
+            }
+            depth += 1;
+            if depth > MAX_RELATIVE_DEPTH {
+                return Err(RelativeError::TooDeep);
+            }
+            cursor = self.find(aimg, aplace).and_then(|p| p.parent);
+        }
+        // Rebase the child's spans onto the parent origin + offset.
+        let span_rows = child.row_range.end - child.row_range.start;
+        let span_cols = child.col_range.end - child.col_range.start;
+        let (start_row, start_col) =
+            offset_origin(parent_origin, child.rel_offset);
+        child.row_range = start_row..start_row.saturating_add(span_rows);
+        child.col_range = start_col..start_col.saturating_add(span_cols);
+        Ok(self.add(child))
+    }
+
+    /// Re-resolve every relative placement's position against its current
+    /// parent (M13). Called after the grid mutates (scroll / shift /
+    /// insert / delete lines) so children follow their parents. Processes
+    /// placements in dependency order via repeated passes (chains resolve
+    /// outward from roots); bounded by [`MAX_RELATIVE_DEPTH`] passes.
+    /// A relative placement whose parent has disappeared is left at its
+    /// last resolved position (it will be cleaned up by the normal
+    /// off-screen/eviction paths).
+    pub fn resolve_relative_positions(&mut self) {
+        let has_relative = self.placements.iter().any(|(_, p)| p.parent.is_some());
+        if !has_relative {
+            return;
+        }
+        for _ in 0..MAX_RELATIVE_DEPTH {
+            let mut changed = false;
+            // Snapshot parent origins by (image_id, placement_id) before
+            // mutating, so each pass uses a consistent view.
+            let origins: Vec<(u32, u32, u16, u16)> = self
+                .placements
+                .iter()
+                .map(|(_, p)| {
+                    (
+                        p.image_id,
+                        p.placement_id,
+                        p.row_range.start,
+                        p.col_range.start,
+                    )
+                })
+                .collect();
+            for (_, p) in &mut self.placements {
+                let Some((pimg, pplace)) = p.parent else {
+                    continue;
+                };
+                let Some(&(_, _, prow, pcol)) = origins
+                    .iter()
+                    .find(|(img, place, _, _)| *img == pimg && *place == pplace)
+                else {
+                    continue;
+                };
+                let span_rows = p.row_range.end - p.row_range.start;
+                let span_cols = p.col_range.end - p.col_range.start;
+                let (start_row, start_col) = offset_origin((prow, pcol), p.rel_offset);
+                let new_rows = start_row..start_row.saturating_add(span_rows);
+                let new_cols = start_col..start_col.saturating_add(span_cols);
+                if p.row_range != new_rows || p.col_range != new_cols {
+                    p.row_range = new_rows;
+                    p.col_range = new_cols;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
     }
 
     /// Remove by handle. Returns the removed placement if it was
@@ -387,6 +531,19 @@ impl ImageGrid {
     }
 }
 
+/// Apply a signed `(cols, rows)` cell offset to a `(row, col)` cell
+/// origin, clamping at the grid edge (row/col 0). Used to resolve
+/// relative placements (M13). Note the offset tuple is `(H=cols,
+/// V=rows)` to match kitty's key ordering, while the origin tuple is
+/// `(row, col)`.
+fn offset_origin(origin: (u16, u16), offset: (i32, i32)) -> (u16, u16) {
+    let (row, col) = origin;
+    let (h_cols, v_rows) = offset;
+    let new_row = (i64::from(row) + i64::from(v_rows)).max(0) as u16;
+    let new_col = (i64::from(col) + i64::from(h_cols)).max(0) as u16;
+    (new_row, new_col)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +557,8 @@ mod tests {
             src_rect: SrcRect::FULL,
             z,
             pix_offset: (0, 0),
+            parent: None,
+            rel_offset: (0, 0),
         }
     }
 
@@ -552,5 +711,106 @@ mod tests {
         assert_ne!(h1, h2);
         assert_ne!(h2, h3);
         assert_ne!(h1, h3);
+    }
+
+    /// Build a relative-placement child: image/placement ids, parent
+    /// ref, `(H,V)` offset, and a 1x1 span anchored at origin.
+    fn rel(
+        image_id: u32,
+        placement_id: u32,
+        parent: (u32, u32),
+        offset: (i32, i32),
+    ) -> Placement {
+        Placement {
+            image_id,
+            placement_id,
+            row_range: 0..1,
+            col_range: 0..1,
+            src_rect: SrcRect::FULL,
+            z: 0,
+            pix_offset: (0, 0),
+            parent: Some(parent),
+            rel_offset: offset,
+        }
+    }
+
+    #[test]
+    fn add_relative_resolves_against_parent_origin() {
+        let mut g = ImageGrid::new();
+        // Parent at row 5, col 3, named (img=1, place=10).
+        let mut parent = p(1, 5..7, 3..6, 0);
+        parent.placement_id = 10;
+        g.add(parent);
+        // Child offset H=2 (cols), V=1 (rows) → row 6, col 5.
+        let h = g.add_relative(rel(2, 20, (1, 10), (2, 1))).unwrap();
+        let child = g.iter().find(|p| p.image_id == 2).unwrap();
+        assert_eq!(child.row_range.start, 6);
+        assert_eq!(child.col_range.start, 5);
+        assert!(g.remove(h).is_some());
+    }
+
+    #[test]
+    fn add_relative_missing_parent_is_no_parent() {
+        let mut g = ImageGrid::new();
+        let err = g.add_relative(rel(2, 20, (99, 99), (1, 1))).unwrap_err();
+        assert_eq!(err, RelativeError::NoParent);
+        assert!(g.is_empty());
+    }
+
+    #[test]
+    fn add_relative_self_reference_is_cycle() {
+        let mut g = ImageGrid::new();
+        let err = g.add_relative(rel(2, 20, (2, 20), (1, 1))).unwrap_err();
+        assert_eq!(err, RelativeError::Cycle);
+    }
+
+    #[test]
+    fn add_relative_loop_back_is_cycle() {
+        let mut g = ImageGrid::new();
+        // (1,10) -> parent (2,20); now add (2,20) -> parent (1,10): cycle.
+        let mut a = p(1, 0..1, 0..1, 0);
+        a.placement_id = 10;
+        a.parent = Some((2, 20));
+        g.add(a);
+        let err = g.add_relative(rel(2, 20, (1, 10), (1, 1))).unwrap_err();
+        assert_eq!(err, RelativeError::Cycle);
+    }
+
+    #[test]
+    fn add_relative_chain_too_deep() {
+        let mut g = ImageGrid::new();
+        // Root (img=1, place=1), no parent.
+        let mut root = p(1, 0..1, 0..1, 0);
+        root.placement_id = 1;
+        g.add(root);
+        // Chain place=2..=MAX_RELATIVE_DEPTH+1 each parented to the prior.
+        // place=(MAX+1) then has MAX ancestors — the deepest allowed.
+        for i in 2..=MAX_RELATIVE_DEPTH as u32 + 1 {
+            g.add_relative(rel(1, i, (1, i - 1), (1, 0))).unwrap();
+        }
+        // The next link would make the chain exceed MAX_RELATIVE_DEPTH.
+        let last = MAX_RELATIVE_DEPTH as u32 + 1;
+        let err = g
+            .add_relative(rel(1, last + 1, (1, last), (1, 0)))
+            .unwrap_err();
+        assert_eq!(err, RelativeError::TooDeep);
+    }
+
+    #[test]
+    fn resolve_relative_positions_follows_parent_move() {
+        let mut g = ImageGrid::new();
+        let mut parent = p(1, 5..7, 3..6, 0);
+        parent.placement_id = 10;
+        g.add(parent);
+        g.add_relative(rel(2, 20, (1, 10), (2, 1))).unwrap();
+        // Move the parent up by 2 rows (simulate a scroll).
+        g.shift_rows_up(2, 0);
+        g.resolve_relative_positions();
+        let parent = g.find(1, 10).unwrap();
+        assert_eq!(parent.row_range.start, 3);
+        let child = g.find(2, 20).unwrap();
+        // child = parent origin (3,3) + (H=2 cols, V=1 row) = row 4, col 5.
+        assert_eq!(child.row_range.start, 4);
+        assert_eq!(child.col_range.start, 5);
     }
 }

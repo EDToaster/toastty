@@ -273,15 +273,21 @@ will exercise, though less common in everyday use than the blockers.
 - **Fix**: implement each selector. Most need only a `remove_where`
   predicate over the existing `image_grid.placements`.
 
-### M13. Relative placements (`P=`, `Q=`, `H=`, `V=`) not implemented
+### M13. Relative placements (`P=`, `Q=`, `H=`, `V=`) — IMPLEMENTED
 - **Spec**: child placements anchored to a parent by image+placement id at
   `(H, V)` cell offsets; cursor never moves; new error codes
   `ENOPARENT` / `ECYCLE` / `ETOODEEP`.
-- **Location**: `crates/toastty-graphics/src/kitty/header.rs:72-73,
-  365-366` (`P`/`Q` parsed and ignored; `H`/`V` not parsed at all and
-  silently swallowed by the tolerant key parser).
-- **Fix**: parse `H` / `V`; resolve parent on placement; reject cycles and
-  excess depth with the appropriate error codes.
+- **Done**: `header.rs` now parses `H=`/`V=` into `h_offset`/`v_offset`.
+  `image_grid::Placement` gained `parent: Option<(u32,u32)>` and
+  `rel_offset: (i32,i32)`; `ImageGrid::add_relative` validates the parent
+  reference (existence → `ENOPARENT`, cycle/self-ref → `ECYCLE`, depth >
+  `MAX_RELATIVE_DEPTH`=8 → `ETOODEEP`) and rebases the child onto the
+  parent origin + `(H,V)`. `KittySink::place_relative` plumbs this through
+  `Term`. `handle_place` takes the relative branch when both `P=`/`Q=` are
+  set (only one set → `EINVAL`) and never moves the cursor. Follow-on-
+  scroll: `ImageGrid::resolve_relative_positions` is invoked after every
+  scroll/shift so children track their parents. Reply codes
+  `Enoparent`/`Ecycle`/`Etoodeep` added to `reply::ErrorCode`.
 
 ### M14. Placement id not plumbed through unicode placeholder pipeline
 - **Location**: `crates/toastty-term/src/term.rs:1796-1808`
