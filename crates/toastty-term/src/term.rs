@@ -328,18 +328,22 @@ pub struct Term {
 /// arrives, then materialize placements.
 #[derive(Debug)]
 pub(crate) struct PlaceholderRun {
-    /// Pre-computed image id derived from the SGR fg color at run
-    /// start. The kitty spec defines three encodings:
+    /// Low bits of the image id, decoded from the SGR foreground color
+    /// at run start (see [`placeholder_image_id_from_sgr`]):
     ///
-    /// - **Truecolor RGB** (`SGR 38;2;R;G;B`): id = `(R << 16) | (G << 8) | B`.
-    ///   Used by yazi, helix's `image.nvim`, and any client that wants
-    ///   24-bit ids without needing the SGR 58 extension. This is the
-    ///   most common encoding in the wild.
-    /// - **256-color + SGR 58** (`SGR 38;5;L` plus `SGR 58;5;H`): id =
-    ///   `(H << 8) | L`. The third diacritic on the first cell can
-    ///   extend to bits 16..24 (not yet wired).
-    /// - **256-color only** (`SGR 38;5;L`): id = `L`. 8-bit ids only.
-    pub image_id: u32,
+    /// - **Truecolor RGB** (`SGR 38;2;R;G;B`): bits 0..24 =
+    ///   `(R << 16) | (G << 8) | B`. Used by yazi and helix's
+    ///   `image.nvim`. The most common encoding in the wild.
+    /// - **256-color** (`SGR 38;5;L`): bits 0..8 = `L`.
+    ///
+    /// The high byte (bits 24..32) comes from each cell's *third*
+    /// diacritic, so the full image id is resolved per cell in
+    /// [`Term::finalize_placeholder_run`] as `(id_msb << 24) | fg_bits`.
+    pub fg_bits: u32,
+    /// Placement id decoded from the SGR underline color (`SGR 58`) at
+    /// run start. Zero means "unnamed". Per the kitty spec the underline
+    /// color carries the placement id, *not* part of the image id.
+    pub placement_id: u32,
     /// Cells collected so far: `(row, col, diacritics)`.
     pub cells: Vec<PlaceholderCell>,
     /// Starting row (so future extensions can detect newline
@@ -1634,26 +1638,27 @@ impl Term {
         // M11a: Unicode placeholder pipeline.
         //
         // Apps emit `<U+10EEEE><diacritic*>` cells where:
-        // - The cursor's SGR fg encodes the image id. Three forms are
-        //   accepted per the kitty spec:
-        //     * Rgb(R, G, B)      → id = (R<<16) | (G<<8) | B  (yazi uses this)
-        //     * Indexed256(L) + SGR 58 = Indexed256(H) → id = (H<<8) | L
-        //     * Indexed256(L) alone → id = L
+        // - The cursor's SGR fg encodes the LOW bits of the image id:
+        //     * Rgb(R, G, B)  → bits 0..24 = (R<<16) | (G<<8) | B  (yazi uses this)
+        //     * Indexed256(L) → bits 0..8  = L
+        // - The SGR underline color (SGR 58) encodes the placement id.
         // - 0..3 diacritics encode source-image row, source-image col,
-        //   and (optionally) the image id MSB extension.
+        //   and (optionally) the image id high byte (bits 24..32). The
+        //   full image id is `(id_msb << 24) | fg_bits`.
         //
         // We collect cells greedily into `placeholder_run` until the
         // next non-placeholder/non-diacritic codepoint arrives, then
         // finalize → emit image placements.
         if toastty_graphics::is_placeholder(c) {
             if self.placeholder_run.is_none()
-                && let Some(image_id) = placeholder_image_id_from_sgr(
+                && let Some((fg_bits, placement_id)) = placeholder_image_id_from_sgr(
                     self.cursor.style.fg,
                     self.cursor_underline_color,
                 )
             {
                 self.placeholder_run = Some(PlaceholderRun {
-                    image_id,
+                    fg_bits,
+                    placement_id,
                     cells: Vec::new(),
                     start_row: self.cursor.row,
                 });
@@ -1759,58 +1764,71 @@ impl Term {
         if run.cells.is_empty() {
             return;
         }
-        // Image id is pre-computed at run-start from the SGR fg
-        // (and optionally SGR 58) — see [`PlaceholderRun::image_id`]
-        // and [`placeholder_image_id_from_sgr`].
-        let id = run.image_id;
-        // The cells in the run form contiguous rectangles (apps emit
-        // them row-by-row). For each contiguous (row, col-range)
-        // segment, emit a placement with a sub-rect derived from the
-        // first/last diacritic pair in that segment.
+        // The image id's low bits come from the SGR fg (run-level,
+        // `run.fg_bits`); the placement id comes from the SGR underline
+        // (run-level, `run.placement_id`). The image id's high byte
+        // (bits 24..32) is the *third* diacritic of each cell, so the
+        // full image id is resolved per cell below.
         //
-        // For M11a we materialize each cell as a 1x1 placement with
-        // src_rect derived from the diacritic pair. A future
-        // optimization can coalesce adjacent cells into a single
-        // placement.
-        if !self.image_registry.contains(id) {
-            // Image not registered: still occupy the cells as
-            // placeholders so the layout doesn't shift; we just don't
-            // emit visible images.
-            return;
-        }
-        // Look up image dims for the sub-rect calculation.
-        let (img_w, img_h) = {
-            let Some(img) = self.image_registry.get(id) else {
-                return;
-            };
-            (img.width, img.height)
-        };
-        // The diacritic table maps to 0..N where N is the number of
-        // cells along the relevant axis. Apps typically emit the same
-        // row diacritic across one display row, with the column
-        // diacritic varying. We treat the FIRST diacritic as the
-        // image row, the SECOND as the image column. Per the kitty
-        // spec the tile size is the terminal's cell-pixel dimensions
-        // (CSI 16t value): each placeholder cell renders a
-        // cell_w × cell_h sub-rect at (col_d * cell_w, row_d * cell_h)
-        // in the source image. Apps (yazi, image.nvim) pre-downscale
-        // their image to `area_cells_w * cell_w` × `area_cells_h *
-        // cell_h` before transmit, so the resulting placements tile
-        // the image perfectly with no leftover edges.
+        // Diacritic semantics (kitty Unicode-placeholder spec):
+        //   1st diacritic → source image ROW
+        //   2nd diacritic → source image COLUMN
+        //   3rd diacritic → image id high byte (bits 24..32)
         //
-        // The previous implementation tried to infer tile size from
-        // the maximum diacritic seen in the run, but `finalize` runs
-        // per row (each newline between yazi's placeholder rows ends
-        // a run), so `max_row_d` was always 0 within a single row and
-        // every row painted the full-height image squashed into one
-        // cell of vertical space.
+        // Inheritance from the LEFT neighbor (within this run): a cell
+        // that omits trailing components inherits them from the
+        // previously resolved cell, with the column auto-incremented:
+        //   0 diacritics → (prev.row, prev.col + 1, prev.id_msb)
+        //   1 diacritic  → (d0,       prev.col + 1, prev.id_msb)
+        //   2 diacritics → (d0,       d1,           prev.id_msb)
+        //   3 diacritics → (d0,       d1,           d2)
+        // With no previous cell, missing components default to 0.
+        //
+        // Per the kitty spec the tile size is the terminal's cell-pixel
+        // dimensions (CSI 16t value): each placeholder cell renders a
+        // cell_w × cell_h sub-rect at (col * cell_w, row * cell_h) in
+        // the source image. Apps (yazi, image.nvim) pre-downscale their
+        // image so the placements tile it perfectly.
         let (cell_pw, cell_ph) = self.cell_pixel_size;
         let cell_pw = u32::from(cell_pw).max(1);
         let cell_ph = u32::from(cell_ph).max(1);
+        let placement_id = run.placement_id;
         let mut placements = Vec::new();
+        // Resolved (row, col, id_msb) of the previous cell, for
+        // left-neighbor inheritance.
+        let mut prev: Option<(u16, u16, u16)> = None;
         for cell in &run.cells {
-            let row_d = cell.diacritics.first().copied().unwrap_or(0);
-            let col_d = cell.diacritics.get(1).copied().unwrap_or(0);
+            let d = &cell.diacritics;
+            let (row_d, col_d, id_msb) = match (d.first().copied(), d.get(1).copied(), d.get(2).copied()) {
+                (None, _, _) => {
+                    // Bare cell: inherit everything; advance column.
+                    let (pr, pc, pm) = prev.unwrap_or((0, 0, 0));
+                    (pr, pc.saturating_add(1), pm)
+                }
+                (Some(r), None, _) => {
+                    // Row only: inherit column (advanced) and id_msb.
+                    let (_, pc, pm) = prev.unwrap_or((0, 0, 0));
+                    (r, pc.saturating_add(1), pm)
+                }
+                (Some(r), Some(c), None) => {
+                    // Row + col: inherit id_msb.
+                    let (_, _, pm) = prev.unwrap_or((0, 0, 0));
+                    (r, c, pm)
+                }
+                (Some(r), Some(c), Some(m)) => (r, c, m),
+            };
+            prev = Some((row_d, col_d, id_msb));
+
+            // Full image id: high byte from 3rd diacritic, low bits
+            // from the SGR foreground.
+            let id = (u32::from(id_msb) << 24) | run.fg_bits;
+            // Image not registered: still occupy the cell as a
+            // placeholder so layout doesn't shift; just skip rendering.
+            let Some(img) = self.image_registry.get(id) else {
+                continue;
+            };
+            let (img_w, img_h) = (img.width, img.height);
+
             let sx_full = u32::from(col_d) * cell_pw;
             let sy_full = u32::from(row_d) * cell_ph;
             // Clamp to image bounds — a stray diacritic past the
@@ -1821,7 +1839,7 @@ impl Term {
             let sh = cell_ph.min(img_h.saturating_sub(sy));
             placements.push(Placement {
                 image_id: id,
-                placement_id: 0,
+                placement_id,
                 row_range: cell.row..cell.row.saturating_add(1),
                 col_range: cell.col..cell.col.saturating_add(1),
                 src_rect: toastty_graphics::SrcRect {
@@ -1832,6 +1850,9 @@ impl Term {
                 },
                 z: 0,
             });
+        }
+        if placements.is_empty() {
+            return;
         }
         for placement in placements {
             mark_placement_dirty(self, &placement);
@@ -3636,24 +3657,42 @@ impl RgpSink for Term {
 /// Returns `None` for any other fg color (Default, Rgb with a third
 /// path not yet seen) — placeholder runs without a recognised id
 /// encoding are silently dropped per the kitty spec.
+/// Decode the SGR colors of a Unicode-placeholder cell into the *low
+/// bits* of the image id and the placement id.
+///
+/// Per the kitty spec the colors carry only part of the image id; the
+/// 3rd diacritic (handled per-cell in [`Term::finalize_placeholder_run`])
+/// supplies bits 24..32:
+///
+/// - **Foreground** carries the low bits of the image id. An 8-bit
+///   indexed fg (`SGR 38;5;L`) gives bits 0..8 (`L`); a 24-bit RGB fg
+///   (`SGR 38;2;R;G;B`) gives bits 0..24 (`(R<<16)|(G<<8)|B`).
+/// - **Underline color** (`SGR 58`) carries the *placement id*, not part
+///   of the image id. An indexed underline gives the low 8 bits; an RGB
+///   underline gives a 24-bit placement id. Absent ⇒ placement id 0
+///   ("unnamed").
+///
+/// Returns `None` when the foreground is unset/default, in which case the
+/// cell is not a usable placeholder reference.
 fn placeholder_image_id_from_sgr(
     fg: Color,
     underline_color: Option<Color>,
-) -> Option<u32> {
-    match fg {
+) -> Option<(u32, u32)> {
+    let fg_bits = match fg {
         Color::Rgb(r, g, b) => {
-            Some((u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b))
+            (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
         }
-        Color::Indexed256(low) => {
-            let low = u32::from(low);
-            let high = match underline_color {
-                Some(Color::Indexed256(h)) => u32::from(h),
-                _ => 0,
-            };
-            Some((high << 8) | low)
+        Color::Indexed256(low) => u32::from(low),
+        _ => return None,
+    };
+    let placement_id = match underline_color {
+        Some(Color::Indexed256(p)) => u32::from(p),
+        Some(Color::Rgb(r, g, b)) => {
+            (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
         }
-        _ => None,
-    }
+        _ => 0,
+    };
+    Some((fg_bits, placement_id))
 }
 
 fn mark_placement_dirty(t: &mut Term, p: &Placement) {
@@ -6822,5 +6861,174 @@ mod blocker_graphics_term_tests {
         let s = String::from_utf8_lossy(&replies);
         assert!(s.contains("EINVAL"), "expected EINVAL reply, got {s:?}");
         assert!(s.contains("i=1"), "reply should echo recovered i=, got {s:?}");
+    }
+}
+
+#[cfg(test)]
+mod blocker_placeholder_tests {
+    use super::*;
+    use base64::Engine;
+    use toastty_parser::Parser;
+
+    /// First 20 kitty placeholder diacritic codepoints (index → char),
+    /// mirroring `scripts/protocol-tests/lib.sh`'s `placeholder_cell`.
+    const DIACRITICS: &[u32] = &[
+        0x0305, 0x030D, 0x030E, 0x0310, 0x0312, 0x033D, 0x033E, 0x033F, 0x0346, 0x034A, 0x034B,
+        0x034C, 0x0350, 0x0351, 0x0352, 0x0357, 0x035B, 0x0363, 0x0364, 0x0365,
+    ];
+
+    fn feed(t: &mut Term, bytes: &[u8]) {
+        let mut p = Parser::new();
+        p.advance(t, bytes);
+    }
+
+    fn diac(i: usize) -> char {
+        char::from_u32(DIACRITICS[i]).unwrap()
+    }
+
+    /// A placeholder cell `U+10EEEE` followed by the given diacritic
+    /// indices (row, col, [msb]).
+    fn placeholder_cell(diacritic_indices: &[usize]) -> String {
+        let mut s = String::new();
+        s.push(toastty_graphics::PLACEHOLDER);
+        for &i in diacritic_indices {
+            s.push(diac(i));
+        }
+        s
+    }
+
+    /// Register an image of `w`x`h` RGBA pixels (all red) under `id`.
+    fn register_image(t: &mut Term, id: u32, w: u32, h: u32) {
+        let raw = vec![255u8; (w * h * 4) as usize];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(
+            format!("\x1b_Ga=t,f=32,s={w},v={h},i={id};").as_bytes(),
+        );
+        payload.extend_from_slice(b64.as_bytes());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(t, &payload);
+        assert!(t.image_registry().contains(id), "image {id} should register");
+    }
+
+    /// B10: fg indexed 5 → image id 5; underline 1 → placement_id 1;
+    /// diacritics (row=0, col=0) → source (0, 0).
+    #[test]
+    fn b10_decodes_indexed_fg_and_underline_placement() {
+        let mut t = Term::new(4, 8, 0);
+        // Use a 16x16 image so the (0,0) cell sub-rect is fully inside.
+        register_image(&mut t, 5, 16, 16);
+        // SGR 38;5;5 (fg=5), SGR 58;5;1 (underline=1), then placeholder
+        // cell with row=0,col=0 diacritics, then a finalizing space.
+        feed(&mut t, b"\x1b[38;5;5m\x1b[58;5;1m");
+        let mut s = placeholder_cell(&[0, 0]);
+        s.push(' ');
+        feed(&mut t, s.as_bytes());
+
+        assert_eq!(t.image_grid().len(), 1);
+        let p = t.image_grid().iter().next().unwrap();
+        assert_eq!(p.image_id, 5, "image id from fg low bits");
+        assert_eq!(p.placement_id, 1, "placement id from underline color");
+        assert_eq!(p.src_rect.x, 0, "col diacritic 0 → src x 0");
+        assert_eq!(p.src_rect.y, 0, "row diacritic 0 → src y 0");
+    }
+
+    /// B10: the 3rd diacritic supplies bits 24..32 of the image id.
+    /// id = (1 << 24) | 5, fg=5, 3rd diacritic index = 1.
+    #[test]
+    fn b10_third_diacritic_is_image_id_high_byte() {
+        let mut t = Term::new(4, 8, 0);
+        let id = (1u32 << 24) | 5;
+        register_image(&mut t, id, 16, 16);
+        feed(&mut t, b"\x1b[38;5;5m");
+        // diacritics: row=0, col=0, msb=1.
+        let mut s = placeholder_cell(&[0, 0, 1]);
+        s.push(' ');
+        feed(&mut t, s.as_bytes());
+
+        assert_eq!(t.image_grid().len(), 1);
+        let p = t.image_grid().iter().next().unwrap();
+        assert_eq!(p.image_id, (1 << 24) | 5);
+    }
+
+    /// B10 direct unit test of the decode helper: fg low bits +
+    /// placement id from underline. The high byte is NOT part of the
+    /// returned image-id low bits (it comes from the 3rd diacritic).
+    #[test]
+    fn b10_decode_helper_splits_fg_and_underline() {
+        // Indexed fg + indexed underline.
+        assert_eq!(
+            placeholder_image_id_from_sgr(Color::Indexed256(5), Some(Color::Indexed256(7))),
+            Some((5, 7))
+        );
+        // RGB fg → 24-bit low bits; no underline → placement 0.
+        assert_eq!(
+            placeholder_image_id_from_sgr(Color::Rgb(0x12, 0x34, 0x56), None),
+            Some((0x0012_3456, 0))
+        );
+        // Default fg → not a usable placeholder.
+        assert_eq!(placeholder_image_id_from_sgr(Color::Default, None), None);
+    }
+
+    /// B11: a bare cell (no diacritics) inherits row from the left
+    /// neighbor and advances the column by one.
+    #[test]
+    fn b11_bare_cell_inherits_row_and_advances_col() {
+        let mut t = Term::new(4, 8, 0);
+        // 2-cell-wide image: cell_pixel default is 8 wide, so make it
+        // at least 16px wide so col=1 maps inside the image.
+        register_image(&mut t, 5, 16, 16);
+        feed(&mut t, b"\x1b[38;5;5m\x1b[58;5;1m");
+        let mut s = String::new();
+        s.push_str(&placeholder_cell(&[0, 0])); // explicit row=0, col=0
+        s.push_str(&placeholder_cell(&[])); // bare — inherits row=0, col=1
+        s.push(' '); // finalize
+        feed(&mut t, s.as_bytes());
+
+        assert_eq!(t.image_grid().len(), 2);
+        let mut ps: Vec<&Placement> = t.image_grid().iter().collect();
+        ps.sort_by_key(|p| p.col_range.start);
+        let (first, second) = (ps[0], ps[1]);
+        // Both reference the same image and placement id.
+        assert_eq!(first.image_id, 5);
+        assert_eq!(second.image_id, 5);
+        assert_eq!(second.placement_id, 1);
+        // Second cell inherits source row 0 (src y 0) and col 1
+        // (src x = 1 * cell_pw = 8).
+        let (cell_pw, _) = t.cell_pixel_size();
+        assert_eq!(second.src_rect.y, 0, "inherited source row 0");
+        assert_eq!(
+            second.src_rect.x,
+            u32::from(cell_pw),
+            "auto-incremented source col 1"
+        );
+        // First cell is at source (0, 0).
+        assert_eq!(first.src_rect.x, 0);
+        assert_eq!(first.src_rect.y, 0);
+    }
+
+    /// B11: a row-only cell (1 diacritic) inherits id_msb and advances
+    /// column, but takes its own row from the diacritic.
+    #[test]
+    fn b11_row_only_cell_inherits_col_and_advances() {
+        let mut t = Term::new(4, 8, 0);
+        // 1px cells so row/col diacritics map directly into a 32x32 image
+        // without hitting the bounds clamp.
+        t.set_cell_pixel_size(1, 1);
+        register_image(&mut t, 5, 32, 32);
+        feed(&mut t, b"\x1b[38;5;5m");
+        let mut s = String::new();
+        s.push_str(&placeholder_cell(&[2, 1])); // row=2, col=1
+        s.push_str(&placeholder_cell(&[3])); // row=3 only → col inherits to 2
+        s.push(' ');
+        feed(&mut t, s.as_bytes());
+
+        assert_eq!(t.image_grid().len(), 2);
+        let mut ps: Vec<&Placement> = t.image_grid().iter().collect();
+        ps.sort_by_key(|p| p.col_range.start);
+        let (cell_pw, cell_ph) = t.cell_pixel_size();
+        // Second cell: row=3 from its own diacritic, col=2 inherited+1.
+        assert_eq!(ps[1].src_rect.y, 3 * u32::from(cell_ph));
+        assert_eq!(ps[1].src_rect.x, 2 * u32::from(cell_pw));
     }
 }
