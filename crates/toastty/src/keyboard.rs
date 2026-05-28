@@ -315,13 +315,20 @@ fn encode_key_kitty(
             } else {
                 c
             });
-            // Decision: when disambiguate is on AND there are no
-            // modifiers AND it's a plain printable, emit the legacy text
-            // directly so apps that opted in only for event types still
-            // type normally. Matches kitty's default behaviour for the
-            // "disambiguate" flag alone.
+            // Under disambiguate-only mode, the kitty spec lists exactly
+            // which modifier combos get the CSI u form for text-producing
+            // keys: Esc, alt+key, ctrl+key, ctrl+alt+key, shift+alt+key.
+            // Bare Shift (and the lock modifiers, which never appear in
+            // that list) stay on the legacy text path — Shift+E goes on
+            // the wire as the byte "E", not as "CSI 101;2 u". Otherwise
+            // upstream multiplexers like zellij that strip the shift bit
+            // when forwarding to non-kitty children deliver lowercase
+            // letters to the inner app.
+            const CSI_U_MODS: Modifiers = Modifiers::CONTROL
+                .union(Modifiers::ALT)
+                .union(Modifiers::SUPER);
             if disambiguate
-                && modifiers.is_empty()
+                && !modifiers.intersects(CSI_U_MODS)
                 && state == KeyState::Pressed
                 && !repeat
                 && let Some(t) = text
@@ -1035,9 +1042,11 @@ mod tests {
     }
 
     #[test]
-    fn kitty_uppercase_input_folds_to_lowercase_codepoint() {
-        // Shift+A under disambiguate -> codepoint of 'a' = 97, modifiers
-        // include SHIFT (2).
+    fn kitty_disambiguate_shift_letter_emits_plain_text() {
+        // Per spec, bare Shift+printable stays on the legacy text path
+        // under disambiguate-only mode. Shift+A => byte "A", not the
+        // "CSI 97;2 u" form (that would lose the shift bit when a
+        // non-kitty consumer like zellij forwards to a child).
         let got = enc_kitty(
             &char_key("A"),
             Some("A"),
@@ -1046,7 +1055,99 @@ mod tests {
             KeyState::Pressed,
             false,
         );
-        assert_eq!(got.as_deref(), Some(b"\x1b[97;2u".as_ref()));
+        assert_eq!(got.as_deref(), Some(b"A".as_ref()));
+    }
+
+    #[test]
+    fn kitty_disambiguate_shift_punctuation_emits_plain_text() {
+        // Same rule applies to shifted symbols: Shift+1 => "!", not
+        // "CSI 33;2 u". The shifted glyph is whatever the OS hands us
+        // in `text`.
+        let got = enc_kitty(
+            &char_key("1"),
+            Some("!"),
+            Modifiers::SHIFT,
+            1,
+            KeyState::Pressed,
+            false,
+        );
+        assert_eq!(got.as_deref(), Some(b"!".as_ref()));
+        let got = enc_kitty(
+            &char_key(";"),
+            Some(":"),
+            Modifiers::SHIFT,
+            1,
+            KeyState::Pressed,
+            false,
+        );
+        assert_eq!(got.as_deref(), Some(b":".as_ref()));
+    }
+
+    #[test]
+    fn kitty_disambiguate_caps_or_num_lock_alone_still_text() {
+        // Lock modifiers aren't in the disambiguate CSI-u list.
+        let got = enc_kitty(
+            &char_key("A"),
+            Some("A"),
+            Modifiers::CAPS_LOCK,
+            1,
+            KeyState::Pressed,
+            false,
+        );
+        assert_eq!(got.as_deref(), Some(b"A".as_ref()));
+        let got = enc_kitty(
+            &char_key("1"),
+            Some("1"),
+            Modifiers::NUM_LOCK,
+            1,
+            KeyState::Pressed,
+            false,
+        );
+        assert_eq!(got.as_deref(), Some(b"1".as_ref()));
+    }
+
+    #[test]
+    fn kitty_disambiguate_alt_letter_still_csi_u() {
+        // Alt+E is in the disambiguate CSI-u list.
+        let got = enc_kitty(
+            &char_key("e"),
+            Some("e"),
+            Modifiers::ALT,
+            1,
+            KeyState::Pressed,
+            false,
+        );
+        assert_eq!(got.as_deref(), Some(b"\x1b[101;3u".as_ref()));
+    }
+
+    #[test]
+    fn kitty_disambiguate_super_letter_still_csi_u() {
+        // Super (Cmd on macOS) should also force CSI u so apps can
+        // distinguish Cmd+E from a bare "E" typed by the user.
+        let got = enc_kitty(
+            &char_key("e"),
+            Some("e"),
+            Modifiers::SUPER,
+            1,
+            KeyState::Pressed,
+            false,
+        );
+        assert_eq!(got.as_deref(), Some(b"\x1b[101;9u".as_ref()));
+    }
+
+    #[test]
+    fn kitty_disambiguate_shift_alt_letter_still_csi_u() {
+        // Per spec, shift+alt+key IS in the CSI-u list — shift alone
+        // isn't, but combined with Alt it is.
+        let got = enc_kitty(
+            &char_key("e"),
+            Some("E"),
+            Modifiers::SHIFT | Modifiers::ALT,
+            1,
+            KeyState::Pressed,
+            false,
+        );
+        assert_eq!(got.as_deref(), Some(b"\x1b[101;4u".as_ref()));
     }
 
     #[test]

@@ -276,6 +276,94 @@ fn pty_drives_focus_reporting_mode_through_term() {
 }
 
 #[test]
+fn shift_letter_under_kitty_disambiguate_writes_plain_uppercase_to_pty() {
+    // Repro for the helix-in-zellij bug: zellij enables kitty
+    // disambiguate (CSI > 1 u). With only that flag set, the spec says
+    // Shift+E goes on the wire as the byte "E", not as "CSI 101;2 u".
+    // If we emit the CSI u form here, zellij decodes "lowercase e +
+    // shift modifier" and forwards plain "e" to the inner child, so
+    // capital letters never reach helix.
+    //
+    // We round-trip the encoded bytes through `cat` and confirm the
+    // PTY hands back "HE" — not "\x1b[101;2u" or "he".
+    let spec = PtySpec::program("/bin/cat").size(WinSize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    });
+    let pty = Pty::spawn(&spec).expect("spawn cat");
+
+    let (tx, rx) = mpsc::channel();
+    let sink = ChannelSink(Mutex::new(tx));
+    let _reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("reader");
+
+    // Flag bit 1 == disambiguate-only, the same value zellij pushes.
+    let kitty_flags = 1u8;
+    let bytes_h = encode_key(
+        &LogicalKey::Character("h".into()),
+        Some("H"),
+        Modifiers::SHIFT,
+        kitty_flags,
+        KeyState::Pressed,
+        false,
+    )
+    .expect("Shift+H must encode");
+    let bytes_e = encode_key(
+        &LogicalKey::Character("e".into()),
+        Some("E"),
+        Modifiers::SHIFT,
+        kitty_flags,
+        KeyState::Pressed,
+        false,
+    )
+    .expect("Shift+E must encode");
+    // Direct byte-level check before the PTY round-trip: this is the
+    // exact moral inverse of the bytes seen in /tmp/toastty.log.
+    assert_eq!(bytes_h, b"H");
+    assert_eq!(bytes_e, b"E");
+
+    let bytes_enter = encode_key(
+        &LogicalKey::Named(NamedKey::Enter),
+        None,
+        Modifiers::empty(),
+        kitty_flags,
+        KeyState::Pressed,
+        false,
+    )
+    .unwrap();
+    pty.write(&bytes_h).unwrap();
+    pty.write(&bytes_e).unwrap();
+    pty.write(&bytes_enter).unwrap();
+
+    let mut parser = Parser::new();
+    let mut term = Term::new(24, 80, 0);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut total = Vec::new();
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(UserEvent::PtyBytes(b)) => {
+                total.extend_from_slice(&b);
+                parser.advance(&mut term, &b);
+                let s = String::from_utf8_lossy(&total);
+                if s.contains("HE") {
+                    break;
+                }
+            }
+            Ok(UserEvent::PtyClosed) => break,
+            Err(_) => {}
+        }
+    }
+    let s = String::from_utf8_lossy(&total);
+    assert!(s.contains("HE"), "cat echo missing 'HE': {s:?}");
+    assert!(
+        !s.contains("\x1b[101;2u"),
+        "raw CSI-u for Shift+E leaked onto the wire: {s:?}",
+    );
+    drop(pty);
+}
+
+#[test]
 fn shell_resolution_falls_back_to_bin_sh() {
     let cfg = ShellConfig {
         program: "auto".into(),
