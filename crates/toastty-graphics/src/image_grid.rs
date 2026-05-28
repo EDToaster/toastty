@@ -236,6 +236,100 @@ impl ImageGrid {
         removed
     }
 
+    /// Like [`Self::shift_rows_down`], but only affects placements that
+    /// start within `[scroll_top, scroll_bottom)` and clips the bottom
+    /// edge to `scroll_bottom` (exclusive). Placements above or below
+    /// the region are untouched; a placement whose top would scroll past
+    /// `scroll_bottom` is dropped and returned.
+    ///
+    /// Used by DECSTBM partial-region scroll-down (Reverse Index inside
+    /// margins): images inside the region scroll with the text and clip
+    /// at the region boundaries.
+    ///
+    /// `n == 0` is a no-op.
+    pub fn shift_rows_down_within(
+        &mut self,
+        n: u16,
+        scroll_top: u16,
+        scroll_bottom: u16,
+    ) -> Vec<Placement> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut removed = Vec::new();
+        let mut i = 0;
+        while i < self.placements.len() {
+            let p = &mut self.placements[i].1;
+            // Only placements wholly within the region participate.
+            if p.row_range.start < scroll_top || p.row_range.start >= scroll_bottom {
+                i += 1;
+                continue;
+            }
+            let new_start = p.row_range.start.saturating_add(n);
+            let new_end = p.row_range.end.saturating_add(n);
+            if new_start >= scroll_bottom {
+                // Entire placement scrolled past the region bottom — drop.
+                removed.push(self.placements.remove(i).1);
+                continue;
+            }
+            let new_end = new_end.min(scroll_bottom);
+            p.row_range = new_start..new_end;
+            i += 1;
+        }
+        removed
+    }
+
+    /// Like [`Self::shift_rows_up`], but clips the bottom edge of each
+    /// shifted placement to `scroll_bottom` (exclusive) and only affects
+    /// placements that start at or below `scroll_top`. Placements whose
+    /// entire row range scrolls above `scroll_top` are dropped and
+    /// returned so the caller can mark cells dirty.
+    ///
+    /// Used by DECSTBM partial-region scroll-up: images inside the
+    /// margin region scroll with the text and are clipped at the region
+    /// boundaries; images above or below the region are untouched.
+    ///
+    /// `n == 0` is a no-op.
+    pub fn shift_rows_up_within(
+        &mut self,
+        n: u16,
+        scroll_top: u16,
+        scroll_bottom: u16,
+    ) -> Vec<Placement> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut removed = Vec::new();
+        let mut i = 0;
+        while i < self.placements.len() {
+            let p = &mut self.placements[i].1;
+            // Only placements wholly within the region participate; a
+            // placement that starts above the region or starts at/below
+            // the region bottom is left alone (it isn't "entirely within
+            // the page area").
+            if p.row_range.start < scroll_top || p.row_range.start >= scroll_bottom {
+                i += 1;
+                continue;
+            }
+            let new_start = p.row_range.start.saturating_sub(n);
+            let new_end = p.row_range.end.saturating_sub(n);
+            // Clamp the top edge to the region top — a placement can't
+            // scroll above its own region; if its whole span scrolls
+            // above `scroll_top`, drop it.
+            if new_end <= scroll_top {
+                removed.push(self.placements.remove(i).1);
+                continue;
+            }
+            let new_start = new_start.max(scroll_top);
+            // Clip the bottom edge to the region (defensive; shifting up
+            // only shrinks the end).
+            let new_end = new_end.min(scroll_bottom);
+            p.row_range = new_start..new_end;
+            i += 1;
+        }
+        removed
+    }
+
     /// Returns true iff any placement covers cell `(row, col)`.
     #[must_use]
     pub fn covers(&self, row: u16, col: u16) -> bool {

@@ -1521,6 +1521,16 @@ impl Term {
         for r in top..=bot {
             self.mark_row(r);
         }
+        // Per the kitty graphics protocol: when a scroll region is
+        // active, only images entirely within it are scrolled, and they
+        // are clipped at the region boundaries. `bot` is an inclusive
+        // margin, so the exclusive bottom bound is `bot + 1`.
+        let dropped = self
+            .image_grid
+            .shift_rows_up_within(1, top, bot.saturating_add(1));
+        if !dropped.is_empty() {
+            self.image_revision = self.image_revision.wrapping_add(1);
+        }
     }
 
     /// Symmetric to `region_scroll_up`: scroll the current DECSTBM
@@ -1565,6 +1575,14 @@ impl Term {
         row.soft_wrap = false;
         for r in top..=bot {
             self.mark_row(r);
+        }
+        // Scroll images within the region, clipping at its boundaries.
+        // `bot` is inclusive → exclusive bottom bound is `bot + 1`.
+        let dropped = self
+            .image_grid
+            .shift_rows_down_within(1, top, bot.saturating_add(1));
+        if !dropped.is_empty() {
+            self.image_revision = self.image_revision.wrapping_add(1);
         }
     }
 
@@ -2198,6 +2216,14 @@ impl Term {
             _ => {
                 grid.clear_visible(style);
                 self.damage.mark_all();
+                // Per the kitty graphics protocol: "The clear screen
+                // escape code (usually ESC[2J) should also clear all
+                // images." This applies to 2J and 3J only — partial
+                // erases (0J/1J) must not affect graphics.
+                let dropped = self.image_grid.clear();
+                if !dropped.is_empty() {
+                    self.image_revision = self.image_revision.wrapping_add(1);
+                }
             }
         }
     }
@@ -6578,5 +6604,149 @@ mod blocker_delete_tests {
         assert!(!t.image_registry().contains(5), "uppercase R frees bytes for id 5");
         assert!(!t.image_registry().contains(8), "uppercase R frees bytes for id 8");
         assert!(t.image_registry().contains(12), "id 12 outside range untouched");
+    }
+}
+
+/// Tests for spec-compliance blockers B1 (CSI 2J/3J clears images) and
+/// B3 (DECSTBM partial-region scroll moves images within the region).
+#[cfg(test)]
+mod blocker_screenops_tests {
+    use super::*;
+    use base64::Engine;
+    use toastty_parser::Parser;
+
+    fn feed(t: &mut Term, bytes: &[u8]) {
+        let mut p = Parser::new();
+        p.advance(t, bytes);
+    }
+
+    fn b64_red_1x1() -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .encode([255u8, 0, 0, 255])
+            .into_bytes()
+    }
+
+    /// Transmit-and-place a 1x1 image occupying `cols`x`rows` cells at
+    /// the current cursor.
+    fn place_image_at_cursor(t: &mut Term, id: u32, cols: u16, rows: u16) {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(
+            format!("\x1b_Ga=T,f=32,s=1,v=1,i={id},c={cols},r={rows};").as_bytes(),
+        );
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(t, &payload);
+    }
+
+    // ---- B1: CSI 2J / 3J must clear images; 0J / 1J must not. ----
+
+    #[test]
+    fn ed_2j_clears_all_images() {
+        let mut t = Term::new(8, 8, 0);
+        place_image_at_cursor(&mut t, 1, 2, 2);
+        assert_eq!(t.image_grid().len(), 1);
+        feed(&mut t, b"\x1b[2J");
+        assert_eq!(t.image_grid().len(), 0, "2J must clear all images");
+    }
+
+    #[test]
+    fn ed_3j_clears_all_images() {
+        let mut t = Term::new(8, 8, 0);
+        place_image_at_cursor(&mut t, 1, 2, 2);
+        assert_eq!(t.image_grid().len(), 1);
+        feed(&mut t, b"\x1b[3J");
+        assert_eq!(t.image_grid().len(), 0, "3J must clear all images");
+    }
+
+    #[test]
+    fn ed_0j_and_1j_do_not_clear_images() {
+        // Partial erases (to-end / to-start) must not affect graphics
+        // per the kitty spec.
+        let mut t = Term::new(8, 8, 0);
+        // Put the cursor mid-screen so both 0J and 1J leave some cells.
+        feed(&mut t, b"\x1b[4;4H");
+        place_image_at_cursor(&mut t, 1, 2, 2);
+        assert_eq!(t.image_grid().len(), 1);
+        feed(&mut t, b"\x1b[0J");
+        assert_eq!(t.image_grid().len(), 1, "0J must NOT clear images");
+        feed(&mut t, b"\x1b[1J");
+        assert_eq!(t.image_grid().len(), 1, "1J must NOT clear images");
+    }
+
+    // ---- B3: DECSTBM partial-region scroll moves images. ----
+
+    #[test]
+    fn decstbm_scroll_up_moves_image_within_region() {
+        // 10-row terminal, region rows 3..=8 (1-based 4;9).
+        let mut t = Term::new(10, 8, 0);
+        feed(&mut t, b"\x1b[4;9r"); // DECSTBM → top=3, bot=8; cursor home.
+        // Place a 2-row image at region-interior row 5 (1-based row 6).
+        feed(&mut t, b"\x1b[6;1H");
+        place_image_at_cursor(&mut t, 1, 2, 2);
+        let before = t.image_grid().iter().next().unwrap().row_range.clone();
+        assert_eq!(before, 5..7, "image placed at rows 5..7");
+        // Drive the cursor to the bottom margin and emit 2 line feeds so
+        // the region scrolls up twice.
+        feed(&mut t, b"\x1b[9;1H\n\n");
+        let after = t.image_grid().iter().next().unwrap().row_range.clone();
+        assert_eq!(after, 3..5, "image shifted up by 2 within the region");
+    }
+
+    #[test]
+    fn decstbm_scroll_up_clips_image_at_region_top() {
+        // Image straddles near the region top; scrolling up clips it at
+        // the top margin (CLIPPING CHOICE: a placement that scrolls past
+        // the region top is clamped to start at `top`; only when its
+        // entire span scrolls above `top` is it dropped).
+        let mut t = Term::new(10, 8, 0);
+        feed(&mut t, b"\x1b[3;8r"); // top=2, bot=7.
+        feed(&mut t, b"\x1b[4;1H"); // row 3 (interior).
+        place_image_at_cursor(&mut t, 1, 2, 3); // rows 3..6.
+        assert_eq!(t.image_grid().iter().next().unwrap().row_range, 3..6);
+        // Scroll up by 2: 3..6 → 1..4, but region top is 2, so clipped
+        // to 2..4.
+        feed(&mut t, b"\x1b[8;1H\n\n");
+        assert_eq!(
+            t.image_grid().iter().next().unwrap().row_range,
+            2..4,
+            "top edge clipped to region top margin"
+        );
+    }
+
+    #[test]
+    fn decstbm_scroll_up_leaves_image_below_region_untouched() {
+        // An image entirely below the scroll region must not move.
+        let mut t = Term::new(10, 8, 0);
+        // Place image at rows 8..9 first (below the region we set next).
+        feed(&mut t, b"\x1b[9;1H");
+        place_image_at_cursor(&mut t, 1, 2, 1); // rows 8..9.
+        assert_eq!(t.image_grid().iter().next().unwrap().row_range, 8..9);
+        // Region rows 1..=5 (1-based 2;6), entirely above the image.
+        feed(&mut t, b"\x1b[2;6r");
+        feed(&mut t, b"\x1b[6;1H\n\n");
+        assert_eq!(
+            t.image_grid().iter().next().unwrap().row_range,
+            8..9,
+            "image below region is untouched"
+        );
+    }
+
+    #[test]
+    fn decstbm_scroll_down_moves_image_within_region() {
+        // Reverse Index within a region scrolls content (and images)
+        // down.
+        let mut t = Term::new(10, 8, 0);
+        feed(&mut t, b"\x1b[3;9r"); // top=2, bot=8.
+        feed(&mut t, b"\x1b[4;1H"); // row 3 interior.
+        place_image_at_cursor(&mut t, 1, 2, 2); // rows 3..5.
+        assert_eq!(t.image_grid().iter().next().unwrap().row_range, 3..5);
+        // Move to top margin and Reverse Index (ESC M) twice to scroll
+        // the region down by 2.
+        feed(&mut t, b"\x1b[3;1H\x1bM\x1bM");
+        assert_eq!(
+            t.image_grid().iter().next().unwrap().row_range,
+            5..7,
+            "image shifted down by 2 within the region"
+        );
     }
 }
