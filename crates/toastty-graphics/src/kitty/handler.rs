@@ -289,9 +289,19 @@ impl KittyHandler {
             self.active_upload_id.unwrap_or(0)
         };
 
+        // We have a continuation target either because the client passed
+        // an explicit `i=` (rare with chunked uploads) or because we're
+        // already mid-stream on an anonymous (no-`i=`) upload that we've
+        // been tracking via `active_upload_id`. Without the latter
+        // branch, clients like bannerfetch that omit `i=` on every chunk
+        // would have their `m=0` final chunk parsed as a brand-new
+        // single-shot transmit — the bare header carries no `s=` / `v=`
+        // and the decoder rejects it with `EINVAL`.
+        let has_route = header.image_id != 0 || self.active_upload_id.is_some();
+
         // Continuation: append to the existing pending buffer.
-        if let Some(pending) = self.pending.get_mut(&key)
-            && key != 0
+        if has_route
+            && let Some(pending) = self.pending.get_mut(&key)
         {
             // Compare critical header fields. Mismatches → Einval and
             // abandon the upload. Skip the check when the continuation
@@ -336,13 +346,12 @@ impl KittyHandler {
         }
 
         if header.more {
-            // First chunk of a multi-chunk upload. Record `active_upload_id`
-            // so continuation chunks that omit `i=` (which is every
-            // real-world client per docs/specs) get routed back to
-            // this pending entry.
-            if key != 0 {
-                self.active_upload_id = Some(key);
-            }
+            // First chunk of a multi-chunk upload. Always record
+            // `active_upload_id` — including `Some(0)` for fully
+            // anonymous uploads (no `i=` on any chunk). Continuation
+            // chunks omit `i=` in every real-world client, so this is
+            // the only state we can route them back through.
+            self.active_upload_id = Some(key);
             self.pending.insert(
                 key,
                 PendingUpload {
@@ -748,6 +757,70 @@ mod tests {
             !joined.contains("EINVAL") && !joined.contains("EBADF"),
             "expected no error reply, got {joined:?}"
         );
+    }
+
+    /// Regression: bannerfetch (and other minimalist clients) omit
+    /// `i=` on *every* chunk, including the first — kitty assigns the
+    /// id. The first chunk arrives with `f=24,s=W,v=H,c=,r=,a=T,m=1`
+    /// (no `i=`); the second chunk is bare `m=0`. Before this fix,
+    /// `active_upload_id` was only set when the first chunk had a
+    /// non-zero `i=`, so the bare final chunk was parsed as a fresh
+    /// single-chunk transmit with width=height=0 and tripped the
+    /// decoder's "missing required dimensions" EINVAL.
+    #[test]
+    fn fully_anonymous_chunked_upload_reassembles() {
+        use base64::Engine;
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+
+        // 2x2 RGB (12 bytes). Split the base64 across two APC blocks
+        // exactly the way bannerfetch does it.
+        let rgb = vec![
+            255, 0, 0, // red
+            0, 255, 0, // green
+            0, 0, 255, // blue
+            255, 255, 255, // white
+        ];
+        let body = base64::engine::general_purpose::STANDARD.encode(&rgb);
+        let half = body.len() / 2;
+        let (a, b) = body.split_at(half);
+
+        // First chunk: full header, NO `i=`.
+        h.process(
+            b"Gf=24,s=2,v=2,c=2,r=2,a=T,m=1",
+            a.as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.registered.len(), 0, "first chunk shouldn't finalize");
+        assert_eq!(h.pending_uploads(), 1, "first chunk must enter pending");
+
+        // Final chunk: bare m=0.
+        h.process(b"Gm=0", b.as_bytes(), &mut sink).unwrap();
+
+        // Exactly one image registered, with the assigned id, no
+        // EINVAL on the wire.
+        assert_eq!(
+            sink.registered.len(),
+            1,
+            "anonymous upload must produce one image, replies={:?}",
+            sink.replies
+                .iter()
+                .map(|r| String::from_utf8_lossy(r).into_owned())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(sink.registered[0].1.width, 2);
+        assert_eq!(sink.registered[0].1.height, 2);
+        let joined: String = sink
+            .replies
+            .iter()
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .collect();
+        assert!(
+            !joined.contains("EINVAL"),
+            "anonymous upload must not EINVAL: {joined:?}",
+        );
+        assert_eq!(h.pending_uploads(), 0, "pending state must drain");
     }
 
     #[test]
