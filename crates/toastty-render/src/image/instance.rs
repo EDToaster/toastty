@@ -28,10 +28,46 @@ pub struct ImageInstance {
     pub texture_index: u32,
     /// Z order. The host splits below/above text using sign.
     pub z: i32,
+    /// Source image id. Not consumed by the shader; carried here so the
+    /// CPU-side sort can tie-break equal-z placements by ascending id
+    /// (kitty spec). Occupies the first std430 pad slot.
+    #[allow(clippy::pub_underscore_fields)]
+    pub image_id: u32,
     /// Padding for std430 alignment. Not consumed by callers; the
     /// underscore prefix tells Rust it's intentional.
     #[allow(clippy::pub_underscore_fields)]
-    pub _pad: [u32; 2],
+    pub _pad: [u32; 1],
+}
+
+/// Which compositing layer a placement belongs to, per the kitty spec's
+/// z-index banding under "Controlling displayed image layout".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    /// `z < INT32_MIN/2`: draw beneath everything, including the cell
+    /// background colors.
+    BelowCellBg,
+    /// `INT32_MIN/2 <= z < 0`: draw below text glyphs but above the cell
+    /// background.
+    BelowText,
+    /// `z >= 0`: draw above text.
+    AboveText,
+}
+
+/// Classify a z-index into its compositing [`Layer`] per the kitty spec.
+///
+/// - `z < INT32_MIN/2` → [`Layer::BelowCellBg`]
+/// - `INT32_MIN/2 <= z < 0` → [`Layer::BelowText`]
+/// - `z >= 0` → [`Layer::AboveText`]
+#[must_use]
+pub fn classify_layer(z: i32) -> Layer {
+    const HALF_MIN: i32 = i32::MIN / 2;
+    if z < HALF_MIN {
+        Layer::BelowCellBg
+    } else if z < 0 {
+        Layer::BelowText
+    } else {
+        Layer::AboveText
+    }
 }
 
 impl ImageInstance {
@@ -128,24 +164,40 @@ pub fn build_image_instances(
             uv_max,
             texture_index: entry.texture_index as u32,
             z: placement.z,
-            _pad: [0; 2],
+            image_id: placement.image_id,
+            _pad: [0; 1],
         });
     }
-    // Stable sort by z so below-text and above-text both come out in
-    // the order they were inserted.
-    out[len_before..].sort_by_key(|i| i.z);
+    // m3: sort by (z, image_id) so equal-z placements tie-break by
+    // ascending image id (kitty: lower id has lower z). The sort is
+    // stable, so any further ties keep insertion order.
+    out[len_before..].sort_by_key(|i| (i.z, i.image_id));
 }
 
-/// Split a `Vec<ImageInstance>` into `(below_text, above_text)` slices
-/// based on the sign of `z`. `z < 0` is below; `z >= 0` is above.
+/// Split a z-sorted `Vec<ImageInstance>` into three layers per the kitty
+/// z-index banding: `(below_cell_bg, below_text, above_text)`.
+///
+/// Instances must already be sorted ascending by z (as
+/// [`build_image_instances`] leaves them).
 #[must_use]
-pub fn split_below_above(instances: &[ImageInstance]) -> (&[ImageInstance], &[ImageInstance]) {
-    // Already z-sorted; find first index where z >= 0.
-    let split = instances
+pub fn split_layers(
+    instances: &[ImageInstance],
+) -> (&[ImageInstance], &[ImageInstance], &[ImageInstance]) {
+    // Boundaries: first index that leaves BelowCellBg, then first index
+    // that leaves BelowText. Both monotonic because z is sorted.
+    let below_bg_end = instances
         .iter()
-        .position(|i| i.z >= 0)
+        .position(|i| classify_layer(i.z) != Layer::BelowCellBg)
         .unwrap_or(instances.len());
-    (&instances[..split], &instances[split..])
+    let below_text_end = instances
+        .iter()
+        .position(|i| classify_layer(i.z) == Layer::AboveText)
+        .unwrap_or(instances.len());
+    (
+        &instances[..below_bg_end],
+        &instances[below_bg_end..below_text_end],
+        &instances[below_text_end..],
+    )
 }
 
 #[cfg(test)]
@@ -255,12 +307,13 @@ mod tests {
     }
 
     #[test]
-    fn split_below_above_partitions_by_z_sign() {
+    fn split_layers_partitions_three_bands() {
         let mut grid = ImageGrid::new();
         grid.add(place(1, 0..1, 0..1, -1));
         grid.add(place(1, 0..1, 1..2, -2));
         grid.add(place(1, 0..1, 2..3, 0));
         grid.add(place(1, 0..1, 3..4, 5));
+        grid.add(place(1, 0..1, 4..5, i32::MIN));
         let mut reg = ImageRegistry::new(4096);
         reg.insert(1, red_pixel(1, 1)).unwrap();
         let mut cache = ImageTextureCache::new(4);
@@ -275,10 +328,12 @@ mod tests {
         );
         let mut out = Vec::new();
         build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 10.0));
-        let (below, above) = split_below_above(&out);
-        assert_eq!(below.len(), 2);
+        let (below_bg, below_text, above) = split_layers(&out);
+        assert_eq!(below_bg.len(), 1);
+        assert_eq!(below_text.len(), 2);
         assert_eq!(above.len(), 2);
-        assert!(below.iter().all(|i| i.z < 0));
+        assert!(below_bg.iter().all(|i| classify_layer(i.z) == Layer::BelowCellBg));
+        assert!(below_text.iter().all(|i| classify_layer(i.z) == Layer::BelowText));
         assert!(above.iter().all(|i| i.z >= 0));
     }
 
@@ -317,5 +372,80 @@ mod tests {
         build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 10.0));
         assert_eq!(out[0].uv_min, [0.25, 0.25]);
         assert_eq!(out[0].uv_max, [0.75, 0.75]);
+    }
+}
+
+#[cfg(test)]
+mod minor_render_tests {
+    use super::*;
+    use toastty_term::{ImageGrid, ImageRegistry, Placement, SrcRect};
+
+    fn red_pixel(width: u32, height: u32) -> toastty_term::ImageData {
+        let n = (width * height) as usize;
+        let mut pixels = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            pixels.extend_from_slice(&[255, 0, 0, 255]);
+        }
+        toastty_term::ImageData {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    fn place(id: u32, z: i32) -> Placement {
+        Placement {
+            image_id: id,
+            placement_id: 0,
+            row_range: 0..1,
+            col_range: 0..1,
+            src_rect: SrcRect::FULL,
+            z,
+            pix_offset: (0, 0),
+            parent: None,
+            rel_offset: (0, 0),
+        }
+    }
+
+    // m3: equal z, differing image ids must sort by ascending image id,
+    // regardless of insertion order.
+    #[test]
+    fn equal_z_ties_break_by_ascending_image_id() {
+        let mut grid = ImageGrid::new();
+        // Insert in descending id order to prove the sort, not insertion
+        // order, decides.
+        grid.add(place(30, 7));
+        grid.add(place(10, 7));
+        grid.add(place(20, 7));
+        let mut reg = ImageRegistry::new(8192);
+        let mut cache = ImageTextureCache::new(8);
+        for id in [10u32, 20, 30] {
+            reg.insert(id, red_pixel(1, 1)).unwrap();
+            cache.insert(
+                id,
+                crate::image::atlas::ImageTexEntry {
+                    texture_index: id as usize,
+                    width: 1,
+                    height: 1,
+                    content_hash: 0,
+                },
+            );
+        }
+        let mut out = Vec::new();
+        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 10.0));
+        let ids: Vec<u32> = out.iter().map(|i| i.image_id).collect();
+        assert_eq!(ids, vec![10, 20, 30]);
+    }
+
+    // m2: layer classification by z-index band.
+    #[test]
+    fn classify_layer_bands() {
+        assert_eq!(classify_layer(i32::MIN), Layer::BelowCellBg);
+        assert_eq!(classify_layer(i32::MIN / 2 - 1), Layer::BelowCellBg);
+        // Boundary: z == INT32_MIN/2 is in the below-text band (>= MIN/2).
+        assert_eq!(classify_layer(i32::MIN / 2), Layer::BelowText);
+        assert_eq!(classify_layer(-1), Layer::BelowText);
+        assert_eq!(classify_layer(0), Layer::AboveText);
+        assert_eq!(classify_layer(5), Layer::AboveText);
     }
 }

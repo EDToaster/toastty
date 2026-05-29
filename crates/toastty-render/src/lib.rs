@@ -41,7 +41,7 @@ use wgpu::{
 };
 
 use crate::image::atlas::ImageTextureCache;
-use crate::image::instance::{ImageInstance, build_image_instances, split_below_above};
+use crate::image::instance::{ImageInstance, build_image_instances, split_layers};
 use crate::image::pipeline::ImagePipeline;
 use crate::rgp::{GpuAssetCache, Rgp3dPipeline};
 use crate::text::glyph_rasterizer::{DEFAULT_LINE_HEIGHT_RATIO, GlyphRasterizer, LineGlyphs};
@@ -234,8 +234,12 @@ pub struct Renderer {
     image_tex_cache: ImageTextureCache,
     /// Last `Term::image_revision` we synced.
     image_revision_seen: u32,
-    /// Reusable storage for the below-text / above-text instance
-    /// vectors. Cleared every frame; allocation survives across frames.
+    /// Reusable storage for the below-cell-bg / below-text / above-text
+    /// instance vectors. Cleared every frame; allocation survives across
+    /// frames. The below-cell-bg band (z < INT32_MIN/2) draws beneath the
+    /// text background pass; below-text (INT32_MIN/2 <= z < 0) above bg
+    /// but below glyphs; above-text (z >= 0) on top.
+    image_instances_below_bg: Vec<ImageInstance>,
     image_instances_below: Vec<ImageInstance>,
     image_instances_above: Vec<ImageInstance>,
     /// Last viewport offset rendered. When it changes we force a full
@@ -560,6 +564,7 @@ impl Renderer {
             image_pipeline: None,
             image_tex_cache: ImageTextureCache::new(ImageTextureCache::DEFAULT_MAX_ACTIVE),
             image_revision_seen: u32::MAX,
+            image_instances_below_bg: Vec::new(),
             image_instances_below: Vec::new(),
             image_instances_above: Vec::new(),
             last_view_offset: (0, 0.0),
@@ -1357,6 +1362,7 @@ impl Renderer {
         // M11a: build image instances split by z sign. We clear the
         // existing vecs and rebuild every frame — the count of images
         // is small (<= 14) so this is cheap.
+        self.image_instances_below_bg.clear();
         self.image_instances_below.clear();
         self.image_instances_above.clear();
         if !term.image_grid().is_empty() {
@@ -1368,7 +1374,8 @@ impl Renderer {
                 &self.image_tex_cache,
                 cell_size,
             );
-            let (below, above) = split_below_above(&tmp);
+            let (below_bg, below, above) = split_layers(&tmp);
+            self.image_instances_below_bg.extend_from_slice(below_bg);
             self.image_instances_below.extend_from_slice(below);
             self.image_instances_above.extend_from_slice(above);
         }
@@ -1516,6 +1523,8 @@ impl Renderer {
             });
 
             // Draw order:
+            //   0. below-cell-bg images (z < INT32_MIN/2) — drawn first
+            //      so the text bg pass paints over them.
             //   1. text bg pass — no depth test/write, so 3D overpaints
             //      cell backgrounds (3D shows through).
             //   2. RGP 3D pass — writes color + depth.
@@ -1529,6 +1538,20 @@ impl Renderer {
             // layer, `depth > 0` lose to it. Cell bg is always behind.
             #[allow(clippy::cast_precision_loss)] // viewport in 16k-px range.
             let viewport = (self.config.width as f32, self.config.height as f32);
+
+            // m2: below-cell-bg images draw before the text bg pass so
+            // the cell background colors paint over them.
+            if let Some(img_pipe) = self.image_pipeline.as_mut()
+                && !self.image_instances_below_bg.is_empty()
+            {
+                img_pipe.render(
+                    &self.device,
+                    &self.queue,
+                    &mut rp,
+                    &self.image_instances_below_bg,
+                    viewport,
+                );
+            }
 
             // Upload text instances + globals once; both bg and glyph
             // passes share the buffer. Drop the &mut borrow before
