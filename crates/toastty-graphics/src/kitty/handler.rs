@@ -703,15 +703,18 @@ pub enum HandlerError {
     BadHeader(super::header::KittyHeaderError),
 }
 
-/// Two headers that belong to the same chunked upload should agree on
-/// the fields below.
+/// A continuation chunk belongs to the same upload as the first chunk
+/// when it routes to the same in-flight identity.
+///
+/// Reference kitty ignores everything except `m=` (and the running
+/// payload) on continuation chunks — the spec says continuation chunks
+/// "must have only the `m` and optionally `q` keys", and terminals
+/// ignore extras rather than validating them. We therefore only compare
+/// the chunk-routing identity (`i=`); incidental keys like `f=`, `o=`,
+/// `a=`, `S=`/`v=` on a continuation chunk are tolerated (and ignored)
+/// rather than rejected with EINVAL.
 fn headers_continuation_compatible(first: &Header, next: &Header) -> bool {
     first.image_id == next.image_id
-        && first.format == next.format
-        && first.compression == next.compression
-        && first.action == next.action
-        && first.source_width == next.source_width
-        && first.source_height == next.source_height
 }
 
 fn decode_base64(input: &[u8]) -> Result<Vec<u8>, String> {
@@ -910,12 +913,14 @@ fn emit_bad_header_einval<S: KittySink>(header_bytes: &[u8], sink: &mut S) {
     };
     let mut image_id = 0u32;
     let mut image_number = 0u32;
+    let mut placement_id = 0u32;
     let mut quiet = Quiet::Verbose;
     for pair in s.split(',') {
         if let Some((key, value)) = pair.split_once('=') {
             match key.trim() {
                 "i" => image_id = value.trim().parse().unwrap_or(image_id),
                 "I" => image_number = value.trim().parse().unwrap_or(image_number),
+                "p" => placement_id = value.trim().parse().unwrap_or(placement_id),
                 "q" => {
                     quiet = match value.trim() {
                         "2" => Quiet::Silent,
@@ -937,6 +942,7 @@ fn emit_bad_header_einval<S: KittySink>(header_bytes: &[u8], sink: &mut S) {
     sink.queue_reply(&encode_error(
         image_id,
         image_number,
+        placement_id,
         ErrorCode::Einval,
         "malformed header",
     ));
@@ -953,7 +959,11 @@ fn reply_ok_if_verbose_with_id<S: KittySink>(header: &Header, sink: &mut S, imag
     if !client_wants_reply(header) {
         return;
     }
-    sink.queue_reply(&encode_ok(image_id, header.image_number));
+    sink.queue_reply(&encode_ok(
+        image_id,
+        header.image_number,
+        header.placement_id,
+    ));
 }
 
 fn reply_error_if_verbose<S: KittySink>(
@@ -979,6 +989,7 @@ fn reply_error_if_verbose<S: KittySink>(
     sink.queue_reply(&encode_error(
         header.image_id,
         header.image_number,
+        header.placement_id,
         code,
         detail,
     ));
@@ -2181,6 +2192,173 @@ mod major_relative_handler_tests {
         assert!(
             sink.replies_joined().contains("EINVAL"),
             "got {:?}",
+            sink.replies_joined()
+        );
+    }
+}
+
+/// Coverage for the minor kitty-protocol fixes m1 (replies echo the
+/// placement id `p=`) and m8 (continuation chunks tolerate stray
+/// incidental keys instead of being rejected with EINVAL).
+#[cfg(test)]
+mod minor_graphics_tests {
+    use super::*;
+
+    /// Sink that records registered images and replies, mirroring the
+    /// `MockSink` pattern in the main test module.
+    #[derive(Debug, Default)]
+    struct MockSink {
+        registered: Vec<(u32, ImageData)>,
+        replies: Vec<Vec<u8>>,
+        budget: u64,
+        assign_next: u32,
+    }
+
+    impl MockSink {
+        fn new() -> Self {
+            Self {
+                budget: 1 << 30,
+                assign_next: 1,
+                ..Self::default()
+            }
+        }
+
+        /// All queued replies concatenated into a single string for easy
+        /// substring assertions.
+        fn replies_joined(&self) -> String {
+            self.replies
+                .iter()
+                .map(|r| String::from_utf8_lossy(r).into_owned())
+                .collect()
+        }
+    }
+
+    impl KittySink for MockSink {
+        fn register_image(
+            &mut self,
+            id_request: u32,
+            _image_number: u32,
+            data: ImageData,
+        ) -> Option<u32> {
+            let id = if id_request == 0 {
+                let assigned = self.assign_next;
+                self.assign_next += 1;
+                assigned
+            } else {
+                id_request
+            };
+            self.registered.push((id, data));
+            Some(id)
+        }
+        fn image_exists(&self, id: u32) -> bool {
+            self.registered.iter().any(|(rid, _)| *rid == id)
+        }
+        fn place_image(&mut self, _placement: Placement) {}
+        fn delete_image(&mut self, _delete: DeleteSpec, _header: &Header) {}
+        fn queue_reply(&mut self, bytes: &[u8]) {
+            self.replies.push(bytes.to_vec());
+        }
+        fn pending_budget_remaining(&self) -> u64 {
+            self.budget
+        }
+    }
+
+    /// 1x1 RGBA red pixel as base64.
+    fn b64_red_pixel() -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode([255u8, 0, 0, 255])
+    }
+
+    // ---- m1: reply echoes placement id -------------------------------
+
+    #[test]
+    fn ok_reply_echoes_placement_id() {
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::new();
+        // a=t transmit with an explicit image id and placement id.
+        h.process(
+            b"Ga=t,f=32,s=1,v=1,i=5,p=3",
+            b64_red_pixel().as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.replies.len(), 1);
+        let reply = sink.replies_joined();
+        assert!(reply.contains("i=5"), "missing i=5 in {reply:?}");
+        assert!(reply.contains("p=3"), "missing p=3 in {reply:?}");
+        assert!(reply.contains("OK"), "expected OK in {reply:?}");
+    }
+
+    #[test]
+    fn ok_reply_omits_placement_id_when_zero() {
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::new();
+        h.process(
+            b"Ga=t,f=32,s=1,v=1,i=5,p=0",
+            b64_red_pixel().as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.replies.len(), 1);
+        let reply = sink.replies_joined();
+        assert!(reply.contains("i=5"), "missing i=5 in {reply:?}");
+        assert!(!reply.contains("p="), "unexpected p= in {reply:?}");
+    }
+
+    #[test]
+    fn error_reply_echoes_placement_id() {
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::new();
+        // A transmit-and-display that asks for both i= and I= is rejected
+        // with EINVAL; the error reply must still echo i= and p=. (We use
+        // the i=/I= conflict because it errors regardless of sink state.)
+        h.process(b"Ga=t,f=32,s=1,v=1,i=7,I=2,p=9", b"", &mut sink)
+            .unwrap();
+        assert_eq!(sink.replies.len(), 1);
+        let reply = sink.replies_joined();
+        assert!(reply.contains("EINVAL"), "expected EINVAL in {reply:?}");
+        assert!(reply.contains("i=7"), "missing i=7 in {reply:?}");
+        assert!(reply.contains("p=9"), "missing p=9 in {reply:?}");
+    }
+
+    // ---- m8: continuation chunks tolerate stray keys -----------------
+
+    #[test]
+    fn continuation_chunk_with_extra_keys_still_completes() {
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::new();
+        let body = b64_red_pixel();
+        let half = body.len() / 2;
+        let (a, b) = body.split_at(half);
+        // First chunk: full header, more coming.
+        h.process(
+            b"Ga=t,f=32,s=1,v=1,i=11,m=1",
+            a.as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.registered.len(), 0);
+        assert_eq!(h.pending_uploads(), 1);
+        // Final chunk: carries a DIFFERENT incidental key (stray S= and a
+        // mismatched f=) plus the routing i=. Reference kitty ignores
+        // these; we must NOT reject with EINVAL.
+        h.process(
+            b"Ga=t,f=100,S=999,i=11,m=0",
+            b.as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(
+            sink.registered.len(),
+            1,
+            "upload should complete; replies={:?}",
+            sink.replies_joined()
+        );
+        assert_eq!(sink.registered[0].0, 11);
+        assert_eq!(h.pending_uploads(), 0);
+        assert!(
+            !sink.replies_joined().contains("EINVAL"),
+            "unexpected EINVAL in {:?}",
             sink.replies_joined()
         );
     }

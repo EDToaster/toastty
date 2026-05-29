@@ -55,9 +55,12 @@ impl ErrorCode {
 /// (kitty's spec says the reply should echo whichever identifier the
 /// client used). We emit both keys when both are non-zero — kitty's
 /// docs are explicit that the terminal MAY do that.
+///
+/// `placement_id` is echoed as `p=` when non-zero, matching the spec
+/// example `ESC_Gi=<id>,p=<placement>;OK ESC\`.
 #[must_use]
-pub fn encode_ok(image_id: u32, image_number: u32) -> Vec<u8> {
-    encode(image_id, image_number, "OK")
+pub fn encode_ok(image_id: u32, image_number: u32, placement_id: u32) -> Vec<u8> {
+    encode(image_id, image_number, placement_id, "OK")
 }
 
 /// Encode an error response.
@@ -66,17 +69,25 @@ pub fn encode_ok(image_id: u32, image_number: u32) -> Vec<u8> {
 /// `"<CODE>"` otherwise. Clients commonly match on the leading code
 /// only, so the colon-separated detail is informational.
 #[must_use]
-pub fn encode_error(image_id: u32, image_number: u32, code: ErrorCode, detail: &str) -> Vec<u8> {
+pub fn encode_error(
+    image_id: u32,
+    image_number: u32,
+    placement_id: u32,
+    code: ErrorCode,
+    detail: &str,
+) -> Vec<u8> {
     let body = if detail.is_empty() {
         code.as_str().to_string()
     } else {
         format!("{}:{}", code.as_str(), detail)
     };
-    encode(image_id, image_number, &body)
+    encode(image_id, image_number, placement_id, &body)
 }
 
 /// Lower-level common encoder for `OK` and error bodies.
-fn encode(image_id: u32, image_number: u32, body: &str) -> Vec<u8> {
+///
+/// Field order mirrors reference kitty: `i`, `I`, then `p`.
+fn encode(image_id: u32, image_number: u32, placement_id: u32, body: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 + body.len());
     out.extend_from_slice(b"\x1b_G");
     let mut first = true;
@@ -89,6 +100,13 @@ fn encode(image_id: u32, image_number: u32, body: &str) -> Vec<u8> {
             out.push(b',');
         }
         out.extend_from_slice(format!("I={image_number}").as_bytes());
+        first = false;
+    }
+    if placement_id != 0 {
+        if !first {
+            out.push(b',');
+        }
+        out.extend_from_slice(format!("p={placement_id}").as_bytes());
     }
     out.push(b';');
     out.extend_from_slice(body.as_bytes());
@@ -102,57 +120,77 @@ mod tests {
 
     #[test]
     fn ok_reply_basic() {
-        let bytes = encode_ok(42, 0);
+        let bytes = encode_ok(42, 0, 0);
         assert_eq!(bytes, b"\x1b_Gi=42;OK\x1b\\");
     }
 
     #[test]
     fn ok_reply_with_image_number_only() {
-        let bytes = encode_ok(0, 7);
+        let bytes = encode_ok(0, 7, 0);
         assert_eq!(bytes, b"\x1b_GI=7;OK\x1b\\");
     }
 
     #[test]
     fn ok_reply_with_both_keys() {
-        let bytes = encode_ok(5, 7);
+        let bytes = encode_ok(5, 7, 0);
         assert_eq!(bytes, b"\x1b_Gi=5,I=7;OK\x1b\\");
     }
 
     #[test]
     fn ok_reply_no_keys() {
         // Both zero: still legal; the reply just has no `i=`/`I=`.
-        let bytes = encode_ok(0, 0);
+        let bytes = encode_ok(0, 0, 0);
         assert_eq!(bytes, b"\x1b_G;OK\x1b\\");
     }
 
     #[test]
+    fn ok_reply_echoes_placement_id() {
+        // p= is echoed after i= when the client supplied a placement id.
+        let bytes = encode_ok(5, 0, 3);
+        assert_eq!(bytes, b"\x1b_Gi=5,p=3;OK\x1b\\");
+    }
+
+    #[test]
+    fn ok_reply_placement_id_with_all_keys() {
+        // Field order is i, I, p.
+        let bytes = encode_ok(5, 7, 3);
+        assert_eq!(bytes, b"\x1b_Gi=5,I=7,p=3;OK\x1b\\");
+    }
+
+    #[test]
     fn error_reply_einval() {
-        let bytes = encode_error(1, 0, ErrorCode::Einval, "");
+        let bytes = encode_error(1, 0, 0, ErrorCode::Einval, "");
         assert_eq!(bytes, b"\x1b_Gi=1;EINVAL\x1b\\");
     }
 
     #[test]
     fn error_reply_ebadf() {
-        let bytes = encode_error(1, 0, ErrorCode::Ebadf, "bad PNG");
+        let bytes = encode_error(1, 0, 0, ErrorCode::Ebadf, "bad PNG");
         assert_eq!(bytes, b"\x1b_Gi=1;EBADF:bad PNG\x1b\\");
     }
 
     #[test]
     fn error_reply_enoent() {
-        let bytes = encode_error(99, 0, ErrorCode::Enoent, "");
+        let bytes = encode_error(99, 0, 0, ErrorCode::Enoent, "");
         assert_eq!(bytes, b"\x1b_Gi=99;ENOENT\x1b\\");
     }
 
     #[test]
     fn error_reply_enotsup() {
-        let bytes = encode_error(0, 0, ErrorCode::Enotsup, "animation");
+        let bytes = encode_error(0, 0, 0, ErrorCode::Enotsup, "animation");
         assert_eq!(bytes, b"\x1b_G;ENOTSUP:animation\x1b\\");
     }
 
     #[test]
     fn error_reply_efbig() {
-        let bytes = encode_error(3, 0, ErrorCode::Efbig, "");
+        let bytes = encode_error(3, 0, 0, ErrorCode::Efbig, "");
         assert_eq!(bytes, b"\x1b_Gi=3;EFBIG\x1b\\");
+    }
+
+    #[test]
+    fn error_reply_echoes_placement_id() {
+        let bytes = encode_error(1, 0, 9, ErrorCode::Einval, "");
+        assert_eq!(bytes, b"\x1b_Gi=1,p=9;EINVAL\x1b\\");
     }
 
     #[test]
