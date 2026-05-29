@@ -26,6 +26,13 @@ wgpu = "=29.0.3"
 naga = { version = "29", features = ["wgsl-in", "wgsl-out", "glsl-in"] }
 vte = "=0.15.0"
 cosmic-text = "=0.19.0"
+# Pinned to match cosmic-text 0.19's transitive swash; used directly for
+# per-face charmap coverage + color-table detection in emoji presentation
+# steering (see toastty-render text::presentation).
+swash = "=0.2.7"
+# Unicode Emoji / Emoji_Presentation properties for UTS #51 presentation
+# selection.
+unic-emoji-char = "=0.9.0"
 memchr = "=2.8.0"
 unicode-width = "=0.2.2"
 

@@ -9,7 +9,7 @@
 
 use cosmic_text::{
     Attrs, Buffer, CacheKey, Family, FontSystem, LayoutGlyph, Metrics, Shaping, SwashCache,
-    SwashContent,
+    SwashContent, fontdb,
 };
 use std::collections::HashMap;
 use toastty_protocols::unicode_core::cluster_cell_width;
@@ -19,6 +19,7 @@ use wgpu::{Device, Extent3d, Queue, Texture, TextureFormat};
 use crate::text::atlas::{Atlas, AtlasLayer, AtlasSlot, GlyphKey};
 use crate::text::cluster_width::{GlyphPos, snap_cluster_widths_per_cluster};
 use crate::text::instance::GlyphSlot;
+use crate::text::presentation;
 
 /// Per-row cache slot: which char was shaped into this column and the
 /// atlas slot we got back. Storing `char` keeps the same defense-in-depth
@@ -223,6 +224,15 @@ pub struct GlyphRasterizer {
     /// isolation shapes. Kept separate from `buffer` so we don't clobber
     /// the in-progress full-line shape inside `shape_line_slow`.
     isolation_buffer: Buffer,
+    /// Per-char cache of the font family to force for **text-presentation**
+    /// emoji (UTS #51). `Some(family)` steers a codepoint whose default
+    /// presentation is text (e.g. ⏺ U+23FA) away from the color-emoji face
+    /// cosmic-text's presentation-unaware fallback would otherwise pick,
+    /// toward a monochrome face that covers it. `Some(None)` records "no
+    /// override needed" (real emoji, or a codepoint the primary font
+    /// already covers). Keyed on the bare codepoint; variation-selected
+    /// clusters are rare and computed live. See [`presentation`].
+    presentation_override: HashMap<char, Option<String>>,
     /// True iff the family name requested by the caller resolved to at
     /// least one face in the loaded font database. When false, cosmic-
     /// text will fall back to whatever the system considers a default
@@ -323,6 +333,7 @@ impl GlyphRasterizer {
             uncacheable_chars: std::collections::HashSet::new(),
             standalone_glyph_ids: HashMap::new(),
             isolation_buffer,
+            presentation_override: HashMap::new(),
             requested_family_available,
         }
     }
@@ -343,7 +354,16 @@ impl GlyphRasterizer {
             return *cached;
         }
 
-        let family_name = self.family_name.clone();
+        // Shape with the same presentation-steered family the slow path
+        // would use for this char. Without this, a text-presentation emoji
+        // (e.g. ⏺) whose in-context glyph comes from a forced monochrome
+        // face would never match its color-fallback standalone id, so it
+        // would be flagged contextual and forced through the slow path on
+        // every line forever. Steering both shapes the same way keeps it
+        // cacheable.
+        let family_name = self
+            .presentation_family(ch, false, false)
+            .unwrap_or_else(|| self.family_name.clone());
         let attrs = Attrs::new().family(Family::Name(&family_name));
 
         let mut s = String::with_capacity(4);
@@ -363,6 +383,155 @@ impl GlyphRasterizer {
 
         self.standalone_glyph_ids.insert(ch, id);
         id
+    }
+
+    /// Font family to force for the cluster led by `base`, or `None` to use
+    /// the default fallback path. See [`presentation`] and
+    /// [`Self::presentation_override`]. The bare (no variation selector)
+    /// result is cached; VS-bearing clusters are rare and computed live.
+    fn presentation_family(
+        &mut self,
+        base: char,
+        has_vs15: bool,
+        has_vs16: bool,
+    ) -> Option<String> {
+        // Only the no-variation-selector result is cached (keyed on the
+        // bare codepoint); selected clusters are rare enough to recompute.
+        let cacheable = !has_vs15 && !has_vs16;
+        if cacheable && let Some(cached) = self.presentation_override.get(&base) {
+            return cached.clone();
+        }
+        let result = self.compute_presentation_family(base, has_vs15, has_vs16);
+        if cacheable {
+            self.presentation_override.insert(base, result.clone());
+        }
+        result
+    }
+
+    /// Uncached core of [`Self::presentation_family`]: decide whether this
+    /// cluster wants text presentation and, if cosmic-text's default
+    /// fallback would (wrongly) render it from a color face, find a
+    /// monochrome face to steer toward.
+    fn compute_presentation_family(
+        &mut self,
+        base: char,
+        has_vs15: bool,
+        has_vs16: bool,
+    ) -> Option<String> {
+        if !presentation::wants_text_presentation(base, has_vs15, has_vs16) {
+            return None;
+        }
+        // If the default fallback already yields a monochrome glyph (the
+        // primary font, or a non-color fallback, covers `base`), leave it
+        // be — no need to override.
+        let font_id = self.default_resolved_font(base)?;
+        if !presentation::face_is_color(self.font_system.db(), font_id) {
+            return None;
+        }
+        // Default fallback landed on a color face but this codepoint wants
+        // text: steer toward a monochrome face that covers it, if one
+        // exists. If none does, return `None` and accept the default
+        // (color) rather than rendering tofu.
+        presentation::find_text_face(self.font_system.db(), base)
+    }
+
+    /// Font id cosmic-text's default fallback resolves `ch` to when shaped
+    /// alone with the configured family. Used to detect when the default
+    /// path lands on a color-emoji face. `None` if nothing renders.
+    fn default_resolved_font(&mut self, ch: char) -> Option<fontdb::ID> {
+        let family_name = self.family_name.clone();
+        let attrs = Attrs::new().family(Family::Name(&family_name));
+
+        let mut s = String::with_capacity(4);
+        s.push(ch);
+
+        let font_system = &mut self.font_system;
+        let isolation_buffer = &mut self.isolation_buffer;
+        isolation_buffer.set_text(&s, &attrs, Shaping::Advanced, None);
+        isolation_buffer.shape_until_scroll(font_system, false);
+
+        isolation_buffer
+            .layout_runs()
+            .next()
+            .and_then(|run| run.glyphs.first().map(|g| g.font_id))
+    }
+
+    /// Segment `text` into byte-range runs that share a forced family, or
+    /// `None` if no cluster needs presentation steering (the overwhelmingly
+    /// common case — a single cheap scan rejects ASCII-only lines).
+    ///
+    /// Attaching chars (variation selectors, ZWJ, combining marks) inherit
+    /// the preceding base's family so a `base + VS` cluster shapes as one
+    /// run; a base's choice is computed with awareness of a following VS15
+    /// / VS16. Adjacent equal choices are coalesced.
+    fn compute_presentation_runs(
+        &mut self,
+        text: &str,
+    ) -> Option<Vec<(usize, usize, Option<String>)>> {
+        if !text.chars().any(presentation::is_candidate) {
+            return None;
+        }
+
+        let indices: Vec<(usize, char)> = text.char_indices().collect();
+        let mut choices: Vec<Option<String>> = Vec::with_capacity(indices.len());
+        let mut any_override = false;
+        for i in 0..indices.len() {
+            let (_, c) = indices[i];
+            if presentation::is_attaching(c) {
+                // Inherit the base cluster's family.
+                choices.push(choices.last().cloned().flatten());
+                continue;
+            }
+            let next = indices.get(i + 1).map(|&(_, c)| c);
+            let has_vs16 = next == Some(presentation::VS16);
+            let has_vs15 = next == Some(presentation::VS15);
+            let fam = self.presentation_family(c, has_vs15, has_vs16);
+            any_override |= fam.is_some();
+            choices.push(fam);
+        }
+        if !any_override {
+            return None;
+        }
+
+        let mut runs: Vec<(usize, usize, Option<String>)> = Vec::new();
+        for (i, (byte, _)) in indices.iter().enumerate() {
+            let end = indices.get(i + 1).map_or(text.len(), |&(b, _)| b);
+            let choice = choices[i].clone();
+            match runs.last_mut() {
+                Some(last) if last.2 == choice => last.1 = end,
+                _ => runs.push((*byte, end, choice)),
+            }
+        }
+        Some(runs)
+    }
+
+    /// Load `text` into the shaping buffer and shape it, applying emoji
+    /// presentation steering when needed.
+    ///
+    /// Most lines need none (a single cheap scan rejects ASCII-only text),
+    /// in which case we shape with the plain configured family exactly as
+    /// before. When a line contains a text-presentation emoji that would
+    /// otherwise resolve to a color face, we shape via rich-text spans that
+    /// force the steered monochrome family for just those clusters.
+    fn shape_buffer_for_line(&mut self, text: &str) {
+        let runs = self.compute_presentation_runs(text);
+        let default_family = self.family_name.clone();
+        let default_attrs = Attrs::new().family(Family::Name(&default_family));
+        match &runs {
+            Some(runs) => {
+                let spans = runs.iter().map(|(start, end, fam)| {
+                    let name = fam.as_deref().unwrap_or(default_family.as_str());
+                    (&text[*start..*end], Attrs::new().family(Family::Name(name)))
+                });
+                self.buffer
+                    .set_rich_text(spans, &default_attrs, Shaping::Advanced, None);
+            }
+            None => {
+                self.buffer
+                    .set_text(text, &default_attrs, Shaping::Advanced, None);
+            }
+        }
+        self.buffer.shape_until_scroll(&mut self.font_system, false);
     }
 
     /// True when the family name passed to [`Self::new`] resolved to a
@@ -491,10 +660,7 @@ impl GlyphRasterizer {
         text: &str,
         mode_2027_active: bool,
     ) -> LineGlyphs {
-        let family_name = self.family_name.clone();
-        let attrs = Attrs::new().family(Family::Name(&family_name));
-        self.buffer.set_text(text, &attrs, Shaping::Advanced, None);
-        self.buffer.shape_until_scroll(&mut self.font_system, false);
+        self.shape_buffer_for_line(text);
 
         let cell_w = self.cell_size.0;
 
@@ -1002,6 +1168,103 @@ mod tests {
         // the .notdef glyph — but the call must not panic and must
         // return without producing two-cell-overlapping glyphs.
         let _ = rasterizer.shape_line(&queue, "❤\u{FE0F}", true);
+    }
+
+    /// A text-presentation emoji (⏺ U+23FA: `Emoji=Yes`,
+    /// `Emoji_Presentation=No`) must not render as a color emoji when the
+    /// host has a monochrome face covering it. This is the exact bug:
+    /// cosmic-text's presentation-unaware fallback reaches Apple Color
+    /// Emoji, so the steering must redirect it to a text face.
+    ///
+    /// Host-tolerant: only asserts on systems whose *default* fallback
+    /// actually lands on a color face AND that have a monochrome covering
+    /// face to steer toward — otherwise there's nothing to fix here.
+    #[test]
+    fn text_presentation_emoji_avoids_color_when_possible() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        let record = '\u{23FA}';
+
+        let default_color = rasterizer
+            .default_resolved_font(record)
+            .is_some_and(|id| presentation::face_is_color(rasterizer.font_system.db(), id));
+        let has_text_face = presentation::find_text_face(rasterizer.font_system.db(), record).is_some();
+
+        let lg = rasterizer.shape_line(&queue, "\u{23FA}", false);
+
+        if default_color && has_text_face {
+            let slot = lg
+                .get(0, record)
+                .expect("expected a glyph slot for U+23FA");
+            assert!(
+                !slot.is_color,
+                "U+23FA must render as a monochrome text glyph, not a color emoji, after steering",
+            );
+        }
+    }
+
+    /// Real emoji (`Emoji_Presentation=Yes`) must keep their color glyph —
+    /// the steering must not regress them. Host-tolerant: only meaningful
+    /// when the host's default fallback gives 😀 a color face at all.
+    #[test]
+    fn real_emoji_keeps_color_presentation() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        let grin = '\u{1F600}';
+
+        let default_color = rasterizer
+            .default_resolved_font(grin)
+            .is_some_and(|id| presentation::face_is_color(rasterizer.font_system.db(), id));
+
+        // No override should be recorded for a default-emoji codepoint.
+        assert_eq!(
+            rasterizer.presentation_family(grin, false, false),
+            None,
+            "default-presentation emoji must never be steered to a text face",
+        );
+
+        let lg = rasterizer.shape_line(&queue, "\u{1F600}", true);
+        if default_color {
+            if let Some(slot) = lg.get(0, grin) {
+                assert!(
+                    slot.is_color,
+                    "😀 must keep its color presentation; steering must not regress real emoji",
+                );
+            }
+        }
+    }
+
+    /// ⏺ is width-1 and not variation-selected, so after the first (slow)
+    /// shape it must land in `char_cache` and serve from the fast path —
+    /// not be flagged contextual and re-shaped every line. Regression
+    /// guard for the `standalone_glyph_id_of` steering: if the standalone
+    /// probe used the default (color) family while the in-context shape
+    /// used the steered (text) family, their glyph ids would differ and ⏺
+    /// would be marked uncacheable forever.
+    #[test]
+    fn steered_text_emoji_is_cacheable() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        let record = '\u{23FA}';
+
+        let steered = presentation::find_text_face(rasterizer.font_system.db(), record).is_some()
+            && rasterizer
+                .default_resolved_font(record)
+                .is_some_and(|id| presentation::face_is_color(rasterizer.font_system.db(), id));
+
+        rasterizer.shape_line(&queue, "\u{23FA}", false);
+
+        if steered {
+            assert!(
+                rasterizer.char_cache.contains_key(&record),
+                "steered text-presentation ⏺ must be cached for the fast path",
+            );
+            assert!(
+                !rasterizer.uncacheable_chars.contains(&record),
+                "steered text-presentation ⏺ must not be flagged contextual/uncacheable",
+            );
+            assert!(
+                rasterizer.try_shape_line_fast("\u{23FA}").is_some(),
+                "a line of only ⏺ must take the fast path after the first shape",
+            );
+        }
     }
 
     /// Regression: a char known to receive contextual GSUB substitution

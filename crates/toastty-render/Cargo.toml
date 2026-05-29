@@ -11,8 +11,10 @@ bytemuck.workspace = true
 cosmic-text.workspace = true
 naga.workspace = true
 raw-window-handle.workspace = true
+swash.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+unic-emoji-char.workspace = true
 unicode-width.workspace = true
 wgpu.workspace = true
 
