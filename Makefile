@@ -1,4 +1,4 @@
-.PHONY: check lint fmt test cover cover-gate cover-html clean
+.PHONY: check lint fmt test cover cover-gate cover-html clean install
 
 # === Local development ===
 
@@ -36,6 +36,23 @@ cover:
 
 cover-gate:
 	cargo llvm-cov --workspace --fail-under-lines 95 --ignore-filename-regex $(COVER_IGNORE)
+
+# === Install ===
+#
+# Build a release binary and register it so it's launchable from the
+# platform's app launcher (Spotlight on macOS, krunner / app menu on Linux).
+# Pass env overrides straight through, e.g.: make install APP_NAME=Toastty
+
+UNAME_S := $(shell uname -s)
+
+install:
+ifeq ($(UNAME_S),Darwin)
+	./scripts/install_mac_app.sh
+else ifeq ($(UNAME_S),Linux)
+	./scripts/install_linux_app.sh
+else
+	@echo "unsupported platform: $(UNAME_S)" >&2; exit 1
+endif
 
 # === Cleanup ===
 
