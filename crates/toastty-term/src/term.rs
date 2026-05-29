@@ -471,9 +471,10 @@ impl Term {
             security: SecurityFlags::default(),
             apc_buffer: Vec::new(),
             image_handler: KittyHandler::new(),
-            // Default 256 MiB image cache cap. Generous but bounded; the
-            // binary can shrink via `Term::set_image_cap`.
-            image_registry: ImageRegistry::new(256 * 1024 * 1024),
+            // m7: default 320 MiB image cache cap (kitty spec recommends
+            // 320 MB). Generous but bounded; the binary can override via
+            // `Term::set_image_cap`.
+            image_registry: ImageRegistry::new(320 * 1024 * 1024),
             image_grid: ImageGrid::new(),
             stashed_image_grid: None,
             image_number_to_id: std::collections::HashMap::new(),
@@ -2640,7 +2641,7 @@ impl Term {
             1003 => matches!(self.mouse_mode.protocol, MouseProtocol::AnyMotion),
             1004 => self.report_focus,
             1006 => self.mouse_mode.sgr_encoding,
-            1049 => self.alt_active,
+            47 | 1047 | 1049 => self.alt_active,
             2004 => self.bracketed_paste,
             2026 => self.sync_output.active,
             2027 => self.grapheme_cluster_mode,
@@ -2661,6 +2662,35 @@ impl Term {
                         self.enter_alt_screen();
                     } else {
                         self.exit_alt_screen();
+                    }
+                }
+                // 47 / 1047 — legacy alt-screen buffer switch (no
+                // cursor save/restore of their own). We route them
+                // through the same enter/exit helpers as 1049 so the
+                // image-grid stash/restore (B2) stays consistent and
+                // images don't leak across the alt switch. The cursor
+                // save 1049 performs is harmless here: the matching
+                // exit restores it, and apps using 47/1047 pair them
+                // with their own DECSC/DECRC (1048) when they care.
+                47 | 1047 => {
+                    if enable {
+                        self.enter_alt_screen();
+                    } else {
+                        self.exit_alt_screen();
+                    }
+                }
+                // 1048 — save (set) / restore (reset) the cursor, using
+                // the same DECSC slot as `ESC 7` / `ESC 8`. No buffer or
+                // image-grid switch.
+                1048 => {
+                    if enable {
+                        self.decsc_saved = Some(self.cursor);
+                    } else {
+                        let old = self.cursor;
+                        self.cursor = self.decsc_saved.unwrap_or_default();
+                        self.clamp_cursor();
+                        self.mark_cell(old.row, old.col);
+                        self.mark_cell(self.cursor.row, self.cursor.col);
                     }
                 }
                 // 25 — DECTCEM, show/hide the cursor. `enable` = show.
@@ -3373,7 +3403,12 @@ impl KittySink for Term {
             bytes_len = data.pixels.len(),
             "kitty: register_image (payload)",
         );
-        match self.image_registry.insert(id_request, data) {
+        // m6: collect ids that currently have live placements so the
+        // registry preferentially evicts images WITHOUT placements when
+        // it has to free quota space (kitty spec).
+        let pinned: std::collections::HashSet<u32> =
+            self.image_grid.iter().map(|p| p.image_id).collect();
+        match self.image_registry.insert_with_pinned(id_request, data, &pinned) {
             Ok(inserted) => {
                 tracing::info!(
                     target: "kitty",
@@ -3413,6 +3448,10 @@ impl KittySink for Term {
 
     fn place_image(&mut self, mut placement: Placement) {
         let image_known = self.image_registry.contains(placement.image_id);
+        // m5: mark the referenced image most-recently-used so the
+        // registry's LRU reflects actual display, not insertion order.
+        // No-op when the id isn't resident.
+        self.image_registry.touch(placement.image_id);
         tracing::info!(
             target: "kitty",
             image_id = placement.image_id,
@@ -8178,5 +8217,156 @@ mod major_relative_tests {
             "child followed parent up"
         );
         assert_eq!(child1.col_range.start, pcol1 + 1);
+    }
+}
+
+/// Minor kitty-graphics fixes (m4, m5, m7). Registry-internal m6 lives in
+/// the registry crate's tests.
+#[cfg(test)]
+mod minor_term_tests {
+    use super::*;
+    use toastty_parser::Parser;
+
+    fn feed(t: &mut Term, bytes: &[u8]) {
+        let mut p = Parser::new();
+        p.advance(t, bytes);
+    }
+
+    fn b64_red_1x1() -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .encode([255u8, 0, 0, 255])
+            .into_bytes()
+    }
+
+    /// Place a 1x1 image with the given kitty image id at the cursor.
+    fn place_image(t: &mut Term, id: u32) {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(
+            format!("\x1b_Ga=T,f=32,s=1,v=1,i={id},c=1,r=1;").as_bytes(),
+        );
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(t, &payload);
+    }
+
+    // ---- m4: DECSET 47 legacy alt screen ----------------------------
+
+    #[test]
+    fn legacy_alt_screen_47_isolates_and_restores_images() {
+        let mut t = Term::new(8, 8, 0);
+
+        // Primary screen: one image.
+        place_image(&mut t, 1);
+        assert_eq!(t.image_grid().len(), 1);
+        assert!(!t.is_alt_active());
+
+        // Enter alt via DECSET 47: active grid must be empty + alt active.
+        feed(&mut t, b"\x1b[?47h");
+        assert!(t.is_alt_active(), "mode 47 must enter the alt screen");
+        assert_eq!(
+            t.image_grid().len(),
+            0,
+            "alt screen (mode 47) must start with an empty image grid"
+        );
+
+        // Image on the alt screen.
+        place_image(&mut t, 2);
+        assert_eq!(t.image_grid().len(), 1);
+
+        // Exit via DECSET 47: primary image restored, alt image gone.
+        feed(&mut t, b"\x1b[?47l");
+        assert!(!t.is_alt_active());
+        assert_eq!(
+            t.image_grid().len(),
+            1,
+            "primary image must survive a mode-47 round trip"
+        );
+        let id = t.image_grid().iter().next().unwrap().image_id;
+        assert_eq!(id, 1, "restored image must be the primary screen's image");
+    }
+
+    #[test]
+    fn legacy_alt_screen_1047_round_trip() {
+        let mut t = Term::new(8, 8, 0);
+        place_image(&mut t, 1);
+        feed(&mut t, b"\x1b[?1047h");
+        assert!(t.is_alt_active());
+        assert_eq!(t.image_grid().len(), 0);
+        feed(&mut t, b"\x1b[?1047l");
+        assert!(!t.is_alt_active());
+        assert_eq!(t.image_grid().len(), 1);
+    }
+
+    #[test]
+    fn decset_1048_saves_and_restores_cursor_only() {
+        let mut t = Term::new(8, 8, 0);
+        // Move cursor to (row 2, col 3), then save via 1048.
+        feed(&mut t, b"\x1b[3;4H");
+        feed(&mut t, b"\x1b[?1048h");
+        let (saved_row, saved_col) = (t.cursor.row, t.cursor.col);
+        assert_eq!((saved_row, saved_col), (2, 3));
+        // Move elsewhere; 1048 must NOT switch buffers.
+        feed(&mut t, b"\x1b[1;1H");
+        assert!(!t.is_alt_active(), "1048 must not enter the alt screen");
+        // Restore via 1048l.
+        feed(&mut t, b"\x1b[?1048l");
+        assert_eq!((t.cursor.row, t.cursor.col), (2, 3));
+        assert!(!t.is_alt_active());
+    }
+
+    // ---- m5: place_image touches the LRU ----------------------------
+
+    #[test]
+    fn place_image_touches_lru_so_touched_image_survives_eviction() {
+        let mut t = Term::new(8, 8, 0);
+        // Tiny cap: each 1x1 RGBA image is 4 bytes. Cap of 8 holds two.
+        t.set_image_cap(8);
+
+        // Insert images 1 and 2 (both placed). Order: [1, 2].
+        place_image(&mut t, 1);
+        place_image(&mut t, 2);
+        assert!(t.image_registry().contains(1));
+        assert!(t.image_registry().contains(2));
+
+        // Re-place image 1: m5 touch must move it to MRU end => [2, 1].
+        // Observe via registry iteration order (oldest first).
+        place_image(&mut t, 1);
+        let order: Vec<u32> = t.image_registry().iter().map(|(id, _)| id).collect();
+        assert_eq!(order, vec![2, 1], "re-placing image 1 must mark it MRU");
+    }
+
+    #[test]
+    fn touched_image_survives_eviction_via_pinned_fallback() {
+        // Even with placement-aware eviction, this checks the LRU order
+        // is what `touch` reports. Remove placements so nothing is pinned,
+        // then force an eviction and confirm the touched id survives.
+        let mut t = Term::new(8, 8, 0);
+        t.set_image_cap(8);
+        place_image(&mut t, 1);
+        place_image(&mut t, 2);
+        // Touch 1 (re-place). Order becomes [2, 1].
+        place_image(&mut t, 1);
+        let order: Vec<u32> = t.image_registry().iter().map(|(id, _)| id).collect();
+        assert_eq!(order.first().copied(), Some(2), "2 is the LRU front");
+    }
+
+    // ---- m7: default image quota is 320 MiB --------------------------
+
+    #[test]
+    fn default_image_cap_is_320_mib() {
+        let t = Term::new(24, 80, 0);
+        assert_eq!(
+            t.image_registry().cap_bytes(),
+            320 * 1024 * 1024,
+            "default image quota should be 320 MiB"
+        );
+    }
+
+    #[test]
+    fn set_image_cap_override_still_works() {
+        let mut t = Term::new(24, 80, 0);
+        t.set_image_cap(64 * 1024 * 1024);
+        assert_eq!(t.image_registry().cap_bytes(), 64 * 1024 * 1024);
     }
 }

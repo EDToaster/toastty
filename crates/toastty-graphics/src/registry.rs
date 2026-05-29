@@ -13,7 +13,7 @@
 //! - Caller supplies an explicit id (Kitty `i=`).
 //! - If `0`, the registry assigns the lowest unused 1-based id.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Decoded image payload, fully resident in memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +138,21 @@ impl ImageRegistry {
     /// An insert under an existing id replaces the prior entry without
     /// disturbing other ids' LRU order.
     pub fn insert(&mut self, id: u32, data: ImageData) -> Result<Inserted, InsertError> {
+        self.insert_with_pinned(id, data, &HashSet::new())
+    }
+
+    /// Like [`insert`](Self::insert), but `pinned` lists image ids that
+    /// currently have live placements. Per the kitty spec — "existing
+    /// images without placements will be preferentially deleted" — the
+    /// eviction prefers unpinned images and only evicts a pinned image
+    /// when no unpinned candidate remains. Both passes still respect LRU
+    /// order (oldest first).
+    pub fn insert_with_pinned(
+        &mut self,
+        id: u32,
+        data: ImageData,
+        pinned: &HashSet<u32>,
+    ) -> Result<Inserted, InsertError> {
         let need = data.byte_size();
         if need > self.cap_bytes {
             return Err(InsertError::TooLarge {
@@ -155,19 +170,30 @@ impl ImageRegistry {
             self.lru.retain(|x| *x != final_id);
         }
 
-        // Evict LRU entries until we have room. Don't ever evict the id
-        // we're about to insert (we removed it above so it's no longer
-        // in `lru`).
+        // Evict until we have room. Don't ever evict the id we're about
+        // to insert (removed above so it's no longer in `lru`).
+        //
+        // m6: a single LRU pop would evict an actively-displayed image
+        // even when an unplaced one is available. Instead pick the LRU
+        // victim from the *unpinned* images first; only when none remain
+        // fall back to the strict LRU front (which may be pinned).
         let mut evicted = Vec::new();
         while self.total_bytes + need > self.cap_bytes {
-            let Some(victim) = self.lru.pop_front() else {
-                // Nothing left to evict — but the cap check above
-                // guarantees `need <= cap_bytes`, so if we got here with
-                // an empty LRU then `total_bytes` must already be zero
-                // and `need <= cap`. The loop must therefore exit. The
-                // `break` is defensive.
+            // Prefer the oldest unpinned image.
+            let victim = self
+                .lru
+                .iter()
+                .copied()
+                .find(|x| !pinned.contains(x))
+                // Fall back to the strict LRU front if everything left is
+                // pinned (we must still free space to honor the cap).
+                .or_else(|| self.lru.front().copied());
+            let Some(victim) = victim else {
+                // Empty LRU; the cap check above guarantees the insert
+                // fits, so this is purely defensive.
                 break;
             };
+            self.lru.retain(|x| *x != victim);
             if let Some(victim_data) = self.entries.remove(&victim) {
                 self.total_bytes -= victim_data.byte_size();
                 evicted.push(victim);
@@ -414,6 +440,73 @@ mod tests {
         let mut ids: Vec<u32> = r.ids().collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![1, 7]);
+    }
+
+    // ---- m6: placement-aware eviction -------------------------------
+
+    #[test]
+    fn eviction_prefers_unpinned_over_pinned() {
+        // Cap holds two 16-byte images. id=1 is the LRU front but PINNED
+        // (has a live placement); id=2 is unpinned. Inserting a third
+        // must evict the unpinned id=2, not the pinned-but-older id=1.
+        let mut r = ImageRegistry::new(32);
+        r.insert(1, img(2, 2, 0)).unwrap();
+        r.insert(2, img(2, 2, 0)).unwrap();
+        let mut pinned = HashSet::new();
+        pinned.insert(1u32);
+        let res = r.insert_with_pinned(3, img(2, 2, 0), &pinned).unwrap();
+        assert_eq!(res.evicted, vec![2], "unpinned image must be evicted first");
+        assert!(r.contains(1), "pinned image must survive");
+        assert!(!r.contains(2));
+        assert!(r.contains(3));
+    }
+
+    #[test]
+    fn eviction_falls_back_to_pinned_when_no_unpinned_candidate() {
+        // Both resident images are pinned and we must still free space.
+        // Eviction falls back to the strict LRU front (id=1).
+        let mut r = ImageRegistry::new(32);
+        r.insert(1, img(2, 2, 0)).unwrap();
+        r.insert(2, img(2, 2, 0)).unwrap();
+        let mut pinned = HashSet::new();
+        pinned.insert(1u32);
+        pinned.insert(2u32);
+        let res = r.insert_with_pinned(3, img(2, 2, 0), &pinned).unwrap();
+        assert_eq!(res.evicted, vec![1], "fall back to LRU front when all pinned");
+        assert!(!r.contains(1));
+        assert!(r.contains(2));
+        assert!(r.contains(3));
+    }
+
+    #[test]
+    fn eviction_prefers_unpinned_respecting_lru_order() {
+        // Three images, cap holds three (48 bytes). Pin the oldest (1).
+        // Insert a 4th: should evict the oldest UNPINNED (2), keeping the
+        // pinned-oldest (1) and newer (3).
+        let mut r = ImageRegistry::new(48);
+        r.insert(1, img(2, 2, 0)).unwrap();
+        r.insert(2, img(2, 2, 0)).unwrap();
+        r.insert(3, img(2, 2, 0)).unwrap();
+        let mut pinned = HashSet::new();
+        pinned.insert(1u32);
+        let res = r.insert_with_pinned(4, img(2, 2, 0), &pinned).unwrap();
+        assert_eq!(res.evicted, vec![2]);
+        assert!(r.contains(1));
+        assert!(!r.contains(2));
+        assert!(r.contains(3));
+        assert!(r.contains(4));
+    }
+
+    #[test]
+    fn insert_with_empty_pinned_matches_plain_insert() {
+        // Sanity: insert_with_pinned with no pins behaves like insert
+        // (strict LRU).
+        let mut r = ImageRegistry::new(48);
+        r.insert(1, img(2, 2, 0)).unwrap();
+        r.insert(2, img(2, 2, 0)).unwrap();
+        r.insert(3, img(2, 2, 0)).unwrap();
+        let res = r.insert_with_pinned(4, img(2, 2, 0), &HashSet::new()).unwrap();
+        assert_eq!(res.evicted, vec![1]);
     }
 
     #[test]
