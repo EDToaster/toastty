@@ -7,6 +7,7 @@ pub mod image_grid;
 pub mod kitty;
 pub mod registry;
 pub mod rgp;
+pub mod sixel;
 
 pub use image_grid::{ImageGrid, Placement, PlacementHandle, SrcRect};
 pub use kitty::{

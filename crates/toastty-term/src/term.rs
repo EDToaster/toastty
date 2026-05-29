@@ -15,6 +15,7 @@ use crate::grid::Grid;
 use toastty_config::CursorShape;
 use toastty_graphics::kitty::handler::{KittyHandler, KittySink};
 use toastty_graphics::kitty::header::DeleteSpec;
+use toastty_graphics::sixel::{SixelDcs, SixelHandler, SIXEL_MAX_COLORS};
 use toastty_graphics::rgp::asset::CpuAsset;
 use toastty_graphics::rgp::glb_loader::load_glb;
 use toastty_graphics::rgp::handler::{RgpHandler, RgpSink};
@@ -232,6 +233,22 @@ pub struct Term {
     apc_buffer: Vec<u8>,
     /// Stateful Kitty dispatcher. Owns chunked-upload reassembly.
     image_handler: KittyHandler,
+    /// Sixel (DCS) decoder. Stateless aside from its pixel cap; the
+    /// per-image DCS header params + body live in `sixel_pending`.
+    sixel_handler: SixelHandler,
+    /// In-progress sixel DCS packet: header params (P1/P2/P3) plus the
+    /// raw body bytes accumulated between `hook` (final byte `q`) and
+    /// `unhook`. `None` outside a sixel DCS.
+    sixel_pending: Option<SixelDcs>,
+    /// DECSDM (mode 80) state. Per current xterm semantics, SET = "sixel
+    /// display mode" (image is anchored, screen does NOT scroll to make
+    /// room); RESET = sixel scrolling (the default, image viewers expect
+    /// it). We store the literal mode bit so DECRQM reports it directly
+    /// and derive "should scroll" as `!sixel_display_mode`.
+    sixel_display_mode: bool,
+    /// DECSET 8452 — leave the cursor to the RIGHT of a sixel image
+    /// (on its last row) instead of on the line below it. Off by default.
+    sixel_cursor_right: bool,
     /// Cache of decoded image bytes keyed by Kitty image id.
     image_registry: ImageRegistry,
     /// Parallel layer of placements over the cell grid. Always refers
@@ -471,6 +488,10 @@ impl Term {
             security: SecurityFlags::default(),
             apc_buffer: Vec::new(),
             image_handler: KittyHandler::new(),
+            sixel_handler: SixelHandler::default(),
+            sixel_pending: None,
+            sixel_display_mode: false,
+            sixel_cursor_right: false,
             // m7: default 320 MiB image cache cap (kitty spec recommends
             // 320 MB). Generous but bounded; the binary can override via
             // `Term::set_image_cap`.
@@ -1924,6 +1945,26 @@ impl Term {
                     self.region_scroll_up();
                 }
             }
+            // XTSMGRAPHICS — `CSI ? Pi ; Pa ; Pv S`. Sixel/graphics
+            // capability query. `Pi=1` asks about color registers,
+            // `Pi=2` about graphics geometry. We report fixed
+            // capabilities (256 palette registers; current text-area
+            // pixel size as the max image geometry). `Pa` (read / reset /
+            // set / read-max) is treated as a read — our limits aren't
+            // client-tunable. Unknown items reply with status 2 (failure).
+            'S' if priv_marker == Some(b'?') => {
+                let pi = first_param(params, 0);
+                let reply = match pi {
+                    1 => format!("\x1b[?1;0;{SIXEL_MAX_COLORS}S"),
+                    2 => {
+                        let w = u32::from(self.cols) * u32::from(self.cell_pixel_size.0);
+                        let h = u32::from(self.rows) * u32::from(self.cell_pixel_size.1);
+                        format!("\x1b[?2;0;{w};{h}S")
+                    }
+                    _ => format!("\x1b[?{pi};2S"),
+                };
+                self.pty_replies.extend_from_slice(reply.as_bytes());
+            }
             // SD — Scroll Down. `CSI Ps T` scrolls the scroll region down
             // `Ps` lines (content moves down, blanks open at the top
             // margin). Default 1. The 5-parameter form
@@ -1983,7 +2024,7 @@ impl Term {
             // and never emit the optimization. Mode 2026 is therefore
             // the load-bearing case, but we answer the full set of
             // modes we already track in `apply_decset` for symmetry.
-            'p' if priv_marker == Some(b'?') && intermediates == b"$" => {
+            'p' if priv_marker == Some(b'?') && intermediates.contains(&b'$') => {
                 let ps = first_param(params, 0);
                 let pm = self.decrqm_status(ps);
                 let reply = format!("\x1b[?{ps};{pm}$y");
@@ -2028,11 +2069,13 @@ impl Term {
             // Apps probe terminal capabilities at startup; many TUIs
             // (yazi, helix, neovim) wait for this reply with a short
             // timeout and refuse to start if it doesn't arrive.
-            // Advertise VT220 (`62`) + ANSI color (`22`). That's enough
-            // for every check we've seen and avoids the
-            // "sixel?"/"unicode-core?"/"images?" probes opening up.
+            // Advertise VT220 (`62`) + sixel (`4`) + ANSI color (`22`).
+            // The `4` is the gate apps probe before sending sixel
+            // (img2sixel, chafa, lsix); without it they refuse to emit
+            // graphics. Paired with the XTSMGRAPHICS handler below and
+            // the DCS sixel decoder.
             'c' if priv_marker.is_none() => {
-                self.pty_replies.extend_from_slice(b"\x1b[?62;22c");
+                self.pty_replies.extend_from_slice(b"\x1b[?62;4;22c");
             }
             // DA2 — Secondary Device Attributes (`CSI > c` / `CSI > 0 c`).
             // Reply with `CSI > <type> ; <version> ; <cartridge> c`. We
@@ -2646,6 +2689,8 @@ impl Term {
             2026 => self.sync_output.active,
             2027 => self.grapheme_cluster_mode,
             2048 => self.inband_resize_mode,
+            80 => self.sixel_display_mode,
+            8452 => self.sixel_cursor_right,
             _ => return 0,
         };
         if is_set { 1 } else { 2 }
@@ -2755,6 +2800,18 @@ impl Term {
                 // 2048 — in-band resize notifications.
                 2048 => {
                     self.inband_resize_mode = enable;
+                }
+                // 80 — DECSDM (sixel display mode). SET disables sixel
+                // scrolling (image stays anchored); RESET enables it
+                // (the default). `place_sixel` derives scroll behavior
+                // from `!sixel_display_mode`.
+                80 => {
+                    self.sixel_display_mode = enable;
+                }
+                // 8452 — leave the cursor to the RIGHT of a sixel image
+                // instead of on the line below it.
+                8452 => {
+                    self.sixel_cursor_right = enable;
                 }
                 // TODO(modes): 1, 7, 12, 25, etc.
                 _ => {}
@@ -3353,6 +3410,57 @@ impl Perform for Term {
         // else: not a protocol we own (tmux passthrough etc.) —
         // silently drop.
     }
+
+    // ---- Sixel (DCS) ----
+    //
+    // Sixel rides DCS (`ESC P P1;P2;P3 q <body> ST`), not APC. vte
+    // drives `hook`/`put`/`unhook` natively (unlike APC, which needed
+    // the parser's pre-scanner), so we just buffer here and hand the
+    // body to the sixel decoder on `unhook`.
+
+    fn hook(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+        // Sixel = final byte `q` with NO intermediates. DECRQSS is `$q`
+        // and other DCS queries carry intermediates — exclude them so we
+        // don't capture a non-sixel DCS as a sixel body.
+        if action == 'q' && intermediates.is_empty() {
+            let mut it = params.iter();
+            let mut next = || it.next().and_then(|sub| sub.first().copied());
+            self.sixel_pending = Some(SixelDcs {
+                p1: next(),
+                p2: next(),
+                p3: next(),
+                buf: Vec::new(),
+            });
+        }
+    }
+
+    fn put(&mut self, byte: u8) {
+        // Cap the buffered body; a hostile stream could otherwise send an
+        // unbounded DCS payload. 64 MiB of sixel source decodes to far
+        // more than any sane image; overflow leaves a truncated buffer
+        // that fails decode cleanly in `unhook`.
+        const SIXEL_BODY_CAP: usize = 64 * 1024 * 1024;
+        if let Some(s) = &mut self.sixel_pending
+            && s.buf.len() < SIXEL_BODY_CAP
+        {
+            s.buf.push(byte);
+        }
+    }
+
+    fn unhook(&mut self) {
+        let Some(dcs) = self.sixel_pending.take() else {
+            return;
+        };
+        // Borrow the handler out so we can pass `&mut self` to placement.
+        let handler = std::mem::take(&mut self.sixel_handler);
+        match handler.decode(&dcs) {
+            Ok(data) => self.place_sixel(data),
+            Err(e) => {
+                tracing::debug!(target: "sixel", error = %e, "sixel decode failed");
+            }
+        }
+        self.sixel_handler = handler;
+    }
 }
 
 // ---- Kitty delete helpers (M10/M11/M12) ----
@@ -3381,6 +3489,74 @@ impl Term {
             seen.push(p.image_id);
             if !self.image_grid.iter().any(|q| q.image_id == p.image_id) {
                 self.remove_image_bytes(p.image_id);
+            }
+        }
+    }
+
+    /// Register a decoded sixel image and place it at the cursor, then
+    /// advance the cursor per the active sixel cursor mode (DECSET 8452).
+    ///
+    /// Sixel carries no client-assigned image ids, so we register under
+    /// id 0 (the registry mints the lowest free id). The cell span is
+    /// derived the way kitty derives an un-annotated transmit:
+    /// `ceil(img_dim / cell_dim)`.
+    fn place_sixel(&mut self, data: ImageData) {
+        let (img_w, img_h) = (data.width, data.height);
+        let Some(id) = self.register_image(0, 0, data) else {
+            return;
+        };
+        let (cell_w, cell_h) = self.cell_pixel_size;
+        let cols = img_w.div_ceil(u32::from(cell_w.max(1))).max(1) as u16;
+        let rows = img_h.div_ceil(u32::from(cell_h.max(1))).max(1) as u16;
+
+        // `place_image` rebases the span against the cursor and scrolls
+        // the screen up if the image doesn't fit below it, computing its
+        // own `start_row` internally. Mirror that math so we know where
+        // the image lands for the cursor advance below.
+        let cur_row = self.cursor.row;
+        let start_col = self.cursor_col();
+        let scroll_n = cur_row.saturating_add(rows).saturating_sub(self.rows);
+        let start_row = cur_row.saturating_sub(scroll_n);
+
+        self.place_image(Placement {
+            image_id: id,
+            placement_id: 0,
+            row_range: 0..rows,
+            col_range: 0..cols,
+            src_rect: toastty_graphics::SrcRect::FULL,
+            z: 0,
+            pix_offset: (0, 0),
+            parent: None,
+            rel_offset: (0, 0),
+        });
+
+        let image_bottom = start_row.saturating_add(rows).saturating_sub(1);
+        if self.sixel_cursor_right {
+            // DECSET 8452: cursor lands on the image's last row, one
+            // column past its right edge (kitty-style).
+            self.cursor.row = image_bottom.min(self.rows.saturating_sub(1));
+            self.cursor.col = start_col
+                .saturating_add(cols)
+                .min(self.cols.saturating_sub(1));
+        } else {
+            // Default sixel scrolling: cursor moves to the left margin of
+            // the line BELOW the image. If that line is past the bottom,
+            // scroll one row (the image scrolls up with the content, as a
+            // real terminal does) and sit on the new last row.
+            self.cursor.col = 0;
+            let want = image_bottom.saturating_add(1);
+            if want >= self.rows {
+                self.active_grid_mut().scroll_up();
+                if !self.alt_active {
+                    self.viewport
+                        .on_grid_scroll_up(self.primary.history_lines());
+                }
+                self.image_grid.shift_rows_up(1, 0);
+                self.image_grid.resolve_relative_positions();
+                self.mark_all_dirty();
+                self.cursor.row = self.rows.saturating_sub(1);
+            } else {
+                self.cursor.row = want;
             }
         }
     }
@@ -5947,18 +6123,97 @@ mod tests {
     // ----- OSC 4 (palette) -------------------------------------------------
 
     #[test]
-    fn da1_replies_with_vt220_plus_color() {
+    fn da1_replies_with_vt220_sixel_and_color() {
         let mut t = Term::new(2, 4, 0);
         feed(&mut t, b"\x1b[c");
         let bytes = t.drain_pty_replies();
-        assert_eq!(&bytes[..], b"\x1b[?62;22c");
+        // `4` advertises sixel support (the gate apps probe before
+        // sending graphics).
+        assert_eq!(&bytes[..], b"\x1b[?62;4;22c");
     }
 
     #[test]
     fn da1_with_explicit_zero_param_also_replies() {
         let mut t = Term::new(2, 4, 0);
         feed(&mut t, b"\x1b[0c");
-        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?62;22c");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?62;4;22c");
+    }
+
+    // ----- Sixel (DCS) ------------------------------------------------------
+
+    /// A minimal valid sixel DCS: define color register 0 as RGB
+    /// (100,0,0), select it, draw three `~` sixels (each = all 6 pixels
+    /// set) → a 3px-wide, 6px-tall image. Body matches `icy_sixel`'s own
+    /// doctest fixture.
+    const SIXEL_3X6: &[u8] = b"\x1bPq#0;2;100;0;0#0~~~\x1b\\";
+
+    #[test]
+    fn sixel_dcs_registers_and_places_image() {
+        let mut t = Term::new(8, 8, 0);
+        feed(&mut t, SIXEL_3X6);
+        assert_eq!(t.image_grid().iter().count(), 1, "one placement expected");
+        let p = t.image_grid().iter().next().unwrap();
+        let img = t.image_registry().get(p.image_id).expect("image registered");
+        assert_eq!(img.width, 3);
+        // Sixel encodes pixels in vertical bands of 6; the decoder reports
+        // the band-aligned height.
+        assert!(img.height >= 6 && img.height.is_multiple_of(6), "got height {}", img.height);
+    }
+
+    #[test]
+    fn sixel_advances_cursor_to_line_below() {
+        let mut t = Term::new(8, 8, 0);
+        feed(&mut t, SIXEL_3X6);
+        // 3x6 image with the default (8,16) cell = one cell; default
+        // sixel scrolling moves the cursor to the left margin of the
+        // line below the image.
+        assert_eq!(t.cursor().row, 1);
+        assert_eq!(t.cursor().col, 0);
+    }
+
+    #[test]
+    fn sixel_mode_8452_leaves_cursor_right_of_image() {
+        let mut t = Term::new(8, 8, 0);
+        feed(&mut t, b"\x1b[?8452h");
+        feed(&mut t, SIXEL_3X6);
+        // One-cell image at the origin; cursor lands on its last row, one
+        // column past the right edge.
+        assert_eq!(t.cursor().row, 0);
+        assert_eq!(t.cursor().col, 1);
+    }
+
+    #[test]
+    fn decset_80_and_8452_round_trip_via_decrqm() {
+        let mut t = Term::new(2, 4, 0);
+        // DECSDM (80) and cursor-right (8452) both report "reset" (2)
+        // until set.
+        feed(&mut t, b"\x1b[?80$p");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?80;2$y");
+        feed(&mut t, b"\x1b[?80h\x1b[?80$p");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?80;1$y");
+        feed(&mut t, b"\x1b[?8452h\x1b[?8452$p");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?8452;1$y");
+    }
+
+    #[test]
+    fn xtsmgraphics_reports_color_registers() {
+        let mut t = Term::new(4, 8, 0);
+        feed(&mut t, b"\x1b[?1;1;0S");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?1;0;256S");
+    }
+
+    #[test]
+    fn xtsmgraphics_reports_geometry_from_text_area() {
+        let mut t = Term::new(4, 8, 0); // 8 cols × 8px, 4 rows × 16px
+        feed(&mut t, b"\x1b[?2;1;0S");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?2;0;64;64S");
+    }
+
+    #[test]
+    fn xtsmgraphics_unknown_item_reports_failure() {
+        let mut t = Term::new(4, 8, 0);
+        feed(&mut t, b"\x1b[?9;1;0S");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?9;2S");
     }
 
     #[test]
