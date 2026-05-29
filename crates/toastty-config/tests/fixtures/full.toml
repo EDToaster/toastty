@@ -27,6 +27,7 @@ lines = 10000
 smooth_scrolling = true
 smoothing_function = "exp_decay"
 lines_per_notch = 3
+pixel_scroll_sensitivity = 1.0
 
 [security]
 osc_52_read  = false

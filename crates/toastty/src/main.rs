@@ -1322,7 +1322,7 @@ impl Toastty {
                     (ny, nx)
                 }
                 toastty_window::ScrollKind::Pixels => {
-                    let threshold = 2.0 * f64::from(cell_h);
+                    let threshold = self.pixel_scroll_threshold(2.0, f64::from(cell_h));
                     self.mouse_scroll_accum_y += delta_y;
                     self.mouse_scroll_accum_x += delta_x;
                     let cy = (self.mouse_scroll_accum_y / threshold).trunc();
@@ -1442,9 +1442,9 @@ impl Toastty {
                         // stays in `scroll_pixel_residual` so a slow
                         // trackpad drag eventually advances by a row.
                         self.scroll_pixel_residual += delta_pixel;
-                        let cell_h_f = f64::from(cell_h);
-                        let crossings = (self.scroll_pixel_residual / cell_h_f).trunc();
-                        self.scroll_pixel_residual -= crossings * cell_h_f;
+                        let threshold = self.pixel_scroll_threshold(1.0, f64::from(cell_h));
+                        let crossings = (self.scroll_pixel_residual / threshold).trunc();
+                        self.scroll_pixel_residual -= crossings * threshold;
                         #[allow(clippy::cast_possible_truncation)]
                         let delta_lines = crossings as i32;
                         if delta_lines != 0 {
@@ -1503,14 +1503,28 @@ impl Toastty {
                 // Accumulate signed pixel motion so direction reversal
                 // cancels out before any arrow is emitted. Sign of
                 // `crossings` is the net direction.
+                let threshold = self.pixel_scroll_threshold(1.0, cell_h);
                 self.alt_scroll_pixel_accum += delta_y;
-                let crossings = (self.alt_scroll_pixel_accum / cell_h).trunc();
-                self.alt_scroll_pixel_accum -= crossings * cell_h;
+                let crossings = (self.alt_scroll_pixel_accum / threshold).trunc();
+                self.alt_scroll_pixel_accum -= crossings * threshold;
                 #[allow(clippy::cast_possible_truncation)]
                 let n = crossings as i32;
                 n
             }
         }
+    }
+
+    /// Pixel travel (device px) that must accumulate before emitting
+    /// one discrete scroll step, for a path whose baseline is `cells`
+    /// cell-heights. Divided by the configured
+    /// [`pixel_scroll_sensitivity`](toastty_config::ScrollbackConfig::pixel_scroll_sensitivity)
+    /// so a higher value means more sensitive (less travel per step).
+    /// The sensitivity is clamped to a small positive floor so a
+    /// degenerate config value can't produce a zero/negative threshold
+    /// and divide by zero in the accumulators.
+    fn pixel_scroll_threshold(&self, cells: f64, cell_h: f64) -> f64 {
+        let sens = self.config.scrollback.pixel_scroll_sensitivity.max(0.05);
+        cells * cell_h / sens
     }
 
     /// Snap the viewport target to the live bottom and schedule a

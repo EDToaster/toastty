@@ -23,7 +23,9 @@ pub enum SmoothingFunction {
 
 /// Scrollback config — how many lines to retain in the ring buffer and
 /// how scrolling animates between positions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+//
+// NOTE: not `Eq` — `pixel_scroll_sensitivity` is an `f64`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ScrollbackConfig {
     /// Maximum scrollback lines retained above the visible region. The
@@ -41,11 +43,25 @@ pub struct ScrollbackConfig {
     /// Trackpad `PixelDelta` events are accumulated as raw pixels and
     /// don't go through this knob.
     pub lines_per_notch: u32,
+    /// How readily accumulated trackpad/`PixelDelta` motion is turned
+    /// into *discrete* scroll steps. This governs the three paths that
+    /// must quantise a continuous pixel stream into whole steps:
+    /// mouse-mode (SGR) forwarding to the app, alt-screen arrow-key
+    /// translation (`less`/`man`/plain `vim`), and primary-grid
+    /// scrollback when `smooth_scrolling = false`. Each path emits one
+    /// step after a baseline of one or two cell-heights of travel;
+    /// this value divides that baseline, so `2.0` makes scrolling twice
+    /// as sensitive (half the finger travel per step) and `0.5` halves
+    /// it. Has no effect on the smooth (`smooth_scrolling = true`)
+    /// primary-grid path, which tracks pixels directly. Default `1.0`.
+    /// Clamped to a small positive floor so it can't divide by zero.
+    pub pixel_scroll_sensitivity: f64,
 }
 
 impl ScrollbackConfig {
     /// Schema defaults. 10 000 lines of history, smooth-scrolling on
-    /// with an 80 ms exponential decay, 3 lines per wheel notch.
+    /// with an 80 ms exponential decay, 3 lines per wheel notch, and a
+    /// neutral (`1.0`) pixel-scroll sensitivity.
     #[must_use]
     pub fn defaults() -> Self {
         Self {
@@ -53,6 +69,7 @@ impl ScrollbackConfig {
             smooth_scrolling: true,
             smoothing_function: SmoothingFunction::ExpDecay,
             lines_per_notch: 3,
+            pixel_scroll_sensitivity: 1.0,
         }
     }
 }
@@ -74,6 +91,7 @@ mod tests {
         assert!(d.smooth_scrolling);
         assert_eq!(d.smoothing_function, SmoothingFunction::ExpDecay);
         assert_eq!(d.lines_per_notch, 3);
+        assert!((d.pixel_scroll_sensitivity - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -88,6 +106,7 @@ mod tests {
             smooth_scrolling: false,
             smoothing_function: SmoothingFunction::Linear,
             lines_per_notch: 1,
+            pixel_scroll_sensitivity: 2.5,
         };
         let t = toml::to_string(&s).unwrap();
         let p: ScrollbackConfig = toml::from_str(&t).unwrap();
@@ -130,5 +149,13 @@ mod tests {
         assert!(cfg.smooth_scrolling);
         assert_eq!(cfg.smoothing_function, SmoothingFunction::ExpDecay);
         assert_eq!(cfg.lines_per_notch, 3);
+        assert!((cfg.pixel_scroll_sensitivity - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn pixel_scroll_sensitivity_parses() {
+        let cfg: ScrollbackConfig =
+            toml::from_str("pixel_scroll_sensitivity = 2.0\n").unwrap();
+        assert!((cfg.pixel_scroll_sensitivity - 2.0).abs() < f64::EPSILON);
     }
 }
