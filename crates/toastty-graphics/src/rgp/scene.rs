@@ -71,7 +71,15 @@ pub struct RgpPlacement {
 pub struct RgpScene {
     assets: HashMap<u32, RgpAsset>,
     placements: HashMap<u32, RgpPlacement>,
+    /// Bumped on every mutation (register / place / update / delete).
+    /// Drives the renderer's repaint + cell re-emit.
     revision: u32,
+    /// Bumped only when the asset *table* changes (register /
+    /// delete-all). Drives the GPU mesh-cache re-upload. Kept
+    /// separate from `revision` so a transform-only `u` (which only
+    /// changes per-draw uniforms) doesn't force every mesh to
+    /// re-upload. See `toastty-render`'s `GpuAssetCache::sync` gate.
+    asset_revision: u32,
     /// Last call to [`Self::tick_animations`]. `None` until the
     /// first tick, then keeps the previous tick's `Instant` so
     /// subsequent ticks can compute elapsed time.
@@ -114,10 +122,20 @@ impl RgpScene {
         self.revision
     }
 
+    /// Asset-table revision. Advances only on register / delete-all —
+    /// i.e. when the set of registered meshes changes. The renderer
+    /// gates its GPU mesh-cache re-upload on this so placement/style
+    /// updates (rotation, scale, color — all per-draw uniforms) don't
+    /// trigger a needless re-upload.
+    #[must_use]
+    pub fn asset_revision(&self) -> u32 {
+        self.asset_revision
+    }
+
     /// Insert or replace a registered asset.
     pub fn apply_register(&mut self, id: u32, asset: RgpAsset) {
         self.assets.insert(id, asset);
-        self.bump();
+        self.bump_assets();
     }
 
     /// Insert or replace a placement. Note: re-placing an existing
@@ -235,10 +253,20 @@ impl RgpScene {
         }
         self.assets.clear();
         self.placements.clear();
-        self.bump();
+        self.bump_assets();
     }
 
+    /// Bump the placement/style revision (drives repaint + cell
+    /// re-emit, but NOT the GPU mesh-cache re-upload).
     fn bump(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Bump the asset-table revision (drives the GPU mesh-cache
+    /// re-upload) *and* the placement revision (an asset change also
+    /// needs a repaint). Use for register / delete-all.
+    fn bump_assets(&mut self) {
+        self.asset_revision = self.asset_revision.wrapping_add(1);
         self.revision = self.revision.wrapping_add(1);
     }
 }
@@ -345,6 +373,78 @@ mod tests {
         let mut s = RgpScene::new();
         s.apply_delete_one(42);
         assert_eq!(s.revision(), 0);
+    }
+
+    // ---- asset_revision vs revision split ----
+
+    #[test]
+    fn register_advances_asset_revision() {
+        let mut s = RgpScene::new();
+        assert_eq!(s.asset_revision(), 0);
+        s.apply_register(1, dummy_asset());
+        assert_eq!(s.asset_revision(), 1);
+        assert_eq!(s.revision(), 1, "register also bumps revision (repaint)");
+    }
+
+    #[test]
+    fn place_update_delete_one_do_not_advance_asset_revision() {
+        let mut s = RgpScene::new();
+        s.apply_register(1, dummy_asset());
+        let asset_rev = s.asset_revision();
+
+        s.apply_place(1, dummy_anchor(), RgpPlacementStyle::default());
+        assert_eq!(s.asset_revision(), asset_rev, "place must not touch assets");
+
+        let upd = RgpPlacementUpdate {
+            rotation: [None, Some(45.0), None],
+            ..Default::default()
+        };
+        s.apply_update(1, &upd);
+        assert_eq!(s.asset_revision(), asset_rev, "update must not touch assets");
+
+        s.apply_delete_one(1);
+        assert_eq!(
+            s.asset_revision(),
+            asset_rev,
+            "delete-one keeps the asset, so asset_revision is unchanged",
+        );
+
+        // …but each of those still advanced the overall (repaint) revision.
+        assert!(s.revision() > asset_rev);
+    }
+
+    #[test]
+    fn delete_all_advances_asset_revision() {
+        let mut s = RgpScene::new();
+        s.apply_register(1, dummy_asset());
+        s.apply_place(1, dummy_anchor(), RgpPlacementStyle::default());
+        let asset_rev = s.asset_revision();
+        s.apply_delete_all();
+        assert_eq!(s.asset_revision(), asset_rev + 1);
+    }
+
+    #[test]
+    fn transform_update_loop_never_advances_asset_revision() {
+        // The molecule viewer's drag-rotate path: many `u` verbs in a
+        // row must not invalidate the GPU mesh cache (no re-upload),
+        // even though the scene repaints each step.
+        let mut s = RgpScene::new();
+        s.apply_register(1, dummy_asset());
+        s.apply_place(1, dummy_anchor(), RgpPlacementStyle::default());
+        let asset_rev = s.asset_revision();
+        for deg in 0u16..360 {
+            let upd = RgpPlacementUpdate {
+                rotation: [None, Some(f32::from(deg)), None],
+                ..Default::default()
+            };
+            s.apply_update(1, &upd);
+        }
+        assert_eq!(
+            s.asset_revision(),
+            asset_rev,
+            "no mesh re-upload during rotation",
+        );
+        assert!(s.revision() > asset_rev, "but the scene still repaints");
     }
 
     // ---- M12c: animation tick + deadline ----

@@ -1,9 +1,10 @@
 //! GPU-side mesh cache for RGP assets.
 //!
 //! Each registered asset (by id) becomes one `GpuMesh` — an
-//! interleaved vertex buffer plus an index buffer. The cache
-//! diffs against `RgpScene::revision()` and uploads / evicts as
-//! needed.
+//! interleaved vertex buffer plus an index buffer. The re-upload is
+//! gated on `RgpScene::asset_revision()` (register / delete-all), NOT
+//! the overall `revision()` — placement/style `u`s (rotation, scale,
+//! color) are per-draw uniforms and never change the geometry.
 
 use std::collections::HashMap;
 
@@ -108,15 +109,15 @@ impl GpuAssetCache {
     /// Rebuild the GPU cache from the scene's registered assets.
     ///
     /// Wipes + re-uploads every asset rather than diffing by id. The
-    /// scene's revision counter only bumps on actual mutations
-    /// (register / place / update / delete), so this is not called
-    /// per frame — animation ticks don't bump revision. The
-    /// previous "missing id → upload" diff missed re-registers of
-    /// an existing id (e.g. the `draw` example calling
-    /// `register_payload` repeatedly on id=700 with growing OBJ
-    /// data), leaving the GPU stuck on the first version. Always
-    /// re-uploading is simpler than per-asset version tracking and
-    /// the meshes are small in v1.
+    /// caller only invokes this when `RgpScene::asset_revision()`
+    /// advances (register / delete-all), so it is NOT called for
+    /// placement/style updates or animation ticks — a drag-rotate loop
+    /// of `u` verbs leaves the geometry cache untouched. Always
+    /// re-uploading on an asset change is simpler than per-asset
+    /// version tracking and correctly picks up re-registers of an
+    /// existing id (e.g. the `draw` example calling `register_payload`
+    /// repeatedly on id=700 with growing OBJ data); a "missing id →
+    /// upload" diff would leave the GPU stuck on the first version.
     pub fn sync(
         &mut self,
         device: &wgpu::Device,

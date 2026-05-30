@@ -580,10 +580,20 @@ impl Term {
 
     /// Monotonic RGP scene revision. Bumps on every mutation
     /// (register / place / update / delete). Renderer compares to
-    /// its cached value to decide when to re-sync GPU meshes.
+    /// its cached value to decide when to repaint the 3D layer.
     #[must_use]
     pub fn rgp_revision(&self) -> u32 {
         self.rgp_scene.revision()
+    }
+
+    /// Monotonic RGP *asset-table* revision. Bumps only on register /
+    /// delete-all — i.e. when the set of registered meshes changes.
+    /// The renderer gates its GPU mesh-cache re-upload on this so a
+    /// transform-only `u` (rotation/scale/color — all per-draw
+    /// uniforms) repaints without re-uploading geometry.
+    #[must_use]
+    pub fn rgp_asset_revision(&self) -> u32 {
+        self.rgp_scene.asset_revision()
     }
 
     /// Advance per-placement animation phases for `animate=1`

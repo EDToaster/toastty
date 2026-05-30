@@ -260,8 +260,13 @@ pub struct Renderer {
     rgp_pipeline: Option<Rgp3dPipeline>,
     /// GPU mesh cache keyed by RGP asset id.
     rgp_cache: GpuAssetCache,
-    /// Last `Term::rgp_revision()` we synced.
+    /// Last `Term::rgp_revision()` we repainted at. Drives the 3D
+    /// layer repaint + cell re-emit.
     rgp_revision_seen: u32,
+    /// Last `Term::rgp_asset_revision()` we uploaded GPU meshes for.
+    /// Drives the mesh-cache re-upload; kept separate so transform-only
+    /// `u` updates repaint without re-uploading geometry.
+    rgp_asset_revision_seen: u32,
     /// Optional debug overlay text rendered at the top-right of the
     /// surface every frame (e.g. an FPS counter). When `Some`, the
     /// skip-submit gate is bypassed so the overlay refreshes even when
@@ -573,6 +578,7 @@ impl Renderer {
             rgp_pipeline: None,
             rgp_cache: GpuAssetCache::new(),
             rgp_revision_seen: u32::MAX,
+            rgp_asset_revision_seen: u32::MAX,
             debug_overlay: None,
             error_banner: None,
             trace_render: std::env::var_os("TOASTTY_TRACE_RENDER").is_some(),
@@ -943,11 +949,19 @@ impl Renderer {
             self.last_view_offset = cur_view;
         }
 
-        // M12d: RGP scene sync. Same pattern as the image registry —
-        // when the term's RGP revision advances, diff the GPU cache
-        // against the scene's asset table and force a full clear.
-        if term.rgp_revision() != self.rgp_revision_seen {
+        // M12d: RGP scene sync. Same pattern as the image registry, but
+        // split across two revision counters so a transform-only `u`
+        // (rotation/scale/color — all per-draw uniforms recomputed in
+        // pipeline.render()) repaints WITHOUT re-uploading geometry.
+        //
+        // Asset table changed (register / delete) → re-upload GPU meshes.
+        if term.rgp_asset_revision() != self.rgp_asset_revision_seen {
             self.rgp_cache.sync(&self.device, term.rgp_scene());
+            self.rgp_asset_revision_seen = term.rgp_asset_revision();
+        }
+        // Any RGP scene change (placement / style / asset) → repaint the
+        // 3D layer and re-emit cells so the new pose is composited.
+        if term.rgp_revision() != self.rgp_revision_seen {
             self.rgp_revision_seen = term.rgp_revision();
             self.needs_full_clear = true;
             term.mark_all_dirty();
