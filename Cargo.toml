@@ -11,7 +11,13 @@ members = [
     "crates/toastty-graphics",
     "crates/toastty-render",
     "crates/toastty-config",
+    "demos/molecule-viewer",
 ]
+
+# A bare `cargo run` / `cargo build` (no `-p`) targets the terminal itself,
+# not the demos. Use `cargo run -p molecule-viewer` for the demo, and
+# `cargo test --workspace` to exercise every crate.
+default-members = ["crates/toastty"]
 
 [workspace.package]
 version = "0.1.0"

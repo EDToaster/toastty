@@ -1,0 +1,25 @@
+[package]
+name = "molecule-viewer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22.1"
+# Direct dep solely to enable crossterm's `bracketed-paste` feature on the
+# same version ratatui 0.30 re-exports (0.29.0) — cargo unifies it so
+# `ratatui::crossterm` gains `Event::Paste` + `Enable/DisableBracketedPaste`.
+crossterm = { version = "0.29.0", features = ["bracketed-paste"] }
+ratatui = "0.30.0"
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1.0.150"
+ureq = "3.3.0"
+
+[dev-dependencies]
+# Validate our generated .glb against toastty's own loader.
+toastty-graphics.workspace = true
+
+[lints]
+workspace = true
