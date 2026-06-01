@@ -1,0 +1,717 @@
+{
+  "phase": "P3 \u2014 Materials & light",
+  "summary": "Dependency-ordered task list for TGP Phase 3 (Materials & light), covering registered PBR materials (material.add metal-roughness), hardened PNG/GLB-embedded texture decode with max_tex_dim/max_texels caps, punctual Light nodes with per-viewport replace-not-augment semantics + deterministic over-cap selection, per-viewport tone-map (Reinhard/ACES/none over the whole linear target), per-viewport MSAA with clamp-down + ack-report and the always-1x pick invariant, the sRGB-wire/linear-internal/sRGB-encode color pipeline, theme-tint as a pre-lighting default-material-input stage, and VRAM accounting for MSAA+resolve+pick targets.\n\nALL deliverables live in the greenfield TGP module trees (crates/toastty-graphics/src/tgp/* and crates/toastty-render/src/tgp/*) parallel to the legacy rgp/ \u2014 never reused (G8). The legacy crates/toastty-graphics/src/rgp/glb_loader.rs (first-primitive, no-texture) is NOT touched; TGP has its own hardened loader from P1 that P3 extends for embedded PNG.\n\nTESTING SEAMS used: INGRESS (Parser::advance(&mut Term, bytes) \u2192 &self accessors: Term::tgp_scene() nodes/materials/textures, scene_revision/asset_revision, per-node/per-viewport dirty flags, viewport effective render opts, computed VRAM, pty_replies bytes); INTERACTION (synthetic pointer events via Term input API for the pick-vs-1x invariant); LIFECYCLE (RIS as bytes). Every test states concrete input bytes/events and the concrete accessor+expected value. The cross-crate apc_end back-channel (perform.rs:42 unit \u2192 ApcEnd) was established in P1 and is unchanged here; P3 binary frames (textures embedded in asset.add GLB, large material/texture patches) ride the existing enc=bin path, so each material/texture task includes an enc=bin variant test asserting the binary-frame path agrees with b64.\n\nCROSS-PHASE DEPENDS (assumed delivered): P1 = TGP scene model, Term::tgp_scene(), dirty-flag/revision machinery, default material (MaterialId 0), CBOR patch decode, handshake/tgp;r/caps emit, viewport pixel rects, injectable clock, CPU world matrices, hardened TGP GLB loader (full mesh set). P2 = multiple viewports, instancing, CPU pick buffer + pick pass, sub/events, explore controller.\n\nEvery protocol surface in \u00a711 gets at least one unit test: ops (material.add, asset.add fmt=png, node.upsert{material}, node.upsert{light}), header/field surfaces (model=pbr, base/metallic/rough/normal/emissive/occlusion, tex_* refs, render.msaa, render.tone_map, render.theme_tint, render.keep_default_light), error codes (parse_error detail=tex_dim|tex_format, cap_exceeded detail=max_tex_dim|max_texels_per_texture|max_lights_per_viewport, vram_exhausted, bad_ref tex:<id>, unsupported), caps (max_tex_dim, max_texels_per_texture, max_lights_per_viewport, msaa, color=srgb), and lifecycle events (cap_exceeded one-time-per-viewport light over-cap; RIS teardown of materials/textures/MSAA targets).",
+  "tasks": [
+    {
+      "id": "P3-T1",
+      "title": "Color pipeline: sRGB-wire \u2192 linear-internal conversion + linear-light offscreen target type",
+      "deliverable": "crates/toastty-graphics/src/tgp/color.rs (new): pub fn srgb_u8_to_linear_f32(u8)->f32, pub fn srgb_rgba8_to_linear([u8;4])->[f32;4] (alpha left linear), reusing the math style of crates/toastty-render/src/color.rs::linear_to_srgb_u8 (the inverse). Add a single canonical entry point WireColor::linearize() applied ON INPUT to every color field. crates/toastty-render/src/tgp/target.rs (new): ViewportColorTarget describing the offscreen as a linear-DATA UNORM format (NOT *_SRGB auto-encoding) plus an explicit in-shader sRGB-encode stage marker; pub fn color_target_format()->wgpu::TextureFormat returning a non-sRGB UNORM. Document the \u00a711.2 invariant: linearize-once-on-input, render linear, sRGB-encode in-shader. No GPU object construction in the pure helpers.",
+      "design_refs": [
+        "11.2",
+        "7.1 (color=srgb)",
+        "G7"
+      ],
+      "depends_on": [
+        "P1-handshake-caps",
+        "P1-tgp-scene-model"
+      ],
+      "tests": [
+        {
+          "name": "srgb_u8_to_linear_roundtrip_matches_render_color_inverse",
+          "seam": "unit (pure fn)",
+          "input": "srgb_u8_to_linear_f32(188) then feed through render::color::linear_to_srgb_u8",
+          "assert": "round-trips back to 188 \u00b11 (inverse of the known 0.5-linear\u2192188 midpoint in render/src/color.rs)"
+        },
+        {
+          "name": "srgb_linearize_endpoints",
+          "seam": "unit (pure fn)",
+          "input": "srgb_u8_to_linear_f32(0) and srgb_u8_to_linear_f32(255)",
+          "assert": "==0.0 and ==1.0 exactly"
+        },
+        {
+          "name": "srgba_alpha_channel_stays_linear",
+          "seam": "unit (pure fn)",
+          "input": "srgb_rgba8_to_linear([0,0,0,128])",
+          "assert": "result[3] \u2248 128/255 (alpha NOT gamma-bent; matches render/src/color.rs bgra_alpha_is_linear_not_srgb)"
+        },
+        {
+          "name": "offscreen_color_format_is_non_srgb_unorm",
+          "seam": "unit (pure fn)",
+          "input": "color_target_format()",
+          "assert": "returns a *Unorm (not *UnormSrgb) format, so tone-map math stays in linear and sRGB-encode is explicit-in-shader per \u00a711.2"
+        }
+      ]
+    },
+    {
+      "id": "P3-T2",
+      "title": "Caps: advertise max_tex_dim, max_texels_per_texture, max_lights_per_viewport, msaa list, color=srgb in tgp;r",
+      "deliverable": "crates/toastty-term/src/tgp/caps.rs (extend P1 cap struct): add max_tex_dim, max_texels_per_texture, max_lights_per_viewport, msaa supported-count list (baseline {1,4}; add {2,8} only where adapter reports support \u2014 CPU-side a fixed default {1,4} for GPU-free tests), and ensure color=srgb is emitted. Extend the tgp;r serializer to print these fields in the exact \u00a77.1 spelling. Extend feat= advertisement to include pbr,material,light (honoring the implication pbr\u21d2material). Expose Term::tgp_caps() accessor returning the struct so tests read the same values the wire prints.",
+      "design_refs": [
+        "7.1",
+        "11.4 (msaa=)",
+        "15.2",
+        "G7"
+      ],
+      "depends_on": [
+        "P1-handshake-caps",
+        "P3-T1"
+      ],
+      "tests": [
+        {
+          "name": "reply_advertises_texture_and_light_caps",
+          "seam": "ingress",
+          "input": "ESC _ tgp;q;v=2;vmin=1;tok=app-7 ESC \\\\ via Parser::advance",
+          "assert": "pty_replies tgp;r bytes contain max_tex_dim=8192, max_texels_per_texture=67108864, max_lights_per_viewport=16, color=srgb"
+        },
+        {
+          "name": "reply_advertises_msaa_list",
+          "seam": "ingress",
+          "input": "same tgp;q",
+          "assert": "tgp;r contains msaa=1,4 (baseline supported set) and Term::tgp_caps().msaa == [1,4]"
+        },
+        {
+          "name": "feat_includes_pbr_material_light_with_implication",
+          "seam": "ingress",
+          "input": "same tgp;q",
+          "assert": "tgp;r feat= token list contains both material and pbr (pbr\u21d2material honored) and light"
+        },
+        {
+          "name": "caps_accessor_matches_wire",
+          "seam": "ingress",
+          "input": "same tgp;q",
+          "assert": "Term::tgp_caps().max_lights_per_viewport == the integer printed in the tgp;r bytes"
+        }
+      ]
+    },
+    {
+      "id": "P3-T3",
+      "title": "Registered material model + table: material.add{model:pbr} decode and storage",
+      "deliverable": "crates/toastty-graphics/src/tgp/material.rs (new): PbrMaterial { base_color:[f32;4] (linearized on input), metallic:f32, roughness:f32, emissive:[f32;3] (linearized), occlusion_strength:f32, normal_scale:f32, tex_base:Option<TexId>, tex_metal_rough:Option<TexId>, tex_normal:Option<TexId>, tex_emissive:Option<TexId>, tex_occlusion:Option<TexId> }; enum MaterialEntry { Default, Pbr(PbrMaterial) }. MaterialTable keyed by (token, MaterialId u32). crates/toastty-graphics/src/tgp/patch.rs (extend P1 op decoder): decode the material.add op (do:\"material.add\"). Scalars (metallic/roughness/occlusion/emissive intensity) are NOT color-managed (\u00a711.2); base/emissive colors ARE linearized via P3-T1. Unknown model string \u2192 x;code=unsupported;detail=material_model. material.add commits bump asset_revision once (per \u00a78.6). Expose Term::tgp_material(token, id) accessor.",
+      "design_refs": [
+        "11.2",
+        "8.6 (material.add, asset_revision)",
+        "15.3 (unsupported)"
+      ],
+      "depends_on": [
+        "P3-T1",
+        "P1-patch-decode",
+        "P1-tgp-scene-model"
+      ],
+      "tests": [
+        {
+          "name": "material_add_pbr_stores_linearized_basecolor",
+          "seam": "ingress",
+          "input": "CBOR patch txn=1 ops=[{do:material.add,id:3,model:pbr,base:[188,188,188,255],metallic:0.9,rough:0.3}] as enc=b64 APC via Parser::advance",
+          "assert": "Term::tgp_material(tok,3) is Pbr with base_color[0..3] \u2248 0.5 (sRGB 188\u2192linear), metallic==0.9, roughness==0.3"
+        },
+        {
+          "name": "material_add_scalars_not_color_managed",
+          "seam": "ingress",
+          "input": "same op with metallic:1.0,rough:0.5,occlusion_strength:0.7",
+          "assert": "metallic==1.0, roughness==0.5, occlusion_strength==0.7 stored verbatim (no sRGB linearization applied to scalars)"
+        },
+        {
+          "name": "material_add_bumps_asset_revision_once",
+          "seam": "ingress",
+          "input": "asset_revision read before; apply patch with two material.add ops in one txn",
+          "assert": "asset_revision increased by exactly 1 after the single committed txn"
+        },
+        {
+          "name": "material_add_unknown_model_unsupported",
+          "seam": "ingress",
+          "input": "patch txn=5 ops=[{do:material.add,id:4,model:\"phong\"}] from handshaked token",
+          "assert": "pty_replies contains tgp;x;tok=...;txn=5;op=0;code=unsupported;detail=material_model and Term::tgp_material(tok,4) is None (txn rejected)"
+        },
+        {
+          "name": "material_add_binary_frame_agrees_with_b64",
+          "seam": "ingress",
+          "input": "same material.add payload sent as enc=bin length-prefixed binary frame",
+          "assert": "Term::tgp_material(tok,3) identical to the b64-decoded result (binary path agrees)"
+        }
+      ]
+    },
+    {
+      "id": "P3-T4",
+      "title": "PBR emissive/normal/occlusion field decode + nullable/default-merge semantics",
+      "deliverable": "crates/toastty-graphics/src/tgp/material.rs + patch.rs: complete decode of emissive (color, linearized), normal_scale, occlusion_strength fields on material.add; apply the \u00a78.6 three-way sparse-merge rule for material.add re-add via remove+add only (assets/materials immutable once committed \u2014 a second material.add on a committed id \u2192 x;code=dup_id). Defaults when fields absent: base white [1,1,1,1], metallic 1.0, roughness 1.0, emissive black [0,0,0], occlusion_strength 1.0, normal_scale 1.0 (glTF metal-rough defaults). Expose the resolved defaults through Term::tgp_material.",
+      "design_refs": [
+        "11.2",
+        "8.4 (dup_id immutability)",
+        "8.6"
+      ],
+      "depends_on": [
+        "P3-T3"
+      ],
+      "tests": [
+        {
+          "name": "material_defaults_when_fields_absent",
+          "seam": "ingress",
+          "input": "patch ops=[{do:material.add,id:7,model:pbr}] (no scalar/color fields)",
+          "assert": "Term::tgp_material(tok,7) has metallic==1.0, roughness==1.0, emissive==[0,0,0], occlusion_strength==1.0, base_color==[1,1,1,1]"
+        },
+        {
+          "name": "material_emissive_linearized",
+          "seam": "ingress",
+          "input": "material.add id:8 emissive:[255,0,0]",
+          "assert": "stored emissive \u2248 [1.0,0.0,0.0] linear (255\u21921.0)"
+        },
+        {
+          "name": "material_readd_committed_id_is_dup_id",
+          "seam": "ingress",
+          "input": "two separate txns each material.add id:9 model:pbr",
+          "assert": "second txn pty_replies contains tgp;x;code=dup_id;detail=9 and the first material is retained unchanged"
+        }
+      ]
+    },
+    {
+      "id": "P3-T5",
+      "title": "Hardened PNG decoder: header-first dimension check vs max_tex_dim, bounded decode vs max_texels_per_texture",
+      "deliverable": "crates/toastty-graphics/src/tgp/texture.rs (new): pub fn decode_png(bytes:&[u8], caps)->Result<DecodedTexture, TexError>. ONE hardened PNG decoder (the only texture path in v1). Reads IHDR width/height FROM THE HEADER BEFORE full decode; if either axis > max_tex_dim \u2192 TexError::DimExceeded. If width*height > max_texels_per_texture \u2192 TexError::TexelsExceeded. Decode is bounded by the decode/parse-time cap (\u00a715.2/\u00a715.5) to guard decompression bombs: running output checked incrementally, abort + free partial on overflow. DecodedTexture { width, height, rgba8:Vec<u8> } stored sRGB on the wire (linearized at sample time / via texture format choice). TexError maps: DimExceeded\u2192(parse_error, detail=tex_dim) for hard-reject AND cap_exceeded;detail=max_tex_dim for the cap locus \u2014 follow \u00a711.2 wording: a texture exceeding max_tex_dim is rejected with parse_error detail=tex_dim. Expose nothing GPU.",
+      "design_refs": [
+        "11.2 (textures v1)",
+        "15.2 (texture decode)",
+        "15.5 (texture decode loci)",
+        "7.1 (max_tex_dim, max_texels_per_texture)"
+      ],
+      "depends_on": [
+        "P3-T2"
+      ],
+      "tests": [
+        {
+          "name": "png_valid_2x2_decodes",
+          "seam": "unit (pure fn)",
+          "input": "a hand-built 2x2 RGBA PNG byte literal",
+          "assert": "decode_png returns DecodedTexture{width:2,height:2,rgba8.len()==16}"
+        },
+        {
+          "name": "png_over_max_tex_dim_rejected_from_header",
+          "seam": "unit (pure fn)",
+          "input": "a PNG whose IHDR declares width=9000 (>8192) with truncated/empty IDAT",
+          "assert": "returns TexError::DimExceeded BEFORE decoding IDAT (no full decompress attempted)"
+        },
+        {
+          "name": "png_over_max_texels_rejected",
+          "seam": "unit (pure fn)",
+          "input": "PNG IHDR 8192x8193 (texels > 67108864)",
+          "assert": "returns TexError::TexelsExceeded"
+        },
+        {
+          "name": "png_decompression_bomb_bounded",
+          "seam": "unit (pure fn)",
+          "input": "PNG header within dim cap but IDAT that would expand beyond the decode budget",
+          "assert": "decode aborts with a cap error and the partial allocation is freed (no unbounded growth)"
+        },
+        {
+          "name": "non_png_magic_rejected",
+          "seam": "unit (pure fn)",
+          "input": "bytes starting with JPEG magic 0xFFD8",
+          "assert": "decode_png returns a format error (not a PNG)"
+        }
+      ]
+    },
+    {
+      "id": "P3-T6",
+      "title": "asset.add fmt=png op: register a PNG texture asset; non-PNG byte asset \u2192 parse_error detail=tex_format",
+      "deliverable": "crates/toastty-graphics/src/tgp/patch.rs + texture.rs: handle asset.add op with fmt=\"png\" \u2192 route bytes through P3-T5 decoder, register a TextureAsset in the asset table keyed by (token, asset id u32). A non-PNG byte asset declared fmt=png (or any non-PNG fmt routed to the texture path) \u2192 x;code=parse_error;detail=tex_format, rejecting the WHOLE txn atomically (\u00a78.6). A texture over max_tex_dim \u2192 x;code=parse_error;detail=tex_dim (whole-txn reject). asset.add commit bumps asset_revision once. Works under chunked asset.add (more=1/0) per \u00a78.7 since textures can exceed one frame. Expose Term::tgp_texture(token, id)->Option<{width,height}>.",
+      "design_refs": [
+        "11.2 (asset.add fmt=png)",
+        "8.6",
+        "8.7 (chunking)",
+        "15.3"
+      ],
+      "depends_on": [
+        "P3-T5",
+        "P1-patch-decode",
+        "P1-asset-table"
+      ],
+      "tests": [
+        {
+          "name": "asset_add_png_registers_texture",
+          "seam": "ingress",
+          "input": "patch txn=2 ops=[{do:asset.add,id:8,fmt:png,data:<2x2 png bytes>}] enc=b64",
+          "assert": "Term::tgp_texture(tok,8) == Some{width:2,height:2} and asset_revision bumped by 1"
+        },
+        {
+          "name": "asset_add_non_png_bytes_parse_error_tex_format",
+          "seam": "ingress",
+          "input": "patch txn=3 ops=[{do:asset.add,id:9,fmt:png,data:<jpeg magic bytes>}] from handshaked token",
+          "assert": "pty_replies contains tgp;x;txn=3;op=0;code=parse_error;detail=tex_format; Term::tgp_texture(tok,9)==None (whole txn rejected)"
+        },
+        {
+          "name": "asset_add_oversize_png_parse_error_tex_dim",
+          "seam": "ingress",
+          "input": "patch txn=4 asset.add id:10 fmt:png data declaring 9000px width",
+          "assert": "tgp;x;txn=4;code=parse_error;detail=tex_dim and the txn is rejected atomically (no texture, no asset_revision bump)"
+        },
+        {
+          "name": "asset_add_png_chunked_commits_on_more0",
+          "seam": "ingress",
+          "input": "two enc=bin chunk frames keyed asset id 11 (more=1 then more=0) carrying a PNG split in half",
+          "assert": "Term::tgp_texture(tok,11) registered only after the more=0 frame; asset_revision bumped exactly once"
+        }
+      ]
+    },
+    {
+      "id": "P3-T7",
+      "title": "GLB-embedded PNG texture extraction in the TGP GLB loader (one shared PNG decoder)",
+      "deliverable": "crates/toastty-graphics/src/tgp/glb_loader.rs (extend the P1 hardened full-mesh-set TGP loader \u2014 NOT the legacy rgp/glb_loader.rs): extract embedded image bytes referenced by glTF material texture slots, route them through the SAME P3-T5 decode_png (embedded JPEG / standalone JPEG / raw RGBA / KTX2 deferred \u2192 x;code=unsupported or parse_error;detail=tex_format). Map glTF metal-rough material \u2192 PbrMaterial with embedded textures registered as implicit TextureAssets. Honor max_tex_dim/max_texels per embedded image. Reject non-PNG embedded image with parse_error detail=tex_format, rejecting the whole asset.add txn.",
+      "design_refs": [
+        "11.2 (PNG embedded in GLB, one hardened decoder)",
+        "15.5",
+        "G8 (no legacy reuse)"
+      ],
+      "depends_on": [
+        "P3-T5",
+        "P3-T3",
+        "P1-tgp-glb-loader"
+      ],
+      "tests": [
+        {
+          "name": "glb_embedded_png_extracted",
+          "seam": "ingress",
+          "input": "asset.add id:12 fmt:glb data=<GLB embedding a 2x2 PNG baseColor texture>",
+          "assert": "the resulting PBR material has tex_base set and Term::tgp_texture for the implicit tex id reports {2,2}"
+        },
+        {
+          "name": "glb_embedded_jpeg_rejected",
+          "seam": "ingress",
+          "input": "asset.add id:13 fmt:glb embedding a JPEG image",
+          "assert": "pty_replies contains tgp;x;code=parse_error;detail=tex_format (embedded JPEG deferred) and the asset txn is rejected"
+        },
+        {
+          "name": "glb_embedded_png_over_dim_rejected",
+          "seam": "ingress",
+          "input": "GLB embedding a PNG declaring width 9000",
+          "assert": "tgp;x;code=parse_error;detail=tex_dim; no asset committed"
+        }
+      ]
+    },
+    {
+      "id": "P3-T8",
+      "title": "node.upsert{material} binding + bad_ref tex resolution within txn",
+      "deliverable": "crates/toastty-graphics/src/tgp/patch.rs: node.upsert with material:<id> binds a Mesh/Instanced node to a registered MaterialId (committed-only ref, order-independent within txn per \u00a78.6). material:null clears back to default (MaterialId 0). A material ref to an uncommitted/missing id \u2192 x;code=bad_ref;detail=material:<id>, whole-txn reject citing first offending op. A material's tex_* ref to an uncommitted/missing texture asset \u2192 x;code=bad_ref;detail=tex:<id>. Cross-token material/texture reference \u2192 x;code=denied;detail=token (\u00a715.2). Setting material on a node bumps scene_revision + the node's transform/material dirty flag (NOT asset_revision). Expose the bound material id via Term::tgp_scene() node accessor (node.material_id()).",
+      "design_refs": [
+        "8.6 (ref resolution, sparse merge)",
+        "8.4 (token isolation)",
+        "G2 (late-bound refs)",
+        "11.2"
+      ],
+      "depends_on": [
+        "P3-T3",
+        "P3-T6",
+        "P1-tgp-scene-model"
+      ],
+      "tests": [
+        {
+          "name": "node_upsert_binds_material",
+          "seam": "ingress",
+          "input": "patch txn=6 ops=[{do:material.add,id:3,model:pbr,...},{do:node.upsert,id:\"box\",mesh:1,material:3}]",
+          "assert": "Term::tgp_scene() node \"box\" .material_id()==Some(3); scene_revision bumped; asset_revision bumped only by the material.add"
+        },
+        {
+          "name": "node_upsert_material_forward_ref_in_same_txn",
+          "seam": "ingress",
+          "input": "same two ops but node.upsert BEFORE material.add in the op list",
+          "assert": "still binds (order-independent within txn); node.material_id()==Some(3)"
+        },
+        {
+          "name": "node_upsert_material_missing_bad_ref",
+          "seam": "ingress",
+          "input": "patch txn=7 ops=[{do:node.upsert,id:\"box\",mesh:1,material:99}] (99 not committed)",
+          "assert": "pty_replies tgp;x;txn=7;op=0;code=bad_ref;detail=material:99; node \"box\" not created (txn rejected)"
+        },
+        {
+          "name": "material_tex_missing_bad_ref_tex",
+          "seam": "ingress",
+          "input": "material.add id:3 model:pbr tex_base:50 where asset 50 never committed",
+          "assert": "tgp;x;code=bad_ref;detail=tex:50"
+        },
+        {
+          "name": "node_upsert_material_null_clears_to_default",
+          "seam": "ingress",
+          "input": "bind material:3 then a later txn node.upsert id:\"box\" material:null",
+          "assert": "node.material_id()==None (back to default MaterialId 0)"
+        },
+        {
+          "name": "cross_token_material_ref_denied",
+          "seam": "ingress",
+          "input": "token A creates material id 3; token B sends node.upsert referencing material:3",
+          "assert": "token B gets tgp;x;code=denied;detail=token; A's material untouched"
+        }
+      ]
+    },
+    {
+      "id": "P3-T9",
+      "title": "Light node kind: node.upsert{light} decode (directional/point/spot, color+intensity)",
+      "deliverable": "crates/toastty-graphics/src/tgp/scene.rs + patch.rs: add Light to the node-kind enum (Group|Mesh|Instanced|Light|Camera). LightData { kind: Directional|Point|Spot, color:[f32;3] (sRGB\u2192linear on input), intensity:f32 (scalar, NOT color-managed), range:Option<f32>, spot_inner/outer angles }. node.upsert with a light:{...} selector creates a Light node (KHR_lights_punctual style); lights are nodes so they inherit TRS and animate (\u00a711.3). Kind-immutability per \u00a78.6: a later upsert implying a different kind \u2192 x;code=kind_conflict. Expose Term::tgp_scene() node .light_data() and confirm Light nodes get a computed WORLD matrix like any node (so a parented headlight's world direction is queryable CPU-side).",
+      "design_refs": [
+        "11.3 (lights as nodes)",
+        "8.6 (kind selector, kind_conflict)"
+      ],
+      "depends_on": [
+        "P3-T1",
+        "P1-patch-decode",
+        "P1-world-matrix"
+      ],
+      "tests": [
+        {
+          "name": "node_upsert_light_creates_light_node",
+          "seam": "ingress",
+          "input": "patch ops=[{do:node.upsert,id:\"sun\",light:{type:directional,color:[255,255,255],intensity:2.0}}]",
+          "assert": "Term::tgp_scene() node \"sun\" kind==Light; light_data().kind==Directional; color\u2248[1,1,1] linear; intensity==2.0"
+        },
+        {
+          "name": "light_color_linearized_intensity_not",
+          "seam": "ingress",
+          "input": "light color:[188,188,188] intensity:0.5",
+          "assert": "color\u2248[0.5,0.5,0.5] linear (188\u21920.5); intensity==0.5 verbatim (scalar, not color-managed)"
+        },
+        {
+          "name": "light_inherits_parent_transform_world",
+          "seam": "ingress",
+          "input": "node.upsert \"car\" trs{translate:[10,0,0]} ; node.upsert \"headlight\" parent:\"car\" light:{type:spot,...}",
+          "assert": "Term::tgp_scene() \"headlight\" WORLD matrix translation == [10,0,0] (inherited)"
+        },
+        {
+          "name": "light_kind_change_conflict",
+          "seam": "ingress",
+          "input": "create \"sun\" as light then upsert \"sun\" mesh:1",
+          "assert": "tgp;x;code=kind_conflict (change kind via remove+add)"
+        }
+      ]
+    },
+    {
+      "id": "P3-T10",
+      "title": "Per-viewport effective light set + replace-not-augment switch (per visible subtree)",
+      "deliverable": "crates/toastty-render/src/tgp/lighting.rs (new, CPU-side selection \u2014 GPU consumes) + crates/toastty-term viewport accessor: compute the effective light set for a viewport per frame from its visible subtree (the viewport's root subtree, defaulting to whole scene). If that set contains \u22651 Light node, the built-in key+ambient+hemisphere is DISABLED for that viewport (replace-not-augment, \u00a711.3) and default-material nodes are lit only by registered lights through the same forward loop. Two viewports sharing one scene differ when their roots include/exclude the light. Expose Term::tgp_viewport_lighting(vp_id) \u2192 { registered_lights:Vec<NodeId>, default_light_active:bool } computed CPU-side without a GPU.",
+      "design_refs": [
+        "11.3 (replace not augment, per visible subtree)",
+        "11.1 (forward loop)",
+        "10.5 (root subtree)"
+      ],
+      "depends_on": [
+        "P3-T9",
+        "P2-multiple-viewports",
+        "P1-world-matrix"
+      ],
+      "tests": [
+        {
+          "name": "no_light_keeps_default_lighting",
+          "seam": "ingress",
+          "input": "scene with one mesh, one viewport, no Light node",
+          "assert": "Term::tgp_viewport_lighting(vp).default_light_active==true; registered_lights empty"
+        },
+        {
+          "name": "one_light_in_subtree_disables_default",
+          "seam": "ingress",
+          "input": "add a Light node inside the viewport's root subtree",
+          "assert": "default_light_active==false; registered_lights==[\"sun\"]"
+        },
+        {
+          "name": "two_viewports_differ_by_root_subtree",
+          "seam": "ingress",
+          "input": "viewport A root=subtree containing the light; viewport B root=a sibling subtree excluding it",
+          "assert": "A.default_light_active==false, B.default_light_active==true (per-subtree, not global)"
+        }
+      ]
+    },
+    {
+      "id": "P3-T11",
+      "title": "render.keep_default_light flag (additive fill) + deterministic over-cap light selection",
+      "deliverable": "crates/toastty-render/src/tgp/lighting.rs + viewport RenderOpts: render.keep_default_light (default false) keeps the built-in key+ambient+hemisphere on ADDITIVELY alongside registered lights. Over-cap selection: when the effective set exceeds max_lights_per_viewport, DETERMINISTICALLY select the N highest-intensity lights (by light.intensity scalar; ties broken by ASCENDING node-id lexicographic order) and ignore the rest for that frame \u2014 never crash, never nondeterministic. The over-cap patch is NOT rejected (animated lights). Expose the selected/dropped split through Term::tgp_viewport_lighting so tests assert the deterministic choice.",
+      "design_refs": [
+        "11.3 (keep_default_light, deterministic selection, cap)",
+        "G9"
+      ],
+      "depends_on": [
+        "P3-T10",
+        "P3-T2"
+      ],
+      "tests": [
+        {
+          "name": "keep_default_light_additive",
+          "seam": "ingress",
+          "input": "vp update render.keep_default_light=true with one registered light in subtree",
+          "assert": "Term::tgp_viewport_lighting(vp).default_light_active==true AND registered_lights==[the light] (both on)"
+        },
+        {
+          "name": "over_cap_selects_highest_intensity",
+          "seam": "ingress",
+          "input": "max_lights_per_viewport advertised small (e.g. cap=2 in test caps); add 3 lights intensity 5,3,1 in subtree",
+          "assert": "tgp_viewport_lighting selected set == the two intensity-5 and intensity-3 lights; the intensity-1 light dropped; patch NOT rejected (all 3 nodes present in scene)"
+        },
+        {
+          "name": "over_cap_tie_broken_by_node_id_ascending",
+          "seam": "ingress",
+          "input": "cap=1; two lights id=\"a\" and id=\"b\" both intensity 4.0",
+          "assert": "selected==[\"a\"] (lexicographic ascending tie-break), deterministic across runs"
+        }
+      ]
+    },
+    {
+      "id": "P3-T12",
+      "title": "One-time-per-viewport cap_exceeded latch for light over-cap (lifecycle event)",
+      "deliverable": "crates/toastty-term/src/tgp/lighting_latch.rs (new) + viewport state: going over max_lights_per_viewport queues a ONE-TIME-PER-VIEWPORT x;code=cap_exceeded;detail=max_lights_per_viewport, routed only to the owning token and only if that token handshaked (\u00a77/\u00a715.3). The latch clears (and may re-fire once) when the visible light count drops back under cap. The over-cap patch itself still commits (T11). Expose Term::tgp_viewport_light_latch(vp)->bool for test assertion. Latch transitions evaluated per frame against the deterministic injectable clock / render tick.",
+      "design_refs": [
+        "11.3 (one-time-per-viewport cap_exceeded)",
+        "15.3 (gating)",
+        "G5"
+      ],
+      "depends_on": [
+        "P3-T11",
+        "P1-clock",
+        "P1-handshake-caps"
+      ],
+      "tests": [
+        {
+          "name": "over_cap_fires_once",
+          "seam": "ingress",
+          "input": "cap=1; add 2 lights to subtree then advance a render tick twice",
+          "assert": "pty_replies contains EXACTLY ONE tgp;x;vp=<id>;code=cap_exceeded;detail=max_lights_per_viewport (not re-fired on the second tick); latch==true"
+        },
+        {
+          "name": "latch_clears_and_can_refire",
+          "seam": "ingress",
+          "input": "after firing, node.remove one light (back under cap) \u2192 tick \u2192 then add 2 lights again \u2192 tick",
+          "assert": "latch==false after the drop; then a SECOND cap_exceeded is queued on re-exceeding (re-fire once)"
+        },
+        {
+          "name": "tokenless_writer_gets_no_cap_event",
+          "seam": "ingress",
+          "input": "over-cap lights added via a frame whose token never handshaked",
+          "assert": "no tgp;x emitted (gated on handshake); scene still safe (lights selected deterministically)"
+        }
+      ]
+    },
+    {
+      "id": "P3-T13",
+      "title": "Theme-tint: render.theme_tint flag + pre-lighting default-material-input stage (default-material, neutral-tint nodes only)",
+      "deliverable": "crates/toastty-render/src/tgp/theme_tint.rs (new, CPU-resolvable resolver) + viewport RenderOpts.theme_tint (default false): when on, multiply the terminal's active DEFAULT-FOREGROUND color (read once per frame, linearized) into the default material's diffuse base, as a pre-lighting material-INPUT stage (\u00a711.1 ordering, strength fixed 1.0 in v1). Applies ONLY to MaterialId 0 (default-material) nodes whose per-node tint is the neutral default white [255,255,255,255]; a node with an explicit non-white tint is left untouched; never touches PBR nodes or registered material baseColor. effective_diffuse_linear = base_linear \u00d7 lerp(white, fg_linear, 1.0). Expose Term::tgp_node_effective_diffuse(vp, node) \u2192 [f32;3] computed CPU-side so the stage is testable without a GPU.",
+      "design_refs": [
+        "11.2 (theme-tint)",
+        "11.1 (ordering: pre-lighting, default-material only)"
+      ],
+      "depends_on": [
+        "P3-T1",
+        "P3-T8",
+        "P2-multiple-viewports"
+      ],
+      "tests": [
+        {
+          "name": "theme_tint_off_by_default",
+          "seam": "ingress",
+          "input": "default-material node, render.theme_tint not set, default fg = blue",
+          "assert": "Term::tgp_node_effective_diffuse == base (no tint applied)"
+        },
+        {
+          "name": "theme_tint_multiplies_fg_into_default_material",
+          "seam": "ingress",
+          "input": "render.theme_tint=true; terminal default fg set to a known color; a white-base default-material node with neutral tint",
+          "assert": "effective_diffuse == fg_linear (white \u00d7 lerp(white,fg,1.0))"
+        },
+        {
+          "name": "theme_tint_skips_explicit_non_white_tint",
+          "seam": "ingress",
+          "input": "theme_tint=true; default-material node with per-node tint [255,0,0,255] (red); fg=blue",
+          "assert": "effective_diffuse stays red-derived (deliberate red sphere never recolored)"
+        },
+        {
+          "name": "theme_tint_never_touches_pbr",
+          "seam": "ingress",
+          "input": "theme_tint=true; node bound to a PBR material with base [0.2,0.2,0.2]",
+          "assert": "the PBR baseColor input is unchanged (tgp_node_effective_diffuse returns the registered baseColor, no fg multiply)"
+        }
+      ]
+    },
+    {
+      "id": "P3-T14",
+      "title": "render.tone_map operator (none/Reinhard/ACES) over the whole linear target",
+      "deliverable": "crates/toastty-render/src/tgp/tonemap.rs (new): enum ToneMap { None, Reinhard, Aces } with pure CPU reference fns tone_map(op, linear_rgb)->linear_rgb so the stage is GPU-free testable. Decode render.tone_map on the vp frame (default None = clamp-only passthrough). Applied UNIFORMLY to the WHOLE linear offscreen color target after lighting, before sRGB-encode (\u00a711.1 ordering); never per-node. With None, default-material colors unchanged; Reinhard/ACES map ALL nodes identically (mixing PBR never silently alters default-material color unless an operator is chosen). Unknown operator string \u2192 silently default None (quality knob, not a resource) OR x;code=bad_param \u2014 follow \u00a711.4: tone_map is a viewport quality knob; an unrecognized value is bad_param. Expose Term::tgp_viewport_render_opts(vp).tone_map.",
+      "design_refs": [
+        "11.4 (tone-map none/Reinhard/ACES, whole target)",
+        "11.1 (ordering)",
+        "11.2 (sRGB-encode after)"
+      ],
+      "depends_on": [
+        "P3-T1",
+        "P2-multiple-viewports"
+      ],
+      "tests": [
+        {
+          "name": "tone_map_default_none",
+          "seam": "ingress",
+          "input": "vp create without render.tone_map",
+          "assert": "Term::tgp_viewport_render_opts(vp).tone_map == ToneMap::None"
+        },
+        {
+          "name": "tone_map_none_is_passthrough_clamp",
+          "seam": "unit (pure fn)",
+          "input": "tone_map(None, [0.5,0.5,0.5])",
+          "assert": "==[0.5,0.5,0.5]; tone_map(None,[2.0,..]) clamps high values only"
+        },
+        {
+          "name": "tone_map_reinhard_monotone_compress",
+          "seam": "unit (pure fn)",
+          "input": "tone_map(Reinhard, [4.0,0,0])",
+          "assert": "result[0] < 1.0 and < input (compresses HDR); deterministic value matches the Reinhard formula"
+        },
+        {
+          "name": "tone_map_set_via_vp_frame",
+          "seam": "ingress",
+          "input": "ESC _ tgp;vp;tok=A;vp=2;render.tone_map=aces;... ESC \\\\",
+          "assert": "Term::tgp_viewport_render_opts(2).tone_map == ToneMap::Aces"
+        },
+        {
+          "name": "tone_map_unknown_operator_bad_param",
+          "seam": "ingress",
+          "input": "vp frame render.tone_map=filmic (unknown)",
+          "assert": "pty_replies contains tgp;x;vp=2;code=bad_param;detail=tone_map (or documented silent-None \u2014 assert the chosen \u00a711.4 behavior)"
+        }
+      ]
+    },
+    {
+      "id": "P3-T15",
+      "title": "Per-viewport MSAA: render.msaa decode, clamp-down to supported set, ack-report effective count",
+      "deliverable": "crates/toastty-term/src/tgp viewport + crates/toastty-render/src/tgp/target.rs: render.msaa per-viewport, default 4x. A requested count NOT in the supported set (P3-T2 msaa list) is silently clamped DOWN to the nearest supported count \u2264 request (never up, never an error \u2014 quality knob). The effective clamped count is reported via the viewport ack (a;vp=<id>;msaa=<n>) ONLY when the app subscribed to acks (any handshaked token, per G4). Expose Term::tgp_viewport_render_opts(vp).effective_msaa.",
+      "design_refs": [
+        "11.4 (MSAA per-viewport, clamp down, ack report)",
+        "G4 (acks to handshaked token)"
+      ],
+      "depends_on": [
+        "P3-T2",
+        "P2-multiple-viewports"
+      ],
+      "tests": [
+        {
+          "name": "msaa_default_4x",
+          "seam": "ingress",
+          "input": "vp create without render.msaa",
+          "assert": "effective_msaa == 4"
+        },
+        {
+          "name": "msaa_requested_supported_kept",
+          "seam": "ingress",
+          "input": "vp render.msaa=1 (supported)",
+          "assert": "effective_msaa == 1"
+        },
+        {
+          "name": "msaa_unsupported_clamps_down",
+          "seam": "ingress",
+          "input": "supported={1,4}; vp render.msaa=2 then a separate vp render.msaa=8",
+          "assert": "msaa=2 \u2192 effective 1 (nearest \u22642 in {1,4}); msaa=8 \u2192 effective 4 (nearest \u22648); neither errors"
+        },
+        {
+          "name": "msaa_effective_reported_in_ack",
+          "seam": "ingress",
+          "input": "handshaked token vp frame with render.msaa=8 (clamps to 4)",
+          "assert": "pty_replies contains tgp;a;vp=<id>;msaa=4"
+        }
+      ]
+    },
+    {
+      "id": "P3-T16",
+      "title": "Pick target ALWAYS 1x invariant: never MSAA-resolved, never tone-mapped (CPU-resolvable, agrees with GPU)",
+      "deliverable": "crates/toastty-render/src/tgp/target.rs + crates/toastty-graphics pick path: the pick target is ALWAYS single-sample (1x) regardless of the viewport's render.msaa, and is NEVER MSAA-resolved and NEVER tone-mapped (\u00a711.4). The CPU-resolvable pick buffer (P2) is authoritative; the optional GPU color-ID pass must agree. Enforce that node-id+instance-index colors are written/read unmodified (nearest/point). Expose Term::tgp_pick_target_samples(vp) (must be 1 always) and ensure the existing P2 CPU pick result is unaffected by render.msaa/tone_map.",
+      "design_refs": [
+        "11.4 (pick always 1x, not resolved, not tone-mapped)",
+        "12.4 (CPU pick authoritative)",
+        "G6"
+      ],
+      "depends_on": [
+        "P3-T15",
+        "P3-T14",
+        "P2-cpu-picking"
+      ],
+      "tests": [
+        {
+          "name": "pick_target_always_1x_regardless_of_msaa",
+          "seam": "ingress",
+          "input": "vp with render.msaa=4 and an active sub (pick enabled)",
+          "assert": "Term::tgp_pick_target_samples(vp) == 1 (never 4)"
+        },
+        {
+          "name": "cpu_pick_unaffected_by_tone_map",
+          "seam": "interaction",
+          "input": "vp render.tone_map=aces; inject a synthetic pointer click over a known node via Term input API",
+          "assert": "the CPU pick resolves the same (node,inst,world-point) as with tone_map=none (pick not tone-mapped); resulting tgp;e;ev=click;node=... identical"
+        },
+        {
+          "name": "cpu_pick_unaffected_by_msaa",
+          "seam": "interaction",
+          "input": "same click with render.msaa=8 vs 1",
+          "assert": "identical (node,inst) reported in tgp;e \u2014 id colors never averaged"
+        }
+      ]
+    },
+    {
+      "id": "P3-T17",
+      "title": "VRAM accounting for MSAA color + depth + resolve + always-1x pick targets (two-phase, pre-upload)",
+      "deliverable": "crates/toastty-term/src/tgp/vram.rs (extend P1/P2 CPU-side two-phase accounting): a viewport's VRAM charge = pixels \u00d7 samples \u00d7 (color_bytes + depth_bytes) for the multisampled target, PLUS the 1x resolve target, PLUS the always-1x pick target (when picking active). Texture-asset bytes (P3-T5/T6) and PBR material textures count once (shared assets counted once). A material/texture/MSAA allocation whose net delta exceeds max_vram_mb_session rejects the WHOLE txn with x;code=vram_exhausted, committing nothing and not bumping revisions (\u00a715.2). Expose Term::tgp_vram_used() and Term::tgp_viewport_vram(vp) computed CPU-side (GPU never queried).",
+      "design_refs": [
+        "11.4 (VRAM accounting: msaa+resolve+pick)",
+        "15.2 (two-phase CPU VRAM, vram_exhausted)"
+      ],
+      "depends_on": [
+        "P3-T15",
+        "P3-T16",
+        "P3-T6",
+        "P2-multiple-viewports"
+      ],
+      "tests": [
+        {
+          "name": "vram_charge_includes_msaa_multiplier_resolve_and_pick",
+          "seam": "ingress",
+          "input": "vp of known pixel size with render.msaa=4 and an active pick sub",
+          "assert": "Term::tgp_viewport_vram(vp) == pixels\u00d74\u00d7(color+depth) + pixels\u00d71\u00d7(color+depth) [resolve] + pixels\u00d71\u00d7(color+depth) [pick] (formula match)"
+        },
+        {
+          "name": "shared_texture_counted_once",
+          "seam": "ingress",
+          "input": "two materials referencing the same texture asset id",
+          "assert": "Term::tgp_vram_used() counts the texture bytes once, not twice"
+        },
+        {
+          "name": "texture_over_vram_rejects_txn_vram_exhausted",
+          "seam": "ingress",
+          "input": "test caps with tiny max_vram_mb_session; asset.add png whose texels exceed remaining VRAM in a txn",
+          "assert": "pty_replies tgp;x;code=vram_exhausted; Term::tgp_texture==None; asset_revision unchanged (whole-txn reject, nothing committed)"
+        }
+      ]
+    },
+    {
+      "id": "P3-T18",
+      "title": "RIS / RGP-independence lifecycle: teardown of materials, textures, light state, and MSAA/pick targets across all tokens",
+      "deliverable": "crates/toastty-term/src/tgp lifecycle path (extend P1 RIS teardown): RIS (ESC c) tears down the full TGP scene including the material table, texture assets, Light nodes, per-viewport MSAA/resolve/pick targets, and light-latch state across ALL tokens, returning Term::tgp_vram_used() to 0 and invalidating session tokens (\u00a710.7/G10). DECSTR leaves it intact. Confirm the TGP material/texture/light path is fully independent of the legacy rgp/ path (G8) \u2014 no shared table mutation.",
+      "design_refs": [
+        "10.7 (RIS teardown)",
+        "G10",
+        "G8 (RGP independence)"
+      ],
+      "depends_on": [
+        "P3-T8",
+        "P3-T12",
+        "P3-T17"
+      ],
+      "tests": [
+        {
+          "name": "ris_tears_down_materials_textures_lights",
+          "seam": "lifecycle",
+          "input": "build a scene with PBR material, png texture, Light node, MSAA viewport with pick; then feed ESC c (RIS) via Parser::advance",
+          "assert": "Term::tgp_material/tgp_texture return None; no Light nodes in tgp_scene(); Term::tgp_vram_used()==0; viewport targets freed"
+        },
+        {
+          "name": "decstr_leaves_tgp_intact",
+          "seam": "lifecycle",
+          "input": "same scene then ESC [ ! p (DECSTR)",
+          "assert": "material/texture/light state and vram_used unchanged"
+        },
+        {
+          "name": "tgp_material_path_independent_of_rgp",
+          "seam": "ingress",
+          "input": "register a TGP PBR material id 3; inspect the legacy RGP scene state",
+          "assert": "the legacy rgp material registry is untouched (TGP writes only the tgp/ tables; G8 clean break)"
+        }
+      ]
+    }
+  ]
+}

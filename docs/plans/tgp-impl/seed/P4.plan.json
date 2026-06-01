@@ -1,0 +1,620 @@
+{
+  "phase": "P4 \u2014 Animation and accessibility",
+  "summary": "Phase P4 adds terminal-side animation playback and accessibility surfacing to TGP, layered on the scene model (S06), asset/GLB import + acks (S08), the wire/error framing + apc_end back-channel, and the deterministic injectable clock + CPU picking/event emission from the interactivity phase (S12). It is split into 14 dependency-ordered tasks.\n\nScope delivered:\n1. Accessibility (S13): `alt` field on nodes/scene/viewports, bounded validation (UTF-8, \u2264max_id_bytes-class cap, no control/ESC), `alt`-only upserts bump no revision, terminal surfacing as accessible name + cell-fallback caption resolved through the CPU pick path.\n2. glTF clip import (S14.1): parse glTF animation channels (STEP/LINEAR/CUBICSPLINE TRS keyframes) on asset.add commit, store AnimationClips, auto-register one ClipId per glTF animation, return the glTF-anim-index\u2192ClipId mapping in the asset's `a` ack.\n3. The `anim` control frame family (S14.3): play/pause/seek/stop verbs on the deterministic clock, the (clip,node) Stopped/Playing/Paused state machine with restart-from-0 semantics, node= subtree-root relative channel resolution (S14.2), loop/speed (S14.4) with anim_speed_max clamp, stop holds last pose + releases TRS ownership, non-loop end holds last frame + emits anim_end.\n4. Ownership/conflicts (S14.5): node_busy on app TRS patch over an active playback, camera_busy vs explore both directions, node.remove auto-stop, no auto-rebind.\n5. Ordering (S14.6): strict PTY receive order so upsert-then-play in one write works; play on uncommitted node = unknown_node.\n6. Clock + scheduling (S14.7) + S06.5 dirty: playback sets per-node dirty flags, recomputes only the dirty subtree, re-renders only affected viewports, never bumps global scene_revision per frame, never touches asset_revision.\n7. Skinning model (S14.8): parse skinned GLB with bounds checks, render bind pose ignoring joint weights, do NOT advertise feat=skin.\n\nEvery protocol surface (each verb, header field, error code, cap, lifecycle event) gets at least one unit test on the INGRESS (Parser::advance \u2192 &self accessors / pty_replies), INTERACTION (synthetic events + clock advance \u2192 camera TRS / tgp;e bytes), or LIFECYCLE (RIS/alt-screen/remove \u2192 teardown via accessors) seam, with concrete input bytes/events and concrete accessor assertions.\n\nCROSS-CRATE apc_end BACK-CHANNEL: the `anim` verbs and the clip-id ack both depend on the foundation-phase change where toastty-parser's `Perform::apc_end` becomes outcome-bearing (returns/forwards a parsed-frame result Term turns into queued tgp;a/tgp;x bytes). P4 does NOT re-do that plumbing; tasks P4-T3/T4/T7 explicitly depend on it (cross-phase dep apc_end-backchannel) and exercise it for anim acks/errors and the clip-id ack.\n\nCROSS-PHASE DEPENDENCIES (task ids from sibling phases, referenced as depends_on): scene-model (nodes/TRS/world-matrix/NodeKind/dirty \u2014 S06) = SCENE-MODEL; asset/wire GLB import + asset.add commit + `a` ack + asset_revision = ASSET-ADD and ACK-FRAME; tgp_scene() accessor + pty_replies + token namespacing + tgp;x error framing/closed enum = TGP-FOUNDATION and ERROR-FRAME; apc_end outcome back-channel = APC-END-BACKCHANNEL; deterministic injectable clock = CLOCK (interactivity phase); CPU pick + event emission (tgp;e) + sub/focus gating = PICK and EVENT-EMIT; explore controller + camera node ownership = EXPLORE. P4-T0 provides a local fallback to introduce the injectable clock into the TGP subsystem if the interactivity phase has not yet landed it, so P4 is buildable/testable standalone.",
+  "tasks": [
+    {
+      "id": "P4-T0",
+      "title": "Inject the deterministic monotonic clock into the TGP subsystem",
+      "deliverable": "toastty-graphics/src/tgp/clock.rs (new): a `Clock` abstraction \u2014 `trait MonotonicClock { fn now(&self) -> Instant }` plus `ManualClock` (test) and `WallClock` (prod), or a thin `TgpClock(Instant)` newtype with `advance(Duration)` for tests, mirroring the existing rgp `tick_animations(now: Instant)` pattern. Wire a single clock handle into the TGP scene state owned by Term (toastty-term/src/term.rs). Add `Term::tgp_now()` / `Term::tgp_advance_clock(Duration)` test hooks and a `Term::tick_tgp(now: Instant)` driver mirroring `tick_rgp_animations`. This task ONLY introduces/forwards the clock seam for TGP; if the interactivity phase (CLOCK) already added a shared clock, this task re-exports/reuses it instead of duplicating. All terminal-side TGP time (playback, seek, anim_end timing) reads from this one clock.",
+      "design_refs": [
+        "14.7",
+        "G6"
+      ],
+      "depends_on": [
+        "TGP-FOUNDATION",
+        "SCENE-MODEL"
+      ],
+      "tests": [
+        {
+          "name": "manual_clock_advances_only_on_explicit_step",
+          "seam": "INGRESS",
+          "input": "Construct Term::new(24,80,0); read t0 = Term::tgp_now(); call Term::tgp_advance_clock(Duration::from_millis(500)); read t1 = Term::tgp_now().",
+          "assert": "t1 - t0 == Duration::from_millis(500); a second tgp_now() with no advance returns t1 unchanged (no wall-clock drift)."
+        },
+        {
+          "name": "tick_tgp_with_no_playbacks_is_noop_on_revisions",
+          "seam": "INGRESS",
+          "input": "Fresh Term; capture scene_revision + asset_revision; call Term::tick_tgp(Term::tgp_now() + Duration::from_secs(1)).",
+          "assert": "Term::tgp_scene().scene_revision() and asset_revision() are unchanged; no per-node dirty flags set (DirtySet empty)."
+        }
+      ]
+    },
+    {
+      "id": "P4-T1",
+      "title": "Add `alt` to the scene model (nodes, scene, viewports) with bounded validation",
+      "deliverable": "toastty-graphics/src/tgp/scene.rs: add `alt: Option<String>` to Node (already in S06.1 struct), and `alt: Option<String>` on Scene and Viewport. Add `validate_alt(&str) -> Result<(), TgpError>` enforcing UTF-8, \u2264 alt cap (reuse max_id_bytes-class bound, 64 bytes per S13.1), and rejection of any control byte (0x00\u20130x1F, 0x7F) or ESC (0x1B). Wire `alt` into the node.upsert sparse-merge (absent=preserve, CBOR null=clear to None, value=set per S06.1 table). Add accessors `Node::alt()`, `Scene::alt()`, `Viewport::alt()`.",
+      "design_refs": [
+        "13.1",
+        "6.1"
+      ],
+      "depends_on": [
+        "SCENE-MODEL",
+        "ERROR-FRAME"
+      ],
+      "tests": [
+        {
+          "name": "node_upsert_sets_alt",
+          "seam": "INGRESS",
+          "input": "Handshake tok=A (tgp;q;v=2;tok=A \u2192 tgp;r). Parser::advance with a node.upsert patch creating Mesh node id=mol with CBOR field alt=\"caffeine molecule, C8H10N4O2\".",
+          "assert": "Term::tgp_scene().node(\"A\",\"mol\").alt() == Some(\"caffeine molecule, C8H10N4O2\"); a tgp;a ack for the txn is queued in pty_replies."
+        },
+        {
+          "name": "alt_only_upsert_bumps_no_revision_no_dirty",
+          "seam": "INGRESS",
+          "input": "Create node id=mol (any kind). Capture scene_revision/asset_revision and the node's transform/visibility dirty flags. Send a second node.upsert touching only alt=\"x\".",
+          "assert": "scene_revision and asset_revision both unchanged after the alt-only upsert; node's per-node dirty flags remain clear (alt never affects rendering/dirty/revisions per S13.1)."
+        },
+        {
+          "name": "alt_clear_via_cbor_null",
+          "seam": "INGRESS",
+          "input": "Create node with alt=\"label\". Send node.upsert with CBOR null for alt key.",
+          "assert": "Term::tgp_scene().node(...).alt() == None."
+        },
+        {
+          "name": "alt_over_cap_rejects_whole_txn_bad_param",
+          "seam": "INGRESS",
+          "input": "node.upsert creating node id=n1 AND node id=n2 in one txn, where n1.alt is a 65-byte ASCII string (over the 64-byte cap).",
+          "assert": "A tgp;x;code=bad_param is queued (detail names alt); NEITHER n1 nor n2 exists in tgp_scene() \u2014 whole txn rejected, scene unchanged (S13.1)."
+        },
+        {
+          "name": "alt_with_esc_byte_rejects_bad_param",
+          "seam": "INGRESS",
+          "input": "node.upsert with alt containing a 0x1B (ESC) byte.",
+          "assert": "tgp;x;code=bad_param queued; node not created (these strings re-enter the host input path via AT tooling, S13.1)."
+        },
+        {
+          "name": "viewport_and_scene_alt_set_and_read",
+          "seam": "INGRESS",
+          "input": "Create a viewport vp=2 with alt=\"interactive 3D inspector\"; set scene-level alt via the scene-alt op.",
+          "assert": "Term::tgp_scene().viewport(\"A\",2).alt() == Some(\"interactive 3D inspector\"); Scene::alt() == the set scene caption."
+        }
+      ]
+    },
+    {
+      "id": "P4-T2",
+      "title": "Surface alt-text: accessible name + cell-fallback caption via the CPU pick path",
+      "deliverable": "toastty-term/src/term.rs: add accessibility surfacing accessors. `Term::viewport_accessible_name(tok, vp) -> Option<&str>` (the viewport alt). `Term::accessible_name_at_cell(line, col) -> Option<&str>` that, for a cell inside a viewport's live placeholder rect, resolves the node under that cell via the SAME CPU pick path used for events (S12.4) and returns that node's alt, falling back to the viewport alt, then None (terminal never fabricates). `Term::inline_viewport_caption(line, col)` returns the placeholder cell's accessible caption (viewport alt) so line-based readers announce the region in flow (S13.2). No GPU: all resolution is the CPU pick + cell\u2192pixel rect math.",
+      "design_refs": [
+        "13.2",
+        "13.3",
+        "12.4"
+      ],
+      "depends_on": [
+        "P4-T1",
+        "PICK",
+        "TGP-FOUNDATION"
+      ],
+      "tests": [
+        {
+          "name": "cell_caption_is_viewport_alt_at_placeholder",
+          "seam": "INGRESS",
+          "input": "Create inline viewport vp=2 with alt=\"inspector\" anchored at a known cell rect (no node under cursor cell yet). Query Term::inline_viewport_caption(line,col) for a cell inside the rect.",
+          "assert": "Returns Some(\"inspector\") \u2014 the placeholder announces the viewport alt as its accessible name (S13.2)."
+        },
+        {
+          "name": "node_alt_resolved_under_at_cursor_cell",
+          "seam": "INTERACTION",
+          "input": "Viewport vp=2 with a Mesh node O1 alt=\"Oxygen\" framed so its world AABB projects under cell (line=3,col=5). Inject an AT cursor / query Term::accessible_name_at_cell(3,5).",
+          "assert": "Returns Some(\"Oxygen\") (node alt resolved by CPU pick at that cell, S13.2); must agree with the CPU pick node id at that cell."
+        },
+        {
+          "name": "unlabeled_graphic_returns_none",
+          "seam": "INGRESS",
+          "input": "Viewport vp=2 with NO alt and a node with NO alt under the queried cell.",
+          "assert": "Term::accessible_name_at_cell(...) returns None \u2014 terminal never fabricates a description (S13.2)."
+        },
+        {
+          "name": "headless_text_only_uses_cell_fallback_caption",
+          "seam": "LIFECYCLE",
+          "input": "Mark the session text-only (no GPU / headless flag on Term); viewport vp=2 alt=\"inspector\". Query inline_viewport_caption inside the rect.",
+          "assert": "Caption Some(\"inspector\") is available with no GPU target present \u2014 the cell-level fallback caption is purely CPU-resolved (S13.2)."
+        }
+      ]
+    },
+    {
+      "id": "P4-T3",
+      "title": "Parse glTF animation channels into AnimationClip on GLB import",
+      "deliverable": "toastty-graphics/src/tgp/clip.rs (new): `AnimationClip { duration: f32, channels: Vec<Channel> }`, `Channel { target_rel: NodeRelPath, path: TrsPath (T|R|S), sampler: Sampler }`, `Sampler { interp: Interp (Step|Linear|CubicSpline), times: Vec<f32>, values: Vec<f32> }`. Add a glTF-animation parser in toastty-graphics/src/tgp/glb_loader.rs (mirror existing rgp/glb_loader.rs) that reads `animations[]` with their channels/samplers and resolves each channel target to a relative node path within the imported hierarchy (NOT a global node id \u2014 see S14.2). Bounds-check all keyframe arrays against caps. CUBICSPLINE stores in/out tangents. Pure CPU; no GPU.",
+      "design_refs": [
+        "14.1",
+        "14.2"
+      ],
+      "depends_on": [
+        "ASSET-ADD"
+      ],
+      "tests": [
+        {
+          "name": "glb_with_one_clip_parses_channels",
+          "seam": "INGRESS",
+          "input": "asset.add a minimal GLB (b64) containing one animation: a single LINEAR rotation channel on the root joint, duration 1.0s. Parser::advance the asset.add (more=0).",
+          "assert": "After commit, Term::tgp_scene().clip_table(\"A\") has exactly one AnimationClip; its duration == 1.0; channels[0].path == R, interp == Linear, target_rel resolves to the root joint."
+        },
+        {
+          "name": "step_and_cubicspline_interp_preserved",
+          "seam": "INGRESS",
+          "input": "asset.add a GLB whose clip has one STEP translation channel and one CUBICSPLINE scale channel.",
+          "assert": "clip.channels contains a Step T channel and a CubicSpline S channel; CubicSpline sampler stores 3 values per keyframe (in-tangent, value, out-tangent)."
+        },
+        {
+          "name": "glb_with_no_animations_yields_empty_clip_table",
+          "seam": "INGRESS",
+          "input": "asset.add a static GLB (no animations[]).",
+          "assert": "Term::tgp_scene().clip_table(\"A\") is empty; asset commits normally (asset_revision bumped once)."
+        },
+        {
+          "name": "oversized_keyframe_array_rejected_cap_exceeded",
+          "seam": "INGRESS",
+          "input": "asset.add a GLB whose animation sampler exceeds a keyframe/cap bound.",
+          "assert": "tgp;x;code=cap_exceeded queued citing the asset id; no clip registered, asset not committed (bounded, no crash \u2014 G8 fuzz oracle)."
+        }
+      ]
+    },
+    {
+      "id": "P4-T4",
+      "title": "Auto-register clips on asset.add and return glTF-index\u2192ClipId mapping in the `a` ack",
+      "deliverable": "toastty-graphics/src/tgp/scene.rs: on asset.add commit, allocate one `ClipId (u32)` per parsed AnimationClip in the creating token's id namespace (alongside asset/material ids), store in `Scene.clips` keyed by (token, ClipId). Build a glTF-animation-index \u2192 ClipId mapping. toastty-term/src/term.rs (or wire/ack module): include that mapping in the asset's commit `a` ack (correlator = asset id, tagged tok=). NO separate clip.add op exists. CROSS-CRATE: the ack is emitted through the apc_end outcome back-channel (APC-END-BACKCHANNEL) \u2014 apc_end forwards the committed asset outcome (including the clip mapping) to Term which formats the tgp;a bytes into pty_replies.",
+      "design_refs": [
+        "14.1",
+        "8.5",
+        "G4"
+      ],
+      "depends_on": [
+        "P4-T3",
+        "ASSET-ADD",
+        "ACK-FRAME",
+        "APC-END-BACKCHANNEL"
+      ],
+      "tests": [
+        {
+          "name": "asset_add_returns_clip_id_mapping_in_ack",
+          "seam": "INGRESS",
+          "input": "Handshake tok=A. asset.add (more=0) a GLB carrying two animations. Drain pty_replies.",
+          "assert": "A tgp;a frame is queued with tok=A and the asset correlator, carrying clip ids for glTF anim indices 0 and 1 (e.g. clip0=<id0>;clip1=<id1>); Term::tgp_scene().clip_table(\"A\") contains exactly those two ClipIds."
+        },
+        {
+          "name": "clip_ids_are_token_namespaced",
+          "seam": "INGRESS",
+          "input": "Two handshaked tokens A and B each asset.add a GLB with one animation.",
+          "assert": "B's anim;play against A's clip id draws tgp;x;code=denied (clip ids are scoped to the creating token, S14.1 / G1); A's own ack and B's own ack each cite only their own clip ids."
+        },
+        {
+          "name": "ack_available_without_subscription",
+          "seam": "INGRESS",
+          "input": "Handshaked tok=A with NO event sub. asset.add a GLB with one animation.",
+          "assert": "The tgp;a clip-mapping ack is still queued \u2014 acks are available to any handshaked token, not gated on sub (G4)."
+        }
+      ]
+    },
+    {
+      "id": "P4-T5",
+      "title": "node= subtree-root relative channel resolution",
+      "deliverable": "toastty-graphics/src/tgp/anim.rs (new): `resolve_targets(clip, subtree_root_node_id, scene) -> ResolvedTargets`. For each clip channel, resolve its relative target path against the subtree rooted at `node=` (by relative id/index within the imported hierarchy, S14.2). A channel whose relative target resolves to no node under `node=` is SKIPPED (animates nothing). If NO channel resolves to any existing target, return an error sentinel used to raise `no_targets`. Pure CPU; queryable resolved-target list for tests.",
+      "design_refs": [
+        "14.2"
+      ],
+      "depends_on": [
+        "P4-T3",
+        "SCENE-MODEL"
+      ],
+      "tests": [
+        {
+          "name": "channels_resolve_relative_to_subtree_root",
+          "seam": "INGRESS",
+          "input": "Instantiate two copies of a rig under nodes base_a and base_b. Resolve a clip's channels against subtree root \"base_a\".",
+          "assert": "ResolvedTargets map to base_a's shoulder/elbow/wrist descendants (not base_b's); the same clip resolved against \"base_b\" maps to base_b's descendants \u2014 same clip, two subtrees (S14.2)."
+        },
+        {
+          "name": "missing_descendant_channel_is_skipped",
+          "seam": "INGRESS",
+          "input": "Resolve a clip with 4 channels against a subtree where one channel's relative target does not exist.",
+          "assert": "ResolvedTargets contains 3 entries (the missing one skipped, not an error); resolution succeeds."
+        },
+        {
+          "name": "no_resolvable_targets_flags_no_targets",
+          "seam": "INGRESS",
+          "input": "Resolve a clip against a node= whose subtree contains none of the clip's relative targets.",
+          "assert": "resolve_targets returns the no-targets sentinel (the caller raises x code=no_targets, S14.2)."
+        }
+      ]
+    },
+    {
+      "id": "P4-T6",
+      "title": "Playback state machine + (clip,node) handle store on the deterministic clock",
+      "deliverable": "toastty-graphics/src/tgp/anim.rs: `Playback { handle: (ClipId, NodeId), state: Stopped|Playing|Paused, t: f32, started_at: Instant, loop_: bool, speed: f32, resolved: ResolvedTargets }`; `PlaybackTable` keyed by (token, ClipId, NodeId). State transitions: play(Stopped)\u2192Playing from t=0; play(Playing|Paused)\u2192restart from t=0; pause(Playing)\u2192Paused holding pose; play(Paused)\u2192restart from t=0; seek(t)\u2192set absolute t, re-evaluate pose, keep Playing/Paused; stop\u2192Stopped. `evaluate_pose(clip, t)` interpolates per Interp (Step/Linear/CubicSpline) and writes the resolved nodes' local TRS. Accessors: `Scene::playback(tok,clip,node) -> Option<&Playback>` exposing state + t. All time via P4-T0 clock.",
+      "design_refs": [
+        "14.3",
+        "14.7",
+        "G6"
+      ],
+      "depends_on": [
+        "P4-T0",
+        "P4-T5"
+      ],
+      "tests": [
+        {
+          "name": "play_starts_at_t_zero_playing",
+          "seam": "INGRESS",
+          "input": "Create rig node base + clip C. Parser::advance anim;play;clip=C;node=base;loop=0;speed=1.",
+          "assert": "Scene::playback(A,C,\"base\").state == Playing and .t == 0.0."
+        },
+        {
+          "name": "tick_advances_clip_time_and_pose",
+          "seam": "INGRESS",
+          "input": "anim;play C on base (1.0s LINEAR rotation clip, speed=1). Term::tgp_advance_clock(500ms); Term::tick_tgp(now).",
+          "assert": "playback.t == 0.5; the driven node's local rotation == LINEAR-interpolated value at t=0.5; its WORLD matrix (Term::tgp_scene().node(...).world()) reflects the rotated pose."
+        },
+        {
+          "name": "play_on_playing_restarts_from_zero",
+          "seam": "INGRESS",
+          "input": "play C on base; advance 700ms + tick (t=0.7); send anim;play C on base again.",
+          "assert": "playback.t == 0.0 and state == Playing (restart semantics, S14.3)."
+        },
+        {
+          "name": "pause_holds_pose_then_play_restarts",
+          "seam": "INGRESS",
+          "input": "play C; advance 300ms+tick (t=0.3); anim;pause C base; advance 1s + tick.",
+          "assert": "After pause: state==Paused, t==0.3, node pose frozen at t=0.3 even after the 1s tick (no advance while paused). Then anim;play C base \u2192 t==0.0 (resume = restart, S14.3)."
+        },
+        {
+          "name": "seek_sets_absolute_t_without_changing_state",
+          "seam": "INGRESS",
+          "input": "pause C base at t=0.3; anim;seek;clip=C;node=base;t=0.8.",
+          "assert": "state stays Paused; t==0.8; node pose == pose at t=0.8 (seek scrubs while paused, S14.3)."
+        },
+        {
+          "name": "speed_scales_time",
+          "seam": "INGRESS",
+          "input": "anim;play C base speed=2; advance 250ms + tick.",
+          "assert": "playback.t == 0.5 (clip time advances at 2x wall time, S14.4)."
+        },
+        {
+          "name": "step_interp_holds_value_between_keys",
+          "seam": "INGRESS",
+          "input": "Clip with STEP translation keys at t=0 (x=0) and t=1 (x=10). play; advance 400ms + tick.",
+          "assert": "node local translate.x == 0 (STEP holds previous key, not interpolated)."
+        }
+      ]
+    },
+    {
+      "id": "P4-T7",
+      "title": "anim control-frame ingress: parse play/pause/seek/stop + verb/field errors",
+      "deliverable": "toastty-graphics/src/tgp/operation.rs (or tgp/anim_frame.rs): parse `tgp;anim;tok=;<verb>;clip=<u32>;node=<id>;loop=0|1;speed=<f32>;t=<sec>`. Dispatch into the P4-T6 state machine. Errors (closed enum G3): unknown clip id \u2192 unknown_clip; node= not a committed node at process time \u2192 unknown_node (not queued, S14.6); pause/seek/stop on a (clip,node) that is not a live playback \u2192 not_playing; over-cap/non-positive speed \u2192 bad_param; no resolvable targets \u2192 no_targets; foreign-token clip/node \u2192 denied. CROSS-CRATE: anim frames are control frames (always parseable, never enter binary-read mode, S7.2); errors/acks for anim verbs route out through the apc_end outcome back-channel (APC-END-BACKCHANNEL) into pty_replies tagged tok=.",
+      "design_refs": [
+        "14.3",
+        "14.6",
+        "G3",
+        "G4"
+      ],
+      "depends_on": [
+        "P4-T6",
+        "ERROR-FRAME",
+        "APC-END-BACKCHANNEL"
+      ],
+      "tests": [
+        {
+          "name": "play_unknown_clip_errors",
+          "seam": "INGRESS",
+          "input": "Handshake tok=A; node base exists; Parser::advance anim;play;clip=999;node=base.",
+          "assert": "tgp;x;code=unknown_clip queued (tok=A); no playback created (never a silent no-op, S14.1)."
+        },
+        {
+          "name": "play_unknown_node_errors_not_queued",
+          "seam": "INGRESS",
+          "input": "Valid clip C; anim;play;clip=C;node=ghost where ghost is not a committed node.",
+          "assert": "tgp;x;code=unknown_node queued; the play is NOT deferred \u2014 a later upsert of \"ghost\" does not start it (S14.6)."
+        },
+        {
+          "name": "pause_seek_stop_on_dead_playback_not_playing",
+          "seam": "INGRESS",
+          "input": "Clip C, node base exist but no live playback. Send anim;pause;clip=C;node=base (and separately seek, stop).",
+          "assert": "Each draws tgp;x;code=not_playing (S14.3)."
+        },
+        {
+          "name": "speed_over_cap_bad_param",
+          "seam": "INGRESS",
+          "input": "anim;play C base speed=99 with anim_speed_max=16.",
+          "assert": "tgp;x;code=bad_param queued; no playback created (speed clamped to (0,anim_speed_max], S14.4)."
+        },
+        {
+          "name": "speed_nonpositive_bad_param",
+          "seam": "INGRESS",
+          "input": "anim;play C base speed=0 (and separately speed=-1).",
+          "assert": "tgp;x;code=bad_param for each (non-positive speed rejected, S14.4)."
+        },
+        {
+          "name": "no_targets_error",
+          "seam": "INGRESS",
+          "input": "Clip C whose channels resolve to nothing under node= picked. anim;play C node=empty_group.",
+          "assert": "tgp;x;code=no_targets queued; no playback (S14.2)."
+        },
+        {
+          "name": "upsert_then_play_same_write_succeeds",
+          "seam": "INGRESS",
+          "input": "ONE Parser::advance byte buffer containing a node.upsert creating base followed by anim;play;clip=C;node=base.",
+          "assert": "Playback exists and is Playing \u2014 upsert committed before play observes the scene (strict receive order, S14.6)."
+        },
+        {
+          "name": "distinct_clip_node_pairs_run_concurrently",
+          "seam": "INGRESS",
+          "input": "anim;play C node=base_a; anim;play C node=base_b (same clip, two subtree roots).",
+          "assert": "Two independent Playbacks both Playing; advancing the clock ticks both (handle = (clip,node), S14.3)."
+        }
+      ]
+    },
+    {
+      "id": "P4-T8",
+      "title": "Playback drives per-node dirty + render scheduling (no global scene_revision spam)",
+      "deliverable": "toastty-graphics/src/tgp/scene.rs + anim.rs: each tick_tgp, for every Playing playback, evaluate the clip, write the affected nodes' local TRS, set those nodes' per-node transform dirty flags (DirtySet), and mark the viewport(s) containing those nodes per-viewport dirty. Recompute world matrices for only the dirty subtree (reuse S06.5 lazy walk). Do NOT bump global scene_revision per frame; NEVER touch asset_revision. Add accessors so tests can read DirtySet membership + the set of dirty viewport ids after a tick.",
+      "design_refs": [
+        "14.7",
+        "6.5",
+        "G9"
+      ],
+      "depends_on": [
+        "P4-T6",
+        "SCENE-MODEL"
+      ],
+      "tests": [
+        {
+          "name": "tick_sets_only_driven_node_dirty",
+          "seam": "INGRESS",
+          "input": "Scene with driven node base (in subtree) and an unrelated node other. play C on base; advance 100ms + tick.",
+          "assert": "DirtySet contains base (transform dirty) and NOT other; only base's subtree world matrices recomputed."
+        },
+        {
+          "name": "tick_does_not_bump_scene_or_asset_revision",
+          "seam": "INGRESS",
+          "input": "play C on base; capture scene_revision + asset_revision; advance 100ms + tick (repeat 5 ticks).",
+          "assert": "scene_revision and asset_revision are BOTH unchanged across all 5 ticks (playback never bumps global revisions, S14.7 / G9)."
+        },
+        {
+          "name": "tick_marks_only_affected_viewport_dirty",
+          "seam": "INGRESS",
+          "input": "Two viewports vp=1 (root contains base) and vp=2 (different root). play C on base; tick.",
+          "assert": "Per-viewport dirty set == {1}; vp=2 not marked dirty (re-render only affected viewports, S14.7)."
+        },
+        {
+          "name": "tick_does_not_reemit_text_cells",
+          "seam": "INGRESS",
+          "input": "Print text into the grid; play C on base; tick.",
+          "assert": "Text-cell damage set is unchanged by the tick (playback does not re-emit unrelated cells, S14.7)."
+        }
+      ]
+    },
+    {
+      "id": "P4-T9",
+      "title": "Non-loop end holds last frame + emits anim_end; loop wraps and never emits",
+      "deliverable": "toastty-graphics/src/tgp/anim.rs: in the tick, when a non-looping playback's t reaches/exceeds clip.duration, clamp pose to the final frame, transition Playing\u2192Stopped, RELEASE TRS ownership of its driven nodes (leave them at the final pose, no snap-to-bind), and emit an optional `anim_end` event to the owning token if subscribed (S14.4). A looping playback wraps t modulo duration and NEVER emits anim_end. CROSS-CRATE: anim_end is a tgp;e event emitted through the EVENT-EMIT path (token-tagged, focus/sub-gated, into pty_replies).",
+      "design_refs": [
+        "14.4",
+        "G2"
+      ],
+      "depends_on": [
+        "P4-T6",
+        "P4-T8",
+        "EVENT-EMIT"
+      ],
+      "tests": [
+        {
+          "name": "nonloop_end_holds_last_frame_and_stops",
+          "seam": "INGRESS",
+          "input": "1.0s clip, loop=0. play; advance 1.2s + tick.",
+          "assert": "playback state == Stopped; driven node pose == final-frame pose (NOT bind/identity); TRS ownership released so a subsequent node.upsert of a TRS field on that node SUCCEEDS (no node_busy)."
+        },
+        {
+          "name": "nonloop_end_emits_anim_end_when_subscribed",
+          "seam": "INTERACTION",
+          "input": "Handshake tok=A; sub for anim_end on the playback's viewport/node. play 1.0s clip loop=0; advance 1.0s + tick.",
+          "assert": "A tgp;e;ev=anim_end (tok=A, node=base) is queued in pty_replies exactly once."
+        },
+        {
+          "name": "nonloop_end_no_event_when_not_subscribed",
+          "seam": "INGRESS",
+          "input": "Handshaked tok=A with NO anim_end sub. play 1.0s loop=0; advance 1.0s + tick.",
+          "assert": "No tgp;e queued; playback still Stopped with last frame held (event is optional, S14.4)."
+        },
+        {
+          "name": "looping_clip_wraps_no_anim_end",
+          "seam": "INGRESS",
+          "input": "1.0s clip loop=1. play; advance 1.3s + tick.",
+          "assert": "playback state == Playing; t == 0.3 (wrapped modulo 1.0); NO anim_end ever queued across multiple wraps (S14.4)."
+        }
+      ]
+    },
+    {
+      "id": "P4-T10",
+      "title": "stop releases ownership + holds last pose; pause holds + retains ownership",
+      "deliverable": "toastty-graphics/src/tgp/anim.rs: `stop` transitions to Stopped, leaves driven nodes at last-evaluated pose, releases TRS ownership (clears the busy-flag on those nodes), and emits an optional ack/event. `pause` holds the current pose AND retains ownership (nodes stay busy). Add `Scene::node_trs_owner(tok,node) -> Option<(ClipId,NodeId)>` accessor exposing which playback owns a node's TRS (None == app-owned).",
+      "design_refs": [
+        "14.3",
+        "14.5",
+        "G2"
+      ],
+      "depends_on": [
+        "P4-T6"
+      ],
+      "tests": [
+        {
+          "name": "stop_holds_last_pose_and_releases_ownership",
+          "seam": "INGRESS",
+          "input": "play C base; advance 400ms+tick (t=0.4, some pose P); anim;stop;clip=C;node=base.",
+          "assert": "state == Stopped; node local TRS == pose P (held, not reset); Scene::node_trs_owner(A,\"base\") == None (released)."
+        },
+        {
+          "name": "pause_retains_ownership",
+          "seam": "INGRESS",
+          "input": "play C base; advance 200ms+tick; anim;pause C base.",
+          "assert": "state == Paused; Scene::node_trs_owner(A,\"base\") == Some((C,\"base\")) (pause holds AND retains, S14.3)."
+        },
+        {
+          "name": "stop_then_app_patch_succeeds",
+          "seam": "INGRESS",
+          "input": "play C base; stop; then node.upsert setting base.trs to a new translate.",
+          "assert": "node.upsert commits (no node_busy); base.trs == the app-set value (app regained control after stop, S14.5)."
+        }
+      ]
+    },
+    {
+      "id": "P4-T11",
+      "title": "Ownership conflict: node_busy on app TRS patch over an active playback",
+      "deliverable": "toastty-graphics/src/tgp/operation.rs (patch apply): when a node.upsert writes a TRS field of a node whose TRS is owned by an active (Playing|Paused) playback, reject the WHOLE txn with x code=node_busy, scene unchanged. Upserts of NON-TRS fields (visible, tint, material ref, alt) on a played node are unaffected and commit. Enforce against the P4-T10 ownership map.",
+      "design_refs": [
+        "14.5",
+        "G2"
+      ],
+      "depends_on": [
+        "P4-T10",
+        "ERROR-FRAME"
+      ],
+      "tests": [
+        {
+          "name": "trs_patch_over_playing_node_rejected_node_busy",
+          "seam": "INGRESS",
+          "input": "play C base (Playing). node.upsert setting base.trs (new rotation).",
+          "assert": "tgp;x;code=node_busy queued; base.trs unchanged from its current playback pose; whole txn rejected (S14.5)."
+        },
+        {
+          "name": "trs_patch_over_paused_node_also_node_busy",
+          "seam": "INGRESS",
+          "input": "play C base; pause; node.upsert setting base.trs.",
+          "assert": "tgp;x;code=node_busy (Paused retains ownership, S14.5)."
+        },
+        {
+          "name": "non_trs_patch_on_played_node_succeeds",
+          "seam": "INGRESS",
+          "input": "play C base (Mesh node). node.upsert setting base.visible=false and base.tint and base.alt (no TRS field).",
+          "assert": "Upsert commits; base.visible==false, tint/alt updated; playback still Playing, still owns TRS (S14.5)."
+        },
+        {
+          "name": "node_busy_txn_is_atomic",
+          "seam": "INGRESS",
+          "input": "ONE txn: node.upsert other (new free node) AND node.upsert base.trs (base is played).",
+          "assert": "tgp;x;code=node_busy; NEITHER op applied \u2014 other not created, base unchanged (whole txn rejected, S14.5)."
+        }
+      ]
+    },
+    {
+      "id": "P4-T12",
+      "title": "Camera ownership: camera_busy vs explore (both directions)",
+      "deliverable": "toastty-graphics/src/tgp/anim.rs + the explore controller (EXPLORE): a viewport's camera node has at most one terminal-side controller. (a) anim;play targeting a node that is the camera of a viewport with explore enabled \u2192 reject x code=camera_busy. (b) Enabling explore on a viewport STOPS any playback already driving that viewport's camera node (releases TRS, holds pose). Ordinary (non-camera) model nodes are never contended. Add `Term::viewport_camera_controller(tok,vp) -> Explore|Playback|None` accessor.",
+      "design_refs": [
+        "14.5",
+        "12.3",
+        "G2"
+      ],
+      "depends_on": [
+        "P4-T6",
+        "EXPLORE"
+      ],
+      "tests": [
+        {
+          "name": "play_on_explore_camera_rejected_camera_busy",
+          "seam": "INTERACTION",
+          "input": "Viewport vp=2 with camera node cam and explore enabled. Parser::advance anim;play;clip=C;node=cam.",
+          "assert": "tgp;x;code=camera_busy queued; no playback on cam; controller stays Explore (S14.5)."
+        },
+        {
+          "name": "enabling_explore_stops_camera_playback",
+          "seam": "INTERACTION",
+          "input": "anim;play C node=cam (Playing) with explore OFF; advance 200ms+tick; then enable explore on vp=2.",
+          "assert": "The cam playback transitions to Stopped (released, pose held); Term::viewport_camera_controller(A,2)==Explore (S14.5)."
+        },
+        {
+          "name": "play_on_ordinary_node_never_camera_busy",
+          "seam": "INTERACTION",
+          "input": "Viewport vp=2 explore enabled on camera cam. anim;play C node=base where base is an ordinary model node (not the camera).",
+          "assert": "Playback on base is Playing; no camera_busy (only the camera is contended, S14.5)."
+        }
+      ]
+    },
+    {
+      "id": "P4-T13",
+      "title": "node.remove auto-stops bound playback; no auto-rebind on same-id upsert",
+      "deliverable": "toastty-graphics/src/tgp/operation.rs (node.remove apply): removing a node bound to an active playback (its subtree root OR any driven descendant) SUCCEEDS and auto-stops that playback \u2014 release ownership, emit optional anim_end/destroyed-style event/ack to the owning token. A later node.upsert reusing the same id starts FRESH (no auto-rebind \u2014 new node is a new animation identity, S14.5).",
+      "design_refs": [
+        "14.5",
+        "G2"
+      ],
+      "depends_on": [
+        "P4-T6",
+        "P4-T9"
+      ],
+      "tests": [
+        {
+          "name": "remove_played_node_autostops",
+          "seam": "INGRESS",
+          "input": "play C base (Playing); node.remove base.",
+          "assert": "node.remove succeeds (base gone from tgp_scene); the playback is auto-stopped (no live playback for (C,base)); no error queued."
+        },
+        {
+          "name": "remove_driven_descendant_autostops",
+          "seam": "INGRESS",
+          "input": "play C base where the clip drives descendant elbow; node.remove elbow.",
+          "assert": "Removal succeeds and the (C,base) playback is auto-stopped (a driven descendant removal stops the playback, S14.5)."
+        },
+        {
+          "name": "autostop_emits_event_when_subscribed",
+          "seam": "INTERACTION",
+          "input": "Handshake tok=A, sub anim_end on base's viewport/node; play C base; node.remove base.",
+          "assert": "An optional auto-stop event (tgp;e, tok=A) is queued for the owning token (S14.5)."
+        },
+        {
+          "name": "same_id_upsert_after_remove_does_not_rebind",
+          "seam": "INGRESS",
+          "input": "play C base; node.remove base (auto-stop); node.upsert re-creating base (same id).",
+          "assert": "The new base node is Stopped/app-owned \u2014 no playback auto-restarts; Scene::node_trs_owner(A,\"base\")==None (no auto-rebind, S14.5)."
+        }
+      ]
+    },
+    {
+      "id": "P4-T14",
+      "title": "Skinning: accept skinned GLB, render bind pose, do NOT advertise feat=skin",
+      "deliverable": "toastty-graphics/src/tgp/glb_loader.rs: parse glTF skins (joints, inverse-bind matrices) into the scene model with the same bounds checks as any asset (S14.8). The renderer (toastty-render) renders the BIND POSE (ignores joint weights) \u2014 never crashes, never garbage. toastty-graphics/src/tgp capability reply (S07): do NOT include `skin` in feat=. Add `Scene::asset_has_skin(tok,asset) -> bool` accessor so tests confirm the skin parsed and bind pose is the render path.",
+      "design_refs": [
+        "14.8",
+        "7.1",
+        "G7"
+      ],
+      "depends_on": [
+        "P4-T3",
+        "ASSET-ADD"
+      ],
+      "tests": [
+        {
+          "name": "skinned_glb_accepted_parses_skin",
+          "seam": "INGRESS",
+          "input": "asset.add (more=0) a GLB containing a skin (joints + inverse-bind matrices) and skinned mesh vertices.",
+          "assert": "Asset commits (asset_revision bumped once); Scene::asset_has_skin(A,asset)==true; no tgp;x error (accepted, S14.8)."
+        },
+        {
+          "name": "feat_skin_not_advertised",
+          "seam": "INGRESS",
+          "input": "Handshake: Parser::advance tgp;q;v=2;tok=A; drain pty_replies and parse the tgp;r feat= list.",
+          "assert": "The feat= token list does NOT contain `skin` (v1 contract, S14.8 / S07.1)."
+        },
+        {
+          "name": "skinned_node_world_matrix_is_bind_pose",
+          "seam": "INGRESS",
+          "input": "asset.add the skinned GLB; instantiate its node hierarchy.",
+          "assert": "The skinned mesh node's WORLD matrix == its bind-pose transform chain (joint weights ignored, deterministic CPU value, S14.8)."
+        },
+        {
+          "name": "malformed_skin_bounded_error_no_crash",
+          "seam": "INGRESS",
+          "input": "asset.add a GLB whose skin references an out-of-range joint index / oversized inverse-bind array.",
+          "assert": "tgp;x with a bounded code (e.g. parse_error / cap_exceeded) citing the asset; no panic, asset not committed (G8 fuzz oracle: bounded scene or structured error, never crash)."
+        }
+      ]
+    }
+  ]
+}

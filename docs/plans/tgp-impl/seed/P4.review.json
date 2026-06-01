@@ -1,0 +1,98 @@
+{
+  "phase": "P4 \u2014 Animation and accessibility",
+  "complete": false,
+  "uncovered_surfaces": [
+    "feat=anim advertised in tgp;r (S07.1) + implication rule anim \u21d2 graph \u2014 P4-T14 only tests that feat=skin is ABSENT; no task/test asserts feat=anim is PRESENT or that anim\u21d2graph holds. This is the headline P4 feature flag and is uncovered.",
+    "anim_speed_max cap advertised in tgp;r (S07.1/S15.2) \u2014 enforcement is tested (P4-T7 speed-over-cap\u2192bad_param) but the cap-advertisement surface itself (the field appears in the reply) has no test.",
+    "camera_report_hz / anim caps surface: no test that the reply carries the anim-related caps at all; only enforcement paths are exercised.",
+    "RIS / DECSTR / alt-screen / CSI-2J lifecycle teardown of active playbacks + clip tables + TRS ownership \u2014 G10 mandates RIS = full scene teardown across all tokens; no P4 task or test drives RIS/alt-screen/CSI-2J and asserts playbacks stop, clips drop, and TRS ownership releases. The testing contract explicitly names LIFECYCLE (RIS/alt-screen/CSI-2J) as a required seam for this phase.",
+    "Emission gating of anim/anim_end on focus-out and foreground-process-group change (G1/S07 'cancels that token's subscriptions, explore, and playback and stops emitting'; S12.5.3 synthesizes gesture-end) \u2014 no test that losing focus / process-group change cancels active playbacks and suppresses anim_end.",
+    "Unknown anim verb \u2192 unknown_op (G3 closed enum): P4-T7 covers unknown_clip/unknown_node/not_playing/bad_param/no_targets/denied/camera_busy/node_busy but NOT an unrecognized anim verb (e.g. tgp;anim;tok=A;frobnicate;...). The closed error enum's unknown_op reject path for anim frames is uncovered.",
+    "anim;seek while Playing (not Paused): S14.3 says seek re-evaluates pose 'without changing Playing/Paused state'. P4-T6 only tests seek in the Paused state; the Playing-seek branch (state stays Playing, t set, pose re-evaluated, clock continues from new t) is untested.",
+    "CUBICSPLINE pose evaluation at a tick: P4-T3 asserts cubicspline tangents are STORED, but no INGRESS test evaluates a CubicSpline channel at a tick and asserts the Hermite-interpolated local TRS. STEP and LINEAR evaluation are tested (P4-T6); CubicSpline evaluation is not.",
+    "C1 control byte range (0x80\u20130x9F) in alt validation: S08.4 (the id-hardening rule alt explicitly inherits per S13.1 'these strings can re-enter the host's input path') rejects C0, DEL, C1, and ESC. P4-T1 validate_alt only lists 0x00\u20130x1F, 0x7F, 0x1B \u2014 the C1 range is omitted from both the validator description and the tests.",
+    "Non-UTF-8 alt rejection: S13.1 requires UTF-8; P4-T1 lists UTF-8 in validate_alt but no test feeds an invalid-UTF-8 alt byte string and asserts rejection. Cap counting in BYTES vs chars (the 64-byte bound) is also untested for multibyte input.",
+    "node-scoped auto-stop event type for node.remove / explore-stop: S12.5 closed ev enum is {click,dblclick,down,up,hover,enter,leave,drag,wheel,camera,resize,destroyed} \u2014 it has NO anim_end and 'destroyed' is viewport-scoped with reason=. P4-T9/T13 emit ev=anim_end/'destroyed-style event' (node=) which is not in the closed S12.5 enum; the event-type surface is undefined and untested against the actual enum."
+  ],
+  "issues": [
+    {
+      "id": "P4-I1",
+      "severity": "high",
+      "problem": "anim_end is NOT a member of the closed ev= enum in S12.5 (click|dblclick|down|up|hover|enter|leave|drag|wheel|camera|resize|destroyed). S14.4 references emitting an 'anim_end' event but the EVENT-EMIT closed vocabulary never adds it. P4-T9/T13 test for ev=anim_end and a 'destroyed-style event' with node= as if it exists, but the design has no such ev token, and 'destroyed' in S12.5 is viewport-scoped (reason=), not node-scoped. This is a real cross-section contradiction the plan must resolve, not assume away.",
+      "fix": "Add an explicit task to extend the EVENT-EMIT closed ev= enum (owned by S12/EVENT-EMIT) with a new node-scoped 'anim_end' token (and define its fields: tok=, vp=, node=, clip=), versioned under v=. Make P4-T9's anim_end emission and P4-T13's auto-stop event depend on that enum extension and assert the exact concrete bytes (e.g. ESC _ tgp;e;tok=A;vp=2;ev=anim_end;node=base;clip=<id> ESC \\) against the actual enum, and add a test that an unsubscribed/feat-less token never sees it. Surface this as a design-reconciliation item: S12.5 and S14.4 currently disagree."
+    },
+    {
+      "id": "P4-I2",
+      "severity": "high",
+      "problem": "No task/test covers RIS/DECSTR/alt-screen/CSI-2J lifecycle teardown of animation state. G10 makes RIS a full scene teardown across all tokens (the VRAM-recovery path) and DECSTR leaves the scene intact; alt-screen hides inline viewports. Active playbacks, the PlaybackTable, the clip tables, and TRS ownership all must tear down on RIS but survive DECSTR. The testing contract explicitly requires a LIFECYCLE seam for this phase. The plan has zero lifecycle tasks/tests.",
+      "fix": "Add a P4 lifecycle task (e.g. P4-T15) with depends_on [P4-T6, P4-T4, LIFECYCLE]: tests (LIFECYCLE seam) \u2014 (a) play C on base; feed RIS (ESC c) bytes; assert PlaybackTable empty, clip_table(A) empty, Scene::node_trs_owner==None, no panic; (b) play C; feed DECSTR (ESC[!p); assert playback still Playing and clips intact (DECSTR leaves scene); (c) inline-viewport-bound playback's viewport hidden by alt-screen switch \u2014 assert playback state survives (resolution-independent, G10) and resumes on return."
+    },
+    {
+      "id": "P4-I3",
+      "severity": "high",
+      "problem": "P4-T1 deliverable invents a 'scene-alt op' / 'scene-alt surface' to set Scene::alt, and a test 'set scene-level alt via the scene-alt op'. No such op exists anywhere in S06/S08/S13. S13.1 says the scene 'may carry an alt caption' but defines NO wire mechanism to set it; the only defined alt-bearing ops are node.upsert (node alt) and viewport create/update (viewport alt). The plan asserts a concrete test against a nonexistent protocol surface.",
+      "fix": "Either (a) remove scene-level alt from P4 and flag to the design owners that S13.1's 'the scene itself ... may carry an alt' has no wire op (mark Scene::alt out of scope for v1), or (b) add an explicit design-reconciliation item defining the op (most naturally a field on the patch header or a dedicated scene.alt op) with its CBOR shape and error path, then write the concrete-bytes test against THAT. As written the test is untestable because the input bytes cannot be specified."
+    },
+    {
+      "id": "P4-I4",
+      "severity": "medium",
+      "problem": "P4-T1 validate_alt omits the C1 control range (0x80\u20130x9F) and has no non-UTF-8 test. S13.1 explicitly ties alt hardening to the same threat as node ids ('can re-enter the host's input path through AT tooling'), and S08.4 node-id hardening rejects C0 (0x00\u20130x1F), DEL (0x7F), C1 (0x80\u20130x9F), AND ESC. Omitting C1 leaves an injection gap when alt is surfaced into a reader/AT path; and an invalid-UTF-8 alt is never tested.",
+      "fix": "Extend validate_alt to reject the C1 range (0x80\u20130x9F) and reject non-UTF-8 byte strings, matching S08.4. Add two INGRESS tests: (1) node.upsert with alt containing 0xC2 0x80 (a C1 codepoint) \u2192 tgp;x;code=bad_param, node not created; (2) node.upsert with an invalid-UTF-8 alt byte string (e.g. 0xFF) \u2192 bad_param (or parse_error per the CBOR text-string rule), node not created. Also state the 64-byte cap is counted in BYTES and add a multibyte over-cap case."
+    },
+    {
+      "id": "P4-I5",
+      "severity": "medium",
+      "problem": "feat=anim (the P4 headline feature flag) advertisement is untested, and the anim\u21d2graph implication rule is unverified. P4-T14 only asserts feat=skin is ABSENT. anim_speed_max / camera_report_hz cap advertisement in tgp;r is also untested \u2014 only enforcement is exercised. These are first-class protocol surfaces (a cap/feat in S07.1) introduced/relevant to this phase and the testing contract requires each cap and each feat token to have a test.",
+      "fix": "Add INGRESS tests (in P4-T7 or a new caps task): handshake tgp;q;v=2;tok=A; drain pty_replies; assert the tgp;r feat= list CONTAINS 'anim' AND 'graph' (anim\u21d2graph), and that the reply carries anim_speed_max=<N> and camera_report_hz=<N>. Use the same N in the speed-over-cap test so enforcement and advertisement agree (advertised=enforced, S15.2)."
+    },
+    {
+      "id": "P4-I6",
+      "severity": "medium",
+      "problem": "Unknown anim verb is not tested. S14.3 defines exactly {play,pause,seek,stop}; G3's closed enum has unknown_op. An anim frame with an unrecognized verb (tgp;anim;tok=A;wiggle;clip=C;node=base) is a reject site that belongs to the anim-frame parser (P4-T7) and is uncovered.",
+      "fix": "Add a P4-T7 INGRESS test: handshake tok=A; Parser::advance an anim frame with a bogus verb; assert tgp;x;code=unknown_op (tok=A) queued, no playback created, scene unchanged."
+    },
+    {
+      "id": "P4-I7",
+      "severity": "medium",
+      "problem": "seek-while-Playing is untested. S14.3: seek re-evaluates pose without changing Playing/Paused state. P4-T6 only has seek_sets_absolute_t_without_changing_state in the Paused branch. The Playing branch (seek mid-play, then continued ticking from the new t) \u2014 the common scrub-during-playback case and the exact op a test uses to set clip time per S14.7 \u2014 is not exercised.",
+      "fix": "Add a P4-T6 INGRESS test: play C base (Playing); advance 200ms+tick (t=0.2); anim;seek;clip=C;node=base;t=0.8; assert state still Playing and t==0.8 and pose==pose(0.8); then advance 100ms+tick and assert t==0.9 (clock resumes from the seeked t)."
+    },
+    {
+      "id": "P4-I8",
+      "severity": "medium",
+      "problem": "CUBICSPLINE evaluation at a tick is untested. P4-T3 asserts cubicspline tangents are STORED (3 values/keyframe) but no test evaluates a CubicSpline channel during tick_tgp and asserts the Hermite-interpolated local TRS. STEP and LINEAR evaluation paths are tested in P4-T6; the CubicSpline evaluation path (a distinct interp branch in evaluate_pose) is a real surface with no behavioral test.",
+      "fix": "Add a P4-T6 INGRESS test: import a clip with a single CUBICSPLINE translation channel with known keyframes/tangents; play; advance to a mid-key t + tick; assert the driven node's local translate equals the deterministic Hermite value (computed CPU-side) \u2014 distinguishing it from the LINEAR result."
+    },
+    {
+      "id": "P4-I9",
+      "severity": "low",
+      "problem": "P4-T5 tests assert on 'ResolvedTargets' but the plan does not name a &self accessor exposing it, only 'queryable resolved-target list for tests'. The testing contract requires naming any NEW Term/Scene accessor a test needs so the plan exposes a testable surface.",
+      "fix": "Name the accessor explicitly, e.g. Scene::playback_resolved_targets(tok, clip, node) -> Option<&ResolvedTargets> (or a resolve_targets pure-fn test harness returning the list), and have P4-T5's assertions reference it by name."
+    },
+    {
+      "id": "P4-I10",
+      "severity": "low",
+      "problem": "Emission gating for anim_end / playback on focus-out and foreground-process-group change is not tested. G1 and S07/S12.5.3 require the terminal to cancel a token's playback and stop emitting on focus loss / process-group change. P4-T9 tests anim_end-when-subscribed but never the gated-off path.",
+      "fix": "Add an INTERACTION/LIFECYCLE test (depends EVENT-EMIT, EXPLORE/focus API): play 1.0s loop=0 clip with anim_end subscribed; inject focus-out (or process-group change) before t reaches duration; advance the clock past duration + tick; assert playback was cancelled and NO ev=anim_end leaked into pty_replies."
+    },
+    {
+      "id": "P4-I11",
+      "severity": "low",
+      "problem": "Clean-break-from-RGP wording risk. P4-T0 ('mirroring the existing rgp tick_animations pattern') and P4-T3 ('mirror existing rgp/glb_loader.rs') describe pattern-mirroring, which is fine, but G8 mandates TGP 'does not bridge, reuse, or inherit' from the RGP path. The deliverables should make explicit these are NEW independent modules, not shared code, to avoid an implementer reusing rgp/glb_loader.rs or rgp/scene.rs types.",
+      "fix": "Reword P4-T0/P4-T3 deliverables to state the TGP clock and TGP glb_loader are independent code paths under toastty-graphics/src/tgp/ that may copy the shape of the RGP equivalents but share no types/functions with rgp/* (G8). No test change needed; this is a deliverable-wording guard."
+    },
+    {
+      "id": "P4-I12",
+      "severity": "low",
+      "problem": "node.remove auto-stop event (P4-T13) and explore-stop event (P4-T12) reuse an ambiguous event token ('destroyed-style event', 'optional auto-stop event'). 'destroyed' in S12.5 is viewport-scoped (reason=), not a node-scoped anim notification. Same root cause as P4-I1.",
+      "fix": "Once P4-I1 defines the node-scoped anim_end (or a dedicated anim_stopped) token, point P4-T12/T13 auto-stop emissions at it with concrete bytes (node=, clip=, reason= such as removed|explore_takeover) and assert those exact bytes; do not overload viewport 'destroyed'."
+    },
+    {
+      "id": "P4-I13",
+      "severity": "low",
+      "problem": "play-before-upsert ordering within one write is not directly tested. S14.6 says an anim;play whose node= is not committed AT PROCESS TIME is unknown_node and is NOT queued. P4-T7 tests upsert-then-play (succeeds) and a separate-write unknown_node, but not the same-write reverse order (play op bytes preceding the upsert bytes) which must error rather than wait for the later upsert in the same buffer.",
+      "fix": "Add a P4-T7 INGRESS test: ONE Parser::advance buffer with anim;play;clip=C;node=base FIRST, then a node.upsert creating base SECOND; assert tgp;x;code=unknown_node for the play (processed before base exists) and that base IS subsequently created by the upsert (the play does not retroactively start)."
+    }
+  ],
+  "notes": "Dependency ordering is sound and buildable: P4-T0 (clock) \u2192 P4-T1 (alt model) \u2192 P4-T2 (a11y surfacing); P4-T3 (clip parse) \u2192 P4-T4 (clip ack) and P4-T5 (resolution) \u2192 P4-T6 (state machine) \u2192 P4-T7 (anim ingress/errors), P4-T8 (dirty), P4-T9 (end/anim_end), P4-T10 (stop/pause ownership) \u2192 P4-T11 (node_busy), P4-T12 (camera_busy), P4-T13 (remove auto-stop); P4-T14 (skinning) is independent off P4-T3. Cross-phase deps (SCENE-MODEL, ASSET-ADD, ACK-FRAME, APC-END-BACKCHANNEL, ERROR-FRAME, CLOCK, PICK, EVENT-EMIT, EXPLORE) are correctly identified, and the plan correctly flags that anim acks/errors and the clip-id ack route through the apc_end outcome back-channel (the cross-crate change where toastty-parser::Perform::apc_end becomes outcome-bearing \u2014 confirmed it currently returns unit at crates/toastty-parser/src/perform.rs:42 and crates/toastty-term/src/term.rs:3389, and S08.2 specifies the new ApcEnd{Done,BinaryFollows} signature). The seam assumptions are accurate against the codebase: tick_rgp_animations(now: Instant) at term.rs:604 and pty_replies/drain_pty_replies at term.rs:203/543 are real, so the proposed Term::tick_tgp/tgp_advance_clock/tgp_now hooks and pty_replies-based assertions are correct ingress/lifecycle seams. Determinism, per-token namespacing of clip ids (P4-T4), CPU-resolvable a11y pick (P4-T2), and dirty-not-global-revision (P4-T8) all honor G6/G9/G1 and contradict nothing in the reconciliation. The plan is NOT complete: the dominant gaps are (1) the anim_end/event-enum contradiction between S12.5 and S14.4 (P4-I1/P4-I12) \u2014 the closed ev= vocabulary never gained anim_end, so every anim event test asserts a surface that does not formally exist; (2) zero LIFECYCLE coverage of RIS/DECSTR/alt-screen teardown of playbacks+clips (P4-I2), despite the testing contract naming LIFECYCLE as required; (3) an invented nonexistent 'scene-alt op' (P4-I3); and (4) the unverified feat=anim / anim cap advertisement surfaces (P4-I5). Fix P4-I1/I2/I3/I5 before this phase is buildable-to-spec; the medium/low items tighten coverage to satisfy the every-surface-has-a-test contract."
+}
