@@ -15,7 +15,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-arboard = "3"
+# `wayland-data-control` makes arboard use the native Wayland clipboard
+# (wl_data_control) when WAYLAND_DISPLAY is set, falling back to X11
+# otherwise. Without it arboard only speaks X11, which can't read a
+# Wayland compositor-owned clipboard through XWayland — so Ctrl+Shift+V
+# and OSC 52 reads silently fail on Wayland sessions.
+arboard = { version = "3", features = ["wayland-data-control"] }
 notify = "8"
 pollster.workspace = true
 toml.workspace = true
