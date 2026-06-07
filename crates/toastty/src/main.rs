@@ -1001,6 +1001,53 @@ impl Toastty {
         ControlSignal::Continue
     }
 
+    /// Insert IME-committed text into the PTY. This is the IME analogue of
+    /// typing: an input method (fcitx5, CJK, Hangul, macOS dead keys, …)
+    /// composes one or more characters and commits them as a single string
+    /// rather than as per-keystroke `Event::Key`s. Treated like typed text
+    /// — written raw (not bracketed-paste wrapped), clears the selection,
+    /// and snaps the viewport to the prompt.
+    fn handle_ime_commit(&mut self, text: &str) -> ControlSignal {
+        // winit emits an empty preedit right before commit, but clear
+        // defensively so the overlay never outlives the composition.
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_preedit(None);
+        }
+        if text.is_empty() {
+            return ControlSignal::RedrawIn(Duration::ZERO);
+        }
+        self.write_pty(text.as_bytes());
+        self.term.clear_selection();
+        self.snap_view_after_input();
+        ControlSignal::RedrawIn(Duration::ZERO)
+    }
+
+    /// Update the inline preedit (in-progress composition) overlay drawn at
+    /// the cursor. Empty text clears it. Also repositions the IME
+    /// candidate popup at the cursor.
+    fn handle_ime_preedit(&mut self, text: &str) -> ControlSignal {
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_preedit(if text.is_empty() { None } else { Some(text) });
+        }
+        self.update_ime_cursor_area();
+        ControlSignal::RedrawIn(Duration::ZERO)
+    }
+
+    /// Tell the compositor where the text cursor is (physical pixels) so the
+    /// IME candidate / preedit popup is positioned beside it instead of at
+    /// the window origin. No-op until the window and renderer exist.
+    fn update_ime_cursor_area(&self) {
+        let (Some(window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_ref())
+        else {
+            return;
+        };
+        let (cell_w, cell_h) = renderer.cell_size();
+        let cursor = self.term.cursor();
+        let x = f64::from(cursor.col) * f64::from(cell_w);
+        let y = f64::from(cursor.row) * f64::from(cell_h);
+        window.set_ime_cursor_area(x, y, f64::from(cell_w), f64::from(cell_h));
+    }
+
     /// Report cursor motion under DECSET 1002 (drag) / 1003 (any motion).
     /// xterm reports motion at cell granularity — emit one event per
     /// new cell crossed, not per pixel — so dragging within a cell stays
@@ -1739,6 +1786,25 @@ impl App for Toastty {
                 repeat,
                 is_synthetic,
             ),
+            // IME (input-method) events. fcitx5 / CJK / Hangul composition
+            // does NOT arrive as `Event::Key` — the composed text comes
+            // through these instead, so they must be handled or typing via
+            // an IME silently does nothing.
+            Event::ImeCommit(text) => self.handle_ime_commit(&text),
+            Event::ImePreedit { text, .. } => self.handle_ime_preedit(&text),
+            Event::ImeEnabled => {
+                // Composition session started; position the candidate popup
+                // at the cursor. No preedit to draw yet.
+                self.update_ime_cursor_area();
+                ControlSignal::Continue
+            }
+            Event::ImeDisabled => {
+                // Session ended — drop any half-formed preedit overlay.
+                if let Some(r) = self.renderer.as_mut() {
+                    r.set_preedit(None);
+                }
+                ControlSignal::RedrawIn(Duration::ZERO)
+            }
             Event::Focus(focused) => {
                 if let Some(bytes) = encode_focus(focused, self.term.report_focus()) {
                     self.write_pty(bytes);

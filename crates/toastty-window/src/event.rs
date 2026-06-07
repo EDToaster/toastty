@@ -203,6 +203,18 @@ pub enum Event {
     /// PTY master closed (child exited / EIO). The binary should reap
     /// and exit.
     PtyClosed,
+    /// IME committed text — should be inserted into the editor (written to the PTY),
+    /// the same as typed text. Arrives via the platform text-input protocol
+    /// (e.g. fcitx5 Hangul/CJK composition), NOT through `Event::Key`.
+    ImeCommit(String),
+    /// IME preedit (in-progress composition) update. An empty `text` clears the
+    /// preedit. `cursor` is the byte-range (start, end) of the IME caret within
+    /// `text`, or `None` to hide it.
+    ImePreedit { text: String, cursor: Option<(usize, usize)> },
+    /// An IME composition session became active.
+    ImeEnabled,
+    /// An IME composition session ended; any pending preedit should be cleared.
+    ImeDisabled,
 }
 
 /// What `run` should do after the app callback returns.

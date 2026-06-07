@@ -45,7 +45,7 @@ use raw_window_handle::{
 use thiserror::Error;
 use tracing::{debug, trace, warn};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseScrollDelta, TouchPhase, WindowEvent};
+use winit::event::{ElementState, Ime, KeyEvent, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey as WNamedKey, PhysicalKey as WPhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
@@ -190,6 +190,19 @@ impl ToasttyWindow {
     /// "IME on by default, with named inhibitors" pattern (decision §2).
     pub fn set_ime_allowed(&self, allowed: bool) {
         self.inner.set_ime_allowed(allowed);
+    }
+
+    /// Tell the IME where the text cursor is (physical pixels) so the
+    /// candidate/preedit popup is positioned near it. Call this when preedit
+    /// updates or the cursor moves while IME is active.
+    pub fn set_ime_cursor_area(&self, x: f64, y: f64, width: f64, height: f64) {
+        let pos = winit::dpi::PhysicalPosition::new(x, y);
+        let size = winit::dpi::PhysicalSize::new(width, height);
+        // Pass the physical position/size straight through: winit's
+        // `set_ime_cursor_area<P: Into<Position>, S: Into<Size>>` infers the
+        // concrete types from these, so an explicit `.into()` would be
+        // ambiguous (the target `Position`/`Size` isn't otherwise pinned).
+        self.inner.set_ime_cursor_area(pos, size);
     }
 
     /// Request a redraw. Honors winit's coalescing.
@@ -437,11 +450,13 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<'_, A> {
                     event_loop,
                 );
             }
-            // IME composition is allowed at the window level for dead-keys,
-            // but we don't ship preedit display yet. M4b will surface
-            // `Ime::Preedit` / `Ime::Commit` once we have a renderer.
-            //
-            // TODO(ime-preedit): render preedit overlay.
+            // IME composition (dead-keys on macOS, fcitx5/Hangul/CJK on
+            // Wayland). We surface the raw enabled/preedit/commit/disabled
+            // transitions here; the preedit overlay rendering and the
+            // commit-to-PTY write happen downstream in the binary.
+            WindowEvent::Ime(ime) => {
+                self.dispatch(translate_ime(ime), event_loop);
+            }
             _ => {}
         }
     }
@@ -493,6 +508,17 @@ pub(crate) fn translate_scroll(delta: MouseScrollDelta) -> (f64, f64) {
     match delta {
         MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),
         MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
+    }
+}
+
+/// Translate a winit `Ime` event into our [`Event`]. Pure so the four
+/// mappings are unit-testable without spinning up an event loop.
+pub(crate) fn translate_ime(ime: Ime) -> Event {
+    match ime {
+        Ime::Enabled => Event::ImeEnabled,
+        Ime::Preedit(text, cursor) => Event::ImePreedit { text, cursor },
+        Ime::Commit(text) => Event::ImeCommit(text),
+        Ime::Disabled => Event::ImeDisabled,
     }
 }
 
@@ -677,6 +703,47 @@ mod tests {
         )));
         assert!((dx - 3.5).abs() < 1e-9);
         assert!((dy + 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn translate_ime_enabled() {
+        assert!(matches!(translate_ime(Ime::Enabled), Event::ImeEnabled));
+    }
+
+    #[test]
+    fn translate_ime_disabled() {
+        assert!(matches!(translate_ime(Ime::Disabled), Event::ImeDisabled));
+    }
+
+    #[test]
+    fn translate_ime_commit() {
+        match translate_ime(Ime::Commit("한".to_string())) {
+            Event::ImeCommit(s) => assert_eq!(s, "한"),
+            other => panic!("expected ImeCommit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_ime_preedit() {
+        match translate_ime(Ime::Preedit("ㅎ".to_string(), Some((0, 3)))) {
+            Event::ImePreedit { text, cursor } => {
+                assert_eq!(text, "ㅎ");
+                assert_eq!(cursor, Some((0, 3)));
+            }
+            other => panic!("expected ImePreedit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_ime_preedit_cleared() {
+        // Empty text + None cursor is how winit signals "clear the preedit".
+        match translate_ime(Ime::Preedit(String::new(), None)) {
+            Event::ImePreedit { text, cursor } => {
+                assert!(text.is_empty());
+                assert_eq!(cursor, None);
+            }
+            other => panic!("expected ImePreedit, got {other:?}"),
+        }
     }
 
     #[test]

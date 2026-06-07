@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use thiserror::Error;
+use toastty_protocols::unicode_core::cluster_cell_width;
 use toastty_term::Term;
 use wgpu::{
     BackendOptions, Backends, CompositeAlphaMode, Device, DeviceDescriptor, Instance,
@@ -100,6 +101,17 @@ fn build_term_dirty_instances_into(
         },
         |line_id, col| term.is_cell_selected(line_id, col),
     );
+}
+
+/// Normalize an IME preedit argument into stored state: `None` or an
+/// empty string both clear the overlay (yield `None`); any non-empty
+/// string is owned. Factored out of [`Renderer::set_preedit`] so the
+/// empty-string normalization is unit-testable without a GPU.
+fn normalize_preedit(text: Option<&str>) -> Option<String> {
+    match text {
+        Some(s) if !s.is_empty() => Some(s.to_owned()),
+        _ => None,
+    }
 }
 
 /// Bundled fallback font: `FiraMono Medium` (OFL).
@@ -278,6 +290,14 @@ pub struct Renderer {
     /// notices without scanning stderr. When `Some`, bypasses the
     /// skip-submit gate so the banner shows up even on an idle grid.
     error_banner: Option<String>,
+    /// Optional IME preedit (in-progress composition) string drawn inline
+    /// at the terminal cursor every frame. Fed by the platform IME
+    /// (e.g. fcitx5) while the user composes Hangul/CJK; it is NOT part of
+    /// the terminal grid and is overlaid each frame until the IME commits
+    /// or clears it. Drawn underlined to distinguish it from committed
+    /// text. When `Some`, bypasses the skip-submit gate so the overlay
+    /// refreshes even on an idle grid (same as `debug_overlay`).
+    preedit: Option<String>,
     /// `TOASTTY_TRACE_RENDER` env var sampled once at construction.
     /// Sampling per-frame was a measurable syscall on the hot path.
     trace_render: bool,
@@ -581,6 +601,7 @@ impl Renderer {
             rgp_asset_revision_seen: u32::MAX,
             debug_overlay: None,
             error_banner: None,
+            preedit: None,
             trace_render: std::env::var_os("TOASTTY_TRACE_RENDER").is_some(),
             // The very first frame is always a full clear → goes
             // through the direct-to-swapchain path → leaves scratch
@@ -820,6 +841,26 @@ impl Renderer {
         self.error_banner.is_some()
     }
 
+    /// Set (or clear) the IME preedit string drawn inline at the cursor.
+    /// `None` or an empty string clears it. The string is the in-progress
+    /// composition text from the platform IME; it is NOT part of the terminal
+    /// grid and is drawn as an overlay each frame until cleared/committed.
+    ///
+    /// Copies into a renderer-owned `String`. An empty string normalizes
+    /// to `None` (via [`normalize_preedit`]) so `has_preedit` and the
+    /// skip-submit bypass both agree there's nothing to draw. Unlike the
+    /// FPS-counter overlay this isn't a hot path — preedit changes at
+    /// keystroke rate — so we don't bother reusing the allocation.
+    pub fn set_preedit(&mut self, text: Option<&str>) {
+        self.preedit = normalize_preedit(text);
+    }
+
+    /// True when a non-empty preedit overlay is currently set.
+    #[must_use]
+    pub fn has_preedit(&self) -> bool {
+        self.preedit.is_some()
+    }
+
     /// Current theme.
     pub fn theme(&self) -> Theme {
         self.theme
@@ -1003,6 +1044,7 @@ impl Renderer {
             && !self.needs_full_clear
             && self.debug_overlay.is_none()
             && self.error_banner.is_none()
+            && self.preedit.is_none()
         {
             return Ok(RenderOutcome::Skipped);
         }
@@ -1370,6 +1412,128 @@ impl Renderer {
                         });
                     }
                 }
+            }
+        }
+
+        // IME preedit overlay. The in-progress composition string is
+        // drawn inline starting at the terminal cursor cell, advancing
+        // cell-by-cell to the right and overlaying whatever grid content
+        // sits underneath. Rendered underlined (and with the theme's
+        // cursor color as fg) so it reads as distinct, half-formed text
+        // until the IME commits it into the grid (or clears it).
+        //
+        // We reuse the same cursor-cell anchor the cursor block uses:
+        // `cursor_pixel_rect` clamps `term.cursor()` into the grid and
+        // applies the sub-pixel scroll y-translate. We take its left edge
+        // (x0) for the start column; the cell-top y is recomputed from the
+        // same clamped row so the underline shapes/underlines align with
+        // the grid regardless of cursor shape (Underline shifts the rect's
+        // own y down).
+        if let Some(preedit) = self.preedit.as_deref() {
+            let (rows, cols) = term.size();
+            let cell_w = cell_size.0;
+            let cell_h = cell_size.1;
+            let cursor_rect = crate::text::instance::cursor_pixel_rect(term, cell_size);
+            // Cell-top y for the cursor row, mirroring cursor_pixel_rect's
+            // cell_pos: clamp the cursor row into the grid and apply the
+            // same sub-pixel scroll y-translate.
+            let view_pixel = term.view_offset_pixel();
+            let y_translate = if view_pixel > 0.0 { view_pixel - cell_h } else { 0.0 };
+            let cur_row = u16::min(term.cursor().row, rows.saturating_sub(1));
+            let y0 = f32::from(cur_row) * cell_h + y_translate;
+            // Start column from the cursor rect's left edge (already
+            // clamped + cell-aligned by cursor_pixel_rect).
+            let start_x = cursor_rect[0];
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let start_col = (start_x / cell_w).round() as u16;
+
+            let lg = text.rasterizer.shape_line(
+                &self.queue,
+                preedit,
+                term.grapheme_cluster_mode(),
+            );
+            let mode_2027 = term.grapheme_cluster_mode();
+            let preedit_fg = theme.cursor;
+            // Walk the composition string char-by-char, advancing the
+            // overlay column by each char's display width so wide CJK
+            // glyphs occupy two cells (matching the shaper's column
+            // assignment, which leaves the continuation column empty).
+            let mut col: u16 = start_col;
+            let mut buf = [0u8; 4];
+            for ch in preedit.chars() {
+                let ch_str = ch.encode_utf8(&mut buf);
+                let width = u16::from(cluster_cell_width(ch_str, mode_2027));
+                // Clip at the right edge: stop emitting once the glyph
+                // (or its trailing continuation cell) would run past the
+                // last column. Don't wrap.
+                if col >= cols || col + width > cols {
+                    break;
+                }
+                let pos = [f32::from(col) * cell_w, y0];
+                let span = [f32::from(width) * cell_w, cell_h];
+                // Cover the grid cell underneath so the half-formed glyph
+                // reads cleanly, not mixed with whatever was already
+                // there. Two covers, mirroring the error banner: a bg-pass
+                // quad (FLAG_NO_GLYPH) repaints the cell bg, and a
+                // glyph-pass cover (FLAG_UNDERLINE | FLAG_NO_GLYPH emits a
+                // solid bg) overpaints the term's own glyph for this cell
+                // — which was already emitted earlier under LoadOp::Load.
+                instances.push(CellInstance {
+                    pos,
+                    size: span,
+                    uv_min: [0.0, 0.0],
+                    uv_max: [0.0, 0.0],
+                    fg: preedit_fg,
+                    bg: theme.bg,
+                    flags: crate::text::instance::FLAG_NO_GLYPH,
+                    pad: [0; 3],
+                });
+                instances.push(CellInstance {
+                    pos,
+                    size: span,
+                    uv_min: [0.0, 0.0],
+                    uv_max: [0.0, 0.0],
+                    fg: preedit_fg,
+                    bg: theme.bg,
+                    flags: crate::text::instance::FLAG_UNDERLINE
+                        | crate::text::instance::FLAG_NO_GLYPH,
+                    pad: [0; 3],
+                });
+                // Underline strip spanning the char's full cell width,
+                // reusing the same machinery a normal underlined cell
+                // emits (FLAG_UNDERLINE, fg-as-bg). This is the preedit's
+                // visual distinction.
+                instances.push(crate::text::instance::underline_instance(
+                    pos,
+                    span,
+                    preedit_fg,
+                ));
+                // The glyph, looked up at this column. `lg` was shaped from
+                // the preedit string alone, so its columns are 0-based
+                // relative to the composition start — subtract `start_col`
+                // to map this absolute grid column back into that space.
+                // (Continuation cells for wide chars are left empty by the
+                // shaper, same as the grid.)
+                if !ch.is_whitespace()
+                    && let Some(slot) = lg.get(col - start_col, ch)
+                {
+                    let flags = if slot.is_color {
+                        crate::text::instance::FLAG_COLOR_GLYPH
+                    } else {
+                        0
+                    };
+                    instances.push(CellInstance {
+                        pos: [pos[0] + slot.glyph_offset[0], pos[1] + slot.glyph_offset[1]],
+                        size: slot.glyph_size,
+                        uv_min: slot.uv_min,
+                        uv_max: slot.uv_max,
+                        fg: preedit_fg,
+                        bg: theme.bg,
+                        flags,
+                        pad: [0; 3],
+                    });
+                }
+                col += width;
             }
         }
 
@@ -1744,6 +1908,23 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `set_preedit`/`has_preedit` contract, exercised through the pure
+    /// normalization helper they delegate to (a full `Renderer` needs a
+    /// real window surface, so it can't be built in a unit test). A
+    /// non-empty string is stored (`has_preedit` → true); `None` and the
+    /// empty string both clear it (`has_preedit` → false).
+    #[test]
+    fn preedit_normalization_mirrors_has_preedit() {
+        // set_preedit(Some("한")) → stored → has_preedit() == true.
+        let some = normalize_preedit(Some("한"));
+        assert_eq!(some.as_deref(), Some("한"));
+        assert!(some.is_some());
+        // set_preedit(None) → cleared → has_preedit() == false.
+        assert!(normalize_preedit(None).is_none());
+        // set_preedit(Some("")) → empty normalizes to None → false.
+        assert!(normalize_preedit(Some("")).is_none());
+    }
 
     #[test]
     fn instance_flags_test_includes_validation() {

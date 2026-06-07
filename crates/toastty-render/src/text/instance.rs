@@ -421,7 +421,10 @@ pub fn is_blank_for_render(cell: &Cell) -> bool {
 /// Build an underline-strip instance for a cell. 2 px thick, flush with
 /// the bottom of the cell, using `fg` as the color (same as the glyph).
 /// Called for cells with SGR underline or an active OSC 8 hyperlink.
-fn underline_instance(pos: [f32; 2], cell_size: [f32; 2], fg: [f32; 4]) -> CellInstance {
+/// Also reused by the renderer's IME preedit overlay
+/// ([`crate::Renderer::set_preedit`]) so the composition string draws
+/// underlined with the same strip geometry as committed underlined text.
+pub(crate) fn underline_instance(pos: [f32; 2], cell_size: [f32; 2], fg: [f32; 4]) -> CellInstance {
     let thickness = 2.0_f32.min(cell_size[1]);
     let y = pos[1] + cell_size[1] - thickness;
     CellInstance {
