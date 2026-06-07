@@ -30,6 +30,7 @@ pub fn theme_from_config(cfg: &ThemeConfig) -> Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use toastty_config::Color;
 
     fn arrs_eq(a: [f32; 4], b: [f32; 4]) -> bool {
         a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-6)
@@ -45,5 +46,22 @@ mod tests {
         for (i, c) in cfg.palette.iter().enumerate() {
             assert!(arrs_eq(theme.palette[i], c.as_array()), "palette[{i}]");
         }
+    }
+
+    #[test]
+    fn sub_one_bg_alpha_is_preserved_in_theme() {
+        // A config bg with alpha < 1.0 must flow through to the Theme with
+        // its alpha intact — this is what drives transparent-window mode.
+        let mut cfg = ThemeConfig::defaults();
+        cfg.bg = Color::from_hex("#12121480").expect("valid hex");
+        assert!(cfg.bg.as_array()[3] < 1.0, "fixture bg should be sub-1.0");
+
+        let theme = theme_from_config(&cfg);
+        assert!(
+            theme.bg[3] < 1.0,
+            "theme bg alpha must stay < 1.0, got {}",
+            theme.bg[3]
+        );
+        assert!(arrs_eq(theme.bg, cfg.bg.as_array()));
     }
 }

@@ -261,8 +261,11 @@ impl TextPipeline {
 }
 
 /// BG pass pipeline. Depth test/write disabled — the bg always paints
-/// behind the RGP 3D pass (which runs immediately after). Straight-alpha
-/// blend; in practice cell bg is opaque (alpha=1.0).
+/// behind the RGP 3D pass (which runs immediately after). REPLACE blend
+/// (One/Zero): the fragment shader emits premultiplied alpha and the bg
+/// pass writes one non-overlapping quad per cell, so a source write is
+/// correct and lets transparent cells erase stale alpha under partial
+/// redraws. In practice the default cell bg is opaque (alpha=1.0).
 fn make_bg_pipeline(
     device: &Device,
     shader: &ShaderModule,
@@ -309,15 +312,26 @@ fn make_bg_pipeline(
             compilation_options: PipelineCompilationOptions::default(),
             targets: &[Some(ColorTargetState {
                 format: color_format,
+                // REPLACE / source-write blend (One/Zero) for both color
+                // and alpha. The bg pass writes one non-overlapping
+                // premultiplied quad per cell region (plus the opaque
+                // cursor block, drawn last), so a straight source write is
+                // correct. This is (a) identical to the old over-blend for
+                // opaque quads — opaque-src "over" already fully replaces
+                // the destination — and (b) correctly ERASES the
+                // destination's alpha back down under LoadOp::Load partial
+                // redraws. An "over" blend can never reduce destination
+                // alpha, so a now-transparent cell would otherwise ghost
+                // the previous opaque glyph's alpha into the swapchain.
                 blend: Some(BlendState {
                     color: BlendComponent {
-                        src_factor: BlendFactor::SrcAlpha,
-                        dst_factor: BlendFactor::OneMinusSrcAlpha,
+                        src_factor: BlendFactor::One,
+                        dst_factor: BlendFactor::Zero,
                         operation: BlendOperation::Add,
                     },
                     alpha: BlendComponent {
                         src_factor: BlendFactor::One,
-                        dst_factor: BlendFactor::OneMinusSrcAlpha,
+                        dst_factor: BlendFactor::Zero,
                         operation: BlendOperation::Add,
                     },
                 }),

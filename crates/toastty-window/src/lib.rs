@@ -60,6 +60,9 @@ pub struct WindowOptions {
     /// decision record — macOS dead keys route through IME, so disabling
     /// it silently breaks Option-key typing.
     pub ime: bool,
+    /// Request a transparent window surface so a sub-1.0 background alpha
+    /// composites over the desktop. Default false.
+    pub transparent: bool,
 }
 
 impl Default for WindowOptions {
@@ -68,6 +71,7 @@ impl Default for WindowOptions {
             title: "toastty".into(),
             size: (1024, 640),
             ime: true,
+            transparent: false,
         }
     }
 }
@@ -317,7 +321,8 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<'_, A> {
             .with_inner_size(winit::dpi::PhysicalSize::new(
                 self.options.size.0,
                 self.options.size.1,
-            ));
+            ))
+            .with_transparent(self.options.transparent);
 
         let window = match event_loop.create_window(attrs) {
             Ok(w) => w,
@@ -660,6 +665,7 @@ mod tests {
             title: "toasted".to_string(),
             size: (800, 600),
             ime: false,
+            transparent: false,
         };
         assert_eq!(o.title, "toasted");
         assert_eq!(o.size, (800, 600));

@@ -313,6 +313,51 @@ pub struct Renderer {
 /// Build the scratch render target. Same dims/format as the surface;
 /// `RENDER_ATTACHMENT` so we can draw into it, `COPY_SRC` so we can
 /// blit it to the swapchain back-buffer.
+/// Pick the surface `CompositeAlphaMode`.
+///
+/// When `transparent` is true we prefer `PreMultiplied` so a sub-1.0 theme
+/// background alpha shows the desktop through. If the surface/compositor
+/// doesn't advertise `PreMultiplied`, we warn and fall back to the opaque
+/// preference below. When `transparent` is false we keep the historical
+/// behavior exactly: prefer `Opaque`, else the first advertised mode.
+fn pick_alpha_mode(modes: &[CompositeAlphaMode], transparent: bool) -> CompositeAlphaMode {
+    if transparent {
+        if let Some(m) = modes
+            .iter()
+            .copied()
+            .find(|m| *m == CompositeAlphaMode::PreMultiplied)
+        {
+            return m;
+        }
+        tracing::warn!(
+            "transparency requested but the surface/compositor does not support \
+             premultiplied-alpha compositing (CompositeAlphaMode::PreMultiplied); \
+             falling back to an opaque surface"
+        );
+    }
+    modes
+        .iter()
+        .copied()
+        .find(|m| *m == CompositeAlphaMode::Opaque)
+        .unwrap_or(modes[0])
+}
+
+/// Premultiply a straight-alpha RGBA color into the `(rgb * a, a)` form
+/// expected by a premultiplied-alpha surface, returning a `wgpu::Color`.
+///
+/// No-op when `a == 1.0` (rgb * 1 == rgb), so this is mathematically
+/// identical to the previous straight-alpha clear for opaque backgrounds;
+/// it only enables premultiplied transparency when `a < 1.0`.
+fn premultiplied_color(c: [f32; 4]) -> wgpu::Color {
+    let a = f64::from(c[3]);
+    wgpu::Color {
+        r: f64::from(c[0]) * a,
+        g: f64::from(c[1]) * a,
+        b: f64::from(c[2]) * a,
+        a,
+    }
+}
+
 fn create_scratch(
     device: &Device,
     width: u32,
@@ -484,7 +529,19 @@ impl Renderer {
     /// `Arc<Window>` (or anything that derefs to a window handle) so the
     /// caller can keep a copy for `request_redraw` etc. The example shows
     /// the pattern.
-    pub async fn new<W>(window: W, size: (u32, u32), vsync: bool) -> Result<Self, RenderError>
+    ///
+    /// When `transparent` is true, the surface is configured for
+    /// premultiplied-alpha compositing (`CompositeAlphaMode::PreMultiplied`)
+    /// so that a sub-1.0 theme background alpha shows the desktop through
+    /// the terminal. When false (the default), the surface prefers
+    /// `CompositeAlphaMode::Opaque` and the window is fully opaque
+    /// regardless of the theme background alpha.
+    pub async fn new<W>(
+        window: W,
+        size: (u32, u32),
+        vsync: bool,
+        transparent: bool,
+    ) -> Result<Self, RenderError>
     where
         W: HasDisplayHandle + HasWindowHandle + Send + Sync + 'static,
     {
@@ -554,12 +611,7 @@ impl Renderer {
                 PresentMode::AutoNoVsync
             },
             desired_maximum_frame_latency: 2,
-            alpha_mode: caps
-                .alpha_modes
-                .iter()
-                .copied()
-                .find(|m| *m == CompositeAlphaMode::Opaque)
-                .unwrap_or(caps.alpha_modes[0]),
+            alpha_mode: pick_alpha_mode(&caps.alpha_modes, transparent),
             view_formats: vec![],
         };
 
@@ -1632,12 +1684,10 @@ impl Renderer {
         }
 
         let load_op = if self.needs_full_clear {
-            wgpu::LoadOp::Clear(wgpu::Color {
-                r: f64::from(self.theme.bg[0]),
-                g: f64::from(self.theme.bg[1]),
-                b: f64::from(self.theme.bg[2]),
-                a: f64::from(self.theme.bg[3]),
-            })
+            // Premultiply the theme bg before clearing: no-op when alpha==1
+            // (rgb*1==rgb); enables premultiplied transparency when alpha<1
+            // so the desktop shows through on a premultiplied-alpha surface.
+            wgpu::LoadOp::Clear(premultiplied_color(self.theme.bg))
         } else {
             wgpu::LoadOp::Load
         };
@@ -1882,12 +1932,10 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: f64::from(self.clear_color[0]),
-                            g: f64::from(self.clear_color[1]),
-                            b: f64::from(self.clear_color[2]),
-                            a: f64::from(self.clear_color[3]),
-                        }),
+                        // Premultiply the clear color: no-op when alpha==1
+                        // (rgb*1==rgb); enables premultiplied transparency
+                        // when alpha<1 on a premultiplied-alpha surface.
+                        load: wgpu::LoadOp::Clear(premultiplied_color(self.clear_color)),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

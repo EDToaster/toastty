@@ -107,7 +107,7 @@ impl Demo {
 impl App for Demo {
     fn init(&mut self, window: ToasttyWindow, _handle: WindowHandle) {
         let size = window.physical_size();
-        let mut renderer = block_on(Renderer::new(window.clone(), size, true)).expect("renderer init");
+        let mut renderer = block_on(Renderer::new(window.clone(), size, true, false)).expect("renderer init");
 
         // Plumb config → renderer:
         //   font.family + font.size_px + font.line_height → with_font_ex
@@ -207,6 +207,7 @@ fn main() {
         title: "toastty — hello_text demo".into(),
         size: (960, 480),
         ime: true,
+        transparent: false,
     };
 
     if let Err(e) = run(opts, Demo::new(config)) {

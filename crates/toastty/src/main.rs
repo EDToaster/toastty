@@ -188,10 +188,15 @@ fn main() -> Result<()> {
     }
 
     let initial_size = (config.window.width.max(1), config.window.height.max(1));
+    let transparent = config.theme.bg.as_array()[3] < 1.0;
+    if transparent {
+        info!("transparent background enabled (theme bg alpha < 1.0)");
+    }
     let opts = WindowOptions {
         title: "toastty".into(),
         size: initial_size,
         ime: true,
+        transparent,
     };
 
     let app = Toastty::new(config, command_override, initial_size, load_err);
@@ -689,11 +694,14 @@ impl Toastty {
         let size = window.physical_size();
         self.physical_size = size;
 
-        // Build the renderer.
+        // Build the renderer. Transparency is logged once at startup in
+        // `run`; here we only need the flag for surface configuration.
+        let transparent = self.config.theme.bg.as_array()[3] < 1.0;
         let mut renderer = match block_on(Renderer::new(
             window.clone(),
             size,
             self.config.window.vsync,
+            transparent,
         )) {
             Ok(r) => r,
             Err(e) => {

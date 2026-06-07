@@ -114,7 +114,7 @@ fn vs_main(
 }
 
 // Background pass. Paints cell bgs AND the cursor block. Output is
-// straight-alpha; the pipeline uses SrcAlpha/OneMinusSrcAlpha blend.
+// premultiplied alpha; the pipeline uses a REPLACE (One/Zero) blend.
 //
 // The cursor moved to the bg pass so glyphs render *over* the cursor
 // instead of being obscured by it. The glyph pass then inverts the
@@ -136,7 +136,10 @@ fn fs_bg(in: VsOut) -> @location(0) vec4<f32> {
     // For both ordinary cell bg quads and the cursor instance, the
     // color we want to paint is in `bg` (cursor color for the cursor
     // instance — see CellInstance::cursor_for_shape).
-    return in.bg;
+    //
+    // Output premultiplied alpha (rgb * a, a): no-op when in.bg.a==1
+    // (rgb*1==rgb); enables premultiplied transparency when in.bg.a<1.
+    return vec4<f32>(in.bg.rgb * in.bg.a, in.bg.a);
 }
 
 // Test whether the current framebuffer pixel is inside the cursor's
