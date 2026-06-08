@@ -35,7 +35,7 @@ use toastty::cli;
 use toastty::cli::CommandOverride;
 use toastty::config_watcher::ConfigWatcher;
 use toastty::focus::encode_focus;
-use toastty::geometry::grid_dims_from_pixels;
+use toastty::geometry::{effective_font_size_px, grid_dims_from_pixels};
 use toastty::keyboard::encode_key;
 use toastty::mouse::{
     MouseEventKind, classify_button_event, encode_mouse, pixel_to_cell, protocol_wants_event,
@@ -222,6 +222,14 @@ struct Toastty {
     /// Most recent physical pixel size — kept so we can re-derive the
     /// cell grid on resize.
     physical_size: (u32, u32),
+    /// Most recent window scale factor (winit `Window::scale_factor`,
+    /// including fractional Wayland values). The configured `font.size_px`
+    /// is logical; the rasterizer is fed `size_px × scale_factor` so text
+    /// stays the same apparent size across monitors and is rasterized at
+    /// each monitor's true resolution. Updated on `Event::Resize` (which
+    /// also carries `ScaleFactorChanged`); a change triggers a font
+    /// rebuild + grid resync.
+    scale_factor: f64,
     /// Last title we pushed to `winit::Window::set_title`. Tracked so
     /// we don't churn the compositor on every `PtyBytes` batch — only
     /// change the title when it actually differs.
@@ -350,6 +358,9 @@ impl Toastty {
             pty: None,
             reader: None,
             physical_size: initial_size,
+            // Real value is read from the window in `init_impl`; 1.0 is a
+            // safe pre-window default.
+            scale_factor: 1.0,
             last_title: None,
             mouse_pos: (0.0, 0.0),
             mouse_held: None,
@@ -623,6 +634,13 @@ impl Toastty {
         }
     }
 
+    /// Physical font size to feed the rasterizer: the logical
+    /// `font.size_px` scaled by the current monitor scale factor. See
+    /// [`effective_font_size_px`] and the `scale_factor` field.
+    fn scaled_font_px(&self) -> f32 {
+        effective_font_size_px(self.config.font.size_px, self.scale_factor)
+    }
+
     /// Feed a batch of PTY bytes through the parser. Returns whether a
     /// fresh BSU (mode 2026 begin-synchronized-update) just went high
     /// during this batch — the caller uses that signal to schedule the
@@ -693,6 +711,11 @@ impl Toastty {
     fn init_impl(&mut self, window: ToasttyWindow, handle: &WindowHandle) {
         let size = window.physical_size();
         self.physical_size = size;
+        // Capture the monitor scale factor before sizing the font so the
+        // very first frame rasterizes at the correct physical resolution
+        // (rather than scale 1.0, then re-rasterizing on the first
+        // `Resize`). Fractional Wayland scales are included.
+        self.scale_factor = window.scale_factor();
 
         // Build the renderer. Transparency is logged once at startup in
         // `run`; here we only need the flag for surface configuration.
@@ -711,7 +734,7 @@ impl Toastty {
         };
         renderer.with_font_ex(
             Some(self.config.font.family.as_str()),
-            self.config.font.size_px,
+            self.scaled_font_px(),
             self.config.font.line_height,
         );
         if !renderer.font_family_available() {
@@ -722,10 +745,12 @@ impl Toastty {
         }
         renderer.set_theme(theme_from_config(&self.config.theme));
         info!(
-            "renderer ready: size={size:?} cell={:?} font={:?} {}px",
+            "renderer ready: size={size:?} cell={:?} font={:?} {}px logical @ {}× = {}px physical",
             renderer.cell_size(),
             self.config.font.family,
             self.config.font.size_px,
+            self.scale_factor,
+            self.scaled_font_px(),
         );
 
         // Compute initial grid from cell size + physical size.
@@ -857,10 +882,13 @@ impl Toastty {
     /// term. Skips knobs that aren't safely live-applicable (window
     /// size, shell program, scrollback ring capacity).
     fn apply_config_to_runtime(&mut self) {
+        // Scale the (possibly reloaded) logical size before borrowing the
+        // renderer — `scaled_font_px` takes `&self`.
+        let font_px = self.scaled_font_px();
         if let Some(r) = self.renderer.as_mut() {
             r.with_font_ex(
                 Some(self.config.font.family.as_str()),
-                self.config.font.size_px,
+                font_px,
                 self.config.font.line_height,
             );
             if !r.font_family_available() {
@@ -1632,10 +1660,32 @@ impl App for Toastty {
                 }
                 ControlSignal::Exit
             }
-            Event::Resize { width, height, .. } => {
+            Event::Resize { width, height, scale_factor } => {
                 self.physical_size = (width, height);
+                // winit folds `ScaleFactorChanged` into this event (see
+                // toastty-window), so this is the single place scale is
+                // observed. A scale change — e.g. the window moved to a
+                // monitor with different DPI scaling — means the logical
+                // `font.size_px` now maps to a different physical size, so
+                // re-rasterize the font at the new resolution. The grid is
+                // re-derived from the new cell size by `resync_grid` below.
+                // A real scale change is at least a few percent (the
+                // smallest fractional-scaling step is ~0.05); a 1e-6
+                // tolerance detects all of those while ignoring any
+                // floating-point jitter, so we never rebuild the font
+                // (atlas + pipeline) for a no-op scale.
+                let scale_changed = (scale_factor - self.scale_factor).abs() > 1e-6;
+                self.scale_factor = scale_factor;
+                let font_px = self.scaled_font_px();
                 if let Some(r) = self.renderer.as_mut() {
                     r.resize(width, height);
+                    if scale_changed {
+                        r.with_font_ex(
+                            Some(self.config.font.family.as_str()),
+                            font_px,
+                            self.config.font.line_height,
+                        );
+                    }
                     // The new back-buffer has undefined contents — the
                     // renderer must clear on the next frame regardless
                     // of damage state. `Renderer::resize` already sets

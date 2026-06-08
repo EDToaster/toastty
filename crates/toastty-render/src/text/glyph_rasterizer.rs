@@ -269,11 +269,21 @@ impl GlyphRasterizer {
                 )));
         }
 
-        // Line height = `font_size * line_height_ratio`. See
+        // Line height = `font_size * line_height_ratio`, snapped to a
+        // whole device pixel. Per-row origins are `row * cell_h`, so a
+        // fractional cell height would land every row on a different
+        // sub-pixel offset — under the atlas's Nearest sampling that
+        // smears glyph stems unpredictably (the "fuzzy / shimmery"
+        // artifact, worst on low-DPI monitors where one pixel is large).
+        // Feeding the rounded value into `Metrics` keeps cosmic-text's
+        // baseline math consistent with the cell we actually draw. See
         // [`DEFAULT_LINE_HEIGHT_RATIO`] for the rationale on the default.
-        let metrics = Metrics::new(font_size, font_size * line_height_ratio);
+        let line_height_px = (font_size * line_height_ratio).round().max(1.0);
+        let metrics = Metrics::new(font_size, line_height_px);
 
-        // Determine cell size by shaping the reference glyph "M".
+        // Determine cell size by shaping the reference glyph "M". Its
+        // advance is snapped to a whole pixel (in `measure_cell`) for the
+        // same pixel-grid-alignment reason as the height above.
         let cell_size = measure_cell(&mut font_system, metrics, font_name);
 
         // Pre-allocate the per-line buffer.
@@ -873,8 +883,14 @@ impl GlyphRasterizer {
         #[allow(clippy::cast_precision_loss)]
         let placement = GlyphPlacement {
             offset: [
+                // `left`/`top` are whole pixels from swash; the baseline is
+                // the only fractional term. Rounding the vertical offset
+                // lands the glyph quad on an integer device pixel — with
+                // integer cell origins the whole quad is then pixel-aligned,
+                // so Nearest sampling copies the atlas texels 1:1 (crisp)
+                // instead of straddling texel boundaries (fuzzy).
                 image.placement.left as f32,
-                baseline_y - image.placement.top as f32,
+                (baseline_y - image.placement.top as f32).round(),
             ],
             size: [w as f32, h as f32],
         };
@@ -985,8 +1001,14 @@ fn measure_cell(
             }
         }
     }
+    // Snap the advance and height to whole device pixels so cell origins
+    // (`col * cell_w`, `row * cell_h`) land on the pixel grid — the
+    // precondition for crisp glyphs under the atlas's Nearest sampling.
+    // `metrics.line_height` is already whole-pixel (rounded in
+    // `GlyphRasterizer::new`); the `max(font_size)` guard for sub-1.0
+    // line-height ratios can reintroduce a fraction, so round again.
     let height = metrics.line_height.max(metrics.font_size);
-    (max_w.max(1.0), height.max(1.0))
+    (max_w.round().max(1.0), height.round().max(1.0))
 }
 
 fn create_atlas_texture(device: &Device, format: TextureFormat, label: &str) -> Texture {
@@ -1086,6 +1108,29 @@ mod tests {
             Some(TEST_FONT),
         );
         (device, queue, rasterizer)
+    }
+
+    /// Cell metrics must be whole device pixels so per-cell origins
+    /// (`col * cell_w`, `row * cell_h`) land on the pixel grid — the
+    /// precondition for crisp glyphs under the atlas's Nearest sampling.
+    /// `make_rasterizer` builds at 16 px × 1.20 line height = 19.2 px,
+    /// which must snap to 19.
+    #[test]
+    fn cell_metrics_are_whole_pixels() {
+        let (_device, _queue, rasterizer) = make_rasterizer();
+        let (w, h) = rasterizer.cell_size();
+        assert!(
+            (w - w.round()).abs() < 1e-6,
+            "cell width {w} must be a whole pixel",
+        );
+        assert!(
+            (h - h.round()).abs() < 1e-6,
+            "cell height {h} must be a whole pixel",
+        );
+        assert!(
+            (h - 19.0).abs() < 1e-6,
+            "16px × 1.20 line height should snap to 19, got {h}",
+        );
     }
 
     /// Wide / zero-width characters must not enter `char_cache`: their
