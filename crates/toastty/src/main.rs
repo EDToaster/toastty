@@ -1685,6 +1685,12 @@ impl App for Toastty {
                             font_px,
                             self.config.font.line_height,
                         );
+                        info!(
+                            "scale changed to {}× → font {}px physical, cell={:?}",
+                            scale_factor,
+                            font_px,
+                            r.cell_size(),
+                        );
                     }
                     // The new back-buffer has undefined contents — the
                     // renderer must clear on the next frame regardless
