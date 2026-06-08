@@ -2056,9 +2056,7 @@ impl Term {
             //   CSI > flags u   — push
             //   CSI < n u       — pop n (default 1)
             //   CSI = flags ; mode u — set/clear without push
-            //   CSI ? u         — query (handled by the binary; no state
-            //                     change here, just observable via
-            //                     `Term::kitty_flags()`).
+            //   CSI ? u         — query active flags
             'u' if priv_marker == Some(b'>') => {
                 let f = first_param(params, 0);
                 self.kitty_push((f & 0xff) as u8);
@@ -2072,8 +2070,15 @@ impl Term {
                 let mode = nth_param(params, 1, 1);
                 self.kitty_set((f & 0xff) as u8, (mode & 0xff) as u8);
             }
-            // `CSI ? u` (query) is handled at the binary level: it needs
-            // to write the reply back to the PTY.
+            // `CSI ? u` — query the active progressive-enhancement flags
+            // (top of the stack). Reply `CSI ? <flags> u`. Apps probe
+            // this to detect kitty-keyboard support; without a reply they
+            // assume legacy mode and never enable the protocol, so the
+            // kitty key encoder never gets exercised.
+            'u' if priv_marker == Some(b'?') => {
+                let reply = format!("\x1b[?{}u", self.kitty_flags());
+                self.pty_replies.extend_from_slice(reply.as_bytes());
+            }
 
             // DA1 — Primary Device Attributes (`CSI c` or `CSI 0 c`).
             // Apps probe terminal capabilities at startup; many TUIs
@@ -4930,6 +4935,18 @@ mod tests {
         assert_eq!(t.kitty_stack().len(), 8);
         // Oldest values rotated out — top is the last value pushed.
         assert_eq!(t.kitty_flags(), 9);
+    }
+
+    #[test]
+    fn kitty_query_replies_with_active_flags() {
+        let mut t = Term::new(2, 4, 0);
+        // Empty stack → flags are 0.
+        feed(&mut t, b"\x1b[?u");
+        assert_eq!(t.drain_pty_replies(), b"\x1b[?0u");
+        // After pushing flags the query reflects the top of the stack.
+        feed(&mut t, b"\x1b[>5u");
+        feed(&mut t, b"\x1b[?u");
+        assert_eq!(t.drain_pty_replies(), b"\x1b[?5u");
     }
 
     #[test]
