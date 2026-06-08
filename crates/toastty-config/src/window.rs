@@ -2,6 +2,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// When to prompt for confirmation before closing the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfirmClose {
+    /// Never prompt; close immediately.
+    Never,
+    /// Prompt only when a non-shell program is running in the foreground
+    /// (the kitty default).
+    #[default]
+    IfRunningProgram,
+    /// Always prompt, even at a bare shell prompt.
+    Always,
+}
+
 /// Window-presentation config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -16,16 +30,21 @@ pub struct WindowConfig {
     /// `AutoNoVsync` (Immediate / Mailbox where available) — minimum
     /// latency at the cost of possible tearing and higher GPU usage.
     pub vsync: bool,
+    /// When to prompt for confirmation before closing the window
+    /// (mirrors kitty's `confirm_os_window_close`).
+    pub confirm_close: ConfirmClose,
 }
 
 impl WindowConfig {
-    /// Schema defaults — 1280 × 800 with vsync on.
+    /// Schema defaults — 1280 × 800 with vsync on, prompting on close
+    /// only when a program is running.
     #[must_use]
     pub fn defaults() -> Self {
         Self {
             width: 1280,
             height: 800,
             vsync: true,
+            confirm_close: ConfirmClose::IfRunningProgram,
         }
     }
 }
@@ -46,6 +65,7 @@ mod tests {
         assert_eq!(d.width, 1280);
         assert_eq!(d.height, 800);
         assert!(d.vsync);
+        assert_eq!(d.confirm_close, ConfirmClose::IfRunningProgram);
     }
 
     #[test]
@@ -59,6 +79,7 @@ mod tests {
             width: 1920,
             height: 1080,
             vsync: false,
+            confirm_close: ConfirmClose::Always,
         };
         let t = toml::to_string(&w).unwrap();
         let p: WindowConfig = toml::from_str(&t).unwrap();
@@ -85,5 +106,64 @@ mod tests {
         let cfg: WindowConfig = toml::from_str("width = 1600\n").unwrap();
         assert_eq!(cfg.width, 1600);
         assert_eq!(cfg.height, 800);
+    }
+
+    #[test]
+    fn confirm_close_defaults_to_if_running_program() {
+        assert_eq!(
+            WindowConfig::defaults().confirm_close,
+            ConfirmClose::IfRunningProgram
+        );
+    }
+
+    #[test]
+    fn confirm_close_round_trips_each_variant() {
+        for variant in [
+            ConfirmClose::Never,
+            ConfirmClose::IfRunningProgram,
+            ConfirmClose::Always,
+        ] {
+            let w = WindowConfig {
+                confirm_close: variant,
+                ..WindowConfig::defaults()
+            };
+            let t = toml::to_string(&w).unwrap();
+            let p: WindowConfig = toml::from_str(&t).unwrap();
+            assert_eq!(p, w);
+        }
+    }
+
+    #[test]
+    fn confirm_close_serializes_to_kebab_case() {
+        let t = toml::to_string(&WindowConfig {
+            confirm_close: ConfirmClose::IfRunningProgram,
+            ..WindowConfig::defaults()
+        })
+        .unwrap();
+        assert!(t.contains("confirm_close = \"if-running-program\""), "{t}");
+    }
+
+    #[test]
+    fn confirm_close_never_parses_and_leaves_others_default() {
+        let cfg: WindowConfig = toml::from_str("confirm_close = \"never\"\n").unwrap();
+        assert_eq!(cfg.confirm_close, ConfirmClose::Never);
+        assert_eq!(cfg.width, 1280);
+        assert_eq!(cfg.height, 800);
+        assert!(cfg.vsync);
+    }
+
+    #[test]
+    fn confirm_close_always_parses_and_leaves_others_default() {
+        let cfg: WindowConfig = toml::from_str("confirm_close = \"always\"\n").unwrap();
+        assert_eq!(cfg.confirm_close, ConfirmClose::Always);
+        assert_eq!(cfg.width, 1280);
+        assert_eq!(cfg.height, 800);
+        assert!(cfg.vsync);
+    }
+
+    #[test]
+    fn confirm_close_invalid_value_rejected() {
+        let r: Result<WindowConfig, _> = toml::from_str("confirm_close = \"sometimes\"\n");
+        assert!(r.is_err());
     }
 }

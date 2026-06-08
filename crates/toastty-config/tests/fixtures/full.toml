@@ -34,6 +34,7 @@ osc_52_read  = false
 osc_52_write = false
 
 [window]
-width  = 1280
-height = 800
-vsync  = true
+width         = 1280
+height        = 800
+vsync         = true
+confirm_close = "always"

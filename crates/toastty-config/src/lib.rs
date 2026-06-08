@@ -42,7 +42,7 @@ pub use scrollback::{ScrollbackConfig, SmoothingFunction};
 pub use security::SecurityConfig;
 pub use shell::ShellConfig;
 pub use theme::ThemeConfig;
-pub use window::WindowConfig;
+pub use window::{ConfirmClose, WindowConfig};
 
 use serde::{Deserialize, Serialize};
 

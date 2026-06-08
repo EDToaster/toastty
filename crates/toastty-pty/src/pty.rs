@@ -139,6 +139,19 @@ impl Pty {
     pub fn child_id(&self) -> u32 {
         self.child.id()
     }
+
+    /// True when a non-shell program is running in the foreground of the
+    /// PTY — i.e. the foreground process group on the slave side differs
+    /// from the shell process we spawned. Returns false when the
+    /// foreground pgrp can't be read (child already exited, no slave
+    /// attached), so a dead/absent child never blocks close.
+    #[must_use]
+    pub fn has_running_program(&self) -> bool {
+        match crate::foreground_cwd::foreground_pid(self.master.as_fd()) {
+            Some(fg) => fg != self.child.id(),
+            None => false,
+        }
+    }
 }
 
 impl Drop for Pty {

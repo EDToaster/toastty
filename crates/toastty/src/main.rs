@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use pollster::block_on;
-use toastty_config::{Config, ConfigError, ConfigSource};
+use toastty_config::{ConfirmClose, Config, ConfigError, ConfigSource};
 use toastty_parser::Parser;
 use toastty_protocols::resize_inband::encode_resize_report;
 use toastty_protocols::synchronized::{BSU_TIMEOUT, should_force_flush};
@@ -25,8 +25,8 @@ use toastty_pty::{Pty, PtySpec, WinSize};
 use toastty_render::{RenderOutcome, Renderer};
 use toastty_term::{ClipboardRequest, Pos, SecurityFlags, Selection, SelectionMode, Smoothing, Term};
 use toastty_window::{
-    App, ControlSignal, Event, KeyState, LogicalKey, Modifiers, MouseButton, ToasttyWindow,
-    WindowHandle, WindowOptions, run,
+    App, ControlSignal, Event, KeyState, LogicalKey, Modifiers, MouseButton, NamedKey,
+    ToasttyWindow, WindowHandle, WindowOptions, run,
 };
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -78,6 +78,11 @@ const FRESH_STARTED_GAP: Duration = Duration::from_millis(50);
 /// enough that an intentional double-click is reliable, slow enough to
 /// be forgiving for a relaxed triple-click.
 const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(350);
+
+/// Text shown in the close-confirmation overlay (kitty's confirm-on-close).
+/// Padded with spaces so the centered banner has a little breathing room.
+const CLOSE_PROMPT_TEXT: &str =
+    "  A program is still running.  Press Enter / y to close, Esc / n to cancel.  ";
 
 /// In-progress drag-select. Persisted between `handle_mouse` press and
 /// `handle_mouse_motion` so motion knows which mode/anchor to extend.
@@ -296,6 +301,12 @@ struct Toastty {
     /// Most recent config-load error from startup (if any). Promoted to
     /// `banner_text` once the renderer is available in `init_impl`.
     pending_load_error: Option<ConfigError>,
+    /// True while the close-confirmation prompt is showing (kitty's
+    /// confirm-on-close). Set when a close is requested with a program
+    /// still running (per `[window] confirm_close`); while set the window
+    /// is modal — keystrokes drive the prompt instead of the PTY. Cleared
+    /// on confirm (we exit) or cancel.
+    close_pending: bool,
     /// Timestamp of the most recent `ScrollKind::Pixels` event we
     /// observed, regardless of routing. Together with
     /// `swallow_pixel_stream` this drives the inertia-swallow
@@ -379,6 +390,7 @@ impl Toastty {
             config_watcher: None,
             banner_text: None,
             pending_load_error: load_err,
+            close_pending: false,
             last_pixel_scroll_at: None,
             swallow_pixel_stream: false,
             selecting: None,
@@ -981,6 +993,83 @@ impl Toastty {
         }
     }
 
+    /// Tear down the PTY and signal the event loop to exit. The single
+    /// place a close actually happens — both the immediate path and the
+    /// confirmed-prompt path funnel through here.
+    fn close_now(&mut self) -> ControlSignal {
+        if let Some(pty) = self.pty.as_mut() {
+            let _ = pty.kill();
+            let _ = pty.wait();
+        }
+        ControlSignal::Exit
+    }
+
+    /// Decide what a window-close request (close button, etc) does, per
+    /// `[window] confirm_close`. Either close immediately or arm the
+    /// confirmation prompt and keep the window open. A close request while
+    /// the prompt is already up confirms it (e.g. an impatient second
+    /// click on the close button).
+    fn handle_close_request(&mut self) -> ControlSignal {
+        if self.close_pending {
+            return self.close_now();
+        }
+        let should_prompt = match self.config.window.confirm_close {
+            ConfirmClose::Never => false,
+            ConfirmClose::Always => true,
+            ConfirmClose::IfRunningProgram => {
+                self.pty.as_ref().is_some_and(Pty::has_running_program)
+            }
+        };
+        if should_prompt {
+            self.close_pending = true;
+            if let Some(r) = self.renderer.as_mut() {
+                r.set_close_prompt(Some(CLOSE_PROMPT_TEXT));
+            }
+            // RedrawIn(ZERO) — not Continue — so the prompt frame is
+            // guaranteed: the loop's RedrawIn handler issues the
+            // `request_redraw` + `ControlFlow::Poll` wake, which a bare
+            // `request_redraw()` from `Wait` doesn't do reliably on macOS
+            // (same reasoning as the `Event::PtyBytes` path).
+            ControlSignal::RedrawIn(Duration::ZERO)
+        } else {
+            self.close_now()
+        }
+    }
+
+    /// Dismiss the close-confirmation prompt. State-only — the caller
+    /// returns the `RedrawIn` that repaints the now-cleared overlay.
+    fn cancel_close_prompt(&mut self) {
+        self.close_pending = false;
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_close_prompt(None);
+        }
+    }
+
+    /// Route a key press while the close-confirmation prompt is modal.
+    /// Enter / `y` confirms (closes); Esc / `n` cancels; anything else is
+    /// swallowed so it can't leak to the PTY behind the prompt.
+    fn handle_close_prompt_key(
+        &mut self,
+        logical: &LogicalKey,
+        text: Option<&str>,
+    ) -> ControlSignal {
+        let confirm = matches!(logical, LogicalKey::Named(NamedKey::Enter))
+            || text.is_some_and(|t| t.eq_ignore_ascii_case("y"));
+        let cancel = matches!(logical, LogicalKey::Named(NamedKey::Escape))
+            || text.is_some_and(|t| t.eq_ignore_ascii_case("n"));
+        if confirm {
+            return self.close_now();
+        }
+        if cancel {
+            self.cancel_close_prompt();
+            // Force the frame that clears the overlay (see arm path).
+            return ControlSignal::RedrawIn(Duration::ZERO);
+        }
+        // Any other key is consumed (the prompt is modal) — never forward
+        // it to the PTY. Nothing changed visually, so no redraw needed.
+        ControlSignal::Continue
+    }
+
     fn handle_key(
         &mut self,
         logical: &LogicalKey,
@@ -990,6 +1079,15 @@ impl Toastty {
         repeat: bool,
         is_synthetic: bool,
     ) -> ControlSignal {
+        // While the close-confirmation prompt is up the window is modal:
+        // keystrokes drive the prompt and are never forwarded to the PTY.
+        // Releases / synthetic focus-loss events are swallowed silently.
+        if self.close_pending {
+            if state != KeyState::Pressed {
+                return ControlSignal::Continue;
+            }
+            return self.handle_close_prompt_key(logical, text);
+        }
         // Intercept paste binding *before* the regular encoder.
         if state == KeyState::Pressed && is_paste_binding(logical, modifiers) {
             self.paste();
@@ -1653,13 +1751,7 @@ impl App for Toastty {
 
     fn event(&mut self, event: Event) -> ControlSignal {
         match event {
-            Event::Close => {
-                if let Some(pty) = self.pty.as_mut() {
-                    let _ = pty.kill();
-                    let _ = pty.wait();
-                }
-                ControlSignal::Exit
-            }
+            Event::Close => self.handle_close_request(),
             Event::Resize { width, height, scale_factor } => {
                 self.physical_size = (width, height);
                 // winit folds `ScaleFactorChanged` into this event (see

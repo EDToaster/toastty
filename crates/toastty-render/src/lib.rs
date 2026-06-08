@@ -290,6 +290,14 @@ pub struct Renderer {
     /// notices without scanning stderr. When `Some`, bypasses the
     /// skip-submit gate so the banner shows up even on an idle grid.
     error_banner: Option<String>,
+    /// Optional multi-line full-width close-confirmation banner painted
+    /// vertically centered on top of the grid every frame. Used by the
+    /// binary when the user tries to close the window while a program is
+    /// still running, to surface a "press again / confirm" prompt without
+    /// tearing down the session. When `Some`, bypasses the skip-submit
+    /// gate so the prompt refreshes even on an idle grid (same as
+    /// `error_banner`).
+    close_prompt: Option<String>,
     /// Optional IME preedit (in-progress composition) string drawn inline
     /// at the terminal cursor every frame. Fed by the platform IME
     /// (e.g. fcitx5) while the user composes Hangul/CJK; it is NOT part of
@@ -516,6 +524,18 @@ impl std::fmt::Debug for TextState {
     }
 }
 
+/// Where a full-width overlay banner is pinned along the vertical axis.
+/// The error banner is bottom-anchored; the close-confirmation prompt is
+/// vertically centered. Both share the same drawing routine
+/// ([`Renderer::draw_banner`]) and differ only in this anchor and color.
+#[derive(Clone, Copy)]
+enum BannerAnchor {
+    /// Pin the banner's bottom edge to the viewport bottom.
+    Bottom,
+    /// Center the banner block vertically in the viewport.
+    Center,
+}
+
 impl Renderer {
     /// Create a renderer attached to `window`.
     ///
@@ -653,6 +673,7 @@ impl Renderer {
             rgp_asset_revision_seen: u32::MAX,
             debug_overlay: None,
             error_banner: None,
+            close_prompt: None,
             preedit: None,
             trace_render: std::env::var_os("TOASTTY_TRACE_RENDER").is_some(),
             // The very first frame is always a full clear → goes
@@ -893,6 +914,163 @@ impl Renderer {
         self.error_banner.is_some()
     }
 
+    /// Set (or clear) a multi-line full-width close-confirmation banner
+    /// painted vertically centered on the surface. Lines are split on
+    /// `\n`. While `Some`, the renderer skips its damage-only
+    /// short-circuit so the prompt remains visible on an idle grid.
+    pub fn set_close_prompt(&mut self, text: Option<&str>) {
+        match text {
+            Some(s) => {
+                if let Some(buf) = self.close_prompt.as_mut() {
+                    buf.clear();
+                    buf.push_str(s);
+                } else {
+                    self.close_prompt = Some(s.to_owned());
+                }
+                self.needs_full_clear = true;
+            }
+            None => {
+                if self.close_prompt.is_some() {
+                    self.close_prompt = None;
+                    self.needs_full_clear = true;
+                }
+            }
+        }
+    }
+
+    /// True when a close-confirmation prompt is currently set.
+    #[must_use]
+    pub fn has_close_prompt(&self) -> bool {
+        self.close_prompt.is_some()
+    }
+
+    /// Append the instances for a full-width, multi-line overlay banner
+    /// to `instances`. Shared by the error banner and the
+    /// close-confirmation prompt; the two differ only in `anchor`, `bg`,
+    /// and `fg`. `width`/`height` are the viewport's physical pixel
+    /// dimensions (`self.config.{width,height}`).
+    ///
+    /// We emit two cover quads per banner cell because the cell pipeline
+    /// draws in two passes (bg + glyph) and the term's own glyphs land in
+    /// the glyph pass too — without an opaque glyph-pass cover, the cells
+    /// underneath bleed through and mix into the banner text. So per row
+    /// we push:
+    ///   1. `FLAG_NO_GLYPH` bg quad — bg pass: paints the banner color
+    ///      where the term bg used to be.
+    ///   2. `FLAG_UNDERLINE` cover quad — glyph pass: re-paints the banner
+    ///      color over any term glyphs that would otherwise render on top.
+    ///   3. The banner's own glyph quads — glyph pass: paint after the
+    ///      cover, so they land cleanly.
+    ///
+    /// Taken as an associated function (not `&mut self`) so it can borrow
+    /// `text` independently of `self`'s other fields at the call site.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_banner(
+        queue: &Queue,
+        width: u32,
+        height: u32,
+        instances: &mut Vec<CellInstance>,
+        text: &mut TextState,
+        banner: &str,
+        anchor: BannerAnchor,
+        bg: [f32; 4],
+        fg: [f32; 4],
+        cell_size: (f32, f32),
+        term: &Term,
+    ) {
+        #[allow(clippy::cast_precision_loss)]
+        let viewport_w = width as f32;
+        #[allow(clippy::cast_precision_loss)]
+        let viewport_h = height as f32;
+        let cell_w = cell_size.0;
+        let cell_h = cell_size.1;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let cols = (viewport_w / cell_w).floor().max(1.0) as u32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let num_lines = banner.lines().count().max(1) as u32;
+        let banner_top_y = match anchor {
+            // Bottom-anchored: viewport height minus the banner's total
+            // line height (clamped non-negative).
+            #[allow(clippy::cast_precision_loss)]
+            BannerAnchor::Bottom => (viewport_h - (num_lines as f32) * cell_h).max(0.0),
+            // Vertically centered: half the leftover vertical space.
+            #[allow(clippy::cast_precision_loss)]
+            BannerAnchor::Center => ((viewport_h - (num_lines as f32) * cell_h) / 2.0).max(0.0),
+        };
+        for (row_idx, line) in banner.lines().enumerate() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+            let y0 = banner_top_y + (row_idx as f32) * cell_h;
+            // bg-pass + glyph-pass cover, one of each per column.
+            for col in 0..cols {
+                #[allow(clippy::cast_precision_loss)]
+                let x0 = (col as f32) * cell_w;
+                // bg pass cover.
+                instances.push(CellInstance {
+                    pos: [x0, y0],
+                    size: [cell_w, cell_h],
+                    uv_min: [0.0, 0.0],
+                    uv_max: [0.0, 0.0],
+                    fg,
+                    bg,
+                    flags: crate::text::instance::FLAG_NO_GLYPH,
+                    pad: [0; 3],
+                });
+                // glyph pass cover. FLAG_UNDERLINE in fs_glyph
+                // emits a solid premultiplied `in.bg`, so we
+                // overpaint any term glyphs the dirty builder
+                // emitted for these rows.
+                instances.push(CellInstance {
+                    pos: [x0, y0],
+                    size: [cell_w, cell_h],
+                    uv_min: [0.0, 0.0],
+                    uv_max: [0.0, 0.0],
+                    fg,
+                    bg,
+                    flags: crate::text::instance::FLAG_UNDERLINE
+                        | crate::text::instance::FLAG_NO_GLYPH,
+                    pad: [0; 3],
+                });
+            }
+            if line.is_empty() {
+                continue;
+            }
+            let lg = text
+                .rasterizer
+                .shape_line(queue, line, term.grapheme_cluster_mode());
+            for (i, ch) in line.chars().enumerate() {
+                #[allow(clippy::cast_possible_truncation)]
+                let col = i as u32;
+                if col >= cols {
+                    break;
+                }
+                if ch.is_whitespace() {
+                    continue;
+                }
+                #[allow(clippy::cast_precision_loss)]
+                let pos = [(col as f32) * cell_w, y0];
+                #[allow(clippy::cast_possible_truncation)]
+                let col_u16 = col as u16;
+                if let Some(slot) = lg.get(col_u16, ch) {
+                    let flags = if slot.is_color {
+                        crate::text::instance::FLAG_COLOR_GLYPH
+                    } else {
+                        0
+                    };
+                    instances.push(CellInstance {
+                        pos: [pos[0] + slot.glyph_offset[0], pos[1] + slot.glyph_offset[1]],
+                        size: slot.glyph_size,
+                        uv_min: slot.uv_min,
+                        uv_max: slot.uv_max,
+                        fg,
+                        bg,
+                        flags,
+                        pad: [0; 3],
+                    });
+                }
+            }
+        }
+    }
+
     /// Set (or clear) the IME preedit string drawn inline at the cursor.
     /// `None` or an empty string clears it. The string is the in-progress
     /// composition text from the platform IME; it is NOT part of the terminal
@@ -1096,6 +1274,7 @@ impl Renderer {
             && !self.needs_full_clear
             && self.debug_overlay.is_none()
             && self.error_banner.is_none()
+            && self.close_prompt.is_none()
             && self.preedit.is_none()
         {
             return Ok(RenderOutcome::Skipped);
@@ -1360,111 +1539,55 @@ impl Renderer {
         }
 
         // Config error banner: full-width, multi-line, dark-red bg /
-        // white fg, anchored to the BOTTOM of the viewport. We have to
-        // emit two cover quads per banner cell because the cell
-        // pipeline draws in two passes (bg + glyph) and the term's
-        // own glyphs land in the glyph pass too — without an opaque
-        // glyph-pass cover, the cells underneath bleed through and
-        // mix into the banner text. So per row we push:
-        //   1. FLAG_NO_GLYPH bg quad — bg pass: paints the banner color
-        //      where the term bg used to be.
-        //   2. FLAG_UNDERLINE cover quad — glyph pass: re-paints the
-        //      banner color over any term glyphs that would otherwise
-        //      render on top.
-        //   3. The banner's own glyph quads — glyph pass: paint after
-        //      the cover, so they land cleanly.
-        // alpha ≈ 0.95 gives a hint of translucency so the panel
-        // doesn't feel hard-edged without letting the underlying
-        // grid be legible through it.
+        // white fg, anchored to the BOTTOM of the viewport. The
+        // two-cover-quad-per-cell drawing (and why) lives in
+        // [`Self::draw_banner`]. alpha ≈ 0.95 gives a hint of
+        // translucency so the panel doesn't feel hard-edged without
+        // letting the underlying grid be legible through it.
         if let Some(banner) = self.error_banner.as_deref() {
-            #[allow(clippy::cast_precision_loss)]
-            let viewport_w = self.config.width as f32;
-            #[allow(clippy::cast_precision_loss)]
-            let viewport_h = self.config.height as f32;
-            let cell_w = cell_size.0;
-            let cell_h = cell_size.1;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let cols = (viewport_w / cell_w).floor().max(1.0) as u32;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let num_lines = banner.lines().count().max(1) as u32;
-            #[allow(clippy::cast_precision_loss)]
-            let banner_top_y = (viewport_h - (num_lines as f32) * cell_h).max(0.0);
             let banner_bg = [0.42, 0.03, 0.03, 0.95];
             let banner_fg = [1.0, 1.0, 1.0, 1.0];
-            for (row_idx, line) in banner.lines().enumerate() {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-                let y0 = banner_top_y + (row_idx as f32) * cell_h;
-                // bg-pass + glyph-pass cover, one of each per column.
-                for col in 0..cols {
-                    #[allow(clippy::cast_precision_loss)]
-                    let x0 = (col as f32) * cell_w;
-                    // bg pass cover.
-                    instances.push(CellInstance {
-                        pos: [x0, y0],
-                        size: [cell_w, cell_h],
-                        uv_min: [0.0, 0.0],
-                        uv_max: [0.0, 0.0],
-                        fg: banner_fg,
-                        bg: banner_bg,
-                        flags: crate::text::instance::FLAG_NO_GLYPH,
-                        pad: [0; 3],
-                    });
-                    // glyph pass cover. FLAG_UNDERLINE in fs_glyph
-                    // emits a solid premultiplied `in.bg`, so we
-                    // overpaint any term glyphs the dirty builder
-                    // emitted for these rows.
-                    instances.push(CellInstance {
-                        pos: [x0, y0],
-                        size: [cell_w, cell_h],
-                        uv_min: [0.0, 0.0],
-                        uv_max: [0.0, 0.0],
-                        fg: banner_fg,
-                        bg: banner_bg,
-                        flags: crate::text::instance::FLAG_UNDERLINE
-                            | crate::text::instance::FLAG_NO_GLYPH,
-                        pad: [0; 3],
-                    });
-                }
-                if line.is_empty() {
-                    continue;
-                }
-                let lg = text.rasterizer.shape_line(
-                    &self.queue,
-                    line,
-                    term.grapheme_cluster_mode(),
-                );
-                for (i, ch) in line.chars().enumerate() {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let col = i as u32;
-                    if col >= cols {
-                        break;
-                    }
-                    if ch.is_whitespace() {
-                        continue;
-                    }
-                    #[allow(clippy::cast_precision_loss)]
-                    let pos = [(col as f32) * cell_w, y0];
-                    #[allow(clippy::cast_possible_truncation)]
-                    let col_u16 = col as u16;
-                    if let Some(slot) = lg.get(col_u16, ch) {
-                        let flags = if slot.is_color {
-                            crate::text::instance::FLAG_COLOR_GLYPH
-                        } else {
-                            0
-                        };
-                        instances.push(CellInstance {
-                            pos: [pos[0] + slot.glyph_offset[0], pos[1] + slot.glyph_offset[1]],
-                            size: slot.glyph_size,
-                            uv_min: slot.uv_min,
-                            uv_max: slot.uv_max,
-                            fg: banner_fg,
-                            bg: banner_bg,
-                            flags,
-                            pad: [0; 3],
-                        });
-                    }
-                }
-            }
+            // Bottom-anchored: top-y is the viewport height minus the
+            // banner's total line height (clamped non-negative).
+            Self::draw_banner(
+                &self.queue,
+                self.config.width,
+                self.config.height,
+                &mut instances,
+                text,
+                banner,
+                BannerAnchor::Bottom,
+                banner_bg,
+                banner_fg,
+                cell_size,
+                term,
+            );
+        }
+
+        // Close-confirmation prompt: same full-width / multi-line /
+        // two-cover-quad technique as the error banner above, but
+        // anchored to the VERTICAL CENTER of the viewport and painted in
+        // a dark-slate panel (distinct from the error banner's red) so
+        // the "program still running" prompt reads as a modal dialog
+        // rather than an error. The binary only sets one of the two at a
+        // time, but if both are somehow set we simply draw the prompt
+        // after the error banner — no ordering assumptions baked in.
+        if let Some(prompt) = self.close_prompt.as_deref() {
+            let prompt_bg = [0.12, 0.14, 0.20, 0.97];
+            let prompt_fg = [0.95, 0.96, 0.98, 1.0];
+            Self::draw_banner(
+                &self.queue,
+                self.config.width,
+                self.config.height,
+                &mut instances,
+                text,
+                prompt,
+                BannerAnchor::Center,
+                prompt_bg,
+                prompt_fg,
+                cell_size,
+                term,
+            );
         }
 
         // IME preedit overlay. The in-progress composition string is

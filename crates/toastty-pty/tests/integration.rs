@@ -144,6 +144,35 @@ fn spawn_failure_for_nonexistent_program() {
 }
 
 #[test]
+fn has_running_program_false_for_exited_child() {
+    // `/usr/bin/true` exits immediately. Once we've reaped it, the slave
+    // side has no foreground pgrp to report, so `tcgetpgrp` fails and
+    // `has_running_program()` must take the `None` → false path. A
+    // dead/reaped child must never block close.
+    let spec = PtySpec::program("/usr/bin/true");
+    let mut pty = Pty::spawn(&spec).expect("spawn");
+    let status = pty.wait().expect("wait");
+    assert!(status.success(), "exit status: {status:?}");
+    assert!(
+        !pty.has_running_program(),
+        "exited+reaped child should report no running program"
+    );
+}
+
+#[test]
+fn has_running_program_false_when_child_is_foreground_leader() {
+    // Spawning `sleep` directly makes it the PTY child *and* its own
+    // foreground pgrp leader, so `foreground_pid == child_id` and the
+    // method returns false — "sleep" is effectively the shell here.
+    let spec = PtySpec::program("/bin/sleep").arg("60");
+    let pty = Pty::spawn(&spec).expect("spawn");
+    assert!(
+        !pty.has_running_program(),
+        "direct child that leads its own pgrp should report no separate program"
+    );
+}
+
+#[test]
 fn drop_kills_running_child() {
     let spec = PtySpec::program("/bin/sleep").arg("60");
     let pty = Pty::spawn(&spec).expect("spawn");
