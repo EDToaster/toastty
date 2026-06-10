@@ -170,6 +170,20 @@ pub struct GlyphRasterizer {
     /// Logical cell size in pixels (width × height). Width is computed
     /// after shaping the reference monospace glyph.
     cell_size: (f32, f32),
+    /// Baseline offset from the cell's top edge, in pixels — a **constant**
+    /// taken from the primary font's reference glyph (see [`measure_cell`]).
+    ///
+    /// Every glyph's vertical placement is `baseline_y - glyph.top`. This
+    /// MUST NOT be recomputed per line from `run.line_y - run.line_top`:
+    /// that value is cosmic-text's per-line `max_ascent`/`max_descent`,
+    /// which grows whenever a line mixes in a taller fallback-font glyph
+    /// (CJK, emoji, Nerd-Font icon). Because the resulting offset is cached
+    /// per glyph and reused on every line, a per-line baseline made a glyph
+    /// that was first rasterized next to a fallback glyph render lower than
+    /// its neighbours *everywhere*, forever. Pinning to the primary font's
+    /// baseline keeps every cell on the same grid baseline. See the
+    /// `glyph_offset_is_independent_of_line_content` regression test.
+    baseline_y: f32,
     /// Configured font family, kept around for `Attrs`.
     family_name: String,
     /// Per-character glyph cache. Keyed on `char` alone, which is **only
@@ -283,8 +297,11 @@ impl GlyphRasterizer {
 
         // Determine cell size by shaping the reference glyph "M". Its
         // advance is snapped to a whole pixel (in `measure_cell`) for the
-        // same pixel-grid-alignment reason as the height above.
-        let cell_size = measure_cell(&mut font_system, metrics, font_name);
+        // same pixel-grid-alignment reason as the height above. The same
+        // probe yields the constant baseline used for every glyph's
+        // vertical placement (see [`Self::baseline_y`]).
+        let (cell_w, cell_h, baseline_y) = measure_cell(&mut font_system, metrics, font_name);
+        let cell_size = (cell_w, cell_h);
 
         // Pre-allocate the per-line buffer.
         let mut buffer = Buffer::new(&mut font_system, metrics);
@@ -337,6 +354,7 @@ impl GlyphRasterizer {
             buffer,
             metrics,
             cell_size,
+            baseline_y,
             family_name,
             char_cache: HashMap::new(),
             char_cache_misses: std::collections::HashSet::new(),
@@ -674,14 +692,13 @@ impl GlyphRasterizer {
 
         let cell_w = self.cell_size.0;
 
-        let mut pending: Vec<(PendingGlyph, f32)> = Vec::new();
+        let mut pending: Vec<PendingGlyph> = Vec::new();
 
         for run in self.buffer.layout_runs() {
-            // Baseline within the cell: cosmic-text reports `line_y`
-            // (baseline) and `line_top` in buffer coords; the difference
-            // is the baseline-from-cell-top offset.
-            let baseline_y = run.line_y - run.line_top;
-
+            // Vertical placement uses the constant primary-font baseline
+            // (`self.baseline_y`), NOT this run's `line_y - line_top` —
+            // see [`Self::baseline_y`] for why the per-line value caused
+            // glyphs to drift lower than their neighbours.
             let positions: Vec<GlyphPos> = run
                 .glyphs
                 .iter()
@@ -729,15 +746,12 @@ impl GlyphRasterizer {
                 .zip(glyph_clusters.iter())
                 .zip(assignments.into_iter())
             {
-                pending.push((
-                    PendingGlyph {
-                        glyph: g.clone(),
-                        col,
-                        ch,
-                        cluster_chars,
-                    },
-                    baseline_y,
-                ));
+                pending.push(PendingGlyph {
+                    glyph: g.clone(),
+                    col,
+                    ch,
+                    cluster_chars,
+                });
             }
         }
 
@@ -750,8 +764,9 @@ impl GlyphRasterizer {
             std::collections::HashSet::new();
 
         let mut out = LineGlyphs::default();
-        for (p, baseline_y) in &pending {
-            if let Some(slot) = self.ensure_atlas_slot(queue, &p.glyph, *baseline_y) {
+        let baseline_y = self.baseline_y;
+        for p in &pending {
+            if let Some(slot) = self.ensure_atlas_slot(queue, &p.glyph, baseline_y) {
                 out.insert(p.col, p.ch, slot);
                 // Decide whether this glyph is safe to drop into
                 // `char_cache`. Requirements:
@@ -981,11 +996,19 @@ fn make_glyph_slot(slot: AtlasSlot, placement: GlyphPlacement) -> GlyphSlot {
     }
 }
 
+/// Probe the primary font's reference glyph "M" to derive the cell
+/// geometry. Returns `(cell_w, cell_h, baseline_y)`.
+///
+/// `baseline_y` (the baseline's distance from the cell's top edge) is read
+/// from this single primary-font line so it is a **constant**, independent
+/// of whatever a real line is later composed of. Sourcing it here rather
+/// than from each rendered line's `run.line_y - run.line_top` is the whole
+/// point — see [`GlyphRasterizer::baseline_y`].
 fn measure_cell(
     font_system: &mut FontSystem,
     metrics: Metrics,
     family: Option<&str>,
-) -> (f32, f32) {
+) -> (f32, f32, f32) {
     let mut probe = Buffer::new(font_system, metrics);
     probe.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
     let fam = family.unwrap_or("monospace");
@@ -994,7 +1017,11 @@ fn measure_cell(
     probe.shape_until_scroll(font_system, false);
 
     let mut max_w: f32 = metrics.font_size * 0.6;
+    // Fallback only if "M" somehow produced no run (never in practice);
+    // `font_size` is a reasonable baseline approximation if so.
+    let mut baseline_y: f32 = metrics.font_size;
     for run in probe.layout_runs() {
+        baseline_y = run.line_y - run.line_top;
         for g in run.glyphs {
             if g.w > max_w {
                 max_w = g.w;
@@ -1007,8 +1034,11 @@ fn measure_cell(
     // `metrics.line_height` is already whole-pixel (rounded in
     // `GlyphRasterizer::new`); the `max(font_size)` guard for sub-1.0
     // line-height ratios can reintroduce a fraction, so round again.
+    // `baseline_y` is left unrounded — the final glyph offset is rounded
+    // once in `ensure_atlas_slot`, matching the previous behaviour for
+    // primary-font lines (so existing snapshots are unchanged).
     let height = metrics.line_height.max(metrics.font_size);
-    (max_w.round().max(1.0), height.round().max(1.0))
+    (max_w.round().max(1.0), height.round().max(1.0), baseline_y)
 }
 
 fn create_atlas_texture(device: &Device, format: TextureFormat, label: &str) -> Texture {
@@ -1108,6 +1138,112 @@ mod tests {
             Some(TEST_FONT),
         );
         (device, queue, rasterizer)
+    }
+
+    fn make_rasterizer_sized(device: &Device, size: f32) -> GlyphRasterizer {
+        GlyphRasterizer::new(
+            device,
+            size,
+            DEFAULT_LINE_HEIGHT_RATIO,
+            Some("Fira Mono"),
+            Some(TEST_FONT),
+        )
+    }
+
+    /// Regression: a glyph's vertical placement must NOT depend on what
+    /// else shared its line. Before the fix, `baseline_y` was taken per
+    /// line from `run.line_y - run.line_top`, which grows when a line
+    /// mixes in a taller fallback-font glyph (CJK here) — so `A` shaped on
+    /// `"A你"` was placed up to a full pixel lower than `A` shaped alone,
+    /// and that offset was then cached and reused everywhere.
+    ///
+    /// Host-tolerant: only meaningful at sizes where the CJK char actually
+    /// resolves to a fallback face (otherwise it maps to `FiraMono`'s
+    /// `.notdef`, same metrics, and the baseline can't move). If no tested
+    /// size resolves a fallback glyph, the test is a no-op rather than a
+    /// false pass/fail. The size sweep includes sizes (13/14/15/18/20/24)
+    /// where the pre-fix shift crossed a rounding boundary into a visible
+    /// 1px — so the test would fail on the old code.
+    #[test]
+    fn glyph_offset_is_independent_of_line_content() {
+        let (device, queue, _r) = make_rasterizer();
+        let mut exercised = false;
+        for size in [13.0_f32, 14.0, 15.0, 16.0, 17.0, 18.0, 20.0, 24.0] {
+            let plain = make_rasterizer_sized(&device, size)
+                .shape_line(&queue, "A", false)
+                .get(0, 'A')
+                .expect("A on plain line")
+                .glyph_offset;
+
+            let mut r_mixed = make_rasterizer_sized(&device, size);
+            let line = r_mixed.shape_line(&queue, "A\u{4f60}", false);
+            // Skip sizes where the CJK char didn't reach a fallback face.
+            if line.get(1, '\u{4f60}').is_none() {
+                continue;
+            }
+            exercised = true;
+            let mixed = line.get(0, 'A').expect("A on mixed line").glyph_offset;
+
+            assert!(
+                (plain[1] - mixed[1]).abs() < 1e-6,
+                "size {size}: A's vertical offset depends on line content \
+                 (plain={:.3}, mixed-with-CJK={:.3}) — the baseline regressed \
+                 to a per-line value",
+                plain[1],
+                mixed[1],
+            );
+        }
+        if !exercised {
+            eprintln!(
+                "glyph_offset_is_independent_of_line_content: no CJK fallback \
+                 face on this host; assertions skipped",
+            );
+        }
+    }
+
+    /// Regression for the user-visible loop: once a glyph is first
+    /// rasterized next to a fallback glyph, every *later plain* line must
+    /// still render it at the same place. Pre-fix, `char_cache` froze the
+    /// poisoned offset, so a plain `"A"` after a `"A你"` rendered low
+    /// forever. Host-tolerant in the same way as the test above.
+    #[test]
+    fn char_cache_offset_survives_mixed_first_line() {
+        let (device, queue, _r) = make_rasterizer();
+        let mut exercised = false;
+        for size in [13.0_f32, 14.0, 15.0, 18.0, 20.0, 24.0] {
+            let clean = make_rasterizer_sized(&device, size)
+                .shape_line(&queue, "A", false)
+                .get(0, 'A')
+                .expect("clean A")
+                .glyph_offset[1];
+
+            // 'A' first seen next to CJK, then a later plain "A" line
+            // (served from char_cache via the fast path).
+            let mut poison = make_rasterizer_sized(&device, size);
+            let first = poison.shape_line(&queue, "A\u{4f60}", false);
+            if first.get(1, '\u{4f60}').is_none() {
+                continue;
+            }
+            exercised = true;
+            let later = poison
+                .shape_line(&queue, "A", false)
+                .get(0, 'A')
+                .expect("later A")
+                .glyph_offset[1];
+
+            assert!(
+                (clean - later).abs() < 1e-6,
+                "size {size}: a plain \"A\" after a fallback-mixed line renders at \
+                 {later:.3} but a never-poisoned \"A\" is at {clean:.3} — char_cache \
+                 froze a line-dependent offset",
+            );
+        }
+        if !exercised {
+            eprintln!(
+                "char_cache_offset_survives_mixed_first_line: no CJK fallback \
+                 face on this host; assertions skipped",
+            );
+        }
     }
 
     /// Cell metrics must be whole device pixels so per-cell origins
