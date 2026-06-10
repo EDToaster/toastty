@@ -1784,6 +1784,11 @@ impl Term {
         let col = self.cursor.col;
         let row = self.cursor.row;
         let max_cols = self.cols;
+        // Reconcile any wide cluster we're about to partially clobber so a
+        // half-overwritten cluster doesn't leave a dangling primary or a
+        // stranded continuation cell (which renders as a gap). The write
+        // spans columns `[col, col + cell_w)`.
+        self.clear_wide_orphans(row, col, cell_w);
         self.active_grid_mut().row_mut(row).put(col, primary, max_cols);
         if cell_w == 2 {
             // Continuation marker: '\0' with the same style.
@@ -1805,6 +1810,44 @@ impl Term {
             self.mark_cell(row, col + 1);
         }
         self.cursor.col += cell_w;
+    }
+
+    /// Before writing `width` cells starting at `col`, blank the surviving
+    /// half of any width-2 cluster the write only partially overwrites:
+    ///
+    /// - **Left straddle:** if `col` is a continuation cell, its primary at
+    ///   `col - 1` would be left as a wide glyph with no continuation —
+    ///   blank it.
+    /// - **Right straddle:** if the last written column's right neighbour
+    ///   (`col + width`) is a continuation cell, the primary we just
+    ///   overwrote was wide and that continuation is now orphaned (renders
+    ///   as a gap) — blank it.
+    ///
+    /// Without this, in-place edits (e.g. zsh redrawing a line of CJK after
+    /// a deletion) strand half-clusters. The blanked cell takes the cursor's
+    /// current style so it matches a space printed there.
+    fn clear_wide_orphans(&mut self, row: u16, col: u16, width: u16) {
+        let last = col + width - 1;
+        let blank = Cell {
+            ch: ' ',
+            style: self.cursor.style,
+            is_continuation: false,
+            hyperlink_id: None,
+        };
+        let cells = &self.active_grid().row(row).cells;
+        let left_orphan = col > 0 && cells.get(col as usize).is_some_and(|c| c.is_continuation);
+        let right_orphan = cells
+            .get(last as usize + 1)
+            .is_some_and(|c| c.is_continuation);
+        let max_cols = self.cols;
+        if left_orphan {
+            self.active_grid_mut().row_mut(row).put(col - 1, blank, max_cols);
+            self.mark_cell(row, col - 1);
+        }
+        if right_orphan {
+            self.active_grid_mut().row_mut(row).put(last + 1, blank, max_cols);
+            self.mark_cell(row, last + 1);
+        }
     }
 
     /// Materialize the accumulated placeholder run into image
@@ -2271,28 +2314,15 @@ impl Term {
     }
 
     fn cursor_back(&mut self, n: u16) {
-        let mut new_col = self.cursor.col.saturating_sub(n);
-        // Snap onto the start of a width-2 cluster: if the landing
-        // column is a continuation cell, step one more column left so
-        // the cursor lands on the cluster's primary cell. Bounds-
-        // checked so we don't underflow at column 0.
-        new_col = self.snap_back_off_continuation(new_col);
+        // CUB moves by exact columns — the cursor may legitimately rest on
+        // a continuation cell. We must NOT snap onto the cluster's primary:
+        // apps (zsh's line editor in particular) count display columns and
+        // emit one cursor-left step per column, so snapping would consume
+        // an extra column whenever the landing spot is a continuation
+        // half, walking the cursor — and every subsequent rewrite — too far
+        // left. See `wide_char_paste_redraw_keeps_alignment`.
+        let new_col = self.cursor.col.saturating_sub(n);
         self.move_cursor(self.cursor.row, new_col);
-    }
-
-    /// If `col` points at a continuation cell, return `col - 1`
-    /// (the cluster's primary). Otherwise return `col` unchanged.
-    /// Bounds-checked: column 0 cannot be a valid continuation, so the
-    /// answer is always in-range.
-    fn snap_back_off_continuation(&self, col: u16) -> u16 {
-        if col == 0 || col >= self.cols {
-            return col;
-        }
-        let cells = &self.active_grid().row(self.cursor.row).cells;
-        let is_cont = cells
-            .get(col as usize)
-            .is_some_and(|c| c.is_continuation);
-        if is_cont { col - 1 } else { col }
     }
 
     fn cursor_position(&mut self, row_1based: u16, col_1based: u16) {
@@ -3064,10 +3094,15 @@ impl Perform for Term {
             }
             b'\n' | 0x0B | 0x0C => self.linefeed(),
             0x08 => {
-                // BS: move cursor left one, no wrap. Snap off the
-                // continuation half of a wide cluster so two BSes
-                // in a row don't strand the cursor inside a CJK
-                // ideograph.
+                // BS: move cursor left exactly one column, no wrap. We do
+                // NOT snap off a continuation half: BS is a column move, and
+                // apps (notably zsh's line editor) emit one BS per display
+                // column — two for a wide cluster — so snapping would eat an
+                // extra column on the boundary backspace and walk the cursor
+                // (and the rewrite that follows) left into the prompt. The
+                // cursor resting on a continuation cell is fine; the next BS
+                // steps onto the primary on its own. See
+                // `wide_char_paste_redraw_keeps_alignment`.
                 //
                 // Mark the old and new cells so the cursor block at
                 // the old column gets overpainted and the new one
@@ -3078,7 +3113,6 @@ impl Perform for Term {
                     let max_col = self.cols.saturating_sub(1);
                     let old_col = self.cursor.col.min(max_col);
                     self.cursor.col -= 1;
-                    self.cursor.col = self.snap_back_off_continuation(self.cursor.col);
                     self.mark_cell(row, old_col);
                     self.mark_cell(row, self.cursor.col);
                 }
@@ -5656,30 +5690,92 @@ mod tests {
     }
 
     #[test]
-    fn backspace_skips_continuation_cell() {
-        // After printing one wide cluster, cursor is at col 2.
-        // BS should land on col 1? No — the continuation cell should
-        // be skipped, so cursor lands on col 0 (the cluster's
-        // primary). Two BSes after a single wide cluster shouldn't
-        // strand the cursor on a continuation half.
+    fn backspace_moves_one_column_over_wide_cluster() {
+        // BS is a per-column move and must NOT snap off the continuation
+        // half: apps emit one BS per display column. After a wide cluster
+        // (你 at cols 0-1) the cursor is at col 2; one BS lands on col 1
+        // (the continuation cell — a valid resting spot), and a second BS
+        // lands on col 0. Snapping would make the first BS jump straight to
+        // col 0, so two BSes would underflow/over-travel — the CJK paste
+        // alignment bug.
         let mut t = Term::new(1, 8, 0);
         feed(&mut t, "你".as_bytes());
         assert_eq!(t.cursor().col, 2);
         feed(&mut t, b"\x08");
-        // After one BS, cursor steps off the continuation: lands at
-        // col 0 (the cluster's primary).
-        assert_eq!(t.cursor().col, 0);
+        assert_eq!(t.cursor().col, 1, "one BS moves exactly one column");
+        feed(&mut t, b"\x08");
+        assert_eq!(t.cursor().col, 0, "second BS reaches the primary");
     }
 
     #[test]
-    fn cursor_back_skips_continuation_cell() {
-        // CUB n by 1 from col 2 should land on col 0 (jumping over
-        // the continuation cell at col 1).
+    fn cursor_back_moves_one_column_over_wide_cluster() {
+        // CUB, like BS, moves by exact columns and must not snap off a
+        // continuation half. From col 2 (after 你 at 0-1): CUB 1 → col 1,
+        // CUB 1 again → col 0.
         let mut t = Term::new(1, 8, 0);
         feed(&mut t, "你".as_bytes());
         assert_eq!(t.cursor().col, 2);
         feed(&mut t, b"\x1b[1D");
+        assert_eq!(t.cursor().col, 1);
+        feed(&mut t, b"\x1b[1D");
         assert_eq!(t.cursor().col, 0);
+    }
+
+    #[test]
+    fn wide_char_paste_redraw_keeps_alignment() {
+        // Regression for the CJK-paste drift: replay the exact bytes zsh
+        // emits when pasting 你 into a line that already holds one. zsh
+        // backs up over the existing wide char with two BSes, then rewrites
+        // 你你 in place. With per-column BS the rewrite must land back on
+        // col 2 and leave the prompt ("> ") untouched.
+        let mut t = Term::new(2, 40, 0);
+        feed(&mut t, b"> ");
+        // Paste #1: ESC[7m 你 ESC[27m ...
+        feed(&mut t, b"\x1b[7m\xe4\xbd\xa0\x1b[27m\x1b[7m\x1b[27m");
+        assert_eq!(t.cursor().col, 4, "你 at cols 2-3, cursor past it");
+        // Paste #2: BS BS, rewrite 你你.
+        feed(
+            &mut t,
+            b"\x08\x08\x1b[27m\xe4\xbd\xa0\x1b[27m\x1b[7m\xe4\xbd\xa0\x1b[27m\x1b[7m\x1b[27m",
+        );
+        let cells = &t.view_row(0).cells;
+        // Prompt intact, 你你 at cols 2..6, never overwriting col 0/1.
+        assert_eq!(cells[0].ch, '>');
+        assert_eq!(cells[1].ch, ' ', "prompt space must not be clobbered");
+        assert_eq!(cells[2].ch, '你');
+        assert!(cells[3].is_continuation);
+        assert_eq!(cells[4].ch, '你');
+        assert!(cells[5].is_continuation);
+        assert_eq!(t.cursor().col, 6);
+    }
+
+    #[test]
+    fn overwriting_one_half_of_wide_cluster_clears_the_other() {
+        // Right straddle: 你你 at cols 0-3, then write 'x' at col 0. The
+        // old primary's continuation at col 1 must be blanked, not left
+        // stranded.
+        let mut t = Term::new(1, 8, 0);
+        feed(&mut t, "你你".as_bytes());
+        feed(&mut t, b"\x1b[1G"); // CHA col 1 (1-based) -> col 0
+        feed(&mut t, b"x");
+        let cells = &t.view_row(0).cells;
+        assert_eq!(cells[0].ch, 'x');
+        assert!(!cells[1].is_continuation, "stranded continuation must be cleared");
+        assert_eq!(cells[1].ch, ' ');
+        // The second cluster is untouched.
+        assert_eq!(cells[2].ch, '你');
+        assert!(cells[3].is_continuation);
+
+        // Left straddle: fresh row, 你 at 0-1, write 'x' at the
+        // continuation col 1. The orphaned primary at col 0 must blank.
+        let mut t2 = Term::new(1, 8, 0);
+        feed(&mut t2, "你".as_bytes());
+        feed(&mut t2, b"\x1b[2G"); // CHA col 2 (1-based) -> col 1
+        feed(&mut t2, b"x");
+        let cells2 = &t2.view_row(0).cells;
+        assert_eq!(cells2[0].ch, ' ', "orphaned wide primary must be cleared");
+        assert!(!cells2[0].is_continuation);
+        assert_eq!(cells2[1].ch, 'x');
     }
 
     #[test]
