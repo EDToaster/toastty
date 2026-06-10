@@ -764,9 +764,8 @@ impl GlyphRasterizer {
             std::collections::HashSet::new();
 
         let mut out = LineGlyphs::default();
-        let baseline_y = self.baseline_y;
         for p in &pending {
-            if let Some(slot) = self.ensure_atlas_slot(queue, &p.glyph, baseline_y) {
+            if let Some(slot) = self.ensure_atlas_slot(queue, &p.glyph) {
                 out.insert(p.col, p.ch, slot);
                 // Decide whether this glyph is safe to drop into
                 // `char_cache`. Requirements:
@@ -851,15 +850,11 @@ impl GlyphRasterizer {
     /// Rasterize `glyph` if not already in the atlas; return its slot
     /// translated into `GlyphSlot` form for `build_instances`.
     ///
-    /// `baseline_y` is the baseline's offset from the cell's top edge
-    /// (pixels). Used to convert swash's bearing into a cell-relative
-    /// offset.
-    fn ensure_atlas_slot(
-        &mut self,
-        queue: &Queue,
-        glyph: &LayoutGlyph,
-        baseline_y: f32,
-    ) -> Option<GlyphSlot> {
+    /// Vertical placement uses the constant primary-font baseline
+    /// [`Self::baseline_y`] to convert swash's bearing into a cell-relative
+    /// offset — never a per-line value (see that field's docs for why).
+    fn ensure_atlas_slot(&mut self, queue: &Queue, glyph: &LayoutGlyph) -> Option<GlyphSlot> {
+        let baseline_y = self.baseline_y;
         let physical = glyph.physical((0.0, 0.0), 1.0);
         let cache_key: CacheKey = physical.cache_key;
 
@@ -1193,12 +1188,14 @@ mod tests {
                 mixed[1],
             );
         }
-        if !exercised {
-            eprintln!(
-                "glyph_offset_is_independent_of_line_content: no CJK fallback \
-                 face on this host; assertions skipped",
-            );
-        }
+        // Fail loudly rather than pass vacuously: if no tested size reached
+        // a fallback face, the regression can't be exercised here. Install a
+        // CJK fallback font (e.g. Noto Sans CJK) to run this.
+        assert!(
+            exercised,
+            "no CJK fallback face available — cannot exercise the baseline \
+             regression; install one (e.g. Noto Sans CJK)",
+        );
     }
 
     /// Regression for the user-visible loop: once a glyph is first
@@ -1238,12 +1235,12 @@ mod tests {
                  froze a line-dependent offset",
             );
         }
-        if !exercised {
-            eprintln!(
-                "char_cache_offset_survives_mixed_first_line: no CJK fallback \
-                 face on this host; assertions skipped",
-            );
-        }
+        // Fail loudly rather than pass vacuously (see the sibling test).
+        assert!(
+            exercised,
+            "no CJK fallback face available — cannot exercise the char_cache \
+             regression; install one (e.g. Noto Sans CJK)",
+        );
     }
 
     /// Cell metrics must be whole device pixels so per-cell origins
