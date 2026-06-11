@@ -411,15 +411,18 @@ pub struct SecurityFlags {
 
 /// One semantic prompt marker recorded from OSC 133.
 ///
-/// `(row, kind)` lets a future command-navigation feature jump between
-/// prompt-start / command-start / command-finished markers without
-/// re-scanning the grid.
+/// `(line_id, kind)` lets command-navigation and resize handling find the
+/// marker's current position via [`Grid::locate`] without re-scanning the
+/// grid. Anchoring by `line_id` (rather than a visible row) keeps the
+/// marker stable as content scrolls — essential for locating the active
+/// prompt at resize time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PromptMark {
-    /// Visible row the marker was recorded on. Note that scrollback can
-    /// push the underlying row off the top of the visible viewport; we
-    /// don't currently rebase the row index in that case.
-    pub row: u16,
+    /// Stable id of the row the marker was recorded on (primary grid).
+    /// Resolve to a current position with `Grid::locate(line_id)`; the
+    /// marker has scrolled out of the retained ring once that returns
+    /// `None`.
+    pub line_id: u64,
     /// What kind of marker this is.
     pub kind: PromptMarkKind,
 }
@@ -725,19 +728,85 @@ impl Term {
         self.prompt_marks.make_contiguous()
     }
 
-    /// Append a prompt mark at the current cursor row, evicting the
-    /// oldest entry when the cap is hit.
+    /// Append a prompt mark anchored to the cursor row's stable line id,
+    /// evicting the oldest entry when the cap is hit.
+    ///
+    /// Only recorded on the primary screen: OSC 133 from a full-screen alt
+    /// app isn't a shell prompt, and an alt-relative line id would be
+    /// meaningless against the primary grid where we consume marks.
     ///
     /// Uses `VecDeque::pop_front` so eviction is O(1) instead of the
     /// O(n) `Vec::remove(0)` shift (M10-followup I3): a hot loop of
     /// rapid prompts no longer pays an N²/2 cost once the cap is
     /// reached.
     fn push_prompt_mark(&mut self, kind: PromptMarkKind) {
-        let row = self.cursor.row;
+        if self.alt_active {
+            return;
+        }
+        let line_id = self.primary_cursor_line_id();
         if self.prompt_marks.len() >= PROMPT_MARK_CAP {
             self.prompt_marks.pop_front();
         }
-        self.prompt_marks.push_back(PromptMark { row, kind });
+        self.prompt_marks.push_back(PromptMark { line_id, kind });
+    }
+
+    /// Stable line id of the cursor's current row in the primary grid.
+    /// Row `r` has id `bottom_id - (visible_rows - 1 - r)`.
+    fn primary_cursor_line_id(&self) -> u64 {
+        let g = &self.primary;
+        let from_bottom = g
+            .visible_rows()
+            .saturating_sub(1)
+            .saturating_sub(self.cursor.row);
+        g.bottom_id().saturating_sub(u64::from(from_bottom))
+    }
+
+    /// If the cursor is currently editing a shell prompt on the primary
+    /// screen (the most recent OSC 133 mark is a prompt start/end, not a
+    /// running command), return the primary visible row where that prompt
+    /// starts. `None` falls back to ordinary reflow.
+    fn active_prompt_start_row(&self) -> Option<u16> {
+        let last = self.prompt_marks.back()?;
+        if !matches!(
+            last.kind,
+            PromptMarkKind::PromptStart | PromptMarkKind::PromptEnd
+        ) {
+            return None;
+        }
+        let start_id = self
+            .prompt_marks
+            .iter()
+            .rev()
+            .find(|m| matches!(m.kind, PromptMarkKind::PromptStart))?
+            .line_id;
+        match self.primary.locate(start_id) {
+            Some(crate::grid::RowLocation::Visible(r)) => Some(r),
+            // Prompt start scrolled above the viewport → treat the whole
+            // visible region as the prompt continuation.
+            Some(crate::grid::RowLocation::Scrollback(_)) => Some(0),
+            None => None,
+        }
+    }
+
+    /// Re-anchor the most recent prompt-start mark to `new_row` in the
+    /// (already-resized) primary grid. Burst resizes (dragging a window
+    /// edge) fire many events before the shell repaints, so the mark must
+    /// track the prompt's new position to keep subsequent resizes prompt-aware.
+    fn reanchor_active_prompt_start(&mut self, new_row: u16) {
+        let g = &self.primary;
+        let from_bottom = g
+            .visible_rows()
+            .saturating_sub(1)
+            .saturating_sub(new_row);
+        let line_id = g.bottom_id().saturating_sub(u64::from(from_bottom));
+        if let Some(m) = self
+            .prompt_marks
+            .iter_mut()
+            .rev()
+            .find(|m| matches!(m.kind, PromptMarkKind::PromptStart))
+        {
+            m.line_id = line_id;
+        }
     }
 
     /// True when DECSET 2004 (bracketed paste) is active.
@@ -1404,9 +1473,13 @@ impl Term {
 
     /// Resize the visible viewport. The **primary** grid reflows —
     /// soft-wrapped lines are re-wrapped to the new width and scrollback is
-    /// preserved (see [`Grid::resize_reflow`]). The alt grid is geometry
-    /// only (full-screen apps redraw on SIGWINCH). The cursor is remapped
-    /// through the reflow and then clamped to the new dimensions.
+    /// preserved (see [`Grid::resize_reflow`]). When the cursor is editing a
+    /// shell prompt (known via OSC 133 marks), the active prompt region is
+    /// left un-rewrapped and the shell repaints it instead, so a multi-line
+    /// / right-aligned prompt doesn't garble on resize (see
+    /// [`Grid::resize_reflow_at_prompt`]). The alt grid is geometry only
+    /// (full-screen apps redraw on SIGWINCH). The cursor is remapped through
+    /// the reflow and then clamped to the new dimensions.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         let rows = rows.max(1);
         let cols = cols.max(1);
@@ -1418,7 +1491,31 @@ impl Term {
         } else {
             (self.cursor.row, self.cursor.col)
         };
-        let (new_row, new_col) = self.primary.resize_reflow(rows, cols, primary_cap, primary_cursor);
+        // When editing a prompt on the primary screen, don't rewrap it —
+        // reflow above it and let the shell repaint (kitty-style).
+        let prompt_start = if self.alt_active {
+            None
+        } else {
+            self.active_prompt_start_row()
+        };
+        let (new_row, new_col) = if let Some(prow) = prompt_start {
+            let num_above = self.cursor.row.saturating_sub(prow);
+            let res = self.primary.resize_reflow_at_prompt(
+                rows,
+                cols,
+                primary_cap,
+                prow,
+                self.cursor.row,
+                self.cursor.col,
+            );
+            // Re-anchor the prompt-start mark so burst (drag) resizes before
+            // the shell repaints stay prompt-aware.
+            let new_prompt_row = res.0.saturating_sub(num_above);
+            self.reanchor_active_prompt_start(new_prompt_row);
+            res
+        } else {
+            self.primary.resize_reflow(rows, cols, primary_cap, primary_cursor)
+        };
         self.alt.resize(rows, cols, rows as usize);
         if self.alt_active {
             // The live cursor belongs to alt (clamped below); update the
@@ -4846,6 +4943,89 @@ mod tests {
     }
 
     #[test]
+    fn resize_at_prompt_preserves_prompt_rows() {
+        // Reproduce a p10k-style prompt: command output above, a full-width
+        // first prompt line (stands in for a right-aligned RPROMPT), then the
+        // input line. On narrow, the prompt must NOT rewrap — the shell will
+        // repaint it. Only the output above reflows.
+        let mut t = Term::new(4, 10, 100);
+        feed(&mut t, b"output\r\n"); // row 0
+        feed(&mut t, b"\x1b]133;A\x1b\\"); // prompt start at row 1
+        feed(&mut t, b"LLLLLLLLLL\r\n"); // row 1, full width (hard line)
+        feed(&mut t, b"\x1b]133;B\x1b\\"); // prompt end (input start) at row 2
+        feed(&mut t, b"> hi"); // row 2, cursor after "hi"
+        assert_eq!(t.cursor().row, 2);
+
+        t.resize(4, 6);
+
+        // Prompt-aware: the prompt line is preserved as ONE (truncated) row,
+        // not rewrapped, so the cursor lands on row 2. (A normal reflow would
+        // split "LLLLLLLLLL" into two rows and push the cursor to row 3.)
+        assert_eq!(t.cursor().row, 2, "prompt was rewrapped — cursor drifted");
+        assert_eq!(row_text(&t, 0), "output");
+        assert_eq!(row_text(&t, 1), "LLLLLL");
+        assert!(!t.row(1).soft_wrap, "prompt line must not be soft-wrapped");
+        assert_eq!(row_text(&t, 2), "> hi");
+    }
+
+    #[test]
+    fn resize_at_prompt_blanks_truncated_wide_char_orphan() {
+        // Narrowing a preserved prompt row that cuts a width-2 cluster's
+        // continuation must blank the orphaned lead, not leave it dangling.
+        let mut t = Term::new(3, 6, 100);
+        feed(&mut t, b"\x1b]133;A\x1b\\");
+        feed(&mut t, "ab世cd".as_bytes()); // a,b,世(+cont),c,d fill 6 cols
+        feed(&mut t, b"\x1b]133;B\x1b\\");
+        t.resize(3, 3); // cut at col 3 → '世' continuation removed
+        let r = t.cursor().row;
+        // The orphaned wide lead is blanked: "ab", not "ab世".
+        assert_eq!(row_text(&t, r), "ab");
+    }
+
+    #[test]
+    fn resize_running_command_reflows_normally() {
+        // While a command is running (last OSC 133 mark is CommandStart), the
+        // prompt-preserving path must NOT engage — output reflows normally.
+        let mut t = Term::new(4, 10, 100);
+        feed(&mut t, b"\x1b]133;A\x1b\\");
+        feed(&mut t, b"$ run\r\n"); // prompt + command on row 0
+        feed(&mut t, b"\x1b]133;C\x1b\\"); // command started → running
+        feed(&mut t, b"XXXXXXXXXX"); // full-width output on row 1
+
+        t.resize(4, 6);
+
+        // The output rewrapped: its first row is soft-wrapped.
+        assert_eq!(row_text(&t, 1), "XXXXXX");
+        assert!(t.row(1).soft_wrap, "running-command output should reflow");
+    }
+
+    #[test]
+    fn resize_at_prompt_survives_burst_resizes() {
+        // Dragging a window edge fires many resizes before the shell
+        // repaints. Re-anchoring the prompt mark must keep each one
+        // prompt-aware (not just the first).
+        let mut t = Term::new(4, 12, 100);
+        feed(&mut t, b"output\r\n");
+        feed(&mut t, b"\x1b]133;A\x1b\\");
+        feed(&mut t, b"PROMPTLINE12\r\n"); // full-width prompt line
+        feed(&mut t, b"\x1b]133;B\x1b\\");
+        feed(&mut t, b"> hi");
+
+        t.resize(4, 8); // first resize
+        let cr = t.cursor().row;
+        assert_eq!(row_text(&t, cr), "> hi");
+        assert!(!t.row(cr - 1).soft_wrap);
+
+        t.resize(4, 6); // second resize, before any shell repaint
+        let cr = t.cursor().row;
+        assert_eq!(row_text(&t, cr), "> hi", "input lost on burst resize");
+        assert!(
+            !t.row(cr - 1).soft_wrap,
+            "prompt rewrapped on second resize — mark wasn't re-anchored"
+        );
+    }
+
+    #[test]
     fn print_after_scroll_keeps_writing_on_last_row() {
         let mut t = Term::new(2, 4, 4);
         feed(&mut t, b"aaaa\r\nbbbb\r\ncccc");
@@ -6216,7 +6396,8 @@ mod tests {
         let marks = t.prompt_marks();
         assert_eq!(marks.len(), 1);
         assert_eq!(marks[0].kind, PromptMarkKind::PromptStart);
-        assert_eq!(marks[0].row, 0);
+        // Fresh grid, no scrolling: row 0's line_id is 0.
+        assert_eq!(marks[0].line_id, 0);
     }
 
     #[test]
@@ -6226,7 +6407,8 @@ mod tests {
         let marks = t.prompt_marks();
         assert_eq!(marks.len(), 1);
         assert_eq!(marks[0].kind, PromptMarkKind::PromptEnd);
-        assert_eq!(marks[0].row, 1);
+        // Cursor on row 1 of a fresh grid: line_id 1.
+        assert_eq!(marks[0].line_id, 1);
     }
 
     #[test]

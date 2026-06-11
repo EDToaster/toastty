@@ -438,15 +438,105 @@ impl Grid {
 
         let (flat, (cur_idx, cur_col)) =
             crate::reflow::reflow_rows(&retained, cols, cursor_idx, cursor.1);
+        self.layout_into_ring(flat, cur_idx, cur_col, visible_rows, cols, cap)
+    }
 
-        // Lay the rewrapped rows into a fresh ring with `head = 0`, so
-        // logical row `i` sits at slot `i` and scrollback row `n` at slot
-        // `cap - 1 - n` (the wrap-around region just before the head).
+    /// Reflow-aware resize while the cursor is **editing a shell prompt**
+    /// (detected via OSC 133 marks by the caller). The current prompt+input
+    /// region (`prompt_start_row..=cursor_row`) is **not** rewrapped — that
+    /// would change how many rows it spans and desync the shell's in-place
+    /// `SIGWINCH` redraw, leaving stale right-prompt fragments. Instead we
+    /// reflow only the scrollback + command output *above* the prompt, keep
+    /// the prompt rows verbatim (width-adjusted, not rewrapped), blank
+    /// everything below, and keep the cursor at the same offset within the
+    /// prompt — then let the shell repaint the prompt at the new width. This
+    /// mirrors kitty's `prevent_current_prompt_from_rewrapping`.
+    ///
+    /// Returns the cursor's new `(row, col)`.
+    #[must_use]
+    pub fn resize_reflow_at_prompt(
+        &mut self,
+        visible_rows: u16,
+        cols: u16,
+        cap: usize,
+        prompt_start_row: u16,
+        cursor_row: u16,
+        cursor_col: u16,
+    ) -> (u16, u16) {
+        let last = self.visible_rows.saturating_sub(1);
+        let prompt_start_row = prompt_start_row.min(last);
+        let cursor_row = cursor_row.clamp(prompt_start_row, last);
+
+        // Reflow scrollback + output strictly above the prompt.
+        let mut above: Vec<Row> =
+            Vec::with_capacity(self.history_lines as usize + prompt_start_row as usize);
+        for n in (0..self.history_lines).rev() {
+            above.push(self.scrollback_row(n).expect("n < history_lines").clone());
+        }
+        for i in 0..prompt_start_row {
+            above.push(self.row(i).clone());
+        }
+        let mut flat = if above.is_empty() {
+            Vec::new()
+        } else {
+            crate::reflow::reflow_rows(&above, cols, above.len() - 1, 0).0
+        };
+        let above_len = flat.len();
+
+        // Keep the prompt rows verbatim — width-adjusted, never rewrapped.
+        for i in prompt_start_row..=cursor_row {
+            let mut r = self.row(i).clone();
+            // If narrowing cuts a width-2 cluster's continuation, the lead
+            // is left orphaned (renders as a gap) — blank it.
+            let cuts_continuation = r
+                .cells
+                .get(cols as usize)
+                .is_some_and(|c| c.is_continuation);
+            r.resize_cols(cols);
+            if cuts_continuation {
+                if let Some(last) = r.cells.last_mut() {
+                    *last = Cell::BLANK;
+                }
+            }
+            // Drop soft-wrap: these rows are kept verbatim for the shell to
+            // repaint and must never be merged by a later reflow — combined
+            // with truncation that could silently drop glyphs.
+            r.soft_wrap = false;
+            flat.push(r);
+        }
+        let cur_idx = above_len + (cursor_row - prompt_start_row) as usize;
+
+        self.layout_into_ring(flat, cur_idx, cursor_col.min(cols), visible_rows, cols, cap)
+    }
+
+    /// Lay a flat oldest→newest list of physical rows into a fresh ring at
+    /// the new geometry, bottom-anchoring the live row (`cur_idx`) and
+    /// spilling the overflow above it into scrollback (capped to the ring
+    /// budget). Shared tail of [`Grid::resize_reflow`] and
+    /// [`Grid::resize_reflow_at_prompt`]. Returns the cursor's `(row, col)`.
+    fn layout_into_ring(
+        &mut self,
+        mut flat: Vec<Row>,
+        mut cur_idx: usize,
+        mut cur_col: u16,
+        visible_rows: u16,
+        cols: u16,
+        cap: usize,
+    ) -> (u16, u16) {
+        let cap = cap.max(visible_rows as usize).max(1);
+        if flat.is_empty() {
+            flat.push(Row::blank(cols));
+            cur_idx = 0;
+            cur_col = 0;
+        }
+
+        // Ring with `head = 0`, so logical row `i` sits at slot `i` and
+        // scrollback row `n` at slot `cap - 1 - n` (the wrap-around region
+        // just before the head).
         let vis = visible_rows as usize;
         let budget = cap.saturating_sub(vis);
         let n = flat.len();
         let mut ring: Vec<Row> = (0..cap).map(|_| Row::blank(cols)).collect();
-        let mut flat = flat;
 
         let (cursor_row, new_history) = if n <= vis {
             // Everything fits on screen; anchor content to the top, blank
