@@ -43,10 +43,10 @@ fn trailing_blank_run(cells: &[Cell]) -> usize {
 /// Build logical lines from a flat, oldest→newest slice of retained rows.
 ///
 /// A logical line is a maximal run of rows in which every row but the last
-/// has `soft_wrap == true`. The content cells are concatenated with
-/// trailing-blank trimming:
-///   - a non-final (soft-wrapped) row drops **at most one** trailing
-///     `Cell::BLANK` (the wide-char wrap pad — see module docs);
+/// has `soft_wrap == true`. The content cells are concatenated:
+///   - a non-final (soft-wrapped) row keeps **all** its cells — a trailing
+///     blank there is a real space at the wrap point, not padding (see the
+///     trim comment in the body);
 ///   - the final row drops **all** trailing `Cell::BLANK` (empty space to
 ///     the right of the last glyph).
 ///
@@ -70,20 +70,28 @@ fn build_logical_lines(
         loop {
             let row = &rows[i];
             let is_last = !row.soft_wrap;
+            // A soft-wrapped (non-final) row keeps ALL its cells. A trailing
+            // blank there is almost always a real space sitting at the wrap
+            // point ("foo bar" wrapping right after the space) — dropping it
+            // would merge words into "foobar". The only case it isn't real
+            // is a width-2 cluster bumped off the last column, which leaves
+            // an unwritten blank there; that's indistinguishable from a real
+            // space without a spacer flag, so we keep it. The cost is a rare
+            // cosmetic extra space before a margin-wrapped wide char on
+            // widen — never data loss. The final (hard-end) row drops all
+            // trailing blanks (empty space to the right of the last glyph).
             let trim = if is_last {
                 trailing_blank_run(&row.cells)
             } else {
-                trailing_blank_run(&row.cells).min(1)
+                0
             };
             let keep = row.cells.len() - trim;
 
             if i == cursor_idx {
                 cursor_line = lines.len();
-                // Clamp to `keep`, not the full row width: a cursor parked
-                // on a soft-wrapped row's trimmed pad cell must map to the
-                // end of this row's surviving content, not overshoot by one
-                // into the next row. A final-row cursor in trailing
-                // whitespace lands at the content end (pending-wrap).
+                // Clamp to `keep`: a final-row cursor parked in trailing
+                // whitespace maps to the content end (pending-wrap) rather
+                // than into trimmed-away cells.
                 cursor_offset = content.len() + (cursor_col as usize).min(keep);
             }
 
@@ -274,11 +282,12 @@ mod tests {
         assert_eq!(narrow.len(), 3);
         assert!(narrow[0].soft_wrap && narrow[1].soft_wrap);
         assert!(!narrow[2].soft_wrap);
-        // Rejoin the narrowed rows and widen back to 11.
+        // Rejoin the narrowed rows (soft rows keep all cells; final row
+        // drops trailing blanks) and widen back to 11.
         let mut rejoined: Vec<Cell> = Vec::new();
         for (idx, r) in narrow.iter().enumerate() {
             let trim = if idx + 1 < narrow.len() {
-                trailing_blank_run(&r.cells).min(1)
+                0
             } else {
                 trailing_blank_run(&r.cells)
             };
@@ -337,16 +346,29 @@ mod tests {
     }
 
     #[test]
-    fn build_logical_lines_soft_wrap_drops_one_pad_blank() {
-        // A soft-wrapped row ending in two default blanks drops exactly one.
-        let cells = vec![cell('a'), cell('b'), Cell::BLANK, Cell::BLANK];
-        let rows = vec![row(cells, true), row(vec![cell('c')], false)];
+    fn build_logical_lines_soft_wrap_keeps_trailing_space() {
+        // A soft-wrapped row's trailing blank is a real space at the wrap
+        // point — it must survive the join, not be eaten. ("foo bar"
+        // wrapping after the space must NOT rejoin to "foobar".)
+        let cells = vec![cell('f'), cell('o'), cell('o'), cell(' ')];
+        let rows = vec![row(cells, true), row(vec![cell('b'), cell('a'), cell('r')], false)];
         let (lines, _) = build_logical_lines(&rows, 0, 0);
         assert_eq!(lines.len(), 1);
-        // "ab" + one surviving blank (the second was dropped) + "c" = 4 cells.
-        assert_eq!(lines[0].len(), 4);
-        assert_eq!(lines[0][2], Cell::BLANK);
-        assert_eq!(lines[0][3].ch, 'c');
+        assert_eq!(text(&lines[0]), "foo bar");
+    }
+
+    #[test]
+    fn reflow_rows_foo_bar_narrow_then_widen_keeps_space() {
+        // End-to-end regression: "foo bar" narrowed (so it wraps after the
+        // space) then widened must come back as "foo bar", not "foobar".
+        let content: Vec<Cell> = "foo bar".chars().map(cell).collect();
+        let rows = vec![row(content, false)];
+        let (narrow, _) = reflow_rows(&rows, 4, 0, 0);
+        // "foo " (soft) / "bar".
+        assert!(narrow[0].soft_wrap);
+        let (widened, _) = reflow_rows(&narrow, 20, 0, 0);
+        assert_eq!(widened.len(), 1);
+        assert_eq!(text(&widened[0].cells).trim_end(), "foo bar");
     }
 
     #[test]
