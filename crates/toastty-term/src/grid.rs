@@ -382,6 +382,117 @@ impl Grid {
             self.bottom_id = self.bottom_id.saturating_sub(d);
         }
     }
+
+    /// Reflow-aware resize for the **primary** grid. Rebuilds the ring at
+    /// the new `(visible_rows, cols, cap)`, re-wrapping soft-wrapped
+    /// logical lines to the new width and *preserving* scrollback (unlike
+    /// [`Grid::resize`], which drops it on a cap change). On a width change
+    /// this is what makes narrowing rewrap instead of truncating glyphs; on
+    /// a height change it keeps history, revealing more of it at the top
+    /// when the window grows and pushing rows into scrollback when it
+    /// shrinks (xterm/Alacritty-style anchoring of the live bottom).
+    ///
+    /// `cursor` is the live-grid `(row, col)` on entry; the returned
+    /// `(row, col)` is where that cursor lands in the new visible region
+    /// (`col` may equal the new `cols` — the pending-wrap sentinel).
+    ///
+    /// The alt grid keeps the geometry-only [`Grid::resize`] (full-screen
+    /// apps redraw on SIGWINCH and carry no scrollback).
+    ///
+    /// Inherent limitation: the ring is sized in *physical* rows, so heavy
+    /// narrowing can evict the oldest scrollback that widening cannot then
+    /// resurrect — matching Alacritty's behaviour.
+    #[must_use]
+    pub fn resize_reflow(
+        &mut self,
+        visible_rows: u16,
+        cols: u16,
+        cap: usize,
+        cursor: (u16, u16),
+    ) -> (u16, u16) {
+        let cap = cap.max(visible_rows as usize).max(1);
+
+        // Collect retained rows oldest→newest: scrollback (oldest first)
+        // then the visible region.
+        let mut retained: Vec<Row> =
+            Vec::with_capacity(self.history_lines as usize + self.visible_rows as usize);
+        for n in (0..self.history_lines).rev() {
+            retained.push(self.scrollback_row(n).expect("n < history_lines").clone());
+        }
+        for i in 0..self.visible_rows {
+            retained.push(self.row(i).clone());
+        }
+        let cursor_idx = self.history_lines as usize + cursor.0 as usize;
+
+        // Trim trailing blank padding below the cursor — but never above
+        // the cursor's own row, so a prompt on an otherwise-blank screen
+        // still yields a line for the cursor.
+        let last_nonblank = retained
+            .iter()
+            .rposition(|r| r.cells.iter().any(|c| *c != Cell::BLANK))
+            .unwrap_or(0);
+        let end = cursor_idx
+            .max(last_nonblank)
+            .min(retained.len().saturating_sub(1));
+        retained.truncate(end + 1);
+
+        let (flat, (cur_idx, cur_col)) =
+            crate::reflow::reflow_rows(&retained, cols, cursor_idx, cursor.1);
+
+        // Lay the rewrapped rows into a fresh ring with `head = 0`, so
+        // logical row `i` sits at slot `i` and scrollback row `n` at slot
+        // `cap - 1 - n` (the wrap-around region just before the head).
+        let vis = visible_rows as usize;
+        let budget = cap.saturating_sub(vis);
+        let n = flat.len();
+        let mut ring: Vec<Row> = (0..cap).map(|_| Row::blank(cols)).collect();
+        let mut flat = flat;
+
+        let (cursor_row, new_history) = if n <= vis {
+            // Everything fits on screen; anchor content to the top, blank
+            // padding below, no scrollback.
+            for (i, row) in flat.into_iter().enumerate() {
+                ring[i] = row;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            (cur_idx as u16, 0u32)
+        } else {
+            // Content overflows: the live bottom is `flat[n-1]`. The last
+            // `vis` rows are visible; rows above become scrollback, capped
+            // to the ring's budget (oldest evicted).
+            for vi in 0..vis {
+                ring[vi] = std::mem::take(&mut flat[n - vis + vi]);
+            }
+            let scrollback_count = n - vis;
+            let keep = scrollback_count.min(budget);
+            for sn in 0..keep {
+                let src = n - vis - 1 - sn;
+                ring[cap - 1 - sn] = std::mem::take(&mut flat[src]);
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let row = (cur_idx.saturating_sub(n - vis)).min(vis - 1) as u16;
+            #[allow(clippy::cast_possible_truncation)]
+            (row, keep as u32)
+        };
+
+        self.rows = ring.into_boxed_slice();
+        self.head = 0;
+        self.cols = cols;
+        self.visible_rows = visible_rows;
+        self.history_lines = new_history;
+        // Reflow changes physical row counts, so the old per-line id
+        // mapping can't survive a rewrap — cross-reflow `line_id` pinning is
+        // best-effort and the only external pin (selection) is cleared on
+        // resize. But `bottom_id` must still bound the retained id window:
+        // raise it to cover the new (history + visible) span so
+        // `oldest_retained_id` doesn't saturate to 0 (which would collapse
+        // the id space when reflow grows scrollback past a small
+        // `bottom_id`). Never decreases.
+        let span = u64::from(new_history) + u64::from(visible_rows.saturating_sub(1));
+        self.bottom_id = self.bottom_id.max(span);
+
+        (cursor_row, cur_col.min(cols))
+    }
 }
 
 #[cfg(test)]
@@ -925,5 +1036,97 @@ mod tests {
         assert_eq!(g.history_lines(), 2);
         g.resize(4, 3, 4);
         assert_eq!(g.history_lines(), 0);
+    }
+
+    // ---------- resize_reflow (primary grid) ----------
+
+    #[test]
+    fn resize_reflow_preserves_scrollback_across_cap_change() {
+        // vis=2, cap=12 → budget 10. Build 6 scrollback rows a..f.
+        let mut g = Grid::new(2, 4, 12);
+        for ch in ['a', 'b', 'c', 'd', 'e', 'f'] {
+            put_at(&mut g, 0, ch);
+            g.scroll_up();
+        }
+        assert_eq!(g.history_lines(), 6);
+        // Grow the visible region 2→4 (cap 12→14). The old realloc path
+        // dropped all history here; reflow preserves it, revealing some at
+        // the top of the now-taller viewport.
+        let (crow, _ccol) = g.resize_reflow(4, 4, 14, (0, 0));
+        assert_eq!(g.cols(), 4);
+        assert_eq!(g.visible_rows(), 4);
+        // 3 rows revealed into the viewport; 3 remain in scrollback.
+        assert_eq!(g.history_lines(), 3);
+        assert_eq!(g.row(0).cells[0].ch, 'd');
+        assert_eq!(g.row(2).cells[0].ch, 'f');
+        // Oldest scrollback ('a') still retained, not evicted.
+        assert_eq!(g.scrollback_row(2).unwrap().cells[0].ch, 'a');
+        assert!(crow < 4, "cursor row must stay in the new viewport");
+    }
+
+    #[test]
+    fn resize_reflow_keeps_locate_self_consistent() {
+        // After a reflow the live bottom must still resolve to the last
+        // visible row and the retained id window must agree with the new
+        // (visible_rows, history_lines). (Replaces the old top-row line_id
+        // stability test — a full rewrap can't preserve per-line ids.)
+        let mut g = Grid::new(4, 8, 4 + 20);
+        for ch in ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'] {
+            put_at(&mut g, 0, ch);
+            g.scroll_up();
+        }
+        let before = g.bottom_id();
+        let _ = g.resize_reflow(6, 8, 6 + 20, (0, 0));
+        assert!(g.bottom_id() >= before, "bottom_id must not decrease");
+        assert_eq!(
+            g.locate(g.bottom_id()),
+            Some(RowLocation::Visible(g.visible_rows() - 1)),
+            "live bottom resolves to the last visible row"
+        );
+        let oldest = g.oldest_retained_id();
+        let span = u64::from(g.history_lines()) + u64::from(g.visible_rows() - 1);
+        assert_eq!(g.bottom_id() - oldest, span);
+    }
+
+    #[test]
+    fn resize_reflow_bumps_bottom_id_when_history_grows() {
+        // Regression: a reflow that grows scrollback from a small
+        // `bottom_id` (no prior scrolling) must raise `bottom_id` so
+        // `oldest_retained_id` doesn't saturate to 0 and collapse the id
+        // space. Build a soft-wrapped logical line "abcdefgh" across the 2
+        // visible rows of a fresh grid (bottom_id == 1).
+        let mut g = Grid::new(2, 4, 2 + 50);
+        let write = |g: &mut Grid, row: u16, s: &str| {
+            for (col, ch) in s.chars().enumerate() {
+                #[allow(clippy::cast_possible_truncation)]
+                g.row_mut(row).put(
+                    col as u16,
+                    Cell {
+                        ch,
+                        style: Style::RESET,
+                        is_continuation: false,
+                        hyperlink_id: None,
+                    },
+                    4,
+                );
+            }
+        };
+        write(&mut g, 0, "abcd");
+        g.row_mut(0).soft_wrap = true;
+        write(&mut g, 1, "efgh");
+        assert_eq!(g.bottom_id(), 1);
+        // Narrow to 2 cols, 1 visible row → "abcdefgh" rewraps to 4 rows,
+        // 3 of which become scrollback.
+        let _ = g.resize_reflow(1, 2, 1 + 50, (0, 0));
+        assert_eq!(g.history_lines(), 3);
+        let span = u64::from(g.history_lines()) + u64::from(g.visible_rows() - 1);
+        // The retained id window must bound all 4 retained rows. Before the
+        // fix this was 1 (bottom_id stayed 1, oldest saturated to 0).
+        assert_eq!(
+            g.bottom_id() - g.oldest_retained_id(),
+            span,
+            "retained id window must bound every retained row"
+        );
+        assert_eq!(g.locate(g.bottom_id()), Some(RowLocation::Visible(0)));
     }
 }

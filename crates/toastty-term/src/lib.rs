@@ -23,6 +23,7 @@ mod cell;
 mod cursor;
 mod damage;
 mod grid;
+mod reflow;
 mod selection;
 mod term;
 mod viewport;

@@ -1402,17 +1402,34 @@ impl Term {
         }
     }
 
-    /// Resize the visible viewport. **Does not reflow** — that's a
-    /// decision #6 / scrollback.md follow-up. The cursor is clamped to the
-    /// new dimensions.
+    /// Resize the visible viewport. The **primary** grid reflows —
+    /// soft-wrapped lines are re-wrapped to the new width and scrollback is
+    /// preserved (see [`Grid::resize_reflow`]). The alt grid is geometry
+    /// only (full-screen apps redraw on SIGWINCH). The cursor is remapped
+    /// through the reflow and then clamped to the new dimensions.
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        // TODO(reflow): walk soft-wrap runs and reshape per
-        // docs/decisions/scrollback.md. M3 only fixes geometry + cursor.
         let rows = rows.max(1);
         let cols = cols.max(1);
         let primary_cap = rows as usize + self.scrollback as usize;
-        self.primary.resize(rows, cols, primary_cap);
+        // The primary's logical cursor is the live cursor when the primary
+        // is active, else the snapshot taken on alt-screen (1049) entry.
+        let primary_cursor = if self.alt_active {
+            (self.saved_cursor.row, self.saved_cursor.col)
+        } else {
+            (self.cursor.row, self.cursor.col)
+        };
+        let (new_row, new_col) = self.primary.resize_reflow(rows, cols, primary_cap, primary_cursor);
         self.alt.resize(rows, cols, rows as usize);
+        if self.alt_active {
+            // The live cursor belongs to alt (clamped below); update the
+            // saved primary cursor so a later 1049 exit restores a position
+            // consistent with the reflowed primary grid.
+            self.saved_cursor.row = new_row;
+            self.saved_cursor.col = new_col;
+        } else {
+            self.cursor.row = new_row;
+            self.cursor.col = new_col;
+        }
         self.rows = rows;
         self.cols = cols;
         // Resize collapses any prior DECSTBM region: xterm resets the
@@ -4767,6 +4784,65 @@ mod tests {
         let mut t = Term::new(2, 2, 0);
         t.resize(0, 0);
         assert_eq!(t.size(), (1, 1));
+    }
+
+    #[test]
+    fn reflow_narrow_then_widen_restores_glyphs() {
+        // Bug 2: narrowing used to truncate glyphs destructively; widening
+        // refilled with blanks, so text was lost for good. With reflow the
+        // logical line rewraps on narrow and rejoins on widen.
+        let mut t = Term::new(3, 12, 100);
+        feed(&mut t, b"hello world");
+        assert_eq!(row_text(&t, 0), "hello world");
+        // Narrow to 5: "hello" / " worl" / "d", first two soft-wrapped.
+        t.resize(3, 5);
+        assert_eq!(row_text(&t, 0), "hello");
+        assert_eq!(row_text(&t, 1), " worl");
+        assert_eq!(row_text(&t, 2), "d");
+        assert!(t.row(0).soft_wrap && t.row(1).soft_wrap);
+        // Widen back to 12: the soft-wrap chain rejoins — no lost glyphs.
+        t.resize(3, 12);
+        assert_eq!(row_text(&t, 0), "hello world");
+    }
+
+    #[test]
+    fn reflow_vertical_grow_preserves_and_reveals_scrollback() {
+        // Bug 1: growing the window used to wipe scrollback (cap change →
+        // history_lines = 0). With reflow it's preserved, and the taller
+        // viewport reveals more of it at the top.
+        let mut t = Term::new(3, 8, 100);
+        feed(&mut t, b"L0\r\nL1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8\r\nL9");
+        assert_eq!(t.history_lines(), 7);
+        assert_eq!(row_text(&t, 0), "L7");
+        // Grow to 6 rows: 3 scrollback lines revealed (L4..L6), 4 remain.
+        t.resize(6, 8);
+        assert_eq!(t.history_lines(), 4, "scrollback must survive a grow");
+        assert_eq!(row_text(&t, 0), "L4");
+        assert_eq!(row_text(&t, 5), "L9");
+    }
+
+    #[test]
+    fn reflow_vertical_shrink_pushes_to_scrollback() {
+        // Shrinking the window pushes top rows into scrollback (cursor and
+        // live bottom stay anchored), the mirror of the grow case.
+        let mut t = Term::new(3, 8, 100);
+        feed(&mut t, b"L0\r\nL1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8\r\nL9");
+        assert_eq!(t.history_lines(), 7);
+        t.resize(2, 8);
+        assert_eq!(t.history_lines(), 8, "a row scrolled into history");
+        assert_eq!(row_text(&t, 0), "L8");
+        assert_eq!(row_text(&t, 1), "L9");
+    }
+
+    #[test]
+    fn reflow_same_width_grow_preserves_visible_content() {
+        // A same-width vertical resize must be lossless for visible content
+        // (only exact-default trailing blanks are trimmed/re-padded).
+        let mut t = Term::new(2, 6, 50);
+        feed(&mut t, b"foo\r\nbar");
+        t.resize(4, 6);
+        assert_eq!(row_text(&t, 0), "foo");
+        assert_eq!(row_text(&t, 1), "bar");
     }
 
     #[test]
