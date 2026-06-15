@@ -290,13 +290,14 @@ pub struct Renderer {
     /// notices without scanning stderr. When `Some`, bypasses the
     /// skip-submit gate so the banner shows up even on an idle grid.
     error_banner: Option<String>,
-    /// Optional multi-line full-width close-confirmation banner painted
-    /// vertically centered on top of the grid every frame. Used by the
-    /// binary when the user tries to close the window while a program is
-    /// still running, to surface a "press again / confirm" prompt without
-    /// tearing down the session. When `Some`, bypasses the skip-submit
-    /// gate so the prompt refreshes even on an idle grid (same as
-    /// `error_banner`).
+    /// Optional close-confirmation dialog body painted every frame as a
+    /// centered, bordered, padded "window" box over a dimmed full-viewport
+    /// backdrop (see [`Self::draw_close_dialog`]). Embedded `\n`s split the
+    /// body into rows. Used by the binary when the user tries to close the
+    /// window while a program is still running, to surface a confirm prompt
+    /// without tearing down the session. When `Some`, bypasses the
+    /// skip-submit gate so the dialog refreshes even on an idle grid (same
+    /// as `error_banner`).
     close_prompt: Option<String>,
     /// Optional IME preedit (in-progress composition) string drawn inline
     /// at the terminal cursor every frame. Fed by the platform IME
@@ -524,16 +525,32 @@ impl std::fmt::Debug for TextState {
     }
 }
 
-/// Where a full-width overlay banner is pinned along the vertical axis.
-/// The error banner is bottom-anchored; the close-confirmation prompt is
-/// vertically centered. Both share the same drawing routine
-/// ([`Renderer::draw_banner`]) and differ only in this anchor and color.
-#[derive(Clone, Copy)]
-enum BannerAnchor {
-    /// Pin the banner's bottom edge to the viewport bottom.
-    Bottom,
-    /// Center the banner block vertically in the viewport.
-    Center,
+/// Compose the text rows of the close-confirmation dialog box: a rounded
+/// border around the `message` lines, with `pad_x` cells of horizontal
+/// padding and `pad_y` blank rows of vertical padding inside the border.
+/// Box width is sized from the widest message line. One `char` == one
+/// column (the dialog text is ASCII + box-drawing glyphs, all width 1).
+fn compose_dialog_rows(message: &str, pad_x: usize, pad_y: usize) -> Vec<String> {
+    let content: Vec<&str> = message.lines().collect();
+    let content_cols = content.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let interior_cols = content_cols + 2 * pad_x;
+    let bar: String = "─".repeat(interior_cols);
+    let blank_interior = format!("│{}│", " ".repeat(interior_cols));
+
+    let mut rows: Vec<String> = Vec::with_capacity(content.len() + 2 * pad_y + 2);
+    rows.push(format!("╭{bar}╮"));
+    for _ in 0..pad_y {
+        rows.push(blank_interior.clone());
+    }
+    for line in &content {
+        let right = interior_cols - pad_x - line.chars().count();
+        rows.push(format!("│{}{line}{}│", " ".repeat(pad_x), " ".repeat(right)));
+    }
+    for _ in 0..pad_y {
+        rows.push(blank_interior.clone());
+    }
+    rows.push(format!("╰{bar}╯"));
+    rows
 }
 
 impl Renderer {
@@ -945,10 +962,10 @@ impl Renderer {
     }
 
     /// Append the instances for a full-width, multi-line overlay banner
-    /// to `instances`. Shared by the error banner and the
-    /// close-confirmation prompt; the two differ only in `anchor`, `bg`,
-    /// and `fg`. `width`/`height` are the viewport's physical pixel
-    /// dimensions (`self.config.{width,height}`).
+    /// to `instances`, bottom-anchored to the viewport. Used by the config
+    /// error banner. (The close-confirmation dialog uses the centered,
+    /// bordered [`Self::draw_close_dialog`] instead.) `width`/`height` are
+    /// the viewport's physical pixel dimensions (`self.config.{width,height}`).
     ///
     /// We emit two cover quads per banner cell because the cell pipeline
     /// draws in two passes (bg + glyph) and the term's own glyphs land in
@@ -972,7 +989,6 @@ impl Renderer {
         instances: &mut Vec<CellInstance>,
         text: &mut TextState,
         banner: &str,
-        anchor: BannerAnchor,
         bg: [f32; 4],
         fg: [f32; 4],
         cell_size: (f32, f32),
@@ -988,15 +1004,10 @@ impl Renderer {
         let cols = (viewport_w / cell_w).floor().max(1.0) as u32;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let num_lines = banner.lines().count().max(1) as u32;
-        let banner_top_y = match anchor {
-            // Bottom-anchored: viewport height minus the banner's total
-            // line height (clamped non-negative).
-            #[allow(clippy::cast_precision_loss)]
-            BannerAnchor::Bottom => (viewport_h - (num_lines as f32) * cell_h).max(0.0),
-            // Vertically centered: half the leftover vertical space.
-            #[allow(clippy::cast_precision_loss)]
-            BannerAnchor::Center => ((viewport_h - (num_lines as f32) * cell_h) / 2.0).max(0.0),
-        };
+        // Bottom-anchored: viewport height minus the banner's total line
+        // height (clamped non-negative).
+        #[allow(clippy::cast_precision_loss)]
+        let banner_top_y = (viewport_h - (num_lines as f32) * cell_h).max(0.0);
         for (row_idx, line) in banner.lines().enumerate() {
             #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
             let y0 = banner_top_y + (row_idx as f32) * cell_h;
@@ -1063,6 +1074,150 @@ impl Renderer {
                         uv_max: slot.uv_max,
                         fg,
                         bg,
+                        flags,
+                        pad: [0; 3],
+                    });
+                }
+            }
+        }
+    }
+
+    /// Append instances for the centered close-confirmation dialog: a
+    /// dimmed full-viewport backdrop with a rounded, padded "window" box
+    /// floating in the middle. Distinct from [`Self::draw_banner`] (the
+    /// full-width error banner) — this is a fixed-width box centered on
+    /// both axes, with a border and interior padding, so the "program
+    /// still running" prompt reads as a modal dialog.
+    ///
+    /// `message` is the dialog body; embedded `\n`s split it into rows (an
+    /// empty line renders as a blank spacer row). The renderer wraps the
+    /// rows in a rounded border and adds horizontal/vertical padding sized
+    /// from the widest row.
+    ///
+    /// Layout assumes one column per `char` (no wide-char handling), same
+    /// as [`Self::draw_banner`] — fine for the ASCII + box-drawing dialog
+    /// text. The per-cell two-cover-quad technique is also shared with
+    /// `draw_banner` (see its docs); here it fills the box panel so the
+    /// term glyphs the dirty builder emitted underneath are overpainted.
+    /// The single translucent quad pushed first is the dim backdrop:
+    /// `FLAG_UNDERLINE | FLAG_NO_GLYPH` routes it through the glyph pass
+    /// only (discarded in the bg pass) and emits premultiplied `bg`, which
+    /// the glyph pass's over-blend composites as a multiply-darken of
+    /// whatever the term/RGP passes drew underneath.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn draw_close_dialog(
+        queue: &Queue,
+        width: u32,
+        height: u32,
+        instances: &mut Vec<CellInstance>,
+        text: &mut TextState,
+        message: &str,
+        scrim: [f32; 4],
+        panel_bg: [f32; 4],
+        fg: [f32; 4],
+        cell_size: (f32, f32),
+        term: &Term,
+    ) {
+        /// Interior horizontal padding, in cells, on each side of the text.
+        const PAD_X: usize = 3;
+        /// Interior vertical padding, in blank rows, above and below the text.
+        const PAD_Y: usize = 1;
+
+        let viewport_w = width as f32;
+        let viewport_h = height as f32;
+        let cell_w = cell_size.0;
+        let cell_h = cell_size.1;
+
+        // Dim backdrop: one translucent black quad over the whole viewport.
+        instances.push(CellInstance {
+            pos: [0.0, 0.0],
+            size: [viewport_w, viewport_h],
+            uv_min: [0.0, 0.0],
+            uv_max: [0.0, 0.0],
+            fg,
+            bg: scrim,
+            flags: crate::text::instance::FLAG_UNDERLINE | crate::text::instance::FLAG_NO_GLYPH,
+            pad: [0; 3],
+        });
+
+        // Compose the box rows (border + padding + content), sized from
+        // the widest content line. The top border row is exactly the box
+        // width, so derive `box_cols` from it.
+        let rows = compose_dialog_rows(message, PAD_X, PAD_Y);
+        let cols = (viewport_w / cell_w).floor().max(1.0) as u32;
+        let vrows = (viewport_h / cell_h).floor().max(1.0) as u32;
+        let box_cols = rows.first().map_or(0, |r| r.chars().count()) as u32;
+        let box_rows = rows.len() as u32;
+
+        // Center the box; clamp to the viewport's top-left if it's larger.
+        let left_col = cols.saturating_sub(box_cols) / 2;
+        let top_row = vrows.saturating_sub(box_rows) / 2;
+
+        for (row_idx, line) in rows.iter().enumerate() {
+            let y0 = (top_row as f32 + row_idx as f32) * cell_h;
+            // Panel fill: bg-pass + glyph-pass cover per box cell (mirrors
+            // draw_banner) so any term glyph underneath is overpainted.
+            for c in 0..box_cols {
+                if left_col + c >= cols {
+                    break;
+                }
+                let x0 = (left_col + c) as f32 * cell_w;
+                instances.push(CellInstance {
+                    pos: [x0, y0],
+                    size: [cell_w, cell_h],
+                    uv_min: [0.0, 0.0],
+                    uv_max: [0.0, 0.0],
+                    fg,
+                    bg: panel_bg,
+                    flags: crate::text::instance::FLAG_NO_GLYPH,
+                    pad: [0; 3],
+                });
+                instances.push(CellInstance {
+                    pos: [x0, y0],
+                    size: [cell_w, cell_h],
+                    uv_min: [0.0, 0.0],
+                    uv_max: [0.0, 0.0],
+                    fg,
+                    bg: panel_bg,
+                    flags: crate::text::instance::FLAG_UNDERLINE
+                        | crate::text::instance::FLAG_NO_GLYPH,
+                    pad: [0; 3],
+                });
+            }
+            // Glyphs for this row. The shaper keys slots by the line-local
+            // column (0-based), so look up with the local index and place
+            // at the centered offset.
+            let lg = text
+                .rasterizer
+                .shape_line(queue, line, term.grapheme_cluster_mode());
+            for (i, ch) in line.chars().enumerate() {
+                let col = i as u32;
+                if col >= box_cols || left_col + col >= cols {
+                    break;
+                }
+                if ch.is_whitespace() {
+                    continue;
+                }
+                let x0 = (left_col + col) as f32 * cell_w;
+                let col_u16 = col as u16;
+                if let Some(slot) = lg.get(col_u16, ch) {
+                    let flags = if slot.is_color {
+                        crate::text::instance::FLAG_COLOR_GLYPH
+                    } else {
+                        0
+                    };
+                    instances.push(CellInstance {
+                        pos: [x0 + slot.glyph_offset[0], y0 + slot.glyph_offset[1]],
+                        size: slot.glyph_size,
+                        uv_min: slot.uv_min,
+                        uv_max: slot.uv_max,
+                        fg,
+                        bg: panel_bg,
                         flags,
                         pad: [0; 3],
                     });
@@ -1556,7 +1711,6 @@ impl Renderer {
                 &mut instances,
                 text,
                 banner,
-                BannerAnchor::Bottom,
                 banner_bg,
                 banner_fg,
                 cell_size,
@@ -1564,27 +1718,27 @@ impl Renderer {
             );
         }
 
-        // Close-confirmation prompt: same full-width / multi-line /
-        // two-cover-quad technique as the error banner above, but
-        // anchored to the VERTICAL CENTER of the viewport and painted in
-        // a dark-slate panel (distinct from the error banner's red) so
-        // the "program still running" prompt reads as a modal dialog
-        // rather than an error. The binary only sets one of the two at a
-        // time, but if both are somehow set we simply draw the prompt
-        // after the error banner — no ordering assumptions baked in.
+        // Close-confirmation dialog: a centered, rounded, padded "window"
+        // box floating over a dimmed full-viewport backdrop, painted in a
+        // dark-slate panel (distinct from the error banner's red) so the
+        // "program still running" prompt reads as a modal dialog rather
+        // than an error. Drawn after the error banner — the binary only
+        // sets one of the two at a time, but no ordering is assumed.
         if let Some(prompt) = self.close_prompt.as_deref() {
-            let prompt_bg = [0.12, 0.14, 0.20, 0.97];
-            let prompt_fg = [0.95, 0.96, 0.98, 1.0];
-            Self::draw_banner(
+            // 50% multiply-darken behind the dialog (premultiplied black).
+            let scrim = [0.0, 0.0, 0.0, 0.5];
+            let panel_bg = [0.12, 0.14, 0.20, 0.98];
+            let panel_fg = [0.95, 0.96, 0.98, 1.0];
+            Self::draw_close_dialog(
                 &self.queue,
                 self.config.width,
                 self.config.height,
                 &mut instances,
                 text,
                 prompt,
-                BannerAnchor::Center,
-                prompt_bg,
-                prompt_fg,
+                scrim,
+                panel_bg,
+                panel_fg,
                 cell_size,
                 term,
             );
@@ -2398,5 +2552,36 @@ mod tests {
             bg_at_cursor.is_some(),
             "OFF frame must emit a bg quad at the cursor's cell to overpaint the old cursor block"
         );
+    }
+
+    /// The close-confirmation dialog box is a well-formed rectangle: every
+    /// row is the same column width, the corners are rounded box-drawing
+    /// glyphs, and the message is inset by the requested padding.
+    #[test]
+    fn compose_dialog_rows_builds_padded_rounded_box() {
+        let pad_x = 3;
+        let pad_y = 1;
+        let rows = compose_dialog_rows("hello\n\nworld!", pad_x, pad_y);
+
+        // border + pad_y blanks + 3 content rows + pad_y blanks + border.
+        assert_eq!(rows.len(), 2 + 2 * pad_y + 3);
+
+        // Width is the widest line ("world!" = 6) + 2*pad_x interior +
+        // 2 border columns. All rows share that width (counted in chars,
+        // since each box glyph occupies one column).
+        let width = 6 + 2 * pad_x + 2;
+        for r in &rows {
+            assert_eq!(r.chars().count(), width, "row not full width: {r:?}");
+        }
+
+        // Rounded corners on the first/last rows.
+        assert!(rows[0].starts_with('╭') && rows[0].ends_with('╮'));
+        let last = rows.last().unwrap();
+        assert!(last.starts_with('╰') && last.ends_with('╯'));
+
+        // Side borders + horizontal padding on a content row.
+        let first_content = &rows[1 + pad_y];
+        assert!(first_content.starts_with(&format!("│{}hello", " ".repeat(pad_x))));
+        assert!(first_content.ends_with('│'));
     }
 }

@@ -79,10 +79,13 @@ const FRESH_STARTED_GAP: Duration = Duration::from_millis(50);
 /// be forgiving for a relaxed triple-click.
 const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(350);
 
-/// Text shown in the close-confirmation overlay (kitty's confirm-on-close).
-/// Padded with spaces so the centered banner has a little breathing room.
+/// Body text for the close-confirmation dialog (kitty's confirm-on-close).
+/// Embedded newlines split into rows; the renderer wraps these in a
+/// centered, padded "window" box and dims the rest of the screen behind it.
+/// The blank middle line becomes a spacer row between the message and the
+/// key hints.
 const CLOSE_PROMPT_TEXT: &str =
-    "  A program is still running.  Press Enter / y to close, Esc / n to cancel.  ";
+    "A program is still running.\n\nEnter / y → Close      Esc / n → Cancel";
 
 /// In-progress drag-select. Persisted between `handle_mouse` press and
 /// `handle_mouse_motion` so motion knows which mode/anchor to extend.
