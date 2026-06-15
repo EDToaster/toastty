@@ -242,10 +242,7 @@ impl Theme {
             bg: [0.07, 0.07, 0.09, 1.0],
             cursor: [0.95, 0.85, 0.30, 1.0],
             palette: DEFAULT_PALETTE_LINEAR,
-            selection_bg: derive_selection_bg(
-                [0.07, 0.07, 0.09, 1.0],
-                [0.85, 0.85, 0.85, 1.0],
-            ),
+            selection_bg: derive_selection_bg([0.07, 0.07, 0.09, 1.0], [0.85, 0.85, 0.85, 1.0]),
         }
     }
 
@@ -295,11 +292,7 @@ impl Theme {
     /// pure-CPU code paths (snapshot tests, benches) that don't care
     /// about OSC 4 — the function then falls back to the xterm formulas.
     #[must_use]
-    pub fn resolve_indexed256(
-        &self,
-        idx: u8,
-        ext_palette: Option<&[[f32; 4]; 256]>,
-    ) -> [f32; 4] {
+    pub fn resolve_indexed256(&self, idx: u8, ext_palette: Option<&[[f32; 4]; 256]>) -> [f32; 4] {
         if idx < 16 {
             return self.palette[idx as usize];
         }
@@ -571,8 +564,7 @@ pub fn build_instances_into<F, S>(
         // means "this row's id would underflow" — only happens at the
         // very top of an unscrolled tiny grid; the cell still renders
         // but selection is treated as off.
-        let line_id =
-            line_id_for_render_row(bottom_id, rows, view_offset_lines, pixel_extra, r);
+        let line_id = line_id_for_render_row(bottom_id, rows, view_offset_lines, pixel_extra, r);
         for c in 0..cols {
             let Some(cell) = row.cells.get(c as usize) else {
                 continue;
@@ -799,8 +791,7 @@ pub fn build_dirty_instances_into<F, S>(
 
     for (r, row_damage) in damage.iter_rows() {
         let row = term.view_row(r);
-        let line_id =
-            line_id_for_render_row(bottom_id, rows, view_offset_lines, pixel_extra, r);
+        let line_id = line_id_for_render_row(bottom_id, rows, view_offset_lines, pixel_extra, r);
         // Stack-allocated iter enum instead of `Box<dyn Iterator>`:
         // boxing was a per-dirty-row heap allocation on the render
         // hot path. Same `all_cols` vs sparse-list dispatch as before.
@@ -866,11 +857,7 @@ pub fn build_dirty_instances_into<F, S>(
             }
 
             if let Some(slot) = locate_glyph(r, c, cell.ch, &cell.style) {
-                let flags = if slot.is_color {
-                    FLAG_COLOR_GLYPH
-                } else {
-                    0
-                };
+                let flags = if slot.is_color { FLAG_COLOR_GLYPH } else { 0 };
                 out.push(CellInstance {
                     pos: [pos[0] + slot.glyph_offset[0], pos[1] + slot.glyph_offset[1]],
                     size: slot.glyph_size,
@@ -974,7 +961,13 @@ mod tests {
         // Empty grid: cells are spaces with default style; nothing should
         // be emitted apart from the cursor.
         let t = Term::new(2, 8, 0);
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
+        );
         assert_eq!(count_non_cursor(&v), 0);
     }
 
@@ -983,7 +976,13 @@ mod tests {
         let mut t = Term::new(1, 4, 0);
         // Set bg to red, then write a space.
         feed(&mut t, b"\x1b[41m ");
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
+        );
         // 1 background-colored cell + cursor.
         assert_eq!(count_non_cursor(&v), 1);
     }
@@ -992,7 +991,13 @@ mod tests {
     fn cursor_position_follows_csi_h() {
         let mut t = Term::new(10, 10, 0);
         feed(&mut t, b"\x1b[5;10H"); // row 5 col 10 (1-based)
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
+        );
         let cur = cursor_instance(&v);
         // 5,10 1-based → row 4, col 9 0-based.
         assert!((cur.pos[0] - 9.0 * 8.0).abs() < 1e-3);
@@ -1002,7 +1007,13 @@ mod tests {
     #[test]
     fn cursor_clamped_into_grid() {
         let t = Term::new(2, 3, 0);
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
+        );
         let cur = cursor_instance(&v);
         assert!(cur.pos[0] < 3.0 * 8.0);
         assert!(cur.pos[1] < 2.0 * 16.0);
@@ -1040,10 +1051,16 @@ mod tests {
         let mut t = Term::new(1, 8, 0);
         feed(&mut t, b"a b"); // "a", " ", "b" — space should not call the locator
         let mut seen = Vec::new();
-        let _ = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, ch, _| {
-            seen.push(ch);
-            None
-        });
+        let _ = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, ch, _| {
+                seen.push(ch);
+                None
+            },
+        );
         assert!(seen.contains(&'a'));
         assert!(seen.contains(&'b'));
         assert!(!seen.contains(&' '));
@@ -1053,15 +1070,21 @@ mod tests {
     fn color_glyph_flag_is_set_when_slot_is_color() {
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"X");
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| {
-            Some(GlyphSlot {
-                uv_min: [0.0, 0.0],
-                uv_max: [8.0, 16.0],
-                is_color: true,
-                glyph_offset: [0.0, 0.0],
-                glyph_size: [8.0, 16.0],
-            })
-        });
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| {
+                Some(GlyphSlot {
+                    uv_min: [0.0, 0.0],
+                    uv_max: [8.0, 16.0],
+                    is_color: true,
+                    glyph_offset: [0.0, 0.0],
+                    glyph_size: [8.0, 16.0],
+                })
+            },
+        );
         let glyph_inst = v
             .iter()
             .find(|i| i.flags & FLAG_COLOR_GLYPH != 0)
@@ -1092,7 +1115,13 @@ mod tests {
     #[test]
     fn cursor_instance_has_no_glyph_flag() {
         let t = Term::new(2, 2, 0);
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
+        );
         let cur = cursor_instance(&v);
         assert!(cur.flags & FLAG_NO_GLYPH != 0);
         assert!(cur.flags & FLAG_CURSOR != 0);
@@ -1137,7 +1166,13 @@ mod tests {
         // in on a later frame.
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"a");
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
+        );
         assert_eq!(count_non_cursor(&v), 1);
         let bg_inst = v.iter().find(|i| i.flags & FLAG_CURSOR == 0).unwrap();
         assert!(bg_inst.flags & FLAG_NO_GLYPH != 0);
@@ -1261,7 +1296,9 @@ mod tests {
     fn cursor_for(shape: CursorShape, cell_size: (f32, f32)) -> CellInstance {
         let mut t = Term::new(1, 4, 0);
         t.set_cursor_default(shape, false);
-        let v = build_instances(&t, cell_size, &Theme::default_dark(), None, |_, _, _, _| None);
+        let v = build_instances(&t, cell_size, &Theme::default_dark(), None, |_, _, _, _| {
+            None
+        });
         *cursor_instance(&v)
     }
 
@@ -1328,7 +1365,11 @@ mod tests {
     fn cursor_thickness_scales_with_cell_width() {
         // Tiny cell — thickness floors at 2 px.
         let cur = cursor_for(CursorShape::Bar, (6.0, 12.0));
-        assert!((cur.size[0] - 2.0).abs() < 1e-3, "tiny cell: width = {}", cur.size[0]);
+        assert!(
+            (cur.size[0] - 2.0).abs() < 1e-3,
+            "tiny cell: width = {}",
+            cur.size[0]
+        );
         // Big cell (HiDPI) — thickness scales up to ~15% but caps at 3 px.
         let cur = cursor_for(CursorShape::Bar, (40.0, 80.0));
         assert!(
@@ -1350,18 +1391,25 @@ mod tests {
         // must be a multiple of cell_w.
         let mut t = Term::new(1, 8, 0);
         feed(&mut t, "a你b".as_bytes());
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
-        let bgs: Vec<_> = v
-            .iter()
-            .filter(|i| i.flags & FLAG_CURSOR == 0)
-            .collect();
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
+        );
+        let bgs: Vec<_> = v.iter().filter(|i| i.flags & FLAG_CURSOR == 0).collect();
         // Exactly 3 instances — one per non-continuation cell.
         assert_eq!(bgs.len(), 3);
         // Each landing on an integer cell boundary.
         for inst in &bgs {
             let col_f = inst.pos[0] / 8.0;
             let col = col_f.round();
-            assert!((col_f - col).abs() < 1e-3, "x={} not on cell grid", inst.pos[0]);
+            assert!(
+                (col_f - col).abs() < 1e-3,
+                "x={} not on cell grid",
+                inst.pos[0]
+            );
         }
         // Columns 0 / 1 / 3 — the continuation column (2) is skipped.
         let cols: Vec<u16> = bgs
@@ -1383,9 +1431,18 @@ mod tests {
         // underline state.
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b]8;;https://example.com\x1b\\X");
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
+        );
         let underline_count = v.iter().filter(|i| i.flags & FLAG_UNDERLINE != 0).count();
-        assert_eq!(underline_count, 1, "hyperlinked cell must emit one underline strip");
+        assert_eq!(
+            underline_count, 1,
+            "hyperlinked cell must emit one underline strip"
+        );
     }
 
     #[test]
@@ -1393,7 +1450,13 @@ mod tests {
         // Same as above but via SGR mode 4 (\\x1b[4mX).
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[4mX");
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
+        );
         let underline_count = v.iter().filter(|i| i.flags & FLAG_UNDERLINE != 0).count();
         assert_eq!(underline_count, 1);
     }
@@ -1402,7 +1465,13 @@ mod tests {
     fn no_underline_when_neither_sgr_nor_hyperlink_set() {
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"X");
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
+        );
         let underline_count = v.iter().filter(|i| i.flags & FLAG_UNDERLINE != 0).count();
         assert_eq!(underline_count, 0);
     }
@@ -1427,14 +1496,21 @@ mod tests {
             &Theme::default_dark(),
             None,
             |_, _, ch, _| {
-                assert_ne!(ch, PLACEHOLDER, "locator must NOT be called for placeholder");
+                assert_ne!(
+                    ch, PLACEHOLDER,
+                    "locator must NOT be called for placeholder"
+                );
                 None
             },
         );
         // Exactly one non-cursor instance: the bg quad. No glyph quad,
         // no underline strip.
         let non_cursor: Vec<_> = v.iter().filter(|i| i.flags & FLAG_CURSOR == 0).collect();
-        assert_eq!(non_cursor.len(), 1, "expected 1 bg quad, got {non_cursor:?}");
+        assert_eq!(
+            non_cursor.len(),
+            1,
+            "expected 1 bg quad, got {non_cursor:?}"
+        );
         assert!(non_cursor[0].flags & FLAG_NO_GLYPH != 0);
         assert_eq!(non_cursor[0].pos, [0.0, 0.0]);
     }
@@ -1455,7 +1531,10 @@ mod tests {
             None,
             true,
             |_, _, ch, _| {
-                assert_ne!(ch, PLACEHOLDER, "locator must NOT be called for placeholder");
+                assert_ne!(
+                    ch, PLACEHOLDER,
+                    "locator must NOT be called for placeholder"
+                );
                 None
             },
             |_, _| false,
@@ -1463,7 +1542,9 @@ mod tests {
         // One bg quad for the placeholder cell + cursor.
         let non_cursor: Vec<_> = out.iter().filter(|i| i.flags & FLAG_CURSOR == 0).collect();
         assert!(
-            non_cursor.iter().any(|i| i.pos == [0.0, 0.0] && i.flags & FLAG_NO_GLYPH != 0),
+            non_cursor
+                .iter()
+                .any(|i| i.pos == [0.0, 0.0] && i.flags & FLAG_NO_GLYPH != 0),
             "expected a bg quad at (0,0); got {non_cursor:?}",
         );
         // No glyph instance (no FLAG_NO_GLYPH cleared, no FLAG_COLOR_GLYPH).
@@ -1485,7 +1566,13 @@ mod tests {
         feed(&mut t, "你".as_bytes());
         // No glyph slots — locator returns None. We only count
         // background instances.
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
+        );
         // Exactly one non-cursor instance (the wide cluster's
         // background quad), even though the cell grid records two
         // cells (one primary + one continuation).
@@ -1498,22 +1585,43 @@ mod tests {
         // emits the right shape.
         let mut t = Term::new(1, 4, 0);
         // Default = block.
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
+        );
         assert_eq!(cursor_instance(&v).size, [8.0, 16.0]);
         // Switch to bar (Ps=5 → bar, blinking).
         feed(&mut t, b"\x1b[5 q");
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
+        );
         assert!(cursor_instance(&v).size[0] < 8.0, "bar after Ps=5");
         // Switch to underline (Ps=4).
         feed(&mut t, b"\x1b[4 q");
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
-        assert!(
-            cursor_instance(&v).size[1] < 16.0,
-            "underline after Ps=4",
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
         );
+        assert!(cursor_instance(&v).size[1] < 16.0, "underline after Ps=4",);
         // Back to block (Ps=2).
         feed(&mut t, b"\x1b[2 q");
-        let v = build_instances(&t, (8.0, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
+        );
         assert_eq!(cursor_instance(&v).size, [8.0, 16.0]);
     }
 
@@ -1732,13 +1840,10 @@ mod tests {
         // glyph instance for index 50. We pull the bg quad (FLAG_NO_GLYPH
         // set, not the underline strip) — its fg encodes the SGR foreground.
         let default_ext = rebuild_ext_palette_for_test(&t);
-        let v_default = build_instances(
-            &t,
-            (8.0, 16.0),
-            &theme,
-            Some(&default_ext),
-            |_, _, _, _| None,
-        );
+        let v_default =
+            build_instances(&t, (8.0, 16.0), &theme, Some(&default_ext), |_, _, _, _| {
+                None
+            });
         let default_fg = v_default
             .iter()
             .find(|i| i.flags & FLAG_CURSOR == 0 && i.flags & FLAG_NO_GLYPH != 0)
@@ -1754,13 +1859,7 @@ mod tests {
         // Rebuild the cached ext_palette to mirror what the renderer
         // would do on `palette_revision` change, then re-emit instances.
         let after_ext = rebuild_ext_palette_for_test(&t);
-        let v_after = build_instances(
-            &t,
-            (8.0, 16.0),
-            &theme,
-            Some(&after_ext),
-            |_, _, _, _| None,
-        );
+        let v_after = build_instances(&t, (8.0, 16.0), &theme, Some(&after_ext), |_, _, _, _| None);
         let after_fg = v_after
             .iter()
             .find(|i| i.flags & FLAG_CURSOR == 0 && i.flags & FLAG_NO_GLYPH != 0)
@@ -1769,7 +1868,10 @@ mod tests {
 
         // The fg must have changed — proving the override actually
         // reached the instance buffer.
-        assert_ne!(default_fg, after_fg, "OSC 4 override must change rendered color");
+        assert_ne!(
+            default_fg, after_fg,
+            "OSC 4 override must change rendered color"
+        );
 
         // And it must equal the linearised override (red).
         let expected = srgb_to_linear_rgba(0xff, 0x00, 0x00);
@@ -1813,7 +1915,13 @@ mod tests {
             "\x1b]8;;https://example.com\x1b\\你\x1b]8;;\x1b\\".as_bytes(),
         );
         let cell_w = 8.0_f32;
-        let v = build_instances(&t, (cell_w, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let v = build_instances(
+            &t,
+            (cell_w, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
+        );
         let underline = v
             .iter()
             .find(|i| i.flags & FLAG_UNDERLINE != 0)
@@ -1836,7 +1944,13 @@ mod tests {
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b]8;;https://example.com\x1b\\X");
         let cell_w = 8.0_f32;
-        let v = build_instances(&t, (cell_w, 16.0), &Theme::default_dark(), None, |_, _, _, _| None);
+        let v = build_instances(
+            &t,
+            (cell_w, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
+        );
         let underline = v
             .iter()
             .find(|i| i.flags & FLAG_UNDERLINE != 0)

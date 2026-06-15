@@ -206,8 +206,7 @@ mod tests {
             let n2 = normals[tri[2] as usize];
             for axis in 0..3 {
                 assert!(
-                    (n0[axis] - n1[axis]).abs() < 1e-4
-                        && (n0[axis] - n2[axis]).abs() < 1e-4,
+                    (n0[axis] - n1[axis]).abs() < 1e-4 && (n0[axis] - n2[axis]).abs() < 1e-4,
                     "triangle {tri:?}: normals diverge on axis {axis}: \
                      {n0:?} {n1:?} {n2:?}",
                 );

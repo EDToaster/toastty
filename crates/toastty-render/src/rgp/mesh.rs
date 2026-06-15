@@ -118,11 +118,7 @@ impl GpuAssetCache {
     /// existing id (e.g. the `draw` example calling `register_payload`
     /// repeatedly on id=700 with growing OBJ data); a "missing id →
     /// upload" diff would leave the GPU stuck on the first version.
-    pub fn sync(
-        &mut self,
-        device: &wgpu::Device,
-        scene: &toastty_graphics::rgp::scene::RgpScene,
-    ) {
+    pub fn sync(&mut self, device: &wgpu::Device, scene: &toastty_graphics::rgp::scene::RgpScene) {
         self.meshes.clear();
         for (id, asset) in scene.assets() {
             self.meshes.insert(id, GpuMesh::upload(device, &asset.data));

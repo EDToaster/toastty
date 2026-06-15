@@ -524,9 +524,7 @@ mod tests {
     #[test]
     fn atlas_full_error_carries_dims() {
         let mut a = Atlas::new(8, 8);
-        let err = a
-            .reserve(GlyphKey(1), AtlasLayer::Mask, 32, 8)
-            .unwrap_err();
+        let err = a.reserve(GlyphKey(1), AtlasLayer::Mask, 32, 8).unwrap_err();
         assert_eq!(err.layer, AtlasLayer::Mask);
         assert_eq!(err.w, 32);
         assert_eq!(err.h, 8);

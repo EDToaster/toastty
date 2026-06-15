@@ -158,10 +158,7 @@ impl Harness {
         let damage = term.damage();
         for r in 0..rows {
             let is_dirty = damage.all
-                || damage
-                    .rows
-                    .get(r as usize)
-                    .is_some_and(|rd| !rd.is_empty())
+                || damage.rows.get(r as usize).is_some_and(|rd| !rd.is_empty())
                 || self.line_cache[r as usize].is_none();
             if !is_dirty {
                 continue;
@@ -284,10 +281,7 @@ impl Harness {
         for r in 0..rows {
             let is_dirty = force_full
                 || damage.all
-                || damage
-                    .rows
-                    .get(r as usize)
-                    .is_some_and(|rd| !rd.is_empty())
+                || damage.rows.get(r as usize).is_some_and(|rd| !rd.is_empty())
                 || self.line_cache[r as usize].is_none();
             if !is_dirty {
                 continue;
@@ -489,7 +483,10 @@ fn bench_single_cell_change(c: &mut Criterion) {
             // exactly what a keystroke echo from the shell looks like.
             // Only row 30 gets marked dirty.
             let ch = b"abcdefghijklmnopqrstuvwxyz"[(tick as usize) % 26];
-            parser.advance(&mut term, &[0x1b, b'[', b'3', b'1', b';', b'1', b'0', b'1', b'H', ch]);
+            parser.advance(
+                &mut term,
+                &[0x1b, b'[', b'3', b'1', b';', b'1', b'0', b'1', b'H', ch],
+            );
             harness.render_term(&term);
             term.clear_damage();
         });
@@ -533,7 +530,10 @@ fn bench_single_cell_change_fullscreen(c: &mut Criterion) {
         b.iter(|| {
             tick = tick.wrapping_add(1);
             let ch = b"abcdefghijklmnopqrstuvwxyz"[(tick as usize) % 26];
-            parser.advance(&mut term, &[0x1b, b'[', b'6', b'1', b';', b'1', b'0', b'1', b'H', ch]);
+            parser.advance(
+                &mut term,
+                &[0x1b, b'[', b'6', b'1', b';', b'1', b'0', b'1', b'H', ch],
+            );
             harness.render_term(&term);
             term.clear_damage();
         });
@@ -560,9 +560,7 @@ fn bench_phase_breakdown(c: &mut Criterion) {
         }
         term.clear_damage();
 
-        println!(
-            "\n=== phase breakdown: {label}  grid={rows}x{cols}  px={width}x{height} ===",
-        );
+        println!("\n=== phase breakdown: {label}  grid={rows}x{cols}  px={width}x{height} ===",);
 
         // Single-cell change (the realistic keystroke case): mark only
         // one row dirty.

@@ -160,19 +160,16 @@ impl Damage {
     /// non-empty (or the `all` shortcut is set, in which case every row
     /// is yielded). Used by the renderer's partial-redraw path.
     pub fn iter_rows(&self) -> impl Iterator<Item = (u16, &RowDamage)> {
-        self.rows
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| {
-                if r.is_empty() {
-                    None
-                } else {
-                    // u16 cast is safe: caller's row count is u16 by
-                    // construction (Term::new clamps).
-                    #[allow(clippy::cast_possible_truncation)]
-                    Some((i as u16, r))
-                }
-            })
+        self.rows.iter().enumerate().filter_map(|(i, r)| {
+            if r.is_empty() {
+                None
+            } else {
+                // u16 cast is safe: caller's row count is u16 by
+                // construction (Term::new clamps).
+                #[allow(clippy::cast_possible_truncation)]
+                Some((i as u16, r))
+            }
+        })
     }
 }
 

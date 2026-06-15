@@ -532,10 +532,7 @@ pub(crate) fn translate_modifiers(m: ModifiersState) -> Modifiers {
     translate_modifiers_with_leds(m, led::LedState::default())
 }
 
-pub(crate) fn translate_modifiers_with_leds(
-    m: ModifiersState,
-    leds: led::LedState,
-) -> Modifiers {
+pub(crate) fn translate_modifiers_with_leds(m: ModifiersState, leds: led::LedState) -> Modifiers {
     let mut out = Modifiers::empty();
     if m.shift_key() {
         out |= Modifiers::SHIFT;

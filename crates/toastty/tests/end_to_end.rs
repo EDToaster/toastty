@@ -235,7 +235,10 @@ fn pty_drives_bracketed_paste_mode_through_term() {
             break;
         }
     }
-    assert!(term.bracketed_paste(), "DECSET 2004 should set bracketed_paste");
+    assert!(
+        term.bracketed_paste(),
+        "DECSET 2004 should set bracketed_paste"
+    );
     drop(pty);
 }
 
@@ -271,7 +274,10 @@ fn pty_drives_focus_reporting_mode_through_term() {
             break;
         }
     }
-    assert!(term.report_focus(), "DECSET 1004 should enable focus reporting");
+    assert!(
+        term.report_focus(),
+        "DECSET 1004 should enable focus reporting"
+    );
     drop(pty);
 }
 

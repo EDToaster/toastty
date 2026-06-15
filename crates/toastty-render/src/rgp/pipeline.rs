@@ -175,10 +175,8 @@ impl Rgp3dPipeline {
             return;
         }
         // Collect placements ordered by id for determinism.
-        let mut placements: Vec<(u32, RgpPlacement)> = scene
-            .placements()
-            .map(|(id, p)| (id, *p))
-            .collect();
+        let mut placements: Vec<(u32, RgpPlacement)> =
+            scene.placements().map(|(id, p)| (id, *p)).collect();
         placements.sort_by_key(|(id, _)| *id);
 
         // Ensure we have enough uniform slots.
@@ -202,8 +200,7 @@ impl Rgp3dPipeline {
             // Y-up (matching the OBJ/glTF model-space convention
             // used by ratty), while terminal rows count top→bottom.
             let center_px_x = (f32::from(p.anchor.col) + 0.5) * cell_size.0;
-            let center_px_y =
-                viewport.1 - (f32::from(p.anchor.row) + 0.5) * cell_size.1;
+            let center_px_y = viewport.1 - (f32::from(p.anchor.row) + 0.5) * cell_size.1;
             // Pick the half-extent so the unit-cube model fits the
             // placement cell box. Use the smaller dimension so the
             // model isn't stretched in non-square placements.
@@ -263,15 +260,9 @@ impl Rgp3dPipeline {
 
             // Color tint: base_color × protocol color × brightness.
             let prot_color = p.style.color.unwrap_or([255, 255, 255]);
-            let r = mesh.base_color[0]
-                * (f32::from(prot_color[0]) / 255.0)
-                * p.style.brightness;
-            let g = mesh.base_color[1]
-                * (f32::from(prot_color[1]) / 255.0)
-                * p.style.brightness;
-            let b = mesh.base_color[2]
-                * (f32::from(prot_color[2]) / 255.0)
-                * p.style.brightness;
+            let r = mesh.base_color[0] * (f32::from(prot_color[0]) / 255.0) * p.style.brightness;
+            let g = mesh.base_color[1] * (f32::from(prot_color[1]) / 255.0) * p.style.brightness;
+            let b = mesh.base_color[2] * (f32::from(prot_color[2]) / 255.0) * p.style.brightness;
             let a = mesh.base_color[3];
             let uniforms = DrawUniforms {
                 mvp,
@@ -297,4 +288,3 @@ fn compose(ms: &[Mat4]) -> Mat4 {
     }
     out
 }
-

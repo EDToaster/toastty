@@ -27,7 +27,7 @@
 use std::collections::BTreeMap;
 use std::f32::consts::{PI, TAU};
 
-use crate::elements::{cpk_color, covalent_radius};
+use crate::elements::{covalent_radius, cpk_color};
 use crate::model::{ColoredMesh, Mesh, Molecule};
 
 // ── Primitive builders ────────────────────────────────────────────────────────
@@ -261,9 +261,7 @@ pub fn build(mol: &Molecule) -> Vec<ColoredMesh> {
 
     for atom in &mol.atoms {
         let radius = covalent_radius(&atom.symbol) * SPHERE_SCALE;
-        let entry = element_meshes
-            .entry(atom.symbol.clone())
-            .or_default();
+        let entry = element_meshes.entry(atom.symbol.clone()).or_default();
         build_uv_sphere(
             atom.pos,
             radius,
@@ -345,7 +343,11 @@ mod tests {
                     pos: [0.6, 0.0, 0.0],
                 },
             ],
-            bonds: vec![Bond { a: 0, b: 1, order: 1 }],
+            bonds: vec![Bond {
+                a: 0,
+                b: 1,
+                order: 1,
+            }],
         }
     }
 
@@ -374,8 +376,8 @@ mod tests {
     fn glb_roundtrip_positions_count() {
         let mesh = unit_cube_mesh();
         let bytes = crate::glb::write(&mesh);
-        let asset = toastty_graphics::rgp::glb_loader::load_glb(&bytes)
-            .expect("load_glb must succeed");
+        let asset =
+            toastty_graphics::rgp::glb_loader::load_glb(&bytes).expect("load_glb must succeed");
         assert_eq!(
             asset.mesh.positions.len(),
             mesh.positions.len(),
@@ -415,11 +417,7 @@ mod tests {
     #[test]
     fn global_normalize_fits_unit_box() {
         let mut meshes = vec![Mesh {
-            positions: vec![
-                [-5.0, -3.0, 0.0],
-                [5.0, 3.0, 0.0],
-                [0.0, 0.0, 2.0],
-            ],
+            positions: vec![[-5.0, -3.0, 0.0], [5.0, 3.0, 0.0], [0.0, 0.0, 2.0]],
             normals: vec![[1.0, 0.0, 0.0]; 3],
             indices: vec![0, 1, 2],
         }];

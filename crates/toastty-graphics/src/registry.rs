@@ -472,7 +472,11 @@ mod tests {
         pinned.insert(1u32);
         pinned.insert(2u32);
         let res = r.insert_with_pinned(3, img(2, 2, 0), &pinned).unwrap();
-        assert_eq!(res.evicted, vec![1], "fall back to LRU front when all pinned");
+        assert_eq!(
+            res.evicted,
+            vec![1],
+            "fall back to LRU front when all pinned"
+        );
         assert!(!r.contains(1));
         assert!(r.contains(2));
         assert!(r.contains(3));
@@ -505,7 +509,9 @@ mod tests {
         r.insert(1, img(2, 2, 0)).unwrap();
         r.insert(2, img(2, 2, 0)).unwrap();
         r.insert(3, img(2, 2, 0)).unwrap();
-        let res = r.insert_with_pinned(4, img(2, 2, 0), &HashSet::new()).unwrap();
+        let res = r
+            .insert_with_pinned(4, img(2, 2, 0), &HashSet::new())
+            .unwrap();
         assert_eq!(res.evicted, vec![1]);
     }
 

@@ -123,7 +123,8 @@ impl Viewport {
         let cell_h = cell_h.max(1.0);
         // Combine current target into a single pixel scalar for clean
         // arithmetic, then re-decompose.
-        let cur_px = f64::from(self.target_lines) * f64::from(cell_h) + f64::from(self.target_pixel);
+        let cur_px =
+            f64::from(self.target_lines) * f64::from(cell_h) + f64::from(self.target_pixel);
         let delta_px = f64::from(delta_lines) * f64::from(cell_h) + f64::from(delta_pixel);
         let mut new_px = cur_px + delta_px;
         let max_px = f64::from(max_lines) * f64::from(cell_h);
@@ -323,7 +324,13 @@ mod tests {
         let mut v = Viewport::new();
         v.target_lines = 10; // 160 px @ 16-px cell.
         // 320 px/sec for 0.25 sec = 80 px.
-        v.advance(0.25, 16.0, Smoothing::Linear { pixels_per_sec: 320.0 });
+        v.advance(
+            0.25,
+            16.0,
+            Smoothing::Linear {
+                pixels_per_sec: 320.0,
+            },
+        );
         // Should be at 5 lines (80 / 16).
         assert_eq!(v.current_lines, 5);
     }

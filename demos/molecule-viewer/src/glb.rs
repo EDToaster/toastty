@@ -235,8 +235,8 @@ mod tests {
     fn glb_write_single_triangle_parses() {
         let mesh = single_triangle_mesh();
         let bytes = write(&mesh);
-        let asset = toastty_graphics::rgp::glb_loader::load_glb(&bytes)
-            .expect("should parse successfully");
+        let asset =
+            toastty_graphics::rgp::glb_loader::load_glb(&bytes).expect("should parse successfully");
         assert_eq!(asset.mesh.positions.len(), 3, "three vertices expected");
         assert_eq!(
             asset.mesh.indices.len() % 3,

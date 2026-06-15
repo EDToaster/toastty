@@ -68,9 +68,8 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     // SAFETY: `cdir` covers `len_bytes` contiguous bytes (kernel-
     // populated). The kernel guarantees a NUL within that span for
     // any successful PROC_PIDVNODEPATHINFO.
-    let raw_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(cdir.as_ptr().cast::<u8>(), len_bytes)
-    };
+    let raw_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(cdir.as_ptr().cast::<u8>(), len_bytes) };
     let cstr = CStr::from_bytes_until_nul(raw_bytes).ok()?;
     let s = cstr.to_str().ok()?;
     if s.is_empty() {

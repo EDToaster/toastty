@@ -338,15 +338,7 @@ pub fn parse(payload: &[u8]) -> Result<RgpOperation, RgpParseError> {
 
     match verb {
         "s" => Ok(RgpOperation::SupportQuery),
-        "r" => parse_register(
-            id,
-            format,
-            path,
-            source,
-            more,
-            name,
-            payload_chunk,
-        ),
+        "r" => parse_register(id, format, path, source, more, name, payload_chunk),
         "p" => Ok(RgpOperation::Place {
             id: id.ok_or(RgpParseError::MissingField("id"))?,
             anchor: RgpAnchor {
@@ -420,11 +412,8 @@ fn parse_register(
     // but the spec doesn't forbid it).
     if source.as_deref() == Some("payload") {
         let chunk = payload_chunk.unwrap_or("");
-        let data = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            chunk,
-        )
-        .map_err(|_| RgpParseError::BadBase64)?;
+        let data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, chunk)
+            .map_err(|_| RgpParseError::BadBase64)?;
         return Ok(RgpOperation::Register {
             id,
             format,
@@ -440,15 +429,21 @@ fn parse_register(
 }
 
 fn parse_u32(key: &'static str, value: &str) -> Result<u32, RgpParseError> {
-    value.parse().map_err(|_| RgpParseError::MalformedField(key))
+    value
+        .parse()
+        .map_err(|_| RgpParseError::MalformedField(key))
 }
 
 fn parse_u16(key: &'static str, value: &str) -> Result<u16, RgpParseError> {
-    value.parse().map_err(|_| RgpParseError::MalformedField(key))
+    value
+        .parse()
+        .map_err(|_| RgpParseError::MalformedField(key))
 }
 
 fn parse_f32(key: &'static str, value: &str) -> Result<f32, RgpParseError> {
-    value.parse().map_err(|_| RgpParseError::MalformedField(key))
+    value
+        .parse()
+        .map_err(|_| RgpParseError::MalformedField(key))
 }
 
 fn parse_bool(key: &'static str, value: &str) -> Result<bool, RgpParseError> {

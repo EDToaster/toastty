@@ -78,10 +78,7 @@ mod tests {
 
     #[test]
     fn parses_command_finished_with_exit_code() {
-        assert_eq!(
-            parse(b"D;0"),
-            Some(PromptKind::CommandFinished(Some(0)))
-        );
+        assert_eq!(parse(b"D;0"), Some(PromptKind::CommandFinished(Some(0))));
         assert_eq!(
             parse(b"D;127"),
             Some(PromptKind::CommandFinished(Some(127)))
@@ -99,10 +96,7 @@ mod tests {
     fn parses_command_finished_with_non_integer_exit_falls_through() {
         // Non-numeric exit code (e.g. some shells use "INT" for SIGINT) →
         // treat as None rather than rejecting the marker.
-        assert_eq!(
-            parse(b"D;INT"),
-            Some(PromptKind::CommandFinished(None))
-        );
+        assert_eq!(parse(b"D;INT"), Some(PromptKind::CommandFinished(None)));
     }
 
     #[test]

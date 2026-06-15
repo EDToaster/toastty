@@ -34,7 +34,10 @@ const APC_END: &[u8] = b"\x1b\\";
 /// that is a multiple of 4 guarantees the final remainder chunk is too.
 /// Do NOT change this to a non-multiple of 4 without reworking chunking.
 const CHUNK_B64: usize = 4096;
-const _: () = assert!(CHUNK_B64.is_multiple_of(4), "CHUNK_B64 must be a multiple of 4 (per-frame base64 decode)");
+const _: () = assert!(
+    CHUNK_B64.is_multiple_of(4),
+    "CHUNK_B64 must be a multiple of 4 (per-frame base64 decode)"
+);
 
 /// Anchor + transform for a placement. row/col = 1-based center cell.
 #[derive(Debug, Clone, Copy)]
@@ -93,15 +96,15 @@ pub fn place<W: Write>(w: &mut W, id: u32, p: &Placement) -> io::Result<()> {
     write!(
         w,
         "ratty;g;p;id={id};row={row};col={col};w={w};h={h};depth={depth};scale={scale};rx={rx};ry={ry};rz={rz};color={cr:02x}{cg:02x}{cb:02x};animate={animate}",
-        row   = p.row,
-        col   = p.col,
-        w     = p.w,
-        h     = p.h,
+        row = p.row,
+        col = p.col,
+        w = p.w,
+        h = p.h,
         depth = p.depth,
         scale = p.scale,
-        rx    = p.rx,
-        ry    = p.ry,
-        rz    = p.rz,
+        rx = p.rx,
+        ry = p.ry,
+        rz = p.rz,
     )?;
     w.write_all(APC_END)?;
     Ok(())
@@ -180,7 +183,10 @@ mod tests {
         let out = run(|w| place(w, 7, &p));
         let s = std::str::from_utf8(&out).unwrap();
 
-        assert!(s.starts_with("\x1b_ratty;g;p;id=7;"), "starts with prefix: {s:?}");
+        assert!(
+            s.starts_with("\x1b_ratty;g;p;id=7;"),
+            "starts with prefix: {s:?}"
+        );
         assert!(s.contains("color=ff8844"), "contains color=ff8844: {s:?}");
         assert!(s.contains("animate=0"), "contains animate=0: {s:?}");
         assert!(s.ends_with("\x1b\\"), "ends with ST: {s:?}");
@@ -231,7 +237,10 @@ mod tests {
         let s = std::str::from_utf8(&out).unwrap();
         let frame_count = s.matches("\x1b_").count();
         assert_eq!(frame_count, 1, "empty payload → 1 frame: {s:?}");
-        assert!(s.contains("more=0"), "empty payload must have more=0: {s:?}");
+        assert!(
+            s.contains("more=0"),
+            "empty payload must have more=0: {s:?}"
+        );
         assert!(s.ends_with("\x1b\\"), "ends with ST: {s:?}");
     }
 

@@ -58,7 +58,7 @@ impl ImagePipeline {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: NonZeroU64::new(
-                            std::mem::size_of::<ImageGlobals>() as u64,
+                            std::mem::size_of::<ImageGlobals>() as u64
                         ),
                     },
                     count: None,
@@ -223,10 +223,8 @@ impl ImagePipeline {
                     }
                     let predicted_evict = cache.peek_evictions_for_insert(id);
                     if !predicted_evict.is_empty() {
-                        let pre_state: HashMap<u32, usize> = cache
-                            .iter()
-                            .map(|(id, e)| (id, e.texture_index))
-                            .collect();
+                        let pre_state: HashMap<u32, usize> =
+                            cache.iter().map(|(id, e)| (id, e.texture_index)).collect();
                         for victim in &predicted_evict {
                             if let Some(&slot) = pre_state.get(victim) {
                                 self.release_texture(slot);

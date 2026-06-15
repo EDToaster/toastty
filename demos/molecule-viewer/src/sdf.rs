@@ -77,15 +77,9 @@ pub fn parse_sdf(text: &str) -> anyhow::Result<Molecule> {
     }
 
     let mut atoms = Vec::with_capacity(n_atoms);
-    for (i, line) in lines
-        .iter()
-        .enumerate()
-        .skip(atom_start)
-        .take(n_atoms)
-    {
-        let atom = parse_atom_line(line).map_err(|e| {
-            anyhow::anyhow!("Error parsing atom line {}: {}: {:?}", i + 1, e, line)
-        })?;
+    for (i, line) in lines.iter().enumerate().skip(atom_start).take(n_atoms) {
+        let atom = parse_atom_line(line)
+            .map_err(|e| anyhow::anyhow!("Error parsing atom line {}: {}: {:?}", i + 1, e, line))?;
         atoms.push(atom);
     }
 
@@ -101,19 +95,13 @@ pub fn parse_sdf(text: &str) -> anyhow::Result<Molecule> {
     }
 
     let mut bonds = Vec::with_capacity(n_bonds);
-    for (i, line) in lines
-        .iter()
-        .enumerate()
-        .skip(bond_start)
-        .take(n_bonds)
-    {
+    for (i, line) in lines.iter().enumerate().skip(bond_start).take(n_bonds) {
         // Stop early if we hit M  END before expected (defensive).
         if line.trim_start().starts_with("M  END") {
             break;
         }
-        let bond = parse_bond_line(line).map_err(|e| {
-            anyhow::anyhow!("Error parsing bond line {}: {}: {:?}", i + 1, e, line)
-        })?;
+        let bond = parse_bond_line(line)
+            .map_err(|e| anyhow::anyhow!("Error parsing bond line {}: {}: {:?}", i + 1, e, line))?;
         // Validate indices against the atom count — an out-of-range bond
         // would otherwise panic downstream at `mol.atoms[bond.a]`.
         if bond.a >= n_atoms || bond.b >= n_atoms {
@@ -142,8 +130,7 @@ fn parse_counts(line: &str) -> anyhow::Result<(usize, usize)> {
     // Fixed-column parse (correct V2000; `.get` avoids a panic on a
     // non-char-boundary should the line contain unexpected bytes).
     if let (Some(a), Some(b)) = (line.get(0..3), line.get(3..6))
-        && let (Ok(n_atoms), Ok(n_bonds)) =
-            (a.trim().parse::<usize>(), b.trim().parse::<usize>())
+        && let (Ok(n_atoms), Ok(n_bonds)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>())
     {
         return Ok((n_atoms, n_bonds));
     }
@@ -351,15 +338,13 @@ M  END
         // Both counts >= 100 merge with no separating space in V2000
         // (`100100`). Fixed-column parsing must still read 100 and 100;
         // a whitespace split would wrongly yield a single 100100 token.
-        let (a, b) = parse_counts("100100  0  0  0  0  0  0  0  0999 V2000")
-            .expect("counts parse");
+        let (a, b) = parse_counts("100100  0  0  0  0  0  0  0  0999 V2000").expect("counts parse");
         assert_eq!((a, b), (100, 100));
     }
 
     #[test]
     fn test_counts_standard_small() {
-        let (a, b) = parse_counts("  3  2  0  0  0  0  0  0  0  0999 V2000")
-            .expect("counts parse");
+        let (a, b) = parse_counts("  3  2  0  0  0  0  0  0  0  0999 V2000").expect("counts parse");
         assert_eq!((a, b), (3, 2));
     }
 

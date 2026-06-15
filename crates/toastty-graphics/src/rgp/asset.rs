@@ -127,7 +127,10 @@ mod tests {
         let m = CpuMesh::unit_cube();
         for p in &m.positions {
             for axis in p {
-                assert!((-0.5..=0.5).contains(axis), "axis out of unit range: {axis}");
+                assert!(
+                    (-0.5..=0.5).contains(axis),
+                    "axis out of unit range: {axis}"
+                );
             }
         }
     }

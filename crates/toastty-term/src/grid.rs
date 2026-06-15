@@ -182,8 +182,8 @@ impl Grid {
     /// else the visible top). All retained `line_id`s fall in
     /// `oldest_retained_id..=bottom_id`.
     pub fn oldest_retained_id(&self) -> u64 {
-        let above_bottom = u64::from(self.history_lines)
-            + u64::from(self.visible_rows.saturating_sub(1));
+        let above_bottom =
+            u64::from(self.history_lines) + u64::from(self.visible_rows.saturating_sub(1));
         self.bottom_id.saturating_sub(above_bottom)
     }
 
@@ -552,7 +552,7 @@ mod tests {
                 ch: 'z',
                 style: Style::RESET,
                 is_continuation: false,
-            hyperlink_id: None,
+                hyperlink_id: None,
             },
             8,
         );
@@ -573,7 +573,7 @@ mod tests {
                 ch: 'x',
                 style: Style::RESET,
                 is_continuation: false,
-            hyperlink_id: None,
+                hyperlink_id: None,
             },
             3,
         );
@@ -589,7 +589,7 @@ mod tests {
                 ch: char::from(b'a' + i as u8),
                 style: Style::RESET,
                 is_continuation: false,
-            hyperlink_id: None,
+                hyperlink_id: None,
             };
         }
         r.erase(1, 3, red_style());
@@ -600,7 +600,7 @@ mod tests {
                 ch: ' ',
                 style: red_style(),
                 is_continuation: false,
-            hyperlink_id: None,
+                hyperlink_id: None,
             }
         );
         assert_eq!(
@@ -609,7 +609,7 @@ mod tests {
                 ch: ' ',
                 style: red_style(),
                 is_continuation: false,
-            hyperlink_id: None,
+                hyperlink_id: None,
             }
         );
         assert_eq!(r.cells[3].ch, 'd');
@@ -647,7 +647,7 @@ mod tests {
                 ch: 'a',
                 style: Style::RESET,
                 is_continuation: false,
-            hyperlink_id: None,
+                hyperlink_id: None,
             },
             3,
         );
@@ -657,7 +657,7 @@ mod tests {
                 ch: 'b',
                 style: Style::RESET,
                 is_continuation: false,
-            hyperlink_id: None,
+                hyperlink_id: None,
             },
             3,
         );
@@ -733,7 +733,7 @@ mod tests {
                 ch: 'x',
                 style: Style::RESET,
                 is_continuation: false,
-            hyperlink_id: None,
+                hyperlink_id: None,
             },
             3,
         );
@@ -759,7 +759,7 @@ mod tests {
                 ch: 'a',
                 style: Style::RESET,
                 is_continuation: false,
-            hyperlink_id: None,
+                hyperlink_id: None,
             },
             4,
         );
@@ -778,7 +778,7 @@ mod tests {
                 ch: 'a',
                 style: Style::RESET,
                 is_continuation: false,
-            hyperlink_id: None,
+                hyperlink_id: None,
             },
             3,
         );
@@ -788,7 +788,7 @@ mod tests {
                 ch: 'b',
                 style: Style::RESET,
                 is_continuation: false,
-            hyperlink_id: None,
+                hyperlink_id: None,
             },
             3,
         );
@@ -1014,7 +1014,10 @@ mod tests {
         // Shrink back; live bottom moves down accordingly.
         g.resize(20, 80, 24 + 100);
         let after_shrink_top = g.bottom_id() - 19;
-        assert_eq!(after_shrink_top, initial_top_id, "top row line_id drifted on shrink");
+        assert_eq!(
+            after_shrink_top, initial_top_id,
+            "top row line_id drifted on shrink"
+        );
     }
 
     #[test]

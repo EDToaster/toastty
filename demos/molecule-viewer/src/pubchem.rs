@@ -72,8 +72,16 @@ fn url_encode(s: &str) -> String {
             }
             _ => {
                 out.push('%');
-                out.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());
-                out.push(char::from_digit((b & 0xf) as u32, 16).unwrap().to_ascii_uppercase());
+                out.push(
+                    char::from_digit((b >> 4) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+                out.push(
+                    char::from_digit((b & 0xf) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
             }
         }
     }
@@ -197,10 +205,7 @@ pub fn search(query: &str) -> anyhow::Result<Vec<Candidate>> {
         format!("{BASE}/compound/name/{encoded}/cids/JSON")
     };
 
-    let cid_json = ureq::get(&cid_url)
-        .call()?
-        .body_mut()
-        .read_to_string()?;
+    let cid_json = ureq::get(&cid_url).call()?.body_mut().read_to_string()?;
 
     let mut cids = parse_cid_list(&cid_json)?;
     cids.truncate(20);
@@ -214,14 +219,10 @@ pub fn search(query: &str) -> anyhow::Result<Vec<Candidate>> {
         .map(std::string::ToString::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let prop_url = format!(
-        "{BASE}/compound/cid/{cid_str}/property/Title,IUPACName,MolecularFormula/JSON"
-    );
+    let prop_url =
+        format!("{BASE}/compound/cid/{cid_str}/property/Title,IUPACName,MolecularFormula/JSON");
 
-    let prop_json = ureq::get(&prop_url)
-        .call()?
-        .body_mut()
-        .read_to_string()?;
+    let prop_json = ureq::get(&prop_url).call()?.body_mut().read_to_string()?;
 
     let mut candidates = parse_properties(&prop_json)?;
 
@@ -254,10 +255,7 @@ pub fn fetch_sdf_3d(cid: u32) -> anyhow::Result<String> {
         Err(ureq::Error::StatusCode(_)) => {
             // No 3D conformer available — fall back to 2D.
             let url_2d = format!("{BASE}/compound/cid/{cid}/record/SDF?record_type=2d");
-            Ok(ureq::get(&url_2d)
-                .call()?
-                .body_mut()
-                .read_to_string()?)
+            Ok(ureq::get(&url_2d).call()?.body_mut().read_to_string()?)
         }
         Err(e) => Err(e.into()),
     }
@@ -268,8 +266,7 @@ mod tests {
     use super::*;
 
     // Captured sample responses from the live endpoint.
-    const FASTFORMULA_JSON: &str =
-        r#"{"IdentifierList":{"CID":[702,8254,102138,177555036]}}"#;
+    const FASTFORMULA_JSON: &str = r#"{"IdentifierList":{"CID":[702,8254,102138,177555036]}}"#;
 
     const PROPERTIES_JSON: &str = r#"{"PropertyTable":{"Properties":[{"CID":702,"MolecularFormula":"C2H6O","IUPACName":"ethanol","Title":"Ethanol"}]}}"#;
 

@@ -77,11 +77,7 @@ fn mod_bits(modifiers: Modifiers) -> u32 {
 
 /// Convert pixel `(x, y)` to 1-based `(col, row)`, clamped to the grid.
 #[must_use]
-pub fn pixel_to_cell(
-    pixel: (f64, f64),
-    cell_size: (f32, f32),
-    grid: (u16, u16),
-) -> (u16, u16) {
+pub fn pixel_to_cell(pixel: (f64, f64), cell_size: (f32, f32), grid: (u16, u16)) -> (u16, u16) {
     let (cw, ch) = cell_size;
     if cw <= 0.0 || ch <= 0.0 {
         return (1, 1);
@@ -463,9 +459,12 @@ mod tests {
             m,
             &MouseEventKind::Press(MouseButton::Left)
         ));
-        assert!(!protocol_wants_event(m, &MouseEventKind::Motion {
-            held: Some(MouseButton::Left)
-        }));
+        assert!(!protocol_wants_event(
+            m,
+            &MouseEventKind::Motion {
+                held: Some(MouseButton::Left)
+            }
+        ));
     }
 
     #[test]
@@ -479,16 +478,25 @@ mod tests {
     #[test]
     fn protocol_wants_event_button_motion_needs_held() {
         let m = mode_on(MouseProtocol::ButtonMotion);
-        assert!(protocol_wants_event(m, &MouseEventKind::Motion {
-            held: Some(MouseButton::Left)
-        }));
-        assert!(!protocol_wants_event(m, &MouseEventKind::Motion { held: None }));
+        assert!(protocol_wants_event(
+            m,
+            &MouseEventKind::Motion {
+                held: Some(MouseButton::Left)
+            }
+        ));
+        assert!(!protocol_wants_event(
+            m,
+            &MouseEventKind::Motion { held: None }
+        ));
     }
 
     #[test]
     fn protocol_wants_event_any_motion() {
         let m = mode_on(MouseProtocol::AnyMotion);
-        assert!(protocol_wants_event(m, &MouseEventKind::Motion { held: None }));
+        assert!(protocol_wants_event(
+            m,
+            &MouseEventKind::Motion { held: None }
+        ));
     }
 
     // ---- word_bounds_in_row ----

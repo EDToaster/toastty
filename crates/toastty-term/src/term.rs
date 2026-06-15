@@ -15,7 +15,6 @@ use crate::grid::Grid;
 use toastty_config::CursorShape;
 use toastty_graphics::kitty::handler::{KittyHandler, KittySink};
 use toastty_graphics::kitty::header::DeleteSpec;
-use toastty_graphics::sixel::{SixelDcs, SixelHandler, SIXEL_MAX_COLORS};
 use toastty_graphics::rgp::asset::CpuAsset;
 use toastty_graphics::rgp::glb_loader::load_glb;
 use toastty_graphics::rgp::handler::{RgpHandler, RgpSink};
@@ -25,6 +24,7 @@ use toastty_graphics::rgp::operation::{
 };
 use toastty_graphics::rgp::path_resolver::resolve as resolve_rgp_path;
 use toastty_graphics::rgp::scene::{RgpAsset, RgpScene};
+use toastty_graphics::sixel::{SIXEL_MAX_COLORS, SixelDcs, SixelHandler};
 use toastty_graphics::{ImageData, ImageGrid, ImageRegistry, Placement};
 use toastty_parser::{Params, Perform};
 
@@ -1379,8 +1379,7 @@ impl Term {
             // separates rows with `\n`.
             let is_last_row = line_id == last.line_id;
             if !is_last_row {
-                let join_soft =
-                    !matches!(sel.mode, SelectionMode::Block) && row.soft_wrap;
+                let join_soft = !matches!(sel.mode, SelectionMode::Block) && row.soft_wrap;
                 if !join_soft {
                     out.push('\n');
                 }
@@ -1418,7 +1417,9 @@ impl Term {
         } else {
             (self.cursor.row, self.cursor.col)
         };
-        let (new_row, new_col) = self.primary.resize_reflow(rows, cols, primary_cap, primary_cursor);
+        let (new_row, new_col) =
+            self.primary
+                .resize_reflow(rows, cols, primary_cap, primary_cursor);
         self.alt.resize(rows, cols, rows as usize);
         if self.alt_active {
             // The live cursor belongs to alt (clamped below); update the
@@ -1719,10 +1720,8 @@ impl Term {
         // finalize → emit image placements.
         if toastty_graphics::is_placeholder(c) {
             if self.placeholder_run.is_none()
-                && let Some((fg_bits, placement_id)) = placeholder_image_id_from_sgr(
-                    self.cursor.style.fg,
-                    self.cursor_underline_color,
-                )
+                && let Some((fg_bits, placement_id)) =
+                    placeholder_image_id_from_sgr(self.cursor.style.fg, self.cursor_underline_color)
             {
                 self.placeholder_run = Some(PlaceholderRun {
                     fg_bits,
@@ -1772,8 +1771,8 @@ impl Term {
         // Wrap before printing if the cursor is past the last column
         // OR — for a width-2 char — there's only 1 column left. The
         // width-2 wrap case matches xterm: a wide char never splits.
-        let needs_wrap = self.cursor.col >= self.cols
-            || (cell_w == 2 && self.cursor.col + 1 >= self.cols);
+        let needs_wrap =
+            self.cursor.col >= self.cols || (cell_w == 2 && self.cursor.col + 1 >= self.cols);
         if needs_wrap {
             // Mark the row we're leaving as soft-wrapped (decision #6).
             // The cursor block was sitting on the last column of the
@@ -1806,7 +1805,9 @@ impl Term {
         // stranded continuation cell (which renders as a gap). The write
         // spans columns `[col, col + cell_w)`.
         self.clear_wide_orphans(row, col, cell_w);
-        self.active_grid_mut().row_mut(row).put(col, primary, max_cols);
+        self.active_grid_mut()
+            .row_mut(row)
+            .put(col, primary, max_cols);
         if cell_w == 2 {
             // Continuation marker: '\0' with the same style.
             let cont = Cell {
@@ -1858,11 +1859,15 @@ impl Term {
             .is_some_and(|c| c.is_continuation);
         let max_cols = self.cols;
         if left_orphan {
-            self.active_grid_mut().row_mut(row).put(col - 1, blank, max_cols);
+            self.active_grid_mut()
+                .row_mut(row)
+                .put(col - 1, blank, max_cols);
             self.mark_cell(row, col - 1);
         }
         if right_orphan {
-            self.active_grid_mut().row_mut(row).put(last + 1, blank, max_cols);
+            self.active_grid_mut()
+                .row_mut(row)
+                .put(last + 1, blank, max_cols);
             self.mark_cell(row, last + 1);
         }
     }
@@ -1910,24 +1915,25 @@ impl Term {
         let mut prev: Option<(u16, u16, u16)> = None;
         for cell in &run.cells {
             let d = &cell.diacritics;
-            let (row_d, col_d, id_msb) = match (d.first().copied(), d.get(1).copied(), d.get(2).copied()) {
-                (None, _, _) => {
-                    // Bare cell: inherit everything; advance column.
-                    let (pr, pc, pm) = prev.unwrap_or((0, 0, 0));
-                    (pr, pc.saturating_add(1), pm)
-                }
-                (Some(r), None, _) => {
-                    // Row only: inherit column (advanced) and id_msb.
-                    let (_, pc, pm) = prev.unwrap_or((0, 0, 0));
-                    (r, pc.saturating_add(1), pm)
-                }
-                (Some(r), Some(c), None) => {
-                    // Row + col: inherit id_msb.
-                    let (_, _, pm) = prev.unwrap_or((0, 0, 0));
-                    (r, c, pm)
-                }
-                (Some(r), Some(c), Some(m)) => (r, c, m),
-            };
+            let (row_d, col_d, id_msb) =
+                match (d.first().copied(), d.get(1).copied(), d.get(2).copied()) {
+                    (None, _, _) => {
+                        // Bare cell: inherit everything; advance column.
+                        let (pr, pc, pm) = prev.unwrap_or((0, 0, 0));
+                        (pr, pc.saturating_add(1), pm)
+                    }
+                    (Some(r), None, _) => {
+                        // Row only: inherit column (advanced) and id_msb.
+                        let (_, pc, pm) = prev.unwrap_or((0, 0, 0));
+                        (r, pc.saturating_add(1), pm)
+                    }
+                    (Some(r), Some(c), None) => {
+                        // Row + col: inherit id_msb.
+                        let (_, _, pm) = prev.unwrap_or((0, 0, 0));
+                        (r, c, pm)
+                    }
+                    (Some(r), Some(c), Some(m)) => (r, c, m),
+                };
             prev = Some((row_d, col_d, id_msb));
 
             // Full image id: high byte from 3rd diacritic, low bits
@@ -2170,7 +2176,11 @@ impl Term {
                     5 => self.pty_replies.extend_from_slice(b"\x1b[0n"),
                     6 => {
                         let row = self.cursor.row.saturating_add(1);
-                        let col = self.cursor.col.min(self.cols.saturating_sub(1)).saturating_add(1);
+                        let col = self
+                            .cursor
+                            .col
+                            .min(self.cols.saturating_sub(1))
+                            .saturating_add(1);
                         let reply = format!("\x1b[{row};{col}R");
                         self.pty_replies.extend_from_slice(reply.as_bytes());
                     }
@@ -2181,7 +2191,11 @@ impl Term {
                 let ps = first_param(params, 0);
                 if ps == 6 {
                     let row = self.cursor.row.saturating_add(1);
-                    let col = self.cursor.col.min(self.cols.saturating_sub(1)).saturating_add(1);
+                    let col = self
+                        .cursor
+                        .col
+                        .min(self.cols.saturating_sub(1))
+                        .saturating_add(1);
                     let reply = format!("\x1b[?{row};{col}R");
                     self.pty_replies.extend_from_slice(reply.as_bytes());
                 }
@@ -2663,8 +2677,14 @@ impl Term {
             // as the implicit 0 (reset) the spec requires.
             let head = slice.first().copied().unwrap_or(0);
             match head {
-                38 if slice.len() >= 2 => self.cursor.style.fg = parse_extended_color_from_slice(&slice[1..]).unwrap_or(self.cursor.style.fg),
-                48 if slice.len() >= 2 => self.cursor.style.bg = parse_extended_color_from_slice(&slice[1..]).unwrap_or(self.cursor.style.bg),
+                38 if slice.len() >= 2 => {
+                    self.cursor.style.fg =
+                        parse_extended_color_from_slice(&slice[1..]).unwrap_or(self.cursor.style.fg)
+                }
+                48 if slice.len() >= 2 => {
+                    self.cursor.style.bg =
+                        parse_extended_color_from_slice(&slice[1..]).unwrap_or(self.cursor.style.bg)
+                }
                 58 if slice.len() >= 2 => {
                     // M11a: SGR 58 underline color is stored on
                     // `cursor_underline_color`. The Unicode placeholder
@@ -3282,9 +3302,7 @@ impl Perform for Term {
                 let rest = &params[1..];
                 let mut i = 0;
                 while i + 1 < rest.len() {
-                    if let Some(op) =
-                        toastty_protocols::palette::parse_pair(rest[i], rest[i + 1])
-                    {
+                    if let Some(op) = toastty_protocols::palette::parse_pair(rest[i], rest[i + 1]) {
                         match op {
                             toastty_protocols::palette::Osc4Op::Query { idx } => {
                                 let rgb = self.palette_override(idx).unwrap_or_else(|| {
@@ -3329,8 +3347,9 @@ impl Perform for Term {
                         }
                         toastty_protocols::clipboard::Osc52Op::Query { selection } => {
                             if self.security.osc_52_read {
-                                self.clipboard_requests
-                                    .push(ClipboardRequest::Query { selection: selection.0 });
+                                self.clipboard_requests.push(ClipboardRequest::Query {
+                                    selection: selection.0,
+                                });
                             }
                         }
                     }
@@ -3650,7 +3669,10 @@ impl KittySink for Term {
         // it has to free quota space (kitty spec).
         let pinned: std::collections::HashSet<u32> =
             self.image_grid.iter().map(|p| p.image_id).collect();
-        match self.image_registry.insert_with_pinned(id_request, data, &pinned) {
+        match self
+            .image_registry
+            .insert_with_pinned(id_request, data, &pinned)
+        {
             Ok(inserted) => {
                 tracing::info!(
                     target: "kitty",
@@ -3736,9 +3758,7 @@ impl KittySink for Term {
         // rows are left below the cursor — which is often 0 or 1 by
         // the time multiple images have been placed, so the image
         // collapses to a single-row band at the bottom.
-        let scroll_n = cur_row
-            .saturating_add(row_span)
-            .saturating_sub(self.rows);
+        let scroll_n = cur_row.saturating_add(row_span).saturating_sub(self.rows);
         if scroll_n > 0 {
             for _ in 0..scroll_n {
                 self.active_grid_mut().scroll_up();
@@ -3832,7 +3852,11 @@ impl KittySink for Term {
         }
     }
 
-    fn delete_image(&mut self, delete: DeleteSpec, header: &toastty_graphics::kitty::header::Header) {
+    fn delete_image(
+        &mut self,
+        delete: DeleteSpec,
+        header: &toastty_graphics::kitty::header::Header,
+    ) {
         // Treat empty / unknown specs the same as `a` (all).
         let spec_byte = if delete.byte == 0 { b'a' } else { delete.byte };
         let mut dropped_placements = Vec::new();
@@ -3880,9 +3904,10 @@ impl KittySink for Term {
                     let img = header.image_id;
                     let pid = header.placement_id;
                     if pid != 0 {
-                        dropped_placements.extend(self.image_grid.remove_where(|p| {
-                            p.image_id == img && p.placement_id == pid
-                        }));
+                        dropped_placements.extend(
+                            self.image_grid
+                                .remove_where(|p| p.image_id == img && p.placement_id == pid),
+                        );
                     } else {
                         dropped_placements.extend(self.image_grid.remove_image(img));
                     }
@@ -3931,9 +3956,10 @@ impl KittySink for Term {
                 let lo = header.src_x;
                 let hi = header.src_y;
                 if lo <= hi {
-                    dropped_placements.extend(self.image_grid.remove_where(|p| {
-                        (lo..=hi).contains(&p.image_id)
-                    }));
+                    dropped_placements.extend(
+                        self.image_grid
+                            .remove_where(|p| (lo..=hi).contains(&p.image_id)),
+                    );
                     if drop_bytes {
                         let ids: Vec<u32> = self
                             .image_registry
@@ -3951,17 +3977,16 @@ impl KittySink for Term {
             b'c' | b'C' => {
                 let row = self.cursor.row;
                 let col = self.cursor.col.min(self.cols.saturating_sub(1));
-                dropped_placements.extend(self.image_grid.remove_where(|p| {
-                    p.row_range.contains(&row) && p.col_range.contains(&col)
-                }));
+                dropped_placements
+                    .extend(self.image_grid.remove_where(|p| {
+                        p.row_range.contains(&row) && p.col_range.contains(&col)
+                    }));
             }
             // `q` / `Q` — placements intersecting cell (sel_col, sel_row)
             // AND having z-index == `z=`.
             b'q' | b'Q' => {
                 dropped_placements.extend(self.image_grid.remove_where(|p| {
-                    p.row_range.contains(&sel_row)
-                        && p.col_range.contains(&sel_col)
-                        && p.z == sel_z
+                    p.row_range.contains(&sel_row) && p.col_range.contains(&sel_col) && p.z == sel_z
                 }));
             }
             // `x` / `X` — placements intersecting COLUMN sel_col.
@@ -3981,8 +4006,7 @@ impl KittySink for Term {
             }
             // `z` / `Z` — placements with z-index == `z=`.
             b'z' | b'Z' => {
-                dropped_placements
-                    .extend(self.image_grid.remove_where(|p| p.z == sel_z));
+                dropped_placements.extend(self.image_grid.remove_where(|p| p.z == sel_z));
             }
             _ => {}
         }
@@ -4053,7 +4077,9 @@ impl KittySink for Term {
     }
 
     fn image_dimensions(&self, id: u32) -> Option<(u32, u32)> {
-        self.image_registry.get(id).map(|img| (img.width, img.height))
+        self.image_registry
+            .get(id)
+            .map(|img| (img.width, img.height))
     }
 
     fn cursor_col(&self) -> u16 {
@@ -4103,14 +4129,8 @@ impl RgpSink for Term {
                     indices = data.mesh.indices.len(),
                     "rgp: register_asset ok",
                 );
-                self.rgp_scene.apply_register(
-                    id,
-                    RgpAsset {
-                        format,
-                        name,
-                        data,
-                    },
-                );
+                self.rgp_scene
+                    .apply_register(id, RgpAsset { format, name, data });
                 true
             }
             Err(error) => {
@@ -4124,12 +4144,7 @@ impl RgpSink for Term {
         }
     }
 
-    fn register_asset_by_path(
-        &mut self,
-        id: u32,
-        format: RgpFormat,
-        name: String,
-    ) -> bool {
+    fn register_asset_by_path(&mut self, id: u32, format: RgpFormat, name: String) -> bool {
         // The app emits `path=` relative to ITS own CWD (e.g.
         // `path=assets/objects/SpinyMouse.glb`). Toastty's own
         // `std::fs::read` resolves relative to TOASTTY's CWD, which
@@ -4254,22 +4269,15 @@ impl RgpSink for Term {
 ///
 /// Returns `None` when the foreground is unset/default, in which case the
 /// cell is not a usable placeholder reference.
-fn placeholder_image_id_from_sgr(
-    fg: Color,
-    underline_color: Option<Color>,
-) -> Option<(u32, u32)> {
+fn placeholder_image_id_from_sgr(fg: Color, underline_color: Option<Color>) -> Option<(u32, u32)> {
     let fg_bits = match fg {
-        Color::Rgb(r, g, b) => {
-            (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
-        }
+        Color::Rgb(r, g, b) => (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b),
         Color::Indexed256(low) => u32::from(low),
         _ => return None,
     };
     let placement_id = match underline_color {
         Some(Color::Indexed256(p)) => u32::from(p),
-        Some(Color::Rgb(r, g, b)) => {
-            (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
-        }
+        Some(Color::Rgb(r, g, b)) => (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b),
         _ => 0,
     };
     Some((fg_bits, placement_id))
@@ -4319,11 +4327,7 @@ mod tests {
     /// to read. Kept tests-only so the migration to per-cell damage
     /// doesn't churn 20+ assert sites.
     fn dirty_rows(t: &Term) -> Vec<bool> {
-        t.damage()
-            .rows
-            .iter()
-            .map(|r| !r.is_empty())
-            .collect()
+        t.damage().rows.iter().map(|r| !r.is_empty()).collect()
     }
 
     #[test]
@@ -4412,7 +4416,10 @@ mod tests {
         // top-down as the lines written in *reverse* order.
         let mut t = run(4, 4, b"P0\r\nP1\r\nP2\r\nP3");
         // Write three new lines [X2, X1, X0] into the top via RI.
-        feed(&mut t, b"\x1b[H\x1bMX2\r\n\x1b[H\x1bMX1\r\n\x1b[H\x1bMX0\r\n");
+        feed(
+            &mut t,
+            b"\x1b[H\x1bMX2\r\n\x1b[H\x1bMX1\r\n\x1b[H\x1bMX0\r\n",
+        );
         assert_eq!(row_text(&t, 0), "X0");
         assert_eq!(row_text(&t, 1), "X1");
         assert_eq!(row_text(&t, 2), "X2");
@@ -4811,7 +4818,10 @@ mod tests {
         // history_lines = 0). With reflow it's preserved, and the taller
         // viewport reveals more of it at the top.
         let mut t = Term::new(3, 8, 100);
-        feed(&mut t, b"L0\r\nL1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8\r\nL9");
+        feed(
+            &mut t,
+            b"L0\r\nL1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8\r\nL9",
+        );
         assert_eq!(t.history_lines(), 7);
         assert_eq!(row_text(&t, 0), "L7");
         // Grow to 6 rows: 3 scrollback lines revealed (L4..L6), 4 remain.
@@ -4826,7 +4836,10 @@ mod tests {
         // Shrinking the window pushes top rows into scrollback (cursor and
         // live bottom stay anchored), the mirror of the grow case.
         let mut t = Term::new(3, 8, 100);
-        feed(&mut t, b"L0\r\nL1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8\r\nL9");
+        feed(
+            &mut t,
+            b"L0\r\nL1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8\r\nL9",
+        );
         assert_eq!(t.history_lines(), 7);
         t.resize(2, 8);
         assert_eq!(t.history_lines(), 8, "a row scrolled into history");
@@ -5521,11 +5534,7 @@ mod tests {
             let mut t = Term::new(1, 4, 0);
             let seq = format!("\x1b[{ps} q");
             feed(&mut t, seq.as_bytes());
-            assert_eq!(
-                t.cursor_shape(),
-                want_shape,
-                "Ps={ps}: wrong cursor shape",
-            );
+            assert_eq!(t.cursor_shape(), want_shape, "Ps={ps}: wrong cursor shape",);
             assert_eq!(t.cursor_blink(), want_blink, "Ps={ps}: wrong blink");
         }
     }
@@ -5836,7 +5845,10 @@ mod tests {
         feed(&mut t, b"x");
         let cells = &t.view_row(0).cells;
         assert_eq!(cells[0].ch, 'x');
-        assert!(!cells[1].is_continuation, "stranded continuation must be cleared");
+        assert!(
+            !cells[1].is_continuation,
+            "stranded continuation must be cleared"
+        );
         assert_eq!(cells[1].ch, ' ');
         // The second cluster is untouched.
         assert_eq!(cells[2].ch, '你');
@@ -6352,11 +6364,18 @@ mod tests {
         feed(&mut t, SIXEL_3X6);
         assert_eq!(t.image_grid().iter().count(), 1, "one placement expected");
         let p = t.image_grid().iter().next().unwrap();
-        let img = t.image_registry().get(p.image_id).expect("image registered");
+        let img = t
+            .image_registry()
+            .get(p.image_id)
+            .expect("image registered");
         assert_eq!(img.width, 3);
         // Sixel encodes pixels in vertical bands of 6; the decoder reports
         // the band-aligned height.
-        assert!(img.height >= 6 && img.height.is_multiple_of(6), "got height {}", img.height);
+        assert!(
+            img.height >= 6 && img.height.is_multiple_of(6),
+            "got height {}",
+            img.height
+        );
     }
 
     #[test]
@@ -6516,10 +6535,7 @@ mod tests {
     #[test]
     fn osc4_multi_pair_handled() {
         let mut t = Term::new(2, 4, 0);
-        feed(
-            &mut t,
-            b"\x1b]4;1;rgb:11/22/33;2;rgb:44/55/66\x1b\\",
-        );
+        feed(&mut t, b"\x1b]4;1;rgb:11/22/33;2;rgb:44/55/66\x1b\\");
         assert_eq!(t.palette_override(1), Some([0x11, 0x22, 0x33]));
         assert_eq!(t.palette_override(2), Some([0x44, 0x55, 0x66]));
     }
@@ -6736,7 +6752,11 @@ mod tests {
         // Row advanced by rows - 1 = 1: 1 + 1 = 2.
         assert_eq!(cur.row, 1 + 1, "cursor row should advance by rows - 1");
         // Column advanced by cols = 1 from start_col=5: 5 + 1 = 6.
-        assert_eq!(cur.col, 5 + 1, "cursor col should advance by cols from start_col");
+        assert_eq!(
+            cur.col,
+            5 + 1,
+            "cursor col should advance by cols from start_col"
+        );
     }
 
     #[test]
@@ -6865,7 +6885,9 @@ mod tests {
         let mut payload = Vec::new();
         payload.extend_from_slice(b"\x1b_Ga=t,f=32,s=2,v=2,i=42;");
         // 2x2 RGBA all-red, base64-encoded.
-        let raw = vec![255u8, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255];
+        let raw = vec![
+            255u8, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+        ];
         let b64 = {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.encode(&raw)
@@ -7214,9 +7236,7 @@ mod blocker_altscreen_tests {
     /// Place a 1x1 image with the given kitty image id at the cursor.
     fn place_image(t: &mut Term, id: u32) {
         let mut payload = Vec::new();
-        payload.extend_from_slice(
-            format!("\x1b_Ga=T,f=32,s=1,v=1,i={id},c=1,r=1;").as_bytes(),
-        );
+        payload.extend_from_slice(format!("\x1b_Ga=T,f=32,s=1,v=1,i={id},c=1,r=1;").as_bytes());
         payload.extend_from_slice(&b64_red_1x1());
         payload.extend_from_slice(b"\x1b\\");
         feed(t, &payload);
@@ -7437,9 +7457,18 @@ mod blocker_delete_tests {
         // Uppercase R over the same range frees the (already
         // placement-less) image bytes for 5 and 8.
         feed(&mut t, b"\x1b_Ga=d,d=R,x=4,y=10,q=2\x1b\\");
-        assert!(!t.image_registry().contains(5), "uppercase R frees bytes for id 5");
-        assert!(!t.image_registry().contains(8), "uppercase R frees bytes for id 8");
-        assert!(t.image_registry().contains(12), "id 12 outside range untouched");
+        assert!(
+            !t.image_registry().contains(5),
+            "uppercase R frees bytes for id 5"
+        );
+        assert!(
+            !t.image_registry().contains(8),
+            "uppercase R frees bytes for id 8"
+        );
+        assert!(
+            t.image_registry().contains(12),
+            "id 12 outside range untouched"
+        );
     }
 }
 
@@ -7626,7 +7655,10 @@ mod blocker_graphics_term_tests {
         feed(&mut t, &payload);
 
         // Image registered.
-        assert!(t.image_registry().contains(1), "U=1 must register the image");
+        assert!(
+            t.image_registry().contains(1),
+            "U=1 must register the image"
+        );
         assert_eq!(
             t.image_registry().len(),
             registry_before + 1,
@@ -7654,7 +7686,10 @@ mod blocker_graphics_term_tests {
         let replies = t.drain_pty_replies();
         let s = String::from_utf8_lossy(&replies);
         assert!(s.contains("EINVAL"), "expected EINVAL reply, got {s:?}");
-        assert!(s.contains("i=1"), "reply should echo recovered i=, got {s:?}");
+        assert!(
+            s.contains("i=1"),
+            "reply should echo recovered i=, got {s:?}"
+        );
     }
 }
 
@@ -7696,13 +7731,14 @@ mod blocker_placeholder_tests {
         let raw = vec![255u8; (w * h * 4) as usize];
         let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
         let mut payload = Vec::new();
-        payload.extend_from_slice(
-            format!("\x1b_Ga=t,f=32,s={w},v={h},i={id};").as_bytes(),
-        );
+        payload.extend_from_slice(format!("\x1b_Ga=t,f=32,s={w},v={h},i={id};").as_bytes());
         payload.extend_from_slice(b64.as_bytes());
         payload.extend_from_slice(b"\x1b\\");
         feed(t, &payload);
-        assert!(t.image_registry().contains(id), "image {id} should register");
+        assert!(
+            t.image_registry().contains(id),
+            "image {id} should register"
+        );
     }
 
     /// B10: fg indexed 5 → image id 5; underline 1 → placement_id 1;
@@ -7898,8 +7934,7 @@ mod major_place_tests {
         let p = t.image_grid().iter().next().expect("placement created");
         let cols = p.col_range.end - p.col_range.start;
         let rows = p.row_range.end - p.row_range.start;
-        let expected_rows =
-            (((10u32 * cpw * 100) + (200 * cph) - 1) / (200 * cph)).max(1) as u16;
+        let expected_rows = (((10u32 * cpw * 100) + (200 * cph) - 1) / (200 * cph)).max(1) as u16;
         assert_eq!(cols, 10, "c=10 honored");
         assert_eq!(
             rows, expected_rows,
@@ -7996,10 +8031,20 @@ mod major_place_tests {
         let p = t.image_grid().iter().next().unwrap().clone();
 
         // Pixel offset is recorded as (3, 4).
-        assert_eq!(p.pix_offset, (3, 4), "X/Y stored as intra-cell pixel offset");
+        assert_eq!(
+            p.pix_offset,
+            (3, 4),
+            "X/Y stored as intra-cell pixel offset"
+        );
         // Cell ranges are UNCHANGED relative to the X=Y=0 case.
-        assert_eq!(p.col_range, base.col_range, "X must not move the starting cell");
-        assert_eq!(p.row_range, base.row_range, "Y must not move the starting cell");
+        assert_eq!(
+            p.col_range, base.col_range,
+            "X must not move the starting cell"
+        );
+        assert_eq!(
+            p.row_range, base.row_range,
+            "Y must not move the starting cell"
+        );
     }
 
     // ---- M5: re-emitting (image_id, placement_id) replaces ----
@@ -8036,7 +8081,11 @@ mod major_place_tests {
         transmit_and_place(&mut t, 1, 2, 2, "");
         feed(&mut t, b"\x1b[7;10H");
         transmit_and_place(&mut t, 1, 2, 2, "");
-        assert_eq!(t.image_grid().len(), 2, "unnamed (p=0) placements accumulate");
+        assert_eq!(
+            t.image_grid().len(),
+            2,
+            "unnamed (p=0) placements accumulate"
+        );
     }
 }
 
@@ -8182,14 +8231,8 @@ mod major_delete_tests {
         assert_eq!(t.image_grid().len(), 2);
         // d=n,I=7 deletes the NEWEST (id=2) placement; bytes kept (n).
         feed(&mut t, b"\x1b_Ga=d,d=n,I=7\x1b\\");
-        assert!(
-            has_placement_for(&t, 1),
-            "older image placement untouched"
-        );
-        assert!(
-            !has_placement_for(&t, 2),
-            "newest image placement removed"
-        );
+        assert!(has_placement_for(&t, 1), "older image placement untouched");
+        assert!(!has_placement_for(&t, 2), "newest image placement removed");
         assert!(t.image_registry().contains(2), "lowercase n keeps bytes");
     }
 
@@ -8282,7 +8325,10 @@ mod major_delete_tests {
             "Y frees bytes for image with no surviving placement"
         );
         assert!(has_placement_for(&t, 2), "row-5 placement kept");
-        assert!(t.image_registry().contains(2), "untouched image keeps bytes");
+        assert!(
+            t.image_registry().contains(2),
+            "untouched image keeps bytes"
+        );
     }
 
     #[test]
@@ -8393,7 +8439,10 @@ mod major_screen_tests {
 
         assert_eq!(first_row_range(&t), 1..3, "SU must shift placement up by 2");
         let row3: String = t.view_row(3).cells.iter().map(|c| c.ch).collect();
-        assert!(row3.starts_with("MARK"), "SU must scroll text up; row3={row3:?}");
+        assert!(
+            row3.starts_with("MARK"),
+            "SU must scroll text up; row3={row3:?}"
+        );
     }
 
     #[test]
@@ -8406,9 +8455,16 @@ mod major_screen_tests {
 
         feed(&mut t, b"\x1b[2T"); // SD 2
 
-        assert_eq!(first_row_range(&t), 3..5, "SD must shift placement down by 2");
+        assert_eq!(
+            first_row_range(&t),
+            3..5,
+            "SD must shift placement down by 2"
+        );
         let row2: String = t.view_row(2).cells.iter().map(|c| c.ch).collect();
-        assert!(row2.starts_with("TOP"), "SD must scroll text down; row2={row2:?}");
+        assert!(
+            row2.starts_with("TOP"),
+            "SD must scroll text down; row2={row2:?}"
+        );
     }
 
     #[test]
@@ -8490,7 +8546,11 @@ mod major_screen_tests {
         feed(&mut t, b"\x1b[3;1H"); // cursor row 2
         let rev_before = t.image_revision();
         feed(&mut t, b"\x1b[2L"); // IL 2
-        assert_eq!(first_row_range(&t), 6..8, "IL must shift placement down by 2");
+        assert_eq!(
+            first_row_range(&t),
+            6..8,
+            "IL must shift placement down by 2"
+        );
         assert_ne!(t.image_revision(), rev_before);
     }
 
@@ -8537,8 +8597,8 @@ mod major_medium_term_tests {
         let before = t.image_registry().len();
 
         // Transmit via file medium: payload is the base64-encoded path.
-        let b64_path = base64::engine::general_purpose::STANDARD
-            .encode(path.to_str().unwrap().as_bytes());
+        let b64_path =
+            base64::engine::general_purpose::STANDARD.encode(path.to_str().unwrap().as_bytes());
         let mut payload = Vec::new();
         payload.extend_from_slice(b"\x1b_Ga=t,f=32,s=2,v=2,i=314,t=f;");
         payload.extend_from_slice(b64_path.as_bytes());
@@ -8586,7 +8646,10 @@ mod major_relative_tests {
         payload.extend_from_slice(b64.as_bytes());
         payload.extend_from_slice(b"\x1b\\");
         feed(t, &payload);
-        assert!(t.image_registry().contains(id), "image {id} should register");
+        assert!(
+            t.image_registry().contains(id),
+            "image {id} should register"
+        );
     }
 
     /// Place an already-transmitted image as a NAMED (absolute) parent at
@@ -8696,9 +8759,7 @@ mod minor_term_tests {
     /// Place a 1x1 image with the given kitty image id at the cursor.
     fn place_image(t: &mut Term, id: u32) {
         let mut payload = Vec::new();
-        payload.extend_from_slice(
-            format!("\x1b_Ga=T,f=32,s=1,v=1,i={id},c=1,r=1;").as_bytes(),
-        );
+        payload.extend_from_slice(format!("\x1b_Ga=T,f=32,s=1,v=1,i={id},c=1,r=1;").as_bytes());
         payload.extend_from_slice(&b64_red_1x1());
         payload.extend_from_slice(b"\x1b\\");
         feed(t, &payload);

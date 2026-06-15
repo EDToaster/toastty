@@ -184,8 +184,7 @@ impl ImageGrid {
         // Rebase the child's spans onto the parent origin + offset.
         let span_rows = child.row_range.end - child.row_range.start;
         let span_cols = child.col_range.end - child.col_range.start;
-        let (start_row, start_col) =
-            offset_origin(parent_origin, child.rel_offset);
+        let (start_row, start_col) = offset_origin(parent_origin, child.rel_offset);
         child.row_range = start_row..start_row.saturating_add(span_rows);
         child.col_range = start_col..start_col.saturating_add(span_cols);
         Ok(self.add(child))
@@ -715,12 +714,7 @@ mod tests {
 
     /// Build a relative-placement child: image/placement ids, parent
     /// ref, `(H,V)` offset, and a 1x1 span anchored at origin.
-    fn rel(
-        image_id: u32,
-        placement_id: u32,
-        parent: (u32, u32),
-        offset: (i32, i32),
-    ) -> Placement {
+    fn rel(image_id: u32, placement_id: u32, parent: (u32, u32), offset: (i32, i32)) -> Placement {
         Placement {
             image_id,
             placement_id,

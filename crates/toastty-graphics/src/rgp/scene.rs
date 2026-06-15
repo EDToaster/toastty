@@ -16,9 +16,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::rgp::asset::CpuAsset;
-use crate::rgp::operation::{
-    RgpAnchor, RgpFormat, RgpPlacementStyle, RgpPlacementUpdate,
-};
+use crate::rgp::operation::{RgpAnchor, RgpFormat, RgpPlacementStyle, RgpPlacementUpdate};
 
 /// How fast `animate=1` placements spin, in radians per second.
 /// One revolution every ~6.3 s — slow enough to read, fast enough
@@ -141,12 +139,7 @@ impl RgpScene {
     /// Insert or replace a placement. Note: re-placing an existing
     /// id replaces the *whole* style — the `u` verb is how you do a
     /// partial update.
-    pub fn apply_place(
-        &mut self,
-        id: u32,
-        anchor: RgpAnchor,
-        style: RgpPlacementStyle,
-    ) {
+    pub fn apply_place(&mut self, id: u32, anchor: RgpAnchor, style: RgpPlacementStyle) {
         // Preserve the existing animation phase across a re-place
         // (the app may be re-anchoring an already-rotating object).
         let preserved_phase = self
@@ -400,7 +393,11 @@ mod tests {
             ..Default::default()
         };
         s.apply_update(1, &upd);
-        assert_eq!(s.asset_revision(), asset_rev, "update must not touch assets");
+        assert_eq!(
+            s.asset_revision(),
+            asset_rev,
+            "update must not touch assets"
+        );
 
         s.apply_delete_one(1);
         assert_eq!(
@@ -483,10 +480,7 @@ mod tests {
         s.tick_animations(Instant::now());
         // First call: only seeds last_animation_tick — phase is
         // unchanged because there's no "previous" timestamp.
-        assert_eq!(
-            s.placement(1).unwrap().animation_phase_rad,
-            phase_before
-        );
+        assert_eq!(s.placement(1).unwrap().animation_phase_rad, phase_before);
     }
 
     #[test]

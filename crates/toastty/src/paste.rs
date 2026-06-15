@@ -32,7 +32,8 @@ pub fn wrap_for_paste(text: &str, bracketed: bool) -> Vec<u8> {
     if !bracketed {
         return text.as_bytes().to_vec();
     }
-    let mut out = Vec::with_capacity(BRACKETED_PASTE_START.len() + text.len() + BRACKETED_PASTE_END.len());
+    let mut out =
+        Vec::with_capacity(BRACKETED_PASTE_START.len() + text.len() + BRACKETED_PASTE_END.len());
     out.extend_from_slice(BRACKETED_PASTE_START);
     // TODO(paste-injection): strip embedded `\x1b[201~` so the host app
     // can't be tricked into exiting paste mode mid-payload.
@@ -83,12 +84,7 @@ mod tests {
         let got = wrap_for_paste(s, true);
         assert_eq!(
             got,
-            [
-                BRACKETED_PASTE_START,
-                s.as_bytes(),
-                BRACKETED_PASTE_END
-            ]
-            .concat()
+            [BRACKETED_PASTE_START, s.as_bytes(), BRACKETED_PASTE_END].concat()
         );
     }
 

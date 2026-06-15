@@ -561,7 +561,11 @@ fn compose_dialog_rows(message: &str, pad_x: usize, pad_y: usize) -> Vec<String>
     }
     for line in &content {
         let right = interior_cols - pad_x - line.chars().count();
-        rows.push(format!("│{}{line}{}│", " ".repeat(pad_x), " ".repeat(right)));
+        rows.push(format!(
+            "│{}{line}{}│",
+            " ".repeat(pad_x),
+            " ".repeat(right)
+        ));
     }
     for _ in 0..pad_y {
         rows.push(blank_interior.clone());
@@ -880,7 +884,9 @@ impl Renderer {
     /// schedule a wake-up.
     #[must_use]
     pub fn next_redraw_deadline(&self, term: &Term) -> Option<Duration> {
-        let blink = self.blink.next_deadline(term.cursor_blink(), Instant::now());
+        let blink = self
+            .blink
+            .next_deadline(term.cursor_blink(), Instant::now());
         let rgp = term.rgp_scene().animation_deadline();
         // Whichever fires first wins. Both are `Option<Duration>`.
         match (blink, rgp) {
@@ -1425,8 +1431,12 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
         // Scratch must match the swapchain dims; recreate. Its contents
         // become undefined → force a full clear on the next frame.
-        let (tex, view) =
-            create_scratch(&self.device, self.config.width, self.config.height, self.config.format);
+        let (tex, view) = create_scratch(
+            &self.device,
+            self.config.width,
+            self.config.height,
+            self.config.format,
+        );
         self.scratch_texture = tex;
         self.scratch_view = view;
         // Depth attachment shares dims with the color scratch; recreate
@@ -1626,7 +1636,11 @@ impl Renderer {
         }
 
         let trace = self.trace_render;
-        let t_total = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_total = if trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         let (rows, _) = term.size();
         let cell_size;
@@ -1649,11 +1663,7 @@ impl Renderer {
             // Number of rows to actually render this frame: one extra
             // when there's a sub-row pixel offset (the partial top row
             // that hangs above y=0).
-            let pixel_extra: u16 = if term.view_offset_pixel() > 0.0 {
-                1
-            } else {
-                0
-            };
+            let pixel_extra: u16 = if term.view_offset_pixel() > 0.0 { 1 } else { 0 };
             let rows_rendered = rows + pixel_extra;
 
             // Re-shape only dirty rows; reuse cached `LineGlyphs` for
@@ -1661,13 +1671,14 @@ impl Renderer {
             // glyph slots stay valid across frames.
             let damage = term.damage();
             let mut shaped = 0u32;
-            let t_shape = if trace { Some(std::time::Instant::now()) } else { None };
+            let t_shape = if trace {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             for r in 0..rows_rendered {
                 let is_dirty = damage.all
-                    || damage
-                        .rows
-                        .get(r as usize)
-                        .is_some_and(|rd| !rd.is_empty())
+                    || damage.rows.get(r as usize).is_some_and(|rd| !rd.is_empty())
                     || text.line_cache[r as usize].is_none();
                 if !is_dirty {
                     continue;
@@ -1761,7 +1772,11 @@ impl Renderer {
         let ext_palette: &[[f32; 4]; 256] = &self.ext_palette;
         let text = self.text.as_mut().expect("text init");
         let mut instances = std::mem::take(&mut text.instances_scratch);
-        let t_bi = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_bi = if trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         // Pick the builder: full build when the framebuffer is being
         // cleared (LoadOp::Clear); partial build under LoadOp::Load
         // so we only emit instances for cells that actually changed.
@@ -1807,11 +1822,9 @@ impl Renderer {
         if let Some(overlay) = self.debug_overlay.as_deref() {
             #[allow(clippy::cast_possible_truncation)]
             let n = overlay.chars().count() as u16;
-            let lg = text.rasterizer.shape_line(
-                &self.queue,
-                overlay,
-                term.grapheme_cluster_mode(),
-            );
+            let lg = text
+                .rasterizer
+                .shape_line(&self.queue, overlay, term.grapheme_cluster_mode());
             #[allow(clippy::cast_precision_loss)]
             let viewport_w = self.config.width as f32;
             let cell_w = cell_size.0;
@@ -1960,7 +1973,11 @@ impl Renderer {
             // cell_pos: clamp the cursor row into the grid and apply the
             // same sub-pixel scroll y-translate.
             let view_pixel = term.view_offset_pixel();
-            let y_translate = if view_pixel > 0.0 { view_pixel - cell_h } else { 0.0 };
+            let y_translate = if view_pixel > 0.0 {
+                view_pixel - cell_h
+            } else {
+                0.0
+            };
             let cur_row = u16::min(term.cursor().row, rows.saturating_sub(1));
             let y0 = f32::from(cur_row) * cell_h + y_translate;
             // Start column from the cursor rect's left edge (already
@@ -1969,11 +1986,9 @@ impl Renderer {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let start_col = (start_x / cell_w).round() as u16;
 
-            let lg = text.rasterizer.shape_line(
-                &self.queue,
-                preedit,
-                term.grapheme_cluster_mode(),
-            );
+            let lg = text
+                .rasterizer
+                .shape_line(&self.queue, preedit, term.grapheme_cluster_mode());
             let mode_2027 = term.grapheme_cluster_mode();
             let preedit_fg = theme.cursor;
             // Walk the composition string char-by-char, advancing the
@@ -2026,9 +2041,7 @@ impl Renderer {
                 // emits (FLAG_UNDERLINE, fg-as-bg). This is the preedit's
                 // visual distinction.
                 instances.push(crate::text::instance::underline_instance(
-                    pos,
-                    span,
-                    preedit_fg,
+                    pos, span, preedit_fg,
                 ));
                 // The glyph, looked up at this column. `lg` was shaped from
                 // the preedit string alone, so its columns are 0-based
@@ -2083,7 +2096,11 @@ impl Renderer {
         // Acquire surface frame. This is where `Fifo` present mode
         // blocks waiting for vsync; if any prior frame is still queued,
         // we sit here for ~16.7ms.
-        let t_acq = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_acq = if trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -2118,7 +2135,11 @@ impl Renderer {
             tracing::info!(target: "render_trace", "surface_acquire took={ms:.3}ms (blocks on vsync under Fifo)");
         }
 
-        let t_enc = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_enc = if trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2182,7 +2203,11 @@ impl Renderer {
         // previous-frame pixels scratch provides.
         let render_direct = self.needs_full_clear;
         let frame_view = if render_direct {
-            Some(frame.texture.create_view(&wgpu::TextureViewDescriptor::default()))
+            Some(
+                frame
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default()),
+            )
         } else {
             None
         };
@@ -2256,7 +2281,9 @@ impl Renderer {
             // taking the shared refs the render pass holds.
             {
                 let text_mut = self.text.as_mut().expect("text init checked above");
-                text_mut.pipeline.upload(&self.device, &self.queue, globals, &instances);
+                text_mut
+                    .pipeline
+                    .upload(&self.device, &self.queue, globals, &instances);
             }
             let text_ref = self.text.as_ref().expect("text init checked above");
             let inst_count = instances.len();
@@ -2330,12 +2357,15 @@ impl Renderer {
             );
         }
 
-
         if let Some(t) = t_enc {
             let ms = t.elapsed().as_secs_f64() * 1000.0;
             tracing::info!(target: "render_trace", "encode_pass took={ms:.3}ms");
         }
-        let t_sub = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_sub = if trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
         if let Some(t) = t_sub {
@@ -2676,8 +2706,11 @@ mod tests {
         // `float_cmp` lint.
         let default_lin =
             crate::text::instance::srgb_to_linear_rgba(default[0], default[1], default[2]);
-        let override_lin =
-            crate::text::instance::srgb_to_linear_rgba(override_rgb[0], override_rgb[1], override_rgb[2]);
+        let override_lin = crate::text::instance::srgb_to_linear_rgba(
+            override_rgb[0],
+            override_rgb[1],
+            override_rgb[2],
+        );
         let any_differs = (0..4).any(|i| (default_lin[i] - override_lin[i]).abs() > 1e-6);
         assert!(any_differs, "override should yield a different linear rgba");
     }
@@ -2735,7 +2768,10 @@ mod tests {
             "OFF frame must not emit any cursor instance"
         );
         // A background-only quad must be present at the cursor's cell.
-        let expected_pos = [f32::from(cur.col) * cell_size.0, f32::from(cur.row) * cell_size.1];
+        let expected_pos = [
+            f32::from(cur.col) * cell_size.0,
+            f32::from(cur.row) * cell_size.1,
+        ];
         let bg_at_cursor = instances.iter().find(|i| {
             i.flags & FLAG_NO_GLYPH != 0
                 && (i.pos[0] - expected_pos[0]).abs() < 1e-3

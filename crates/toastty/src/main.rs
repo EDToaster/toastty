@@ -17,13 +17,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use pollster::block_on;
-use toastty_config::{ConfirmClose, Config, ConfigError, ConfigSource};
+use toastty_config::{Config, ConfigError, ConfigSource, ConfirmClose};
 use toastty_parser::Parser;
 use toastty_protocols::resize_inband::encode_resize_report;
 use toastty_protocols::synchronized::{BSU_TIMEOUT, should_force_flush};
 use toastty_pty::{Pty, PtySpec, WinSize};
 use toastty_render::{RenderOutcome, Renderer};
-use toastty_term::{ClipboardRequest, Pos, SecurityFlags, Selection, SelectionMode, Smoothing, Term};
+use toastty_term::{
+    ClipboardRequest, Pos, SecurityFlags, Selection, SelectionMode, Smoothing, Term,
+};
 use toastty_window::{
     App, ControlSignal, Event, KeyState, LogicalKey, Modifiers, MouseButton, NamedKey,
     ToasttyWindow, WindowHandle, WindowOptions, run,
@@ -112,12 +114,8 @@ fn smoothing_from_config(cfg: &Config) -> Smoothing {
         toastty_config::SmoothingFunction::Linear => Smoothing::Linear {
             pixels_per_sec: 600.0,
         },
-        toastty_config::SmoothingFunction::EaseOut => Smoothing::EaseOut {
-            duration_sec: 0.25,
-        },
-        toastty_config::SmoothingFunction::ExpDecay => Smoothing::ExpDecay {
-            halflife_sec: 0.08,
-        },
+        toastty_config::SmoothingFunction::EaseOut => Smoothing::EaseOut { duration_sec: 0.25 },
+        toastty_config::SmoothingFunction::ExpDecay => Smoothing::ExpDecay { halflife_sec: 0.08 },
     }
 }
 
@@ -139,10 +137,10 @@ fn min_deadline(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
 /// fall back to `$HOME`; when launched from another shell, inherit its CWD.
 fn initial_cwd() -> std::path::PathBuf {
     let cwd = std::env::current_dir().ok();
-    let launched_from_root = cwd.as_deref().is_some_and(|p| p == std::path::Path::new("/"));
-    if !launched_from_root
-        && let Some(p) = cwd
-    {
+    let launched_from_root = cwd
+        .as_deref()
+        .is_some_and(|p| p == std::path::Path::new("/"));
+    if !launched_from_root && let Some(p) = cwd {
         return p;
     }
     std::env::var_os("HOME")
@@ -171,8 +169,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         cli::Action::PrintDefaultConfig => {
-            cli::write_default_config(&mut std::io::stdout())
-                .context("write default config")?;
+            cli::write_default_config(&mut std::io::stdout()).context("write default config")?;
             return Ok(());
         }
         cli::Action::Run {
@@ -526,8 +523,7 @@ impl Toastty {
                         return;
                     }
                 };
-                let sel =
-                    toastty_protocols::clipboard::SelectionChars(selection.clone());
+                let sel = toastty_protocols::clipboard::SelectionChars(selection.clone());
                 let reply = toastty_protocols::clipboard::encode_reply(&sel, &bytes);
                 self.term.push_pty_reply(&reply);
             }
@@ -599,20 +595,14 @@ impl Toastty {
                 let (lo, hi) = self
                     .word_bounds_at(origin.line_id, origin.col)
                     .unwrap_or((origin.col, origin.col));
-                let mut sel = Selection::new(
-                    Pos::new(origin.line_id, lo),
-                    SelectionMode::Word,
-                );
+                let mut sel = Selection::new(Pos::new(origin.line_id, lo), SelectionMode::Word);
                 sel.set_active(Pos::new(origin.line_id, hi));
                 sel
             }
             3 => {
                 // Line: full row.
                 let end = cols.saturating_sub(1);
-                let mut sel = Selection::new(
-                    Pos::new(origin.line_id, 0),
-                    SelectionMode::Line,
-                );
+                let mut sel = Selection::new(Pos::new(origin.line_id, 0), SelectionMode::Line);
                 sel.set_active(Pos::new(origin.line_id, end));
                 sel
             }
@@ -893,8 +883,7 @@ impl Toastty {
         // (even if the file doesn't currently exist — the parent dir
         // watch still picks up a future CREATE event).
         if let Some(path) = self.config_path.clone() {
-            self.config_watcher =
-                ConfigWatcher::spawn(path, handle.event_loop_proxy());
+            self.config_watcher = ConfigWatcher::spawn(path, handle.event_loop_proxy());
         }
 
         // Promote any startup config load error to the in-window
@@ -1194,8 +1183,7 @@ impl Toastty {
     /// IME candidate / preedit popup is positioned beside it instead of at
     /// the window origin. No-op until the window and renderer exist.
     fn update_ime_cursor_area(&self) {
-        let (Some(window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_ref())
-        else {
+        let (Some(window), Some(renderer)) = (self.window.as_ref(), self.renderer.as_ref()) else {
             return;
         };
         let (cell_w, cell_h) = renderer.cell_size();
@@ -1210,11 +1198,7 @@ impl Toastty {
     /// new cell crossed, not per pixel — so dragging within a cell stays
     /// silent and a slow drag across the grid produces one event per
     /// column/row boundary.
-    fn handle_mouse_motion(
-        &mut self,
-        position: (f64, f64),
-        modifiers: Modifiers,
-    ) -> ControlSignal {
+    fn handle_mouse_motion(&mut self, position: (f64, f64), modifiers: Modifiers) -> ControlSignal {
         self.mouse_pos = position;
         // Local drag-select first: when we've started a selection,
         // every motion event extends it, even if the foreground app
@@ -1377,16 +1361,17 @@ impl Toastty {
                 // Snap `here` to the word containing it, then extend
                 // anchor → active to the far edge so the selection
                 // grows by whole words on each side.
-                let (lo_here, hi_here) =
-                    self.word_bounds_at(here.line_id, here.col).unwrap_or((here.col, here.col));
+                let (lo_here, hi_here) = self
+                    .word_bounds_at(here.line_id, here.col)
+                    .unwrap_or((here.col, here.col));
                 let (lo_origin, hi_origin) = self
                     .word_bounds_at(drag.origin.line_id, drag.origin.col)
                     .unwrap_or((drag.origin.col, drag.origin.col));
                 // Build a Selection with anchor at the further-from-here
                 // edge of the origin word, active at the further-from-
                 // origin edge of the here word.
-                let dragging_forward = (here.line_id, here.col)
-                    >= (drag.origin.line_id, drag.origin.col);
+                let dragging_forward =
+                    (here.line_id, here.col) >= (drag.origin.line_id, drag.origin.col);
                 let (anchor_col, active_col) = if dragging_forward {
                     (lo_origin, hi_here)
                 } else {
@@ -1507,9 +1492,7 @@ impl Toastty {
         //      faster than waiting out the full 150 ms lull.
         if scroll_kind == toastty_window::ScrollKind::Pixels {
             let now = Instant::now();
-            let gap = self
-                .last_pixel_scroll_at
-                .map(|t| now.duration_since(t));
+            let gap = self.last_pixel_scroll_at.map(|t| now.duration_since(t));
             let big_gap = gap.is_none_or(|g| g >= SCROLL_STREAM_LULL);
             let fresh_started = scroll_phase == toastty_window::ScrollPhase::Started
                 && gap.is_none_or(|g| g >= FRESH_STARTED_GAP);
@@ -1815,7 +1798,11 @@ impl App for Toastty {
     fn event(&mut self, event: Event) -> ControlSignal {
         match event {
             Event::Close => self.handle_close_request(),
-            Event::Resize { width, height, scale_factor } => {
+            Event::Resize {
+                width,
+                height,
+                scale_factor,
+            } => {
                 self.physical_size = (width, height);
                 // winit folds `ScaleFactorChanged` into this event (see
                 // toastty-window), so this is the single place scale is
@@ -1863,9 +1850,13 @@ impl App for Toastty {
                 let (rows, cols) = self.term.size();
                 let pixel_w = u16::try_from(width).unwrap_or(u16::MAX);
                 let pixel_h = u16::try_from(height).unwrap_or(u16::MAX);
-                if let Some(bytes) =
-                    encode_resize_report(rows, cols, pixel_h, pixel_w, self.term.inband_resize_mode())
-                {
+                if let Some(bytes) = encode_resize_report(
+                    rows,
+                    cols,
+                    pixel_h,
+                    pixel_w,
+                    self.term.inband_resize_mode(),
+                ) {
                     self.write_pty(&bytes);
                 }
                 ControlSignal::RedrawIn(Duration::ZERO)
@@ -2277,19 +2268,13 @@ mod tests {
     fn cmd_left_is_open_link_on_macos() {
         assert!(is_open_link_binding(MouseButton::Left, Modifiers::SUPER));
         // Ctrl-Left is NOT open-link on macOS.
-        assert!(!is_open_link_binding(
-            MouseButton::Left,
-            Modifiers::CONTROL
-        ));
+        assert!(!is_open_link_binding(MouseButton::Left, Modifiers::CONTROL));
     }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn ctrl_left_is_open_link_on_non_macos() {
-        assert!(is_open_link_binding(
-            MouseButton::Left,
-            Modifiers::CONTROL
-        ));
+        assert!(is_open_link_binding(MouseButton::Left, Modifiers::CONTROL));
         assert!(!is_open_link_binding(MouseButton::Left, Modifiers::SUPER));
     }
 

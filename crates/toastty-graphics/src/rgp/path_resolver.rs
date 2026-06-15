@@ -59,7 +59,8 @@ pub fn resolve(
     // Embedded bundle: only consult when `name` is a pure leaf.
     // A path-like input (containing a separator) means the app is
     // addressing the filesystem, not the bundle.
-    if !name.contains('/') && !name.contains('\\')
+    if !name.contains('/')
+        && !name.contains('\\')
         && let Some(asset) = embedded_lookup(name)
     {
         return Ok(asset);

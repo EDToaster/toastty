@@ -17,25 +17,25 @@ pub fn cpk_color(symbol: &str) -> [u8; 3] {
     // Normalize to first-letter uppercase, rest lowercase.
     let normalized = normalize_symbol(symbol);
     match normalized.as_str() {
-        "H"  => [0xFF, 0xFF, 0xFF], // FFFFFF
-        "C"  => [0x90, 0x90, 0x90], // 909090
-        "N"  => [0x30, 0x50, 0xF8], // 3050F8
-        "O"  => [0xFF, 0x0D, 0x0D], // FF0D0D
-        "F"  => [0x90, 0xE0, 0x50], // 90E050
-        "P"  => [0xFF, 0x80, 0x00], // FF8000
-        "S"  => [0xFF, 0xFF, 0x30], // FFFF30
+        "H" => [0xFF, 0xFF, 0xFF],  // FFFFFF
+        "C" => [0x90, 0x90, 0x90],  // 909090
+        "N" => [0x30, 0x50, 0xF8],  // 3050F8
+        "O" => [0xFF, 0x0D, 0x0D],  // FF0D0D
+        "F" => [0x90, 0xE0, 0x50],  // 90E050
+        "P" => [0xFF, 0x80, 0x00],  // FF8000
+        "S" => [0xFF, 0xFF, 0x30],  // FFFF30
         "Cl" => [0x1F, 0xF0, 0x1F], // 1FF01F
         "Br" => [0xA6, 0x29, 0x29], // A62929
-        "I"  => [0x94, 0x00, 0x94], // 940094
-        "B"  => [0xFF, 0xB5, 0xB5], // FFB5B5
+        "I" => [0x94, 0x00, 0x94],  // 940094
+        "B" => [0xFF, 0xB5, 0xB5],  // FFB5B5
         "Si" => [0xF0, 0xC8, 0xA0], // F0C8A0
         "Na" => [0xAB, 0x5C, 0xF2], // AB5CF2
-        "K"  => [0x8F, 0x40, 0xD4], // 8F40D4
+        "K" => [0x8F, 0x40, 0xD4],  // 8F40D4
         "Ca" => [0x3D, 0xFF, 0x00], // 3DFF00
         "Mg" => [0x8A, 0xFF, 0x00], // 8AFF00
         "Fe" => [0xE0, 0x66, 0x33], // E06633
         "Zn" => [0x7D, 0x80, 0xB0], // 7D80B0
-        _    => [255, 192, 203],     // CPK pink fallback
+        _ => [255, 192, 203],       // CPK pink fallback
     }
 }
 
@@ -46,25 +46,25 @@ pub fn cpk_color(symbol: &str) -> [u8; 3] {
 pub fn covalent_radius(symbol: &str) -> f32 {
     let normalized = normalize_symbol(symbol);
     match normalized.as_str() {
-        "H"  => 0.31,
-        "C"  => 0.76,
-        "N"  => 0.71,
-        "O"  => 0.66,
-        "F"  => 0.57,
-        "P"  => 1.07,
-        "S"  => 1.05,
+        "H" => 0.31,
+        "C" => 0.76,
+        "N" => 0.71,
+        "O" => 0.66,
+        "F" => 0.57,
+        "P" => 1.07,
+        "S" => 1.05,
         "Cl" => 1.02,
         "Br" => 1.20,
-        "I"  => 1.39,
-        "B"  => 0.84,
+        "I" => 1.39,
+        "B" => 0.84,
         "Si" => 1.11,
         "Na" => 1.66,
-        "K"  => 2.03,
+        "K" => 2.03,
         "Ca" => 1.76,
         "Mg" => 1.41,
         "Fe" => 1.32,
         "Zn" => 1.22,
-        _    => 0.7,
+        _ => 0.7,
     }
 }
 

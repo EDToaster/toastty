@@ -352,7 +352,12 @@ fn encode_key_kitty(
 ///   apps that only handle the bare legacy form still see it.
 /// - Tilde-final keys: the leading code is always emitted (`CSI 5 ~`),
 ///   since `CSI ~` alone isn't a valid functional-key encoding.
-fn format_kitty_legacy(code: u32, modifiers: u32, event_suffix: Option<&str>, final_byte: u8) -> Vec<u8> {
+fn format_kitty_legacy(
+    code: u32,
+    modifiers: u32,
+    event_suffix: Option<&str>,
+    final_byte: u8,
+) -> Vec<u8> {
     let mut out: Vec<u8> = b"\x1b[".to_vec();
     let mods_default = modifiers == 1 && event_suffix.is_none();
     let is_letter_final = final_byte.is_ascii_alphabetic();
@@ -371,7 +376,12 @@ fn format_kitty_legacy(code: u32, modifiers: u32, event_suffix: Option<&str>, fi
     out
 }
 
-fn format_kitty(code: u32, modifiers: u32, event_suffix: Option<&str>, final_byte: char) -> Vec<u8> {
+fn format_kitty(
+    code: u32,
+    modifiers: u32,
+    event_suffix: Option<&str>,
+    final_byte: char,
+) -> Vec<u8> {
     // Kitty CSI u form:
     //   CSI keycode [; modifiers [: event-type]] u
     // We always include modifiers when they're non-default or when an

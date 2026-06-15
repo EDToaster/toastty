@@ -136,8 +136,7 @@ mod tests {
 
     #[test]
     fn smoothing_function_rejects_unknown() {
-        let r: Result<ScrollbackConfig, _> =
-            toml::from_str("smoothing_function = \"bogus\"\n");
+        let r: Result<ScrollbackConfig, _> = toml::from_str("smoothing_function = \"bogus\"\n");
         assert!(r.is_err());
     }
 
@@ -154,8 +153,7 @@ mod tests {
 
     #[test]
     fn pixel_scroll_sensitivity_parses() {
-        let cfg: ScrollbackConfig =
-            toml::from_str("pixel_scroll_sensitivity = 2.0\n").unwrap();
+        let cfg: ScrollbackConfig = toml::from_str("pixel_scroll_sensitivity = 2.0\n").unwrap();
         assert!((cfg.pixel_scroll_sensitivity - 2.0).abs() < f64::EPSILON);
     }
 }

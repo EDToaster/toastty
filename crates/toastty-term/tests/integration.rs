@@ -199,11 +199,18 @@ fn apc_demux_routes_kitty_and_rgp_to_their_own_handlers() {
     let mut p = Parser::new();
     // Kitty query packet — should NOT touch rgp_scene.
     p.advance(&mut t, b"\x1b_Ga=q,i=1,s=1,v=1;AAAA\x1b\\");
-    assert_eq!(t.rgp_revision(), 0, "Kitty packet must not bump RGP revision");
+    assert_eq!(
+        t.rgp_revision(),
+        0,
+        "Kitty packet must not bump RGP revision"
+    );
     // Then an RGP packet — must NOT show up in image registry/grid.
     p.advance(&mut t, &rgp_apc("p;id=99;row=1;col=1;w=2;h=2"));
     assert!(t.rgp_scene().placement(99).is_some());
-    assert!(t.image_grid().is_empty(), "RGP packet must not place a Kitty image");
+    assert!(
+        t.image_grid().is_empty(),
+        "RGP packet must not place a Kitty image"
+    );
 }
 
 #[test]
@@ -220,17 +227,13 @@ fn rgp_chunked_payload_register_reassembles_through_term() {
 
     p.advance(
         &mut t,
-        &rgp_apc(&format!(
-            "r;id=7;fmt=glb;source=payload;more=1;{first}"
-        )),
+        &rgp_apc(&format!("r;id=7;fmt=glb;source=payload;more=1;{first}")),
     );
     // Asset must NOT exist yet — we're mid-upload.
     assert!(t.rgp_scene().asset(7).is_none());
     p.advance(
         &mut t,
-        &rgp_apc(&format!(
-            "r;id=7;fmt=glb;source=payload;more=0;{second}"
-        )),
+        &rgp_apc(&format!("r;id=7;fmt=glb;source=payload;more=0;{second}")),
     );
     let asset = t
         .rgp_scene()
@@ -314,8 +317,7 @@ mod selection {
         let t = term_with_lines(4, 16, &["hello world"]);
         // "hello world" is on visible row 0 because the writes happen
         // before any LF — cursor sits on row 0 throughout.
-        let mut sel =
-            Selection::new(pos_for(&t, 0, 0), SelectionMode::Char);
+        let mut sel = Selection::new(pos_for(&t, 0, 0), SelectionMode::Char);
         sel.set_active(pos_for(&t, 0, 4));
         let mut t = t;
         t.set_selection(sel);
@@ -325,15 +327,11 @@ mod selection {
     #[test]
     fn extract_char_multi_row_joins_with_newline() {
         let t = term_with_lines(4, 16, &["foo", "bar", "baz"]);
-        let mut sel =
-            Selection::new(pos_for(&t, 0, 0), SelectionMode::Char);
+        let mut sel = Selection::new(pos_for(&t, 0, 0), SelectionMode::Char);
         sel.set_active(pos_for(&t, 2, 2));
         let mut t = t;
         t.set_selection(sel);
-        assert_eq!(
-            t.extract_selection_text().as_deref(),
-            Some("foo\nbar\nbaz"),
-        );
+        assert_eq!(t.extract_selection_text().as_deref(), Some("foo\nbar\nbaz"),);
     }
 
     #[test]
@@ -341,8 +339,7 @@ mod selection {
         // Each row gets padded with blanks out to `cols`; the extractor
         // must strip them.
         let t = term_with_lines(4, 16, &["hi", "world"]);
-        let mut sel =
-            Selection::new(pos_for(&t, 0, 0), SelectionMode::Char);
+        let mut sel = Selection::new(pos_for(&t, 0, 0), SelectionMode::Char);
         sel.set_active(pos_for(&t, 1, 15));
         let mut t = t;
         t.set_selection(sel);
@@ -352,16 +349,12 @@ mod selection {
     #[test]
     fn extract_block_rectangle() {
         let t = term_with_lines(4, 16, &["abcdefgh", "ijklmnop", "qrstuvwx"]);
-        let mut sel =
-            Selection::new(pos_for(&t, 0, 2), SelectionMode::Block);
+        let mut sel = Selection::new(pos_for(&t, 0, 2), SelectionMode::Block);
         sel.set_active(pos_for(&t, 2, 4));
         let mut t = t;
         t.set_selection(sel);
         // Block: cols [2..=4] on each of rows 0..=2.
-        assert_eq!(
-            t.extract_selection_text().as_deref(),
-            Some("cde\nklm\nstu"),
-        );
+        assert_eq!(t.extract_selection_text().as_deref(), Some("cde\nklm\nstu"),);
     }
 
     #[test]
@@ -372,14 +365,10 @@ mod selection {
         let mut t = Term::new(4, 4, 32);
         let mut p = Parser::new();
         p.advance(&mut t, b"hello world");
-        let mut sel =
-            Selection::new(pos_for(&t, 0, 0), SelectionMode::Char);
+        let mut sel = Selection::new(pos_for(&t, 0, 0), SelectionMode::Char);
         sel.set_active(pos_for(&t, 2, 3));
         t.set_selection(sel);
-        assert_eq!(
-            t.extract_selection_text().as_deref(),
-            Some("hello world"),
-        );
+        assert_eq!(t.extract_selection_text().as_deref(), Some("hello world"),);
     }
 
     #[test]

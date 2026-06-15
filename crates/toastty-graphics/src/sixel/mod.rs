@@ -132,15 +132,28 @@ mod tests {
         // back at height 6 — assert it covers the original rows.
         assert_eq!(out.width, w as u32);
         assert!(out.height >= h as u32);
-        assert_eq!(out.height % 6, 0, "height should be a multiple of the sixel band");
-        assert_eq!(out.pixels.len(), out.width as usize * out.height as usize * 4);
+        assert_eq!(
+            out.height % 6,
+            0,
+            "height should be a multiple of the sixel band"
+        );
+        assert_eq!(
+            out.pixels.len(),
+            out.width as usize * out.height as usize * 4
+        );
 
         // Sixel is lossy (palette quantization); assert the top-left
         // corner is "close" to red rather than exactly equal.
         let tl = &out.pixels[0..4];
         assert!(tl[0] > 180, "top-left should be reddish, got {tl:?}");
-        assert!(tl[1] < 80, "top-left green channel should be low, got {tl:?}");
-        assert!(tl[2] < 80, "top-left blue channel should be low, got {tl:?}");
+        assert!(
+            tl[1] < 80,
+            "top-left green channel should be low, got {tl:?}"
+        );
+        assert!(
+            tl[2] < 80,
+            "top-left blue channel should be low, got {tl:?}"
+        );
     }
 
     #[test]

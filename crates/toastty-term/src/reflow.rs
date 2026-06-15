@@ -37,7 +37,11 @@ fn cluster_width(cells: &[Cell], i: usize) -> u16 {
 /// blanks count, so a cell erased to a coloured background (non-default
 /// style) or a hyperlinked space is preserved.
 fn trailing_blank_run(cells: &[Cell]) -> usize {
-    cells.iter().rev().take_while(|c| **c == Cell::BLANK).count()
+    cells
+        .iter()
+        .rev()
+        .take_while(|c| **c == Cell::BLANK)
+        .count()
 }
 
 /// Build logical lines from a flat, oldest→newest slice of retained rows.
@@ -299,7 +303,11 @@ mod tests {
         let (rows, _) = wrap_line(&content, 4, None);
         assert_eq!(rows.len(), 2);
         assert!(rows[0].soft_wrap);
-        assert_eq!(rows[0].cells[3], Cell::BLANK, "last col left blank, no spacer");
+        assert_eq!(
+            rows[0].cells[3],
+            Cell::BLANK,
+            "last col left blank, no spacer"
+        );
         assert_eq!(rows[1].cells[0].ch, '世');
         assert!(rows[1].cells[1].is_continuation);
     }

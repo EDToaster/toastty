@@ -210,7 +210,10 @@ pub enum Event {
     /// IME preedit (in-progress composition) update. An empty `text` clears the
     /// preedit. `cursor` is the byte-range (start, end) of the IME caret within
     /// `text`, or `None` to hide it.
-    ImePreedit { text: String, cursor: Option<(usize, usize)> },
+    ImePreedit {
+        text: String,
+        cursor: Option<(usize, usize)>,
+    },
     /// An IME composition session became active.
     ImeEnabled,
     /// An IME composition session ended; any pending preedit should be cleared.

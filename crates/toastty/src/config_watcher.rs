@@ -44,10 +44,7 @@ impl ConfigWatcher {
     /// directory doesn't exist or the watcher can't be installed —
     /// failure here is non-fatal (the terminal still runs without
     /// hot-reload), so we log + return None instead of bubbling.
-    pub fn spawn(
-        path: PathBuf,
-        proxy: EventLoopProxy<toastty_window::UserEvent>,
-    ) -> Option<Self> {
+    pub fn spawn(path: PathBuf, proxy: EventLoopProxy<toastty_window::UserEvent>) -> Option<Self> {
         let parent = path.parent()?.to_path_buf();
         if !parent.exists() {
             debug!(?parent, "config parent dir missing — not watching");
@@ -57,8 +54,8 @@ impl ConfigWatcher {
         let pending_for_cb = Arc::clone(&pending);
         let target = path.clone();
 
-        let mut watcher = match notify::recommended_watcher(
-            move |res: notify::Result<notify::Event>| match res {
+        let mut watcher =
+            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
                 Ok(ev) => {
                     if !matches_target(&ev, &target) {
                         return;
@@ -73,14 +70,13 @@ impl ConfigWatcher {
                     let _ = proxy.send_event(toastty_window::UserEvent::Wake);
                 }
                 Err(e) => warn!("config watcher error: {e}"),
-            },
-        ) {
-            Ok(w) => w,
-            Err(e) => {
-                warn!("config watcher init failed: {e}");
-                return None;
-            }
-        };
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    warn!("config watcher init failed: {e}");
+                    return None;
+                }
+            };
 
         if let Err(e) = watcher.watch(&parent, RecursiveMode::NonRecursive) {
             warn!("config watch() failed for {}: {e}", parent.display());
@@ -117,9 +113,7 @@ fn is_payload_event(kind: EventKind) -> bool {
         kind,
         EventKind::Create(_)
             | EventKind::Remove(_)
-            | EventKind::Modify(
-                ModifyKind::Data(_) | ModifyKind::Name(_) | ModifyKind::Any
-            )
+            | EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_) | ModifyKind::Any)
             | EventKind::Any
     )
 }

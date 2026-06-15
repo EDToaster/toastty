@@ -56,8 +56,8 @@ impl Demo {
 impl App for Demo {
     fn init(&mut self, window: ToasttyWindow, _handle: WindowHandle) {
         let size = window.physical_size();
-        let renderer =
-            block_on(Renderer::new(window.clone(), size, true, false)).expect("failed to construct renderer");
+        let renderer = block_on(Renderer::new(window.clone(), size, true, false))
+            .expect("failed to construct renderer");
         tracing::info!(
             "renderer ready: format={:?} size={size:?}",
             renderer.format()

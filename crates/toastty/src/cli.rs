@@ -260,7 +260,10 @@ mod tests {
     #[test]
     fn bare_positional_starts_command() {
         let action = parse(["bash", "-c", "echo hi"]).unwrap();
-        let Action::Run { command: Some(cmd), .. } = action else {
+        let Action::Run {
+            command: Some(cmd), ..
+        } = action
+        else {
             panic!("expected Run with command");
         };
         assert_eq!(cmd.program, PathBuf::from("bash"));
@@ -273,7 +276,10 @@ mod tests {
     #[test]
     fn dash_e_separator_starts_command() {
         let action = parse(["-e", "htop", "--", "-d", "5"]).unwrap();
-        let Action::Run { command: Some(cmd), .. } = action else {
+        let Action::Run {
+            command: Some(cmd), ..
+        } = action
+        else {
             panic!("expected Run with command");
         };
         assert_eq!(cmd.program, PathBuf::from("htop"));
@@ -290,7 +296,10 @@ mod tests {
     #[test]
     fn double_dash_separator_starts_command() {
         let action = parse(["--", "python", "-m", "http.server"]).unwrap();
-        let Action::Run { command: Some(cmd), .. } = action else {
+        let Action::Run {
+            command: Some(cmd), ..
+        } = action
+        else {
             panic!("expected Run with command");
         };
         assert_eq!(cmd.program, PathBuf::from("python"));
@@ -305,10 +314,7 @@ mod tests {
         // Action-bearing flags before the command still resolve their
         // action; the command stays attached to Run only if no action
         // wins. (`--version` here wins.)
-        assert_eq!(
-            parse(["--version", "bash"]).unwrap(),
-            Action::PrintVersion
-        );
+        assert_eq!(parse(["--version", "bash"]).unwrap(), Action::PrintVersion);
     }
 
     #[test]
@@ -380,7 +386,10 @@ mod tests {
         // After the separator, leading-dash args are part of the
         // command — they must NOT be re-interpreted as toastty flags.
         let action = parse(["--", "bash", "-c", "exit 0"]).unwrap();
-        let Action::Run { command: Some(cmd), .. } = action else {
+        let Action::Run {
+            command: Some(cmd), ..
+        } = action
+        else {
             panic!("expected Run with command");
         };
         assert_eq!(cmd.program, PathBuf::from("bash"));

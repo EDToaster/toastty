@@ -334,14 +334,11 @@ impl GlyphRasterizer {
         // the same name. Used by the binary to log a warning when the
         // user's `font.family` config doesn't match anything.
         let requested_family_available = font_name.is_none_or(|requested| {
-            font_system
-                .db()
-                .faces()
-                .any(|face| {
-                    face.families
-                        .iter()
-                        .any(|(name, _)| name.eq_ignore_ascii_case(requested))
-                })
+            font_system.db().faces().any(|face| {
+                face.families
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(requested))
+            })
         });
 
         Self {
@@ -682,12 +679,7 @@ impl GlyphRasterizer {
     /// Slow path: cosmic-text shaping. Populates `char_cache` /
     /// `char_cache_misses` with whatever cosmic-text resolves so that
     /// future calls with the same characters can take the fast path.
-    fn shape_line_slow(
-        &mut self,
-        queue: &Queue,
-        text: &str,
-        mode_2027_active: bool,
-    ) -> LineGlyphs {
+    fn shape_line_slow(&mut self, queue: &Queue, text: &str, mode_2027_active: bool) -> LineGlyphs {
         self.shape_buffer_for_line(text);
 
         let cell_w = self.cell_size.0;
@@ -760,8 +752,7 @@ impl GlyphRasterizer {
         // (e.g. zero-width spaces, control chars, characters mapped to
         // the .notdef glyph) and we record it as a miss so the fast
         // path stops trying.
-        let mut produced_chars: std::collections::HashSet<char> =
-            std::collections::HashSet::new();
+        let mut produced_chars: std::collections::HashSet<char> = std::collections::HashSet::new();
 
         let mut out = LineGlyphs::default();
         for p in &pending {
@@ -1365,14 +1356,13 @@ mod tests {
         let default_color = rasterizer
             .default_resolved_font(record)
             .is_some_and(|id| presentation::face_is_color(rasterizer.font_system.db(), id));
-        let has_text_face = presentation::find_text_face(rasterizer.font_system.db(), record).is_some();
+        let has_text_face =
+            presentation::find_text_face(rasterizer.font_system.db(), record).is_some();
 
         let lg = rasterizer.shape_line(&queue, "\u{23FA}", false);
 
         if default_color && has_text_face {
-            let slot = lg
-                .get(0, record)
-                .expect("expected a glyph slot for U+23FA");
+            let slot = lg.get(0, record).expect("expected a glyph slot for U+23FA");
             assert!(
                 !slot.is_color,
                 "U+23FA must render as a monochrome text glyph, not a color emoji, after steering",
@@ -1511,8 +1501,23 @@ mod tests {
         // (`fi`, `fl`, `ffi`, `ffl`) — those are the case that bites
         // users on a fresh terminal printing `printf` or `'before:'`.
         for line in [
-            "fi", "fl", "ffi", "ffl", "==", "!=", ">=", "<=", "=>", "->",
-            "<-", ":=", "===", "!==", "<==>", "fi==", "if x != y:",
+            "fi",
+            "fl",
+            "ffi",
+            "ffl",
+            "==",
+            "!=",
+            ">=",
+            "<=",
+            "=>",
+            "->",
+            "<-",
+            ":=",
+            "===",
+            "!==",
+            "<==>",
+            "fi==",
+            "if x != y:",
         ] {
             rasterizer.shape_line(&queue, line, false);
         }
@@ -1521,8 +1526,7 @@ mod tests {
         // either rendered (in `char_cache`) or silently produced via a
         // ligature — but NEVER a "miss" that would suppress future
         // renders.
-        let all_chars: std::collections::HashSet<char> =
-            "filfffi==!><=->:if xy".chars().collect();
+        let all_chars: std::collections::HashSet<char> = "filfffi==!><=->:if xy".chars().collect();
         for ch in all_chars {
             assert!(
                 !rasterizer.char_cache_misses.contains(&ch),
@@ -1594,7 +1598,10 @@ mod tests {
         fn three_glyph_cluster_at_offset_keys_per_cell() {
             let glyphs = [(0, 3, 5), (0, 3, 6), (0, 3, 7)];
             let out = assign_glyph_chars(&glyphs, "===");
-            assert_eq!(out.iter().map(|x| x.0).collect::<Vec<_>>(), vec!['=', '=', '=']);
+            assert_eq!(
+                out.iter().map(|x| x.0).collect::<Vec<_>>(),
+                vec!['=', '=', '=']
+            );
         }
 
         /// Mix of clusters in one run: `a!=b` — `a` (single-char), then

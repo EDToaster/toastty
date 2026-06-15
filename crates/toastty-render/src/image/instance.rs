@@ -133,8 +133,14 @@ pub fn build_image_instances(
         let Some(entry) = cache.get(placement.image_id) else {
             continue;
         };
-        let cols = placement.col_range.end.saturating_sub(placement.col_range.start);
-        let rows = placement.row_range.end.saturating_sub(placement.row_range.start);
+        let cols = placement
+            .col_range
+            .end
+            .saturating_sub(placement.col_range.start);
+        let rows = placement
+            .row_range
+            .end
+            .saturating_sub(placement.row_range.start);
         if cols == 0 || rows == 0 {
             continue;
         }
@@ -332,8 +338,16 @@ mod tests {
         assert_eq!(below_bg.len(), 1);
         assert_eq!(below_text.len(), 2);
         assert_eq!(above.len(), 2);
-        assert!(below_bg.iter().all(|i| classify_layer(i.z) == Layer::BelowCellBg));
-        assert!(below_text.iter().all(|i| classify_layer(i.z) == Layer::BelowText));
+        assert!(
+            below_bg
+                .iter()
+                .all(|i| classify_layer(i.z) == Layer::BelowCellBg)
+        );
+        assert!(
+            below_text
+                .iter()
+                .all(|i| classify_layer(i.z) == Layer::BelowText)
+        );
         assert!(above.iter().all(|i| i.z >= 0));
     }
 

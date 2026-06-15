@@ -43,8 +43,12 @@ pub trait KittySink {
     /// number→most-recent-id mapping so `d=n`/`d=N` can resolve it.
     /// Returns the *final* id, or `None` if the host could not accept the
     /// image. The handler maps `None` to [`ErrorCode::Efbig`].
-    fn register_image(&mut self, id_request: u32, image_number: u32, data: ImageData)
-    -> Option<u32>;
+    fn register_image(
+        &mut self,
+        id_request: u32,
+        image_number: u32,
+        data: ImageData,
+    ) -> Option<u32>;
 
     /// Insert a placement onto the cell grid.
     fn place_image(&mut self, placement: Placement);
@@ -304,7 +308,12 @@ impl KittyHandler {
                 }
             },
         };
-        match decode(header.format, &raw, header.source_width, header.source_height) {
+        match decode(
+            header.format,
+            &raw,
+            header.source_width,
+            header.source_height,
+        ) {
             Ok(_) => reply_ok_if_verbose(&header, sink),
             Err(e) => {
                 let code = match e {
@@ -357,9 +366,7 @@ impl KittyHandler {
         let has_route = header.image_id != 0 || self.active_upload_id.is_some();
 
         // Continuation: append to the existing pending buffer.
-        if has_route
-            && let Some(pending) = self.pending.get_mut(&key)
-        {
+        if has_route && let Some(pending) = self.pending.get_mut(&key) {
             // Compare critical header fields. Mismatches → Einval and
             // abandon the upload. Skip the check when the continuation
             // chunk was routed via `active_upload_id` (its header is
@@ -505,7 +512,8 @@ impl KittyHandler {
                 // the temp dir or a `tty-graphics-protocol` marker) so a
                 // hostile client can't trick the terminal into unlinking
                 // an arbitrary file. Best-effort: ignore unlink errors.
-                if matches!(header.transmission, Transmission::TempFile) && is_under_temp_dir(&path) {
+                if matches!(header.transmission, Transmission::TempFile) && is_under_temp_dir(&path)
+                {
                     let _ = std::fs::remove_file(&path);
                 }
                 self.finalize_decoded(header, raw, sink);
@@ -551,7 +559,12 @@ impl KittyHandler {
             },
         };
 
-        let img = match decode(header.format, &raw, header.source_width, header.source_height) {
+        let img = match decode(
+            header.format,
+            &raw,
+            header.source_width,
+            header.source_height,
+        ) {
             Ok(d) => d,
             Err(e) => {
                 let code = match e {
@@ -1081,7 +1094,8 @@ mod tests {
         let mut sink = MockSink::with_budget(1 << 30);
         let header = "Ga=t,f=32,s=1,v=1,i=42";
         let body = b64_red_pixel();
-        h.process(header.as_bytes(), body.as_bytes(), &mut sink).unwrap();
+        h.process(header.as_bytes(), body.as_bytes(), &mut sink)
+            .unwrap();
         assert_eq!(sink.registered.len(), 1);
         assert_eq!(sink.registered[0].0, 42);
         assert_eq!(sink.registered[0].1.width, 1);
@@ -1097,7 +1111,8 @@ mod tests {
         let mut sink = MockSink::with_budget(1 << 30);
         let header = "Ga=T,f=32,s=1,v=1,i=1,c=2,r=3";
         let body = b64_red_pixel();
-        h.process(header.as_bytes(), body.as_bytes(), &mut sink).unwrap();
+        h.process(header.as_bytes(), body.as_bytes(), &mut sink)
+            .unwrap();
         assert_eq!(sink.registered.len(), 1);
         assert_eq!(sink.placements.len(), 1);
         let p = &sink.placements[0];
@@ -1112,21 +1127,13 @@ mod tests {
         let half = body.len() / 2;
         let (a, b) = body.split_at(half);
         // First chunk: m=1 (more coming).
-        h.process(
-            b"Ga=t,f=32,s=1,v=1,i=7,m=1",
-            a.as_bytes(),
-            &mut sink,
-        )
-        .unwrap();
+        h.process(b"Ga=t,f=32,s=1,v=1,i=7,m=1", a.as_bytes(), &mut sink)
+            .unwrap();
         assert_eq!(sink.registered.len(), 0);
         assert_eq!(h.pending_uploads(), 1);
         // Final: m=0.
-        h.process(
-            b"Ga=t,f=32,s=1,v=1,i=7,m=0",
-            b.as_bytes(),
-            &mut sink,
-        )
-        .unwrap();
+        h.process(b"Ga=t,f=32,s=1,v=1,i=7,m=0", b.as_bytes(), &mut sink)
+            .unwrap();
         assert_eq!(sink.registered.len(), 1);
         assert_eq!(sink.registered[0].0, 7);
         assert_eq!(h.pending_uploads(), 0);
@@ -1149,12 +1156,8 @@ mod tests {
         let (a, rest) = body.split_at(third);
         let (b, c) = rest.split_at(third);
         // First chunk: full header (i=, s=, v=, format, m=1).
-        h.process(
-            b"Ga=t,f=32,s=1,v=1,i=42,m=1",
-            a.as_bytes(),
-            &mut sink,
-        )
-        .unwrap();
+        h.process(b"Ga=t,f=32,s=1,v=1,i=42,m=1", a.as_bytes(), &mut sink)
+            .unwrap();
         // Continuation: only m=1, no i= and no s=/v=.
         h.process(b"Gm=1", b.as_bytes(), &mut sink).unwrap();
         // Final: only m=0.
@@ -1199,12 +1202,8 @@ mod tests {
         let (a, b) = body.split_at(half);
 
         // First chunk: full header, NO `i=`.
-        h.process(
-            b"Gf=24,s=2,v=2,c=2,r=2,a=T,m=1",
-            a.as_bytes(),
-            &mut sink,
-        )
-        .unwrap();
+        h.process(b"Gf=24,s=2,v=2,c=2,r=2,a=T,m=1", a.as_bytes(), &mut sink)
+            .unwrap();
         assert_eq!(sink.registered.len(), 0, "first chunk shouldn't finalize");
         assert_eq!(h.pending_uploads(), 1, "first chunk must enter pending");
 
@@ -1253,7 +1252,8 @@ mod tests {
         let half = body.len() / 2;
         let (a, b) = body.split_at(half);
 
-        h.process(b"Gf=24,s=2,v=2,c=2,r=2,a=T,m=1", a.as_bytes(), &mut sink).unwrap();
+        h.process(b"Gf=24,s=2,v=2,c=2,r=2,a=T,m=1", a.as_bytes(), &mut sink)
+            .unwrap();
         h.process(b"Gm=0", b.as_bytes(), &mut sink).unwrap();
 
         assert_eq!(sink.registered.len(), 1, "image must still register");
@@ -1288,13 +1288,21 @@ mod tests {
         // helix, btop etc. all rely on the `OK` reply being delivered.
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
-        h.process(b"Ga=t,f=32,s=1,v=1,i=7", b64_red_pixel().as_bytes(), &mut sink).unwrap();
+        h.process(
+            b"Ga=t,f=32,s=1,v=1,i=7",
+            b64_red_pixel().as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
         let joined: String = sink
             .replies
             .iter()
             .map(|r| String::from_utf8_lossy(r).into_owned())
             .collect();
-        assert!(joined.contains("i=7"), "must echo client id, got {joined:?}");
+        assert!(
+            joined.contains("i=7"),
+            "must echo client id, got {joined:?}"
+        );
         assert!(joined.contains(";OK"), "must reply OK, got {joined:?}");
     }
 
@@ -1305,14 +1313,22 @@ mod tests {
         // reply. The new gate must still let this through.
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
-        h.process(b"Ga=t,f=32,s=1,v=1,I=11", b64_red_pixel().as_bytes(), &mut sink).unwrap();
+        h.process(
+            b"Ga=t,f=32,s=1,v=1,I=11",
+            b64_red_pixel().as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
         let joined: String = sink
             .replies
             .iter()
             .map(|r| String::from_utf8_lossy(r).into_owned())
             .collect();
         assert!(joined.contains("I=11"), "must echo I=, got {joined:?}");
-        assert!(joined.contains("i="), "must include assigned i=, got {joined:?}");
+        assert!(
+            joined.contains("i="),
+            "must include assigned i=, got {joined:?}"
+        );
         assert!(joined.contains(";OK"), "must reply OK, got {joined:?}");
     }
 
@@ -1320,41 +1336,33 @@ mod tests {
     fn chunked_header_mismatch_is_einval() {
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
-        h.process(
-            b"Ga=t,f=32,s=1,v=1,i=7,m=1",
-            b"AAAA",
-            &mut sink,
-        )
-        .unwrap();
+        h.process(b"Ga=t,f=32,s=1,v=1,i=7,m=1", b"AAAA", &mut sink)
+            .unwrap();
         // Second chunk with mismatched format.
-        h.process(
-            b"Ga=t,f=24,s=1,v=1,i=7,m=0",
-            b"BBBB",
-            &mut sink,
-        )
-        .unwrap();
+        h.process(b"Ga=t,f=24,s=1,v=1,i=7,m=0", b"BBBB", &mut sink)
+            .unwrap();
         // Reply should be EINVAL; upload abandoned.
         assert_eq!(sink.registered.len(), 0);
         assert_eq!(h.pending_uploads(), 0);
-        assert!(sink.replies.iter().any(|r| {
-            std::str::from_utf8(r).is_ok_and(|s| s.contains("EINVAL"))
-        }));
+        assert!(
+            sink.replies
+                .iter()
+                .any(|r| { std::str::from_utf8(r).is_ok_and(|s| s.contains("EINVAL")) })
+        );
     }
 
     #[test]
     fn oversized_declared_payload_rejected_with_efbig() {
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(16);
-        h.process(
-            b"Ga=t,f=32,s=64,v=64,i=1,S=16384",
-            b"",
-            &mut sink,
-        )
-        .unwrap();
+        h.process(b"Ga=t,f=32,s=64,v=64,i=1,S=16384", b"", &mut sink)
+            .unwrap();
         assert_eq!(sink.registered.len(), 0);
-        assert!(sink.replies.iter().any(|r| {
-            std::str::from_utf8(r).is_ok_and(|s| s.contains("EFBIG"))
-        }));
+        assert!(
+            sink.replies
+                .iter()
+                .any(|r| { std::str::from_utf8(r).is_ok_and(|s| s.contains("EFBIG")) })
+        );
     }
 
     #[test]
@@ -1362,9 +1370,11 @@ mod tests {
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
         h.process(b"Ga=a,i=1", b"", &mut sink).unwrap();
-        assert!(sink.replies.iter().any(|r| {
-            std::str::from_utf8(r).is_ok_and(|s| s.contains("ENOTSUP"))
-        }));
+        assert!(
+            sink.replies
+                .iter()
+                .any(|r| { std::str::from_utf8(r).is_ok_and(|s| s.contains("ENOTSUP")) })
+        );
     }
 
     #[test]
@@ -1406,9 +1416,11 @@ mod tests {
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
         h.process(b"Ga=p,I=9", b"", &mut sink).unwrap();
-        assert!(sink.replies.iter().any(|r| {
-            std::str::from_utf8(r).is_ok_and(|s| s.contains("EINVAL"))
-        }));
+        assert!(
+            sink.replies
+                .iter()
+                .any(|r| { std::str::from_utf8(r).is_ok_and(|s| s.contains("EINVAL")) })
+        );
     }
 
     #[test]
@@ -1416,12 +1428,8 @@ mod tests {
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
         let body = b64_red_pixel();
-        h.process(
-            b"Ga=t,f=32,s=1,v=1,i=42,q=1",
-            body.as_bytes(),
-            &mut sink,
-        )
-        .unwrap();
+        h.process(b"Ga=t,f=32,s=1,v=1,i=42,q=1", body.as_bytes(), &mut sink)
+            .unwrap();
         // OK reply suppressed.
         let replies_str: Vec<String> = sink
             .replies
@@ -1443,12 +1451,8 @@ mod tests {
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
         // Trigger an error (bad b64).
-        h.process(
-            b"Ga=t,f=32,s=1,v=1,i=42,q=2",
-            b"!!!",
-            &mut sink,
-        )
-        .unwrap();
+        h.process(b"Ga=t,f=32,s=1,v=1,i=42,q=2", b"!!!", &mut sink)
+            .unwrap();
         assert!(sink.replies.is_empty(), "got {:?}", sink.replies);
     }
 
@@ -1456,9 +1460,7 @@ mod tests {
     fn bad_header_is_handler_error() {
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
-        let err = h
-            .process(b"NotG", b"", &mut sink)
-            .unwrap_err();
+        let err = h.process(b"NotG", b"", &mut sink).unwrap_err();
         assert!(matches!(err, HandlerError::BadHeader(_)));
     }
 
@@ -1490,22 +1492,15 @@ mod tests {
         // must not store).
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
-        h.process(
-            b"Ga=q,s=1,v=1,t=d,f=24,i=31",
-            b"AAAA",
-            &mut sink,
-        )
-        .unwrap();
+        h.process(b"Ga=q,s=1,v=1,t=d,f=24,i=31", b"AAAA", &mut sink)
+            .unwrap();
         let joined: String = sink
             .replies
             .iter()
             .map(|r| String::from_utf8_lossy(r).into_owned())
             .collect();
         assert!(joined.contains(";OK"), "got {joined:?}");
-        assert!(
-            sink.registered.is_empty(),
-            "Query must not store the image"
-        );
+        assert!(sink.registered.is_empty(), "Query must not store the image");
     }
 
     #[test]
@@ -1515,12 +1510,8 @@ mod tests {
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
         // "garbage!" base64-encoded.
-        h.process(
-            b"Ga=q,f=100,i=99",
-            b"Z2FyYmFnZSE=",
-            &mut sink,
-        )
-        .unwrap();
+        h.process(b"Ga=q,f=100,i=99", b"Z2FyYmFnZSE=", &mut sink)
+            .unwrap();
         let joined: String = sink
             .replies
             .iter()
@@ -1535,12 +1526,8 @@ mod tests {
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
         let body = b64_red_pixel();
-        h.process(
-            b"Ga=t,f=32,s=1,v=1,i=7",
-            body.as_bytes(),
-            &mut sink,
-        )
-        .unwrap();
+        h.process(b"Ga=t,f=32,s=1,v=1,i=7", body.as_bytes(), &mut sink)
+            .unwrap();
         // Drop the transmit reply so we only inspect query replies.
         sink.replies.clear();
         h.process(b"Ga=q,i=7", b"", &mut sink).unwrap();
@@ -1559,22 +1546,16 @@ mod tests {
         h.set_pending_cap(8);
         let mut sink = MockSink::with_budget(1 << 30);
         // Start.
-        h.process(
-            b"Ga=t,f=32,s=1,v=1,i=5,m=1",
-            b"AAAAAA",
-            &mut sink,
-        )
-        .unwrap();
+        h.process(b"Ga=t,f=32,s=1,v=1,i=5,m=1", b"AAAAAA", &mut sink)
+            .unwrap();
         // Overflow the 8-byte pending cap.
-        h.process(
-            b"Ga=t,f=32,s=1,v=1,i=5,m=1",
-            b"BBBBBB",
-            &mut sink,
-        )
-        .unwrap();
-        assert!(sink.replies.iter().any(|r| {
-            std::str::from_utf8(r).is_ok_and(|s| s.contains("EFBIG"))
-        }));
+        h.process(b"Ga=t,f=32,s=1,v=1,i=5,m=1", b"BBBBBB", &mut sink)
+            .unwrap();
+        assert!(
+            sink.replies
+                .iter()
+                .any(|r| { std::str::from_utf8(r).is_ok_and(|s| s.contains("EFBIG")) })
+        );
         assert_eq!(h.pending_uploads(), 0);
     }
 
@@ -1585,9 +1566,11 @@ mod tests {
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
         h.process(b"Ga=q,t=f,i=1", b"L3RtcC94", &mut sink).unwrap();
-        assert!(sink.replies.iter().any(|r| {
-            std::str::from_utf8(r).is_ok_and(|s| s.contains("ENOTSUP"))
-        }));
+        assert!(
+            sink.replies
+                .iter()
+                .any(|r| { std::str::from_utf8(r).is_ok_and(|s| s.contains("ENOTSUP")) })
+        );
     }
 }
 
@@ -1676,8 +1659,14 @@ mod blocker_graphics_tests {
             "i=+I= conflict must not register an image"
         );
         // The reply should echo both identifiers.
-        assert!(joined.contains("i=1"), "reply should echo i=, got {joined:?}");
-        assert!(joined.contains("I=2"), "reply should echo I=, got {joined:?}");
+        assert!(
+            joined.contains("i=1"),
+            "reply should echo i=, got {joined:?}"
+        );
+        assert!(
+            joined.contains("I=2"),
+            "reply should echo I=, got {joined:?}"
+        );
     }
 
     // ----- B9: malformed header replies EINVAL (id recoverable) -----
@@ -1688,14 +1677,24 @@ mod blocker_graphics_tests {
         let mut sink = RecordingSink::new();
         // `f=999` is not a valid format enum → BadEnum on parse.
         let err = h
-            .process(b"Ga=t,i=1,f=999,s=1,v=1", b64_red_pixel().as_bytes(), &mut sink)
+            .process(
+                b"Ga=t,i=1,f=999,s=1,v=1",
+                b64_red_pixel().as_bytes(),
+                &mut sink,
+            )
             .unwrap_err();
         assert!(matches!(err, HandlerError::BadHeader(_)));
         let joined = sink.joined_replies();
         assert!(joined.contains("EINVAL"), "expected EINVAL, got {joined:?}");
         // Best-effort id recovery: the reply echoes the scanned i=1.
-        assert!(joined.contains("i=1"), "reply should echo recovered i=, got {joined:?}");
-        assert!(sink.registered.is_empty(), "malformed header must not register");
+        assert!(
+            joined.contains("i=1"),
+            "reply should echo recovered i=, got {joined:?}"
+        );
+        assert!(
+            sink.registered.is_empty(),
+            "malformed header must not register"
+        );
     }
 
     #[test]
@@ -1706,7 +1705,10 @@ mod blocker_graphics_tests {
         h.process(b"Ga=X,I=7", b"", &mut sink).unwrap_err();
         let joined = sink.joined_replies();
         assert!(joined.contains("EINVAL"), "expected EINVAL, got {joined:?}");
-        assert!(joined.contains("I=7"), "reply should echo recovered I=, got {joined:?}");
+        assert!(
+            joined.contains("I=7"),
+            "reply should echo recovered I=, got {joined:?}"
+        );
     }
 
     #[test]
@@ -1748,17 +1750,18 @@ mod blocker_graphics_tests {
         )
         .unwrap();
         // Image IS registered.
-        assert_eq!(sink.registered.len(), 1, "U=1 must still register the image");
+        assert_eq!(
+            sink.registered.len(),
+            1,
+            "U=1 must still register the image"
+        );
         assert_eq!(sink.registered[0].0, 5);
         // No visible placement, no cursor advance.
         assert!(
             sink.placements.is_empty(),
             "U=1 must not create a visible placement"
         );
-        assert_eq!(
-            sink.cursor_advances, 0,
-            "U=1 must not advance the cursor"
-        );
+        assert_eq!(sink.cursor_advances, 0, "U=1 must not advance the cursor");
         // Still replies OK (id present).
         assert!(sink.joined_replies().contains(";OK"));
     }
@@ -1802,7 +1805,11 @@ mod major_place_handler_tests {
         };
         let p = default_placement_from_header(&header, 1, 200, 100, 10, 20);
         assert_eq!(p.col_range, 0..10);
-        assert_eq!(p.row_range, 0..3, "rows derived from aspect, not natural cell count");
+        assert_eq!(
+            p.row_range,
+            0..3,
+            "rows derived from aspect, not natural cell count"
+        );
     }
 
     #[test]
@@ -1818,7 +1825,11 @@ mod major_place_handler_tests {
         };
         let p = default_placement_from_header(&header, 1, 200, 100, 10, 20);
         assert_eq!(p.row_range, 0..4);
-        assert_eq!(p.col_range, 0..16, "cols derived from aspect, not natural cell count");
+        assert_eq!(
+            p.col_range,
+            0..16,
+            "cols derived from aspect, not natural cell count"
+        );
     }
 
     #[test]
@@ -1854,8 +1865,14 @@ mod major_place_handler_tests {
         };
         let p = default_placement_from_header(&header, 1, 16, 16, 8, 8);
         assert_eq!(p.pix_offset, (3, 4));
-        assert_eq!(p.col_range, base.col_range, "X must not shift the cell range");
-        assert_eq!(p.row_range, base.row_range, "Y must not shift the cell range");
+        assert_eq!(
+            p.col_range, base.col_range,
+            "X must not shift the cell range"
+        );
+        assert_eq!(
+            p.row_range, base.row_range,
+            "Y must not shift the cell range"
+        );
     }
 }
 
@@ -1934,7 +1951,12 @@ mod major_medium_tests {
         h.process(b"Ga=t,f=32,s=2,v=2,i=77,t=f", &b64_path(&path), &mut sink)
             .unwrap();
 
-        assert_eq!(sink.registered.len(), 1, "replies={:?}", replies_joined(&sink));
+        assert_eq!(
+            sink.registered.len(),
+            1,
+            "replies={:?}",
+            replies_joined(&sink)
+        );
         assert_eq!(sink.registered[0].0, 77);
         assert_eq!(sink.registered[0].1.width, 2);
         assert_eq!(sink.registered[0].1.height, 2);
@@ -1956,10 +1978,18 @@ mod major_medium_tests {
         h.process(b"Ga=t,f=32,s=2,v=1,i=88,t=t", &b64_path(&path), &mut sink)
             .unwrap();
 
-        assert_eq!(sink.registered.len(), 1, "replies={:?}", replies_joined(&sink));
+        assert_eq!(
+            sink.registered.len(),
+            1,
+            "replies={:?}",
+            replies_joined(&sink)
+        );
         assert_eq!(sink.registered[0].1.pixels, raw);
         // Temp file under the temp dir must be deleted after reading.
-        assert!(!path.exists(), "t=t must delete the temp file after reading");
+        assert!(
+            !path.exists(),
+            "t=t must delete the temp file after reading"
+        );
     }
 
     #[test]
@@ -1977,10 +2007,19 @@ mod major_medium_tests {
         let mut h = KittyHandler::new();
         let mut sink = MockSink::default();
         // 2x1 image, offset 4 bytes, size 8 bytes.
-        h.process(b"Ga=t,f=32,s=2,v=1,i=5,t=f,O=4,S=8", &b64_path(&path), &mut sink)
-            .unwrap();
+        h.process(
+            b"Ga=t,f=32,s=2,v=1,i=5,t=f,O=4,S=8",
+            &b64_path(&path),
+            &mut sink,
+        )
+        .unwrap();
 
-        assert_eq!(sink.registered.len(), 1, "replies={:?}", replies_joined(&sink));
+        assert_eq!(
+            sink.registered.len(),
+            1,
+            "replies={:?}",
+            replies_joined(&sink)
+        );
         assert_eq!(sink.registered[0].1.pixels, raw[4..12]);
         std::fs::remove_file(&path).ok();
     }
@@ -1996,7 +2035,10 @@ mod major_medium_tests {
         h.process(b"Ga=t,f=32,s=2,v=2,i=9,t=f", &b64_path(&path), &mut sink)
             .unwrap();
 
-        assert!(sink.registered.is_empty(), "no image must register on read failure");
+        assert!(
+            sink.registered.is_empty(),
+            "no image must register on read failure"
+        );
         let joined = replies_joined(&sink);
         assert!(
             joined.contains("EBADF") || joined.contains("ENOENT"),
@@ -2331,23 +2373,15 @@ mod minor_graphics_tests {
         let half = body.len() / 2;
         let (a, b) = body.split_at(half);
         // First chunk: full header, more coming.
-        h.process(
-            b"Ga=t,f=32,s=1,v=1,i=11,m=1",
-            a.as_bytes(),
-            &mut sink,
-        )
-        .unwrap();
+        h.process(b"Ga=t,f=32,s=1,v=1,i=11,m=1", a.as_bytes(), &mut sink)
+            .unwrap();
         assert_eq!(sink.registered.len(), 0);
         assert_eq!(h.pending_uploads(), 1);
         // Final chunk: carries a DIFFERENT incidental key (stray S= and a
         // mismatched f=) plus the routing i=. Reference kitty ignores
         // these; we must NOT reject with EINVAL.
-        h.process(
-            b"Ga=t,f=100,S=999,i=11,m=0",
-            b.as_bytes(),
-            &mut sink,
-        )
-        .unwrap();
+        h.process(b"Ga=t,f=100,S=999,i=11,m=0", b.as_bytes(), &mut sink)
+            .unwrap();
         assert_eq!(
             sink.registered.len(),
             1,

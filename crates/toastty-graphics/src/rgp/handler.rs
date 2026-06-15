@@ -16,8 +16,8 @@
 use std::collections::HashMap;
 
 use crate::rgp::operation::{
-    RgpAnchor, RgpFormat, RgpOperation, RgpParseError, RgpPlacementStyle,
-    RgpPlacementUpdate, RgpRegisterSource, parse,
+    RgpAnchor, RgpFormat, RgpOperation, RgpParseError, RgpPlacementStyle, RgpPlacementUpdate,
+    RgpRegisterSource, parse,
 };
 use crate::rgp::reply::support_reply;
 
@@ -53,12 +53,7 @@ pub trait RgpSink {
     /// handler intentionally does not do filesystem I/O.
     ///
     /// Returns `true` iff the resolution + registration succeeded.
-    fn register_asset_by_path(
-        &mut self,
-        id: u32,
-        format: RgpFormat,
-        name: String,
-    ) -> bool;
+    fn register_asset_by_path(&mut self, id: u32, format: RgpFormat, name: String) -> bool;
 
     /// Apply a `p` verb: insert/replace a placement.
     fn place(&mut self, id: u32, anchor: RgpAnchor, style: RgpPlacementStyle);
@@ -127,11 +122,7 @@ impl RgpHandler {
     /// Returns `Ok(())` if the payload was parsed and dispatched
     /// (or buffered as an in-flight chunked register); `Err` if
     /// the payload was malformed enough that no dispatch happened.
-    pub fn process(
-        &mut self,
-        payload: &[u8],
-        sink: &mut dyn RgpSink,
-    ) -> Result<(), RgpParseError> {
+    pub fn process(&mut self, payload: &[u8], sink: &mut dyn RgpSink) -> Result<(), RgpParseError> {
         let op = parse(payload)?;
         self.dispatch(op, sink);
         Ok(())
@@ -261,12 +252,7 @@ mod tests {
             self.registered.push((id, format, name, bytes));
             true
         }
-        fn register_asset_by_path(
-            &mut self,
-            id: u32,
-            format: RgpFormat,
-            name: String,
-        ) -> bool {
+        fn register_asset_by_path(&mut self, id: u32, format: RgpFormat, name: String) -> bool {
             self.registered_by_path.push((id, format, name));
             true
         }

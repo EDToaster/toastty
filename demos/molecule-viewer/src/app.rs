@@ -22,10 +22,10 @@ use ratatui::crossterm::execute;
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 
-use crate::pubchem::Candidate;
 use crate::model::ColoredMesh;
-use crate::{geometry, glb, pubchem, rgp, sdf};
+use crate::pubchem::Candidate;
 use crate::ui::{self, DrawMode, RgpAnchor};
+use crate::{geometry, glb, pubchem, rgp, sdf};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Worker messages
@@ -412,23 +412,21 @@ impl App {
                     }
                 },
                 Ok(WorkerMsg::SdfText(res)) => match res {
-                    Ok(sdf_text) => {
-                        match sdf::parse_sdf(&sdf_text) {
-                            Ok(mol) => {
-                                let meshes = geometry::build(&mol);
-                                if let Err(e) = self.register_and_place_meshes(meshes) {
-                                    self.status = Some(format!("RGP error: {e}"));
-                                    self.mode = Mode::Input;
-                                } else {
-                                    self.mode = Mode::Viewing;
-                                }
-                            }
-                            Err(e) => {
-                                self.status = Some(format!("Parse error: {e}"));
+                    Ok(sdf_text) => match sdf::parse_sdf(&sdf_text) {
+                        Ok(mol) => {
+                            let meshes = geometry::build(&mol);
+                            if let Err(e) = self.register_and_place_meshes(meshes) {
+                                self.status = Some(format!("RGP error: {e}"));
                                 self.mode = Mode::Input;
+                            } else {
+                                self.mode = Mode::Viewing;
                             }
                         }
-                    }
+                        Err(e) => {
+                            self.status = Some(format!("Parse error: {e}"));
+                            self.mode = Mode::Input;
+                        }
+                    },
                     Err(e) => {
                         self.status = Some(format!("Fetch error: {e}"));
                         self.mode = Mode::Input;
