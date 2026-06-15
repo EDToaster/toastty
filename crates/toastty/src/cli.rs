@@ -22,8 +22,12 @@ pub struct CommandOverride {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     /// Run the terminal normally. `command` overrides the configured
-    /// shell when present.
-    Run { command: Option<CommandOverride> },
+    /// shell when present; `working_directory` overrides the CWD the
+    /// shell (or command) is spawned in.
+    Run {
+        command: Option<CommandOverride>,
+        working_directory: Option<PathBuf>,
+    },
     /// Print the default config (TOML) to stdout and exit.
     PrintDefaultConfig,
     /// Print the help text to stdout and exit.
@@ -50,8 +54,8 @@ impl std::error::Error for ParseError {}
 /// [`ParseError`] naming the bad flag.
 ///
 /// Argument convention:
-/// - Known flags (`--help`, `--version`, `--print-default-config`) are
-///   consumed in any order.
+/// - Known flags (`--help`, `--version`, `--print-default-config`,
+///   `--working-directory`) are consumed in any order.
 /// - The first bare token (no leading `-`), OR a `--` separator, OR
 ///   `-e` / `--command`, switches the parser into "command mode": every
 ///   remaining argument is passed through verbatim as `program` +
@@ -64,18 +68,34 @@ where
 {
     let mut action_kind: Option<ActionKind> = None;
     let mut command: Option<CommandOverride> = None;
+    let mut working_directory: Option<PathBuf> = None;
     let mut iter = args.into_iter().map(Into::into);
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--print-default-config" => action_kind = Some(ActionKind::PrintDefaultConfig),
             "--help" | "-h" => action_kind = Some(ActionKind::PrintHelp),
             "--version" | "-V" => action_kind = Some(ActionKind::PrintVersion),
+            // Initial CWD for the spawned shell/command. Value form
+            // (`--working-directory=PATH`) is handled below; the
+            // space-separated form consumes the next token.
+            "--working-directory" | "-d" => {
+                let Some(dir) = iter.next() else {
+                    return Err(ParseError {
+                        arg: format!("{arg} requires a path"),
+                    });
+                };
+                working_directory = Some(PathBuf::from(dir));
+            }
             // `--` separator, `-e`, `--command`: everything that follows
             // is the command to run. We don't second-guess it; even
             // `-h` after the separator is part of the command.
             "--" | "-e" | "--command" => {
                 command = Some(collect_command(&mut iter, &arg)?);
                 break;
+            }
+            other if other.starts_with("--working-directory=") => {
+                let val = &other["--working-directory=".len()..];
+                working_directory = Some(PathBuf::from(val));
             }
             other if other.starts_with('-') => {
                 return Err(ParseError {
@@ -101,7 +121,10 @@ where
         Some(ActionKind::PrintDefaultConfig) => Action::PrintDefaultConfig,
         Some(ActionKind::PrintHelp) => Action::PrintHelp,
         Some(ActionKind::PrintVersion) => Action::PrintVersion,
-        None => Action::Run { command },
+        None => Action::Run {
+            command,
+            working_directory,
+        },
     })
 }
 
@@ -140,6 +163,9 @@ USAGE:
     toastty [FLAGS] <command> [args...]
 
 FLAGS:
+    -d, --working-directory <PATH>
+                              Spawn the shell (or command) in <PATH> instead of
+                              the current directory. Accepts `--working-directory=<PATH>` too.
     --print-default-config    Print the default TOML config to stdout and exit.
                               Useful for bootstrapping: `toastty --print-default-config > ~/.config/toastty/config.toml`
     -h, --help                Print this help and exit
@@ -178,7 +204,10 @@ mod tests {
     use super::*;
 
     fn run_action() -> Action {
-        Action::Run { command: None }
+        Action::Run {
+            command: None,
+            working_directory: None,
+        }
     }
 
     #[test]
@@ -231,7 +260,7 @@ mod tests {
     #[test]
     fn bare_positional_starts_command() {
         let action = parse(["bash", "-c", "echo hi"]).unwrap();
-        let Action::Run { command: Some(cmd) } = action else {
+        let Action::Run { command: Some(cmd), .. } = action else {
             panic!("expected Run with command");
         };
         assert_eq!(cmd.program, PathBuf::from("bash"));
@@ -244,7 +273,7 @@ mod tests {
     #[test]
     fn dash_e_separator_starts_command() {
         let action = parse(["-e", "htop", "--", "-d", "5"]).unwrap();
-        let Action::Run { command: Some(cmd) } = action else {
+        let Action::Run { command: Some(cmd), .. } = action else {
             panic!("expected Run with command");
         };
         assert_eq!(cmd.program, PathBuf::from("htop"));
@@ -261,7 +290,7 @@ mod tests {
     #[test]
     fn double_dash_separator_starts_command() {
         let action = parse(["--", "python", "-m", "http.server"]).unwrap();
-        let Action::Run { command: Some(cmd) } = action else {
+        let Action::Run { command: Some(cmd), .. } = action else {
             panic!("expected Run with command");
         };
         assert_eq!(cmd.program, PathBuf::from("python"));
@@ -289,11 +318,69 @@ mod tests {
     }
 
     #[test]
+    fn working_directory_space_form() {
+        let action = parse(["--working-directory", "/tmp/work"]).unwrap();
+        assert_eq!(
+            action,
+            Action::Run {
+                command: None,
+                working_directory: Some(PathBuf::from("/tmp/work")),
+            }
+        );
+    }
+
+    #[test]
+    fn working_directory_equals_form() {
+        let action = parse(["--working-directory=/tmp/work"]).unwrap();
+        assert_eq!(
+            action,
+            Action::Run {
+                command: None,
+                working_directory: Some(PathBuf::from("/tmp/work")),
+            }
+        );
+    }
+
+    #[test]
+    fn working_directory_short_flag() {
+        let action = parse(["-d", "/var/log"]).unwrap();
+        assert_eq!(
+            action,
+            Action::Run {
+                command: None,
+                working_directory: Some(PathBuf::from("/var/log")),
+            }
+        );
+    }
+
+    #[test]
+    fn working_directory_combines_with_command() {
+        // `--working-directory` is independent of the command override:
+        // spawn `bash` but in `/srv`.
+        let action = parse(["--working-directory", "/srv", "-e", "bash"]).unwrap();
+        let Action::Run {
+            command: Some(cmd),
+            working_directory: Some(dir),
+        } = action
+        else {
+            panic!("expected Run with command + working_directory");
+        };
+        assert_eq!(cmd.program, PathBuf::from("bash"));
+        assert_eq!(dir, PathBuf::from("/srv"));
+    }
+
+    #[test]
+    fn working_directory_without_path_errors() {
+        let err = parse(["--working-directory"]).unwrap_err();
+        assert!(err.arg.contains("--working-directory"));
+    }
+
+    #[test]
     fn command_arg_with_leading_dash_passes_through() {
         // After the separator, leading-dash args are part of the
         // command — they must NOT be re-interpreted as toastty flags.
         let action = parse(["--", "bash", "-c", "exit 0"]).unwrap();
-        let Action::Run { command: Some(cmd) } = action else {
+        let Action::Run { command: Some(cmd), .. } = action else {
             panic!("expected Run with command");
         };
         assert_eq!(cmd.program, PathBuf::from("bash"));

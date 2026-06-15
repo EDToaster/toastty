@@ -158,7 +158,7 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
-    let command_override = match action {
+    let (command_override, cli_working_dir) = match action {
         cli::Action::PrintHelp => {
             print!("{}", cli::help_text());
             return Ok(());
@@ -172,7 +172,10 @@ fn main() -> Result<()> {
                 .context("write default config")?;
             return Ok(());
         }
-        cli::Action::Run { command } => command,
+        cli::Action::Run {
+            command,
+            working_directory,
+        } => (command, working_directory),
     };
 
     tracing_subscriber::fmt()
@@ -204,7 +207,13 @@ fn main() -> Result<()> {
         transparent,
     };
 
-    let app = Toastty::new(config, command_override, initial_size, load_err);
+    let app = Toastty::new(
+        config,
+        command_override,
+        cli_working_dir,
+        initial_size,
+        load_err,
+    );
     run(opts, app).context("window run")?;
     Ok(())
 }
@@ -216,6 +225,9 @@ struct Toastty {
     /// CLI command override. Consumed by `init_impl` when spawning the
     /// PTY; `None` falls back to the configured shell.
     command_override: Option<CommandOverride>,
+    /// CLI `--working-directory` override. Consumed by `init_impl` when
+    /// spawning the PTY; `None` falls back to [`initial_cwd`].
+    cli_working_dir: Option<std::path::PathBuf>,
     window: Option<ToasttyWindow>,
     renderer: Option<Renderer>,
     parser: Parser,
@@ -344,6 +356,7 @@ impl Toastty {
     fn new(
         config: Config,
         command_override: Option<CommandOverride>,
+        cli_working_dir: Option<std::path::PathBuf>,
         initial_size: (u32, u32),
         load_err: Option<ConfigError>,
     ) -> Self {
@@ -362,6 +375,7 @@ impl Toastty {
         Self {
             config,
             command_override,
+            cli_working_dir,
             window: None,
             renderer: None,
             parser: Parser::new(),
@@ -788,7 +802,11 @@ impl Toastty {
         // Spawn the PTY. CLI command override (xterm-style `-e`,
         // `kitty <cmd>`, etc.) wins over the configured shell.
         let (program, args) = resolve_command(self.command_override.take(), &self.config.shell);
-        info!(?program, ?args, rows, cols, "spawning shell");
+        // `--working-directory` wins over the inherited CWD; otherwise
+        // fall back to `initial_cwd()` (inherited CWD, or $HOME when
+        // launched from `/`).
+        let working_dir = self.cli_working_dir.take().unwrap_or_else(initial_cwd);
+        info!(?program, ?args, ?working_dir, rows, cols, "spawning shell");
         let pixel_width = u16::try_from(size.0).unwrap_or(u16::MAX);
         let pixel_height = u16::try_from(size.1).unwrap_or(u16::MAX);
         // TERM: until `terminfo/toastty.terminfo` is installed via
@@ -835,7 +853,7 @@ impl Toastty {
             // haven't validated). The value is informational — apps
             // generally treat any non-empty string as "we're in kitty".
             .env("KITTY_WINDOW_ID", "1")
-            .working_dir(initial_cwd())
+            .working_dir(working_dir)
             .size(WinSize {
                 rows,
                 cols,
