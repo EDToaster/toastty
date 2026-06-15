@@ -936,7 +936,17 @@ impl GlyphRasterizer {
             }
         };
 
-        upload_glyph_pixels(queue, self.atlas_texture_for(layer), slot, &image.data);
+        // Embedded color bitmaps (CBDT/sbix PNGs) arrive with straight
+        // alpha and must be premultiplied to match the glyph blend; COLR
+        // color glyphs are already premultiplied. See `color_rgba_to_bgra`.
+        let premultiply = matches!(image.source, swash::scale::Source::ColorBitmap(_));
+        upload_glyph_pixels(
+            queue,
+            self.atlas_texture_for(layer),
+            slot,
+            &image.data,
+            premultiply,
+        );
 
         self.placements.insert(key, placement);
         Some(make_glyph_slot(slot, placement))
@@ -1044,23 +1054,53 @@ fn create_atlas_texture(device: &Device, format: TextureFormat, label: &str) -> 
     })
 }
 
-fn upload_glyph_pixels(queue: &Queue, texture: &Texture, slot: AtlasSlot, data: &[u8]) {
+/// Convert swash color-glyph RGBA bytes into the premultiplied BGRA the
+/// color atlas expects.
+///
+/// swash hands us two different alpha conventions for `Content::Color`:
+///   * COLR/vector color glyphs are composited internally and arrive
+///     already **premultiplied** (`Source::ColorOutline`).
+///   * Embedded color *bitmaps* (CBDT/sbix PNGs — Noto Color Emoji on
+///     Linux, Apple Color Emoji) are decoded straight from the PNG with
+///     **straight, non-premultiplied** alpha (`Source::ColorBitmap`).
+///
+/// The glyph pass blends with One/OneMinusSrcAlpha, which assumes
+/// premultiplied input. Uploading straight-alpha data unchanged makes the
+/// antialiased edge texels (bright RGB, partial A) over-add and bloom into
+/// a white halo around the emoji — so premultiply those here. Channels are
+/// also swapped RGBA -> BGRA for the `Bgra8Unorm` atlas.
+fn color_rgba_to_bgra(data: &[u8], premultiply: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    for px in data.chunks_exact(4) {
+        let (r, g, b, a) = (px[0], px[1], px[2], px[3]);
+        if premultiply {
+            // Rounded c*a/255; idempotent at a==255 and a==0.
+            let scale = |c: u8| ((u32::from(c) * u32::from(a) + 127) / 255) as u8;
+            out.extend_from_slice(&[scale(b), scale(g), scale(r), a]);
+        } else {
+            out.extend_from_slice(&[b, g, r, a]);
+        }
+    }
+    out
+}
+
+fn upload_glyph_pixels(
+    queue: &Queue,
+    texture: &Texture,
+    slot: AtlasSlot,
+    data: &[u8],
+    premultiply: bool,
+) {
     let bytes_per_pixel = match texture.format() {
         TextureFormat::R8Unorm => 1u32,
         TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm => 4u32,
         other => panic!("unexpected atlas format: {other:?}"),
     };
 
-    // swash emits BGRA-ordered bytes for color content (its
-    // SwashImage.data is RGBA premultiplied for color, A only for mask).
-    // We need BGRA for the color texture. Translate if needed.
+    // Color content needs RGBA -> premultiplied BGRA; mask content is
+    // alpha-only and uploaded as-is.
     let bytes: std::borrow::Cow<'_, [u8]> = if matches!(slot.layer, AtlasLayer::Color) {
-        let mut out = Vec::with_capacity(data.len());
-        for px in data.chunks_exact(4) {
-            // swash gives RGBA; swap to BGRA.
-            out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
-        }
-        std::borrow::Cow::Owned(out)
+        std::borrow::Cow::Owned(color_rgba_to_bgra(data, premultiply))
     } else {
         std::borrow::Cow::Borrowed(data)
     };
@@ -1763,5 +1803,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Straight-alpha color bitmap data (CBDT/sbix emoji) must be
+    /// premultiplied on upload, else its antialiased edges — bright RGB
+    /// with partial alpha — bloom into a white halo under the
+    /// One/OneMinusSrcAlpha glyph blend. The classic offender is a white
+    /// matte texel at the glyph edge: full white RGB, partial coverage.
+    #[test]
+    fn color_bitmap_edge_is_premultiplied() {
+        // One opaque red texel and one half-transparent white edge texel,
+        // in swash's RGBA order.
+        let rgba = [
+            255, 0, 0, 255, // opaque red
+            255, 255, 255, 128, // white matte edge, ~50% coverage
+            200, 100, 50, 0, // fully-transparent matte (the most common edge texel)
+        ];
+
+        let bgra = color_rgba_to_bgra(&rgba, true);
+
+        // Opaque texel: premultiply is a no-op (a==255); just RGBA->BGRA.
+        assert_eq!(&bgra[0..4], &[0, 0, 255, 255], "opaque red -> BGRA");
+
+        // Fully-transparent texel: RGB must collapse to 0 so it contributes
+        // nothing under premultiplied-over (else a colored ghost leaks in).
+        assert_eq!(&bgra[8..12], &[0, 0, 0, 0], "transparent edge zeroed");
+
+        // Edge texel: every color channel must be scaled down to its alpha
+        // so rgb <= a. Pre-fix this stayed (255,255,255,128) and blended to
+        // a white fringe. 255*128/255 rounded == 128.
+        let (b, g, r, a) = (bgra[4], bgra[5], bgra[6], bgra[7]);
+        assert_eq!((b, g, r, a), (128, 128, 128, 128), "white edge premultiplied");
+        assert!(
+            b <= a && g <= a && r <= a,
+            "premultiplied invariant rgb <= a violated: {:?}",
+            (r, g, b, a),
+        );
+    }
+
+    /// Already-premultiplied COLR data must pass through untouched (only
+    /// channel-swapped) — premultiplying a second time would darken edges.
+    #[test]
+    fn color_outline_passthrough_only_swaps_channels() {
+        // A premultiplied edge texel: rgb already <= a.
+        let rgba = [64, 32, 16, 128];
+        let bgra = color_rgba_to_bgra(&rgba, false);
+        assert_eq!(&bgra[..], &[16, 32, 64, 128], "RGBA->BGRA, values unchanged");
     }
 }
