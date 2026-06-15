@@ -25,6 +25,7 @@ mod color;
 mod cursor;
 mod error;
 mod font;
+mod scroll_button;
 mod scrollback;
 mod security;
 mod shell;
@@ -38,6 +39,7 @@ pub use color::Color;
 pub use cursor::{CursorConfig, CursorShape};
 pub use error::ConfigError;
 pub use font::FontConfig;
+pub use scroll_button::{ScrollButtonConfig, ScrollButtonPosition};
 pub use scrollback::{ScrollbackConfig, SmoothingFunction};
 pub use security::SecurityConfig;
 pub use shell::ShellConfig;
@@ -61,6 +63,7 @@ pub struct Config {
     pub scrollback: ScrollbackConfig,
     pub security: SecurityConfig,
     pub window: WindowConfig,
+    pub scroll_button: ScrollButtonConfig,
 }
 
 impl Default for Config {
@@ -84,6 +87,7 @@ impl Config {
             scrollback: ScrollbackConfig::defaults(),
             security: SecurityConfig::defaults(),
             window: WindowConfig::defaults(),
+            scroll_button: ScrollButtonConfig::defaults(),
         }
     }
 

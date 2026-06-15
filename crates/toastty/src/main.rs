@@ -44,7 +44,7 @@ use toastty::mouse::{
 use toastty::paste::wrap_for_paste;
 use toastty::pty_log::{Direction, PtyLogger};
 use toastty::shell::resolve_command;
-use toastty::theme_bridge::theme_from_config;
+use toastty::theme_bridge::{scroll_button_corner, theme_from_config};
 
 /// Target wake-up cadence while the scrollback viewport is animating.
 /// 16 ms ≈ 60 Hz — fast enough to feel smooth on macOS trackpad
@@ -773,6 +773,7 @@ impl Toastty {
             );
         }
         renderer.set_theme(theme_from_config(&self.config.theme));
+        renderer.set_scroll_button(scroll_button_corner(&self.config.scroll_button));
         info!(
             "renderer ready: size={size:?} cell={:?} font={:?} {}px logical @ {}× = {}px physical",
             renderer.cell_size(),
@@ -931,6 +932,7 @@ impl Toastty {
                 );
             }
             r.set_theme(theme_from_config(&self.config.theme));
+            r.set_scroll_button(scroll_button_corner(&self.config.scroll_button));
             // Re-plumb the theme bg into Term so OSC 11 queries reply
             // with the new value.
             let theme_bg = r.theme().bg;
@@ -1260,6 +1262,15 @@ impl Toastty {
                 }
             }
         }
+        // Scroll-to-bottom button: a left-press landing on the on-screen
+        // button (shown only while scrolled back) jumps to the live bottom
+        // and is consumed here — it never reaches selection or the PTY.
+        if state == KeyState::Pressed
+            && button == MouseButton::Left
+            && self.try_click_scroll_button(position)
+        {
+            return ControlSignal::RedrawIn(Duration::ZERO);
+        }
         // OSC 8 click-to-open: Cmd-Left on macOS / Ctrl-Left elsewhere
         // on press only. Consume the event so the mouse encoder doesn't
         // also forward it to the foreground app.
@@ -1291,6 +1302,37 @@ impl Toastty {
             }
         }
         ControlSignal::Continue
+    }
+
+    /// If the scroll-to-bottom button is currently visible and `position`
+    /// (viewport pixels) lands inside it, snap the view to the live bottom
+    /// and return `true` so the caller consumes the click. Returns `false`
+    /// when the button is disabled, hidden (already at bottom), or the
+    /// click is elsewhere. The renderer owns the button's pixel rect so the
+    /// hit-test always matches what's drawn.
+    fn try_click_scroll_button(&mut self, position: (f64, f64)) -> bool {
+        let Some(rect) = self
+            .renderer
+            .as_ref()
+            .and_then(|r| r.scroll_button_rect(&self.term))
+        else {
+            return false;
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let (x, y) = (position.0 as f32, position.1 as f32);
+        if x < rect[0] || x >= rect[2] || y < rect[1] || y >= rect[3] {
+            return false;
+        }
+        // Mirror snap_view_after_input's smoothing handling: animate under
+        // smooth scrolling, jump immediately otherwise.
+        self.term.snap_view_to_bottom();
+        if !self.config.scrollback.smooth_scrolling
+            || self.config.scrollback.smoothing_function
+                == toastty_config::SmoothingFunction::Instant
+        {
+            self.term.force_snap_view();
+        }
+        true
     }
 
     /// Start a fresh selection (or step the multi-click counter) at

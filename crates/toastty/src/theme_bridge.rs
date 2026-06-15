@@ -5,8 +5,23 @@
 //! and `toastty-render` GPU-only. The `hello_text` demo has its own
 //! copy of the same function; the binary's copy is the canonical one.
 
-use toastty_config::ThemeConfig;
+use toastty_config::{ScrollButtonConfig, ScrollButtonPosition, ThemeConfig};
+use toastty_render::ScrollButtonCorner;
 use toastty_render::text::instance::Theme;
+
+/// Map the `[scroll_button]` config to the renderer's corner enum.
+/// `None` when the button is disabled (`enabled = false`) — the renderer
+/// treats `None` as "never paint and never hit-test".
+#[must_use]
+pub fn scroll_button_corner(cfg: &ScrollButtonConfig) -> Option<ScrollButtonCorner> {
+    if !cfg.enabled {
+        return None;
+    }
+    Some(match cfg.position {
+        ScrollButtonPosition::BottomRight => ScrollButtonCorner::BottomRight,
+        ScrollButtonPosition::BottomLeft => ScrollButtonCorner::BottomLeft,
+    })
+}
 
 #[must_use]
 pub fn theme_from_config(cfg: &ThemeConfig) -> Theme {
@@ -34,6 +49,34 @@ mod tests {
 
     fn arrs_eq(a: [f32; 4], b: [f32; 4]) -> bool {
         a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-6)
+    }
+
+    #[test]
+    fn scroll_button_corner_maps_position_and_disable() {
+        // Disabled → None regardless of position.
+        let off = ScrollButtonConfig {
+            enabled: false,
+            position: ScrollButtonPosition::BottomLeft,
+        };
+        assert_eq!(scroll_button_corner(&off), None);
+
+        // Enabled → the matching corner.
+        let right = ScrollButtonConfig {
+            enabled: true,
+            position: ScrollButtonPosition::BottomRight,
+        };
+        assert_eq!(
+            scroll_button_corner(&right),
+            Some(ScrollButtonCorner::BottomRight)
+        );
+        let left = ScrollButtonConfig {
+            enabled: true,
+            position: ScrollButtonPosition::BottomLeft,
+        };
+        assert_eq!(
+            scroll_button_corner(&left),
+            Some(ScrollButtonCorner::BottomLeft)
+        );
     }
 
     #[test]

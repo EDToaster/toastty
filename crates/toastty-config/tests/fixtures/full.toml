@@ -38,3 +38,7 @@ width         = 1280
 height        = 800
 vsync         = true
 confirm_close = "always"
+
+[scroll_button]
+enabled  = true
+position = "bottom-right"

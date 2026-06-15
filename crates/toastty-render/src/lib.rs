@@ -317,6 +317,23 @@ pub struct Renderer {
     /// redraw is requested we cascade to a full clear instead. Cleared
     /// when a scratch-path frame restores the texture.
     scratch_stale: bool,
+    /// Scroll-to-bottom button: `Some(corner)` enables it (the binary maps
+    /// the `[scroll_button]` config here), `None` disables it. When
+    /// enabled, the button is painted in `corner` each frame the view is
+    /// scrolled back (see [`Self::draw_scroll_button`]).
+    scroll_button: Option<ScrollButtonCorner>,
+}
+
+/// Which corner the scroll-to-bottom button is anchored to. Render-side
+/// mirror of `toastty_config::ScrollButtonPosition` (the render crate does
+/// not depend on the config crate — the binary bridges the two, same as it
+/// does for `Theme`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollButtonCorner {
+    /// Bottom-right corner.
+    BottomRight,
+    /// Bottom-left corner.
+    BottomLeft,
 }
 
 /// Build the scratch render target. Same dims/format as the surface;
@@ -698,6 +715,7 @@ impl Renderer {
             // untouched. So scratch is "stale" from the start. Subsequent
             // frames pick up the cascade rule.
             scratch_stale: true,
+            scroll_button: None,
         })
     }
 
@@ -961,6 +979,14 @@ impl Renderer {
         self.close_prompt.is_some()
     }
 
+    /// Enable (`Some(corner)`) or disable (`None`) the scroll-to-bottom
+    /// button. When enabled, the button is painted in `corner` on any
+    /// frame where the view is scrolled back into the scrollback. Cheap to
+    /// call every config reload; it just stores the corner.
+    pub fn set_scroll_button(&mut self, corner: Option<ScrollButtonCorner>) {
+        self.scroll_button = corner;
+    }
+
     /// Append the instances for a full-width, multi-line overlay banner
     /// to `instances`, bottom-anchored to the viewport. Used by the config
     /// error banner. (The close-confirmation dialog uses the centered,
@@ -1157,13 +1183,42 @@ impl Renderer {
         // Center the box; clamp to the viewport's top-left if it's larger.
         let left_col = cols.saturating_sub(box_cols) / 2;
         let top_row = vrows.saturating_sub(box_rows) / 2;
+        Self::draw_box_rows(
+            queue, instances, text, &rows, left_col, top_row, cols, cell_size, panel_bg, fg, term,
+        );
+    }
 
+    /// Paint a pre-composed block of box rows (border + content) at cell
+    /// position `(left_col, top_row)`. Each cell gets the banner's two
+    /// cover quads (bg pass + glyph-pass cover) filled with `panel_bg`, and
+    /// each row's glyphs are drawn in `fg` on top. `grid_cols` clips any
+    /// cell that would run past the right edge. The box width is taken from
+    /// the first row (every row is the same width). Shared by
+    /// [`Self::draw_close_dialog`] and [`Self::draw_scroll_button`]; the
+    /// per-cell two-cover-quad rationale lives in [`Self::draw_banner`].
+    #[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
+    fn draw_box_rows(
+        queue: &Queue,
+        instances: &mut Vec<CellInstance>,
+        text: &mut TextState,
+        rows: &[String],
+        left_col: u32,
+        top_row: u32,
+        grid_cols: u32,
+        cell_size: (f32, f32),
+        panel_bg: [f32; 4],
+        fg: [f32; 4],
+        term: &Term,
+    ) {
+        let cell_w = cell_size.0;
+        let cell_h = cell_size.1;
+        let box_cols = rows.first().map_or(0, |r| r.chars().count()) as u32;
         for (row_idx, line) in rows.iter().enumerate() {
             let y0 = (top_row as f32 + row_idx as f32) * cell_h;
-            // Panel fill: bg-pass + glyph-pass cover per box cell (mirrors
-            // draw_banner) so any term glyph underneath is overpainted.
+            // Panel fill: bg-pass + glyph-pass cover per box cell so any
+            // term glyph underneath is overpainted.
             for c in 0..box_cols {
-                if left_col + c >= cols {
+                if left_col + c >= grid_cols {
                     break;
                 }
                 let x0 = (left_col + c) as f32 * cell_w;
@@ -1191,21 +1246,20 @@ impl Renderer {
             }
             // Glyphs for this row. The shaper keys slots by the line-local
             // column (0-based), so look up with the local index and place
-            // at the centered offset.
+            // at the offset column.
             let lg = text
                 .rasterizer
                 .shape_line(queue, line, term.grapheme_cluster_mode());
             for (i, ch) in line.chars().enumerate() {
                 let col = i as u32;
-                if col >= box_cols || left_col + col >= cols {
+                if col >= box_cols || left_col + col >= grid_cols {
                     break;
                 }
                 if ch.is_whitespace() {
                     continue;
                 }
                 let x0 = (left_col + col) as f32 * cell_w;
-                let col_u16 = col as u16;
-                if let Some(slot) = lg.get(col_u16, ch) {
+                if let Some(slot) = lg.get(col as u16, ch) {
                     let flags = if slot.is_color {
                         crate::text::instance::FLAG_COLOR_GLYPH
                     } else {
@@ -1224,6 +1278,115 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    /// Scroll-to-bottom button box dimensions, in cells — a 5×3 rounded
+    /// box (`╭───╮` / `│ ↓ │` / `╰───╯`) — and its margin from the
+    /// viewport edge.
+    const SCROLL_BTN_COLS: u32 = 5;
+    const SCROLL_BTN_ROWS: u32 = 3;
+    const SCROLL_BTN_MARGIN: u32 = 1;
+
+    /// Cell-space top-left `(left_col, top_row)` of the scroll-to-bottom
+    /// button for the given viewport pixels + corner. `None` when the
+    /// viewport is too small to fit the box plus its margins.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn scroll_button_cell_origin(
+        width: u32,
+        height: u32,
+        cell_size: (f32, f32),
+        corner: ScrollButtonCorner,
+    ) -> Option<(u32, u32)> {
+        let (cell_w, cell_h) = cell_size;
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+        let cols = (width as f32 / cell_w).floor() as u32;
+        let rows = (height as f32 / cell_h).floor() as u32;
+        if cols < Self::SCROLL_BTN_COLS + 2 * Self::SCROLL_BTN_MARGIN
+            || rows < Self::SCROLL_BTN_ROWS + Self::SCROLL_BTN_MARGIN
+        {
+            return None;
+        }
+        let top_row = rows - Self::SCROLL_BTN_ROWS - Self::SCROLL_BTN_MARGIN;
+        let left_col = match corner {
+            ScrollButtonCorner::BottomRight => {
+                cols - Self::SCROLL_BTN_COLS - Self::SCROLL_BTN_MARGIN
+            }
+            ScrollButtonCorner::BottomLeft => Self::SCROLL_BTN_MARGIN,
+        };
+        Some((left_col, top_row))
+    }
+
+    /// Pixel-space rect `[x0, y0, x1, y1]` of the scroll-to-bottom button
+    /// when it is currently visible — i.e. enabled via
+    /// [`Self::set_scroll_button`] AND `term` is scrolled back into the
+    /// scrollback. `None` otherwise. The binary uses this to hit-test
+    /// mouse clicks against the button.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn scroll_button_rect(&self, term: &Term) -> Option<[f32; 4]> {
+        let corner = self.scroll_button?;
+        if !term.is_view_scrolled_back() {
+            return None;
+        }
+        let cell_size = self.cell_size();
+        let (left_col, top_row) = Self::scroll_button_cell_origin(
+            self.config.width,
+            self.config.height,
+            cell_size,
+            corner,
+        )?;
+        let (cw, ch) = cell_size;
+        let x0 = left_col as f32 * cw;
+        let y0 = top_row as f32 * ch;
+        Some([
+            x0,
+            y0,
+            x0 + Self::SCROLL_BTN_COLS as f32 * cw,
+            y0 + Self::SCROLL_BTN_ROWS as f32 * ch,
+        ])
+    }
+
+    /// Append instances for the scroll-to-bottom button anchored at
+    /// `corner`. The caller is responsible for deciding visibility (config
+    /// enabled + view scrolled back); this just paints the box. Reuses
+    /// [`compose_dialog_rows`] to build the `↓`-in-a-rounded-box rows and
+    /// [`Self::draw_box_rows`] to paint them.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn draw_scroll_button(
+        queue: &Queue,
+        width: u32,
+        height: u32,
+        instances: &mut Vec<CellInstance>,
+        text: &mut TextState,
+        corner: ScrollButtonCorner,
+        panel_bg: [f32; 4],
+        fg: [f32; 4],
+        cell_size: (f32, f32),
+        term: &Term,
+    ) {
+        let Some((left_col, top_row)) =
+            Self::scroll_button_cell_origin(width, height, cell_size, corner)
+        else {
+            return;
+        };
+        let grid_cols = (width as f32 / cell_size.0).floor().max(1.0) as u32;
+        // "↓" in a 3-wide rounded box → ["╭───╮", "│ ↓ │", "╰───╯"].
+        let rows = compose_dialog_rows("↓", 1, 0);
+        Self::draw_box_rows(
+            queue, instances, text, &rows, left_col, top_row, grid_cols, cell_size, panel_bg, fg,
+            term,
+        );
     }
 
     /// Set (or clear) the IME preedit string drawn inline at the cursor.
@@ -1691,6 +1854,36 @@ impl Renderer {
                     });
                 }
             }
+        }
+
+        // Scroll-to-bottom button: a small rounded box in a corner, shown
+        // only while the view is scrolled up into the scrollback. Drawn
+        // before the error banner / close dialog so a modal scrim dims it.
+        // The chip background is the theme bg nudged toward fg so it reads
+        // as a raised affordance against the grid; the arrow + border use
+        // the theme fg.
+        if let Some(corner) = self.scroll_button
+            && term.is_view_scrolled_back()
+        {
+            let mix = |a: f32, b: f32, k: f32| a + (b - a) * k;
+            let chip = [
+                mix(theme.bg[0], theme.fg[0], 0.16),
+                mix(theme.bg[1], theme.fg[1], 0.16),
+                mix(theme.bg[2], theme.fg[2], 0.16),
+                0.95,
+            ];
+            Self::draw_scroll_button(
+                &self.queue,
+                self.config.width,
+                self.config.height,
+                &mut instances,
+                text,
+                corner,
+                chip,
+                theme.fg,
+                cell_size,
+                term,
+            );
         }
 
         // Config error banner: full-width, multi-line, dark-red bg /
@@ -2583,5 +2776,38 @@ mod tests {
         let first_content = &rows[1 + pad_y];
         assert!(first_content.starts_with(&format!("│{}hello", " ".repeat(pad_x))));
         assert!(first_content.ends_with('│'));
+    }
+
+    /// The scroll-button corner math anchors the 5×3 box one cell in from
+    /// the chosen corner, and bails out when the viewport is too small.
+    #[test]
+    fn scroll_button_origin_anchors_to_corner() {
+        // 800×400 with 10×20 cells → 80 cols, 20 rows.
+        let cell = (10.0, 20.0);
+        // top_row = rows - BTN_ROWS(3) - MARGIN(1) = 16 for both corners.
+        let br =
+            Renderer::scroll_button_cell_origin(800, 400, cell, ScrollButtonCorner::BottomRight);
+        // left = cols - BTN_COLS(5) - MARGIN(1) = 74.
+        assert_eq!(br, Some((74, 16)));
+        let bl =
+            Renderer::scroll_button_cell_origin(800, 400, cell, ScrollButtonCorner::BottomLeft);
+        // left = MARGIN(1).
+        assert_eq!(bl, Some((1, 16)));
+
+        // Too few columns to fit box + margins → None.
+        assert!(
+            Renderer::scroll_button_cell_origin(30, 400, cell, ScrollButtonCorner::BottomRight)
+                .is_none()
+        );
+        // Degenerate cell size → None (no divide-by-zero blowup).
+        assert!(
+            Renderer::scroll_button_cell_origin(
+                800,
+                400,
+                (0.0, 0.0),
+                ScrollButtonCorner::BottomRight
+            )
+            .is_none()
+        );
     }
 }
