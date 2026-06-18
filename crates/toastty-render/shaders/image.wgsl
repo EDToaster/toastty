@@ -17,9 +17,10 @@ struct ImageInstance {
 
 struct Globals {
     viewport: vec2<f32>,
-    // Texture pixel dims so the shader can compute uv from pixel coords
-    // (not currently used — we expect callers to pre-normalize uv).
-    tex_dims: vec2<f32>,
+    // (origin_x_px, origin_y_px) — window-padding inset. Added to the
+    // quad position below before the px->NDC map so the image layer is
+    // inset by the same content origin as the text layer.
+    content_origin: vec2<f32>,
 };
 
 struct VsOut {
@@ -48,8 +49,8 @@ fn vs_main(
         vec2<f32>(0.0, 1.0), // BL
     );
     let c = corners[vi];
-    // Screen pixels for this vertex.
-    let p = instance.pos + c * instance.size;
+    // Screen pixels for this vertex (+ content origin = padding inset).
+    let p = instance.pos + c * instance.size + globals.content_origin;
     // Clip-space (NDC): x in [-1, 1] left→right; y in [-1, 1] top→bottom
     // is flipped to top-down for image space (our screen has +y down).
     let ndc_x = (p.x / globals.viewport.x) * 2.0 - 1.0;

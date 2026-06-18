@@ -1833,7 +1833,11 @@ mod tests {
         // so rgb <= a. Pre-fix this stayed (255,255,255,128) and blended to
         // a white fringe. 255*128/255 rounded == 128.
         let (b, g, r, a) = (bgra[4], bgra[5], bgra[6], bgra[7]);
-        assert_eq!((b, g, r, a), (128, 128, 128, 128), "white edge premultiplied");
+        assert_eq!(
+            (b, g, r, a),
+            (128, 128, 128, 128),
+            "white edge premultiplied"
+        );
         assert!(
             b <= a && g <= a && r <= a,
             "premultiplied invariant rgb <= a violated: {:?}",
@@ -1848,6 +1852,10 @@ mod tests {
         // A premultiplied edge texel: rgb already <= a.
         let rgba = [64, 32, 16, 128];
         let bgra = color_rgba_to_bgra(&rgba, false);
-        assert_eq!(&bgra[..], &[16, 32, 64, 128], "RGBA->BGRA, values unchanged");
+        assert_eq!(
+            &bgra[..],
+            &[16, 32, 64, 128],
+            "RGBA->BGRA, values unchanged"
+        );
     }
 }

@@ -16,6 +16,55 @@ pub enum ConfirmClose {
     Always,
 }
 
+/// When to paint each edge cell's background outward into the window
+/// padding (overscan/bleed), so a full-page TUI's colors reach the
+/// physical window edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExtendBackground {
+    /// Never bleed — the padding always shows the base theme background.
+    #[default]
+    Never,
+    /// Always bleed the edge cells into the padding.
+    Always,
+    /// Bleed only while the alternate screen is active (serializes as
+    /// `"alt-screen"`).
+    AltScreen,
+}
+
+/// Window padding (cell-grid inset) in logical pixels, per side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PaddingConfig {
+    /// Top inset (logical px).
+    pub top: u16,
+    /// Right inset (logical px).
+    pub right: u16,
+    /// Bottom inset (logical px).
+    pub bottom: u16,
+    /// Left inset (logical px).
+    pub left: u16,
+}
+
+impl PaddingConfig {
+    /// Schema defaults — zero padding on every side.
+    #[must_use]
+    pub fn defaults() -> Self {
+        Self {
+            top: 0,
+            right: 0,
+            bottom: 0,
+            left: 0,
+        }
+    }
+}
+
+impl Default for PaddingConfig {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
 /// Window-presentation config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -33,6 +82,11 @@ pub struct WindowConfig {
     /// When to prompt for confirmation before closing the window
     /// (mirrors kitty's `confirm_os_window_close`).
     pub confirm_close: ConfirmClose,
+    /// When to bleed each edge cell's background into the padding.
+    pub extend_background: ExtendBackground,
+    /// Cell-grid inset (logical px) per side. Declared LAST so a partial
+    /// `[window.padding]` sub-table and TOML field ordering round-trip.
+    pub padding: PaddingConfig,
 }
 
 impl WindowConfig {
@@ -45,6 +99,8 @@ impl WindowConfig {
             height: 800,
             vsync: true,
             confirm_close: ConfirmClose::IfRunningProgram,
+            extend_background: ExtendBackground::Never,
+            padding: PaddingConfig::defaults(),
         }
     }
 }
@@ -80,6 +136,13 @@ mod tests {
             height: 1080,
             vsync: false,
             confirm_close: ConfirmClose::Always,
+            extend_background: ExtendBackground::Always,
+            padding: PaddingConfig {
+                top: 1,
+                right: 2,
+                bottom: 3,
+                left: 4,
+            },
         };
         let t = toml::to_string(&w).unwrap();
         let p: WindowConfig = toml::from_str(&t).unwrap();

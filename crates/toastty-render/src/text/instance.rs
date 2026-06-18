@@ -56,6 +56,86 @@ pub struct CellInstance {
     pub pad: [u32; 3],
 }
 
+/// Edge-background extension ("overscan/bleed") parameters.
+///
+/// When `enabled`, edge-cell background quads are grown outward in
+/// pre-origin space so they reach the physical window edge through the
+/// padding gutter (the shader adds `content_origin` afterward). A
+/// `default()` value (`enabled = false`, zero pad) is a no-op, so callers
+/// that don't care about bleed pass `EdgeBleed::default()`.
+///
+/// The `pad` ordering is `[top, right, bottom, left]` (matching
+/// `PaddingConfig` / `set_padding`); this is intentionally distinct from
+/// the `content_origin` `(x = left, y = top)` convention — do NOT "fix"
+/// them into agreement.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct EdgeBleed {
+    /// Physical-px padding `[top, right, bottom, left]`.
+    pub pad: [f32; 4],
+    /// Pre-resolved gate: `mode == Always || (mode == AltScreen &&
+    /// term.is_alt_active())`. Resolved by `render_term` where `Term` and
+    /// config meet, keeping this leaf code trivially unit-testable.
+    pub enabled: bool,
+}
+
+impl EdgeBleed {
+    const TOP: usize = 0;
+    const RIGHT: usize = 1;
+    const BOTTOM: usize = 2;
+    const LEFT: usize = 3;
+}
+
+/// Grow an edge cell's background quad outward into the padding gutter so
+/// it reaches the physical window edge.
+///
+/// Instances are emitted in **pre-origin space** (`pos = [col*cell_w,
+/// row*cell_h (+y_translate)]`); the vertex shader adds `content_origin`
+/// afterward. Growing left by `pad_left` (and shifting `pos.x` left by the
+/// same amount) makes the left edge land at `x = 0` after the shader adds
+/// `+pad_left`; the right/top/bottom edges grow analogously. Corner cells
+/// satisfy two predicates and compose both grows automatically — no
+/// dedicated corner code.
+///
+/// `top_row` is the index of the content-top row in the **caller's row
+/// space**: the full builder iterates RENDER space (`top_row =
+/// pixel_extra`); the dirty builder iterates CONTENT-row space via
+/// `iter_rows()` (`top_row = 0`).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn extend_edge_quad(
+    mut pos: [f32; 2],
+    mut size: [f32; 2],
+    c: u16,
+    r: u16,
+    cols: u16,
+    rows: u16,
+    top_row: u16,
+    is_wide: bool,
+    bleed: EdgeBleed,
+) -> ([f32; 2], [f32; 2]) {
+    if !bleed.enabled {
+        return (pos, size);
+    }
+    if c == 0 {
+        pos[0] -= bleed.pad[EdgeBleed::LEFT];
+        size[0] += bleed.pad[EdgeBleed::LEFT];
+    }
+    // A width-2 primary occupies cols-2 (continuation at cols-1) — OR it
+    // into the last-column check so it still bleeds right.
+    let touches_right = c == cols.saturating_sub(1) || (is_wide && c + 1 == cols.saturating_sub(1));
+    if touches_right {
+        size[0] += bleed.pad[EdgeBleed::RIGHT];
+    }
+    if r == top_row {
+        pos[1] -= bleed.pad[EdgeBleed::TOP];
+        size[1] += bleed.pad[EdgeBleed::TOP];
+    }
+    if r == rows.saturating_sub(1) {
+        size[1] += bleed.pad[EdgeBleed::BOTTOM];
+    }
+    (pos, size)
+}
+
 impl CellInstance {
     /// Construct a glyphless background-only instance.
     #[must_use]
@@ -493,6 +573,7 @@ where
         ext_palette,
         locate_glyph,
         |_, _| false,
+        EdgeBleed::default(),
     );
     out
 }
@@ -520,6 +601,7 @@ fn line_id_for_render_row(
 /// Same as [`build_instances`] but appends into a caller-provided
 /// `Vec` (which is `clear()`ed first). Reusing the buffer across frames
 /// avoids per-frame allocations on the hot render path.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn build_instances_into<F, S>(
     out: &mut Vec<CellInstance>,
     term: &Term,
@@ -528,6 +610,7 @@ pub fn build_instances_into<F, S>(
     ext_palette: Option<&[[f32; 4]; 256]>,
     mut locate_glyph: F,
     mut is_selected: S,
+    bleed: EdgeBleed,
 ) where
     F: FnMut(u16, u16, char, &Style) -> Option<GlyphSlot>,
     S: FnMut(u64, u16) -> bool,
@@ -590,23 +673,35 @@ pub fn build_instances_into<F, S>(
             // Width-2 (CJK) primaries: widen the bg quad to span both
             // columns so the continuation half isn't left showing the
             // previous frame / default bg.
-            let bg_w = if row
+            let is_wide = row
                 .cells
                 .get(c as usize + 1)
-                .is_some_and(|next| next.is_continuation)
-            {
-                2.0 * cell_w
-            } else {
-                cell_w
-            };
+                .is_some_and(|next| next.is_continuation);
+            let bg_w = if is_wide { 2.0 * cell_w } else { cell_w };
 
             // Always emit a cell-sized background quad. The glyph (if
             // present) is rendered as a separate, glyph-sized quad on
             // top of it — so a narrow `l` does not stretch to fill the
             // whole cell.
-            out.push(CellInstance {
+            //
+            // Edge bleed: grow the bg quad outward into the padding
+            // gutter for edge cells. Full builder iterates RENDER space,
+            // so the content-top row is `pixel_extra`. Only the bg quad
+            // grows — glyph/underline/cursor keep natural geometry.
+            let (bg_pos, bg_size) = extend_edge_quad(
                 pos,
-                size: [bg_w, cell_h],
+                [bg_w, cell_h],
+                c,
+                r,
+                cols,
+                rows,
+                pixel_extra,
+                is_wide,
+                bleed,
+            );
+            out.push(CellInstance {
+                pos: bg_pos,
+                size: bg_size,
                 uv_min: [0.0, 0.0],
                 uv_max: [0.0, 0.0],
                 fg,
@@ -728,7 +823,7 @@ impl<'a> Iterator for DirtyCols<'a> {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // mirrors build_instances_into + adds damage/visibility/ext_palette
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // mirrors build_instances_into + adds damage/visibility/ext_palette
 pub fn build_dirty_instances_into<F, S>(
     out: &mut Vec<CellInstance>,
     term: &Term,
@@ -739,6 +834,7 @@ pub fn build_dirty_instances_into<F, S>(
     cursor_visible: bool,
     mut locate_glyph: F,
     mut is_selected: S,
+    bleed: EdgeBleed,
 ) where
     F: FnMut(u16, u16, char, &Style) -> Option<GlyphSlot>,
     S: FnMut(u64, u16) -> bool,
@@ -755,6 +851,7 @@ pub fn build_dirty_instances_into<F, S>(
             ext_palette,
             locate_glyph,
             is_selected,
+            bleed,
         );
         if !cursor_visible {
             // Drop the trailing cursor instance the full builder
@@ -820,22 +917,26 @@ pub fn build_dirty_instances_into<F, S>(
             // Width-2 (CJK) primaries: widen the bg quad to span both
             // columns so the continuation half isn't left showing the
             // previous frame / default bg.
-            let bg_w = if row
+            let is_wide = row
                 .cells
                 .get(c as usize + 1)
-                .is_some_and(|next| next.is_continuation)
-            {
-                2.0 * cell_w
-            } else {
-                cell_w
-            };
+                .is_some_and(|next| next.is_continuation);
+            let bg_w = if is_wide { 2.0 * cell_w } else { cell_w };
 
             // Always emit a background quad — even for blank cells —
             // under LoadOp::Load, so old glyphs / cursor blocks get
             // overpainted.
+            //
+            // Edge bleed: apply the SAME grow as the full builder so an
+            // edge cell reverting to default bg repaints the gutter with
+            // default bg, erasing stale bleed. CRITICAL: the dirty
+            // builder iterates CONTENT-row space via `iter_rows()`, so
+            // the content-top row is `0`, NOT `pixel_extra`.
+            let (bg_pos, bg_size) =
+                extend_edge_quad(pos, [bg_w, cell_h], c, r, cols, rows, 0, is_wide, bleed);
             out.push(CellInstance {
-                pos,
-                size: [bg_w, cell_h],
+                pos: bg_pos,
+                size: bg_size,
                 uv_min: [0.0, 0.0],
                 uv_max: [0.0, 0.0],
                 fg,
@@ -1538,6 +1639,7 @@ mod tests {
                 None
             },
             |_, _| false,
+            EdgeBleed::default(),
         );
         // One bg quad for the placeholder cell + cursor.
         let non_cursor: Vec<_> = out.iter().filter(|i| i.flags & FLAG_CURSOR == 0).collect();
@@ -1643,6 +1745,7 @@ mod tests {
             true,
             |_, _, _, _| None,
             |_, _| false,
+            EdgeBleed::default(),
         );
         // No dirty cells, cursor visible: only the cursor instance.
         assert_eq!(out.len(), 1);
@@ -1665,6 +1768,7 @@ mod tests {
             true,
             |_, _, _, _| None,
             |_, _| false,
+            EdgeBleed::default(),
         );
         // 1 bg quad + cursor.
         assert_eq!(out.len(), 2);
@@ -1695,6 +1799,7 @@ mod tests {
             true,
             |_, _, _, _| None,
             |_, _| false,
+            EdgeBleed::default(),
         );
         // 1 bg quad (even though the cell is blank) + cursor.
         let bgs: Vec<_> = out.iter().filter(|i| i.flags & FLAG_CURSOR == 0).collect();
@@ -1718,6 +1823,7 @@ mod tests {
             None,
             |_, _, _, _| None,
             |_, _| false,
+            EdgeBleed::default(),
         );
         let mut dirty = Vec::new();
         super::build_dirty_instances_into(
@@ -1730,6 +1836,7 @@ mod tests {
             true,
             |_, _, _, _| None,
             |_, _| false,
+            EdgeBleed::default(),
         );
         // Same instance count (cursor + per-cell quads).
         assert_eq!(full.len(), dirty.len());
@@ -1753,6 +1860,7 @@ mod tests {
             true,
             |_, _, _, _| None,
             |_, _| false,
+            EdgeBleed::default(),
         );
         // Only one non-cursor instance: the primary cell's bg quad
         // (continuation skipped).
@@ -1776,6 +1884,7 @@ mod tests {
             false, // cursor hidden (mid-blink off-phase)
             |_, _, _, _| None,
             |_, _| false,
+            EdgeBleed::default(),
         );
         // No cursor instance.
         assert!(out.iter().all(|i| i.flags & FLAG_CURSOR == 0));
@@ -1800,6 +1909,7 @@ mod tests {
             false,
             |_, _, _, _| None,
             |_, _| false,
+            EdgeBleed::default(),
         );
         // No cursor instance.
         assert!(out.iter().all(|i| i.flags & FLAG_CURSOR == 0));
@@ -1987,6 +2097,7 @@ mod tests {
             true,
             |_, _, _, _| None,
             |_, _| false,
+            EdgeBleed::default(),
         );
         let underline = out
             .iter()
@@ -1998,5 +2109,361 @@ mod tests {
             underline.size[0],
             2.0 * cell_w,
         );
+    }
+
+    // ----- Edge-background extension (bleed) -------------------------------
+
+    /// pad ordering `[top, right, bottom, left]`.
+    const PAD_T: f32 = 2.0;
+    const PAD_R: f32 = 3.0;
+    const PAD_B: f32 = 4.0;
+    const PAD_L: f32 = 5.0;
+
+    fn bleed_on() -> EdgeBleed {
+        EdgeBleed {
+            pad: [PAD_T, PAD_R, PAD_B, PAD_L],
+            enabled: true,
+        }
+    }
+
+    /// Fill every cell of an `rows`×`cols` grid with a red background so
+    /// the builders emit a bg quad for each cell (non-blank-for-render).
+    fn red_grid(rows: u16, cols: u16) -> Term {
+        let mut t = Term::new(rows, cols, 0);
+        feed(&mut t, b"\x1b[41m"); // red bg
+        for r in 0..rows {
+            for _ in 0..cols {
+                feed(&mut t, b" ");
+            }
+            // Avoid auto-wrap edge cases on the last row.
+            if r + 1 < rows {
+                feed(&mut t, b"\r\n");
+            }
+        }
+        t
+    }
+
+    /// Like [`red_grid`] but with scrollback history, then fractionally
+    /// scrolled up by 8px so `pixel_extra == 1` (`view_offset_pixel ==
+    /// 8.0`, `y_translate == 8 - 16 == -8`). Used by the fractional-scroll
+    /// edge-bleed tests. Feeds `rows + 2` red rows so the partial extra
+    /// row rendered at the top is also red.
+    fn red_grid_scrolled(rows: u16, cols: u16) -> Term {
+        let mut t = Term::new(rows, cols, 100);
+        feed(&mut t, b"\x1b[41m"); // red bg
+        let total = rows + 2;
+        for r in 0..total {
+            for _ in 0..cols {
+                feed(&mut t, b" ");
+            }
+            if r + 1 < total {
+                feed(&mut t, b"\r\n");
+            }
+        }
+        // Fractional scroll: 8px on a 16px cell → pixel_extra == 1.
+        t.scroll_view_by(0, 8.0, 16.0);
+        t.force_snap_view();
+        t
+    }
+
+    /// All non-cursor bg quads, in emission order (row-major).
+    fn bg_quads(v: &[CellInstance]) -> Vec<CellInstance> {
+        v.iter()
+            .filter(|i| i.flags & FLAG_CURSOR == 0 && i.flags & FLAG_NO_GLYPH != 0)
+            .copied()
+            .collect()
+    }
+
+    fn full_build(t: &Term, bleed: EdgeBleed) -> Vec<CellInstance> {
+        let mut out = Vec::new();
+        super::build_instances_into(
+            &mut out,
+            t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| None,
+            |_, _| false,
+            bleed,
+        );
+        out
+    }
+
+    #[test]
+    fn edge_bleed_disabled_is_noop() {
+        // Regression guard: a disabled (default) EdgeBleed must not move
+        // or resize any quad, even at the edges.
+        let t = red_grid(3, 4);
+        let off = full_build(&t, EdgeBleed::default());
+        let with_disabled = full_build(
+            &t,
+            EdgeBleed {
+                pad: [PAD_T, PAD_R, PAD_B, PAD_L],
+                enabled: false,
+            },
+        );
+        assert_eq!(off, with_disabled, "disabled bleed must be a no-op");
+        // And the geometry is the natural cell geometry.
+        for q in bg_quads(&off) {
+            assert_eq!(q.size, [8.0, 16.0]);
+        }
+    }
+
+    #[test]
+    fn left_edge_cell_grows_left() {
+        let t = red_grid(3, 4);
+        let v = full_build(&t, bleed_on());
+        let q = bg_quads(&v);
+        // Interior row r=1, col 0: grows left only.
+        // Order is row-major: r=1 starts at index cols*1 = 4.
+        let cell = q[4]; // (r=1, c=0)
+        assert_eq!(cell.pos, [0.0 - PAD_L, 16.0]);
+        assert_eq!(cell.size, [8.0 + PAD_L, 16.0]);
+    }
+
+    #[test]
+    fn right_edge_cell_grows_right() {
+        let t = red_grid(3, 4);
+        let v = full_build(&t, bleed_on());
+        let q = bg_quads(&v);
+        // (r=1, c=3) last col: grows right only.
+        let cell = q[4 + 3];
+        assert_eq!(cell.pos, [3.0 * 8.0, 16.0]);
+        assert_eq!(cell.size, [8.0 + PAD_R, 16.0]);
+    }
+
+    #[test]
+    fn top_edge_and_bottom_edge_grow_y() {
+        let t = red_grid(3, 4);
+        let v = full_build(&t, bleed_on());
+        let q = bg_quads(&v);
+        // Top edge, interior col 1 (r=0, c=1): grows up only.
+        let top = q[1];
+        assert_eq!(top.pos, [8.0, 0.0 - PAD_T]);
+        assert_eq!(top.size, [8.0, 16.0 + PAD_T]);
+        // Bottom edge, interior col 1 (r=2, c=1): grows down only.
+        let bottom = q[2 * 4 + 1];
+        assert_eq!(bottom.pos, [8.0, 2.0 * 16.0]);
+        assert_eq!(bottom.size, [8.0, 16.0 + PAD_B]);
+    }
+
+    #[test]
+    fn corner_cell_grows_both_axes() {
+        // Proves no dedicated corner code: top-left corner composes the
+        // left + top grows automatically.
+        let t = red_grid(3, 4);
+        let v = full_build(&t, bleed_on());
+        let q = bg_quads(&v);
+        let tl = q[0]; // (r=0, c=0)
+        assert_eq!(tl.pos, [0.0 - PAD_L, 0.0 - PAD_T]);
+        assert_eq!(tl.size, [8.0 + PAD_L, 16.0 + PAD_T]);
+        // Bottom-right corner (r=2, c=3): right + bottom.
+        let br = q[2 * 4 + 3];
+        assert_eq!(br.pos, [3.0 * 8.0, 2.0 * 16.0]);
+        assert_eq!(br.size, [8.0 + PAD_R, 16.0 + PAD_B]);
+    }
+
+    #[test]
+    fn interior_cell_not_grown() {
+        // A 3x3 grid has exactly one fully-interior cell: (r=1, c=1).
+        let t = red_grid(3, 3);
+        let v = full_build(&t, bleed_on());
+        let q = bg_quads(&v);
+        let interior = q[3 + 1]; // (r=1, c=1): r*cols + c = 1*3 + 1
+        assert_eq!(interior.pos, [8.0, 16.0]);
+        assert_eq!(interior.size, [8.0, 16.0]);
+    }
+
+    #[test]
+    fn wide_primary_at_right_edge_grows() {
+        // A width-2 primary in the last visual column sits at c == cols-2
+        // (continuation at cols-1). The naive c==cols-1 check misses it;
+        // the is_wide OR must catch it.
+        let mut t = Term::new(1, 4, 0);
+        // Two narrow cells then a CJK ideograph filling cols 2-3.
+        feed(&mut t, "ab你".as_bytes());
+        let v = full_build(&t, bleed_on());
+        let q = bg_quads(&v);
+        // The wide primary's bg quad spans 2 cells (bg_w = 16) and is the
+        // rightmost quad. It is at col 2, and must have grown right.
+        let wide = q
+            .iter()
+            .find(|i| (i.size[0] - (2.0 * 8.0 + PAD_R)).abs() < 1e-3)
+            .expect("wide primary bg quad must have grown right");
+        assert_eq!(wide.pos[0], 2.0 * 8.0);
+        // Width = 2 cells + right pad; only top+bottom on a 1-row grid
+        // also apply (r==0==top_row and r==rows-1), so height grew both.
+        assert_eq!(wide.size[0], 2.0 * 8.0 + PAD_R);
+    }
+
+    #[test]
+    fn continuation_cell_emits_nothing_at_edge() {
+        // The continuation half of a wide cluster at the right edge is
+        // skipped — it never emits (and thus never grows). Only the
+        // primary's quad exists.
+        let mut t = Term::new(1, 2, 0);
+        feed(&mut t, "你".as_bytes()); // fills cols 0-1
+        let v = full_build(&t, bleed_on());
+        let q = bg_quads(&v);
+        assert_eq!(q.len(), 1, "continuation must not emit a quad");
+        // Primary at col 0: left + right (cols-2==0 wide) + top + bottom.
+        assert_eq!(q[0].pos[0], 0.0 - PAD_L);
+    }
+
+    #[test]
+    fn fractional_scroll_top_row_uses_pixel_extra() {
+        // Full builder iterates RENDER space. At pixel_extra==1 an extra
+        // partial row renders at r==0; the content-top row is r==1, which
+        // is the one that must grow UP. r==0 must NOT grow up.
+        let t = red_grid_scrolled(3, 4);
+        assert!(t.view_offset_pixel() > 0.0, "must be fractionally scrolled");
+        let v = full_build(&t, bleed_on());
+        let q = bg_quads(&v);
+        // rows_rendered = 4. Row-major emission. cols=4.
+        // The extra partial row is r==0 (y_translate = -8): top NOT grown.
+        let y_translate = 8.0 - 16.0;
+        let extra_row_cell = q[1]; // r=0, c=1 (interior col)
+        assert_eq!(
+            extra_row_cell.pos,
+            [8.0, 0.0 * 16.0 + y_translate],
+            "extra partial row (r==0) must NOT grow up"
+        );
+        assert_eq!(extra_row_cell.size, [8.0, 16.0]);
+        // Content-top row r==1 (== pixel_extra) DOES grow up.
+        let content_top = q[4 + 1]; // r=1, c=1
+        assert_eq!(content_top.pos, [8.0, 1.0 * 16.0 + y_translate - PAD_T]);
+        assert_eq!(content_top.size, [8.0, 16.0 + PAD_T]);
+    }
+
+    #[test]
+    fn glyph_and_cursor_not_grown() {
+        // Bleed is background-only: glyph quads and the cursor keep their
+        // natural geometry.
+        let mut t = Term::new(1, 2, 0);
+        feed(&mut t, b"\x1b[41mA"); // red bg + a glyph at (0,0)
+        let mut out = Vec::new();
+        super::build_instances_into(
+            &mut out,
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            // Return a glyph slot so a glyph quad is emitted.
+            |_, _, _, _| {
+                Some(GlyphSlot {
+                    glyph_offset: [0.0, 0.0],
+                    glyph_size: [6.0, 12.0],
+                    uv_min: [0.0, 0.0],
+                    uv_max: [6.0, 12.0],
+                    is_color: false,
+                })
+            },
+            |_, _| false,
+            bleed_on(),
+        );
+        // Glyph quad: identified by having a glyph (uv_min != uv_max).
+        let glyph = out
+            .iter()
+            .find(|i| i.uv_min != i.uv_max)
+            .expect("glyph quad must exist");
+        assert_eq!(glyph.size, [6.0, 12.0], "glyph quad must not grow");
+        let cursor = cursor_instance(&out);
+        assert_eq!(cursor.size, [8.0, 16.0], "cursor must not grow");
+    }
+
+    // ----- Dirty builder edge bleed ----------------------------------------
+
+    fn dirty_build(t: &Term, damage: &Damage, bleed: EdgeBleed) -> Vec<CellInstance> {
+        let mut out = Vec::new();
+        super::build_dirty_instances_into(
+            &mut out,
+            t,
+            damage,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            true,
+            |_, _, _, _| None,
+            |_, _| false,
+            bleed,
+        );
+        out
+    }
+
+    #[test]
+    fn extend_bg_dirty_grows_edge_quad() {
+        // A damaged top-left cell with red bg grows both axes in the
+        // dirty path (top_row == 0 in content-row space).
+        let t = red_grid(2, 3);
+        let mut damage = Damage::new(2);
+        damage.clear();
+        damage.rows[0].mark(0); // (r=0, c=0) — top-left corner
+        let v = dirty_build(&t, &damage, bleed_on());
+        let q = bg_quads(&v);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].pos, [0.0 - PAD_L, 0.0 - PAD_T]);
+        assert_eq!(q[0].size, [8.0 + PAD_L, 16.0 + PAD_T]);
+    }
+
+    #[test]
+    fn dirty_overpaint_extends_into_padding() {
+        // THE key regression. An edge cell reverts to default bg, is
+        // marked dirty: the overpaint quad must STILL carry the grown
+        // pos/size so it repaints the gutter (erasing stale bleed).
+        // Without the fix the quad would be the un-grown [cw, ch].
+        let t = Term::new(2, 3, 0); // all default-bg (blank) cells
+        let mut damage = Damage::new(2);
+        damage.clear();
+        damage.rows[0].mark(0); // top-left, default bg
+        let v = dirty_build(&t, &damage, bleed_on());
+        let q = bg_quads(&v);
+        assert_eq!(q.len(), 1, "blank dirty edge cell still emits a bg quad");
+        assert_eq!(
+            q[0].pos,
+            [0.0 - PAD_L, 0.0 - PAD_T],
+            "overpaint quad must extend into the padding gutter"
+        );
+        assert_eq!(q[0].size, [8.0 + PAD_L, 16.0 + PAD_T]);
+        // The bg is the theme default bg (== the clear color), so the
+        // grown quad REPLACES stale bleed with base bg.
+        assert_eq!(q[0].bg, Theme::default_dark().bg);
+    }
+
+    #[test]
+    fn dirty_top_row_uses_content_space_zero() {
+        // Pins the top_row = 0 decision against top_row = pixel_extra.
+        // At pixel_extra==1 with a SPARSE (non-all) damage set, the
+        // content-top row r==0 must grow UP and r==1 must NOT.
+        let t = red_grid_scrolled(3, 4);
+        assert!(t.view_offset_pixel() > 0.0);
+        let y_translate = 8.0 - 16.0;
+        // Sparse damage: mark content rows 0 and 1, col 1 (interior col).
+        let mut damage = Damage::new(3);
+        damage.clear();
+        damage.rows[0].mark(1);
+        damage.rows[1].mark(1);
+        let v = dirty_build(&t, &damage, bleed_on());
+        let q = bg_quads(&v);
+        assert_eq!(q.len(), 2);
+        // q[0] is content row 0 (top) → grows up.
+        assert_eq!(q[0].pos, [8.0, 0.0 * 16.0 + y_translate - PAD_T]);
+        assert_eq!(q[0].size, [8.0, 16.0 + PAD_T]);
+        // q[1] is content row 1 → does NOT grow up.
+        assert_eq!(q[1].pos, [8.0, 1.0 * 16.0 + y_translate]);
+        assert_eq!(q[1].size, [8.0, 16.0]);
+    }
+
+    #[test]
+    fn extend_bg_dirty_all_falls_back_to_full() {
+        // Smoke check that `bleed` is threaded through the damage.all
+        // re-call into build_instances_into: an `all` damage with bleed
+        // must produce the same grown quads as the full builder.
+        let t = red_grid(2, 3);
+        let mut damage = Damage::new(2);
+        damage.mark_all(); // damage.all = true
+        assert!(damage.all);
+        let dirty = dirty_build(&t, &damage, bleed_on());
+        let full = full_build(&t, bleed_on());
+        assert_eq!(bg_quads(&dirty), bg_quads(&full));
     }
 }

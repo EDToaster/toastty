@@ -21,7 +21,7 @@ use pollster::block_on;
 use toastty_parser::Parser;
 use toastty_render::DEFAULT_LINE_HEIGHT;
 use toastty_render::text::glyph_rasterizer::{GlyphRasterizer, LineGlyphs};
-use toastty_render::text::instance::{CellInstance, Theme, build_instances_into};
+use toastty_render::text::instance::{CellInstance, EdgeBleed, Theme, build_instances_into};
 use toastty_render::text::pipeline::{self, GlobalsUbo, TextPipeline};
 use toastty_render::{instance_descriptor, instance_flags_for_release};
 use toastty_term::Term;
@@ -189,6 +189,7 @@ impl Harness {
                 lg.get(col, ch)
             },
             |_, _| false,
+            EdgeBleed::default(),
         );
         let instances = &self.instances;
 
@@ -208,6 +209,7 @@ impl Harness {
             ],
             cursor_rect: toastty_render::text::instance::cursor_pixel_rect(term, cell_size),
             cursor_color: theme.cursor,
+            content_origin: [0.0; 4],
         };
 
         {
@@ -328,6 +330,7 @@ impl Harness {
                 lg.get(col, ch)
             },
             |_, _| false,
+            EdgeBleed::default(),
         );
         let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
         let n_instances = self.instances.len();
@@ -351,6 +354,7 @@ impl Harness {
             ],
             cursor_rect: toastty_render::text::instance::cursor_pixel_rect(term, cell_size),
             cursor_color: theme.cursor,
+            content_origin: [0.0; 4],
         };
         {
             let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {

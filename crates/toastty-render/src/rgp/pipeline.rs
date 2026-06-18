@@ -158,9 +158,13 @@ impl Rgp3dPipeline {
     /// mesh from `cache`. Caller must have already called
     /// `cache.sync(...)` for this frame.
     ///
-    /// `viewport` is the physical pixel size of the render target.
+    /// `viewport` is the physical pixel size of the render target (full
+    /// surface — the px->NDC divisor stays full-surface).
     /// `cell_size` is the cell pixel size (width, height) used to
     /// map cell-space anchor coordinates to pixel-space.
+    /// `content_origin` is `(pad_left, pad_top)` in physical px — the
+    /// window-padding inset, folded into the per-placement anchor below.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -170,6 +174,7 @@ impl Rgp3dPipeline {
         cache: &GpuAssetCache,
         viewport: (f32, f32),
         cell_size: (f32, f32),
+        content_origin: (f32, f32),
     ) {
         if scene.placements().next().is_none() {
             return;
@@ -199,8 +204,15 @@ impl Rgp3dPipeline {
             // inverted because the ortho projection treats world as
             // Y-up (matching the OBJ/glTF model-space convention
             // used by ratty), while terminal rows count top→bottom.
-            let center_px_x = (f32::from(p.anchor.col) + 0.5) * cell_size.0;
-            let center_px_y = viewport.1 - (f32::from(p.anchor.row) + 0.5) * cell_size.1;
+            //
+            // content_origin folds in the window-padding inset. X is a
+            // straight +pad_left. Y subtracts pad_top: a screen-down
+            // inset is a world-Y-DOWN shift because RGP world is Y-up
+            // (ortho_screen maps worldY → 2*worldY/h - 1 over the
+            // full-surface h, which is left unchanged).
+            let center_px_x = (f32::from(p.anchor.col) + 0.5) * cell_size.0 + content_origin.0;
+            let center_px_y =
+                viewport.1 - (f32::from(p.anchor.row) + 0.5) * cell_size.1 - content_origin.1;
             // Pick the half-extent so the unit-cube model fits the
             // placement cell box. Use the smaller dimension so the
             // model isn't stretched in non-square placements.

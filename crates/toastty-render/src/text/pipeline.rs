@@ -33,6 +33,9 @@ pub struct GlobalsUbo {
     /// for any glyph pixel inside `cursor_rect`, so a glyph at the cursor
     /// cell remains legible no matter what its original fg was.
     pub cursor_color: [f32; 4],
+    /// `(origin_x_px, origin_y_px, _pad, _pad)`. Added to px,py in the
+    /// vertex shader before the px->NDC map (window-padding inset).
+    pub content_origin: [f32; 4],
 }
 
 /// The text/cell pipeline plus its bind-group skeleton.

@@ -34,10 +34,17 @@ osc_52_read  = false
 osc_52_write = false
 
 [window]
-width         = 1280
-height        = 800
-vsync         = true
-confirm_close = "always"
+width             = 1280
+height            = 800
+vsync             = true
+confirm_close     = "always"
+extend_background = "alt-screen"
+
+[window.padding]
+top    = 8
+right  = 8
+bottom = 8
+left   = 8
 
 [scroll_button]
 enabled  = true

@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 
-use toastty_config::{Color, Config, ConfigError, ConfigSource, CursorShape};
+use toastty_config::{
+    Color, Config, ConfigError, ConfigSource, CursorShape, ExtendBackground, PaddingConfig,
+};
 
 #[test]
 fn fully_populated_fixture_parses_via_load_from_path() {
@@ -16,6 +18,18 @@ fn fully_populated_fixture_parses_via_load_from_path() {
     // Spot-check a couple of palette entries against the published hex.
     assert_eq!(cfg.theme.palette[0], Color::from_hex("#000000").unwrap());
     assert_eq!(cfg.theme.palette[15], Color::from_hex("#ffffff").unwrap());
+
+    // Window padding + extend_background from the fixture.
+    assert_eq!(cfg.window.extend_background, ExtendBackground::AltScreen);
+    assert_eq!(
+        cfg.window.padding,
+        PaddingConfig {
+            top: 8,
+            right: 8,
+            bottom: 8,
+            left: 8,
+        }
+    );
 }
 
 #[test]

@@ -37,7 +37,9 @@ use toastty::cli;
 use toastty::cli::CommandOverride;
 use toastty::config_watcher::ConfigWatcher;
 use toastty::focus::encode_focus;
-use toastty::geometry::{effective_font_size_px, grid_dims_from_pixels};
+use toastty::geometry::{
+    content_rect_from_padding, effective_font_size_px, grid_dims_from_pixels, scaled_pads,
+};
 use toastty::keyboard::encode_key;
 use toastty::mouse::{
     MouseEventKind, classify_button_event, encode_mouse, pixel_to_cell, protocol_wants_event,
@@ -46,7 +48,7 @@ use toastty::mouse::{
 use toastty::paste::wrap_for_paste;
 use toastty::pty_log::{Direction, PtyLogger};
 use toastty::shell::resolve_command;
-use toastty::theme_bridge::{scroll_button_corner, theme_from_config};
+use toastty::theme_bridge::{extend_background, scroll_button_corner, theme_from_config};
 
 /// Target wake-up cadence while the scrollback viewport is animating.
 /// 16 ms ≈ 60 Hz — fast enough to feel smooth on macOS trackpad
@@ -531,12 +533,14 @@ impl Toastty {
     }
 
     fn current_cell(&self) -> (u16, u16) {
-        let cell_size = self
+        let (cell_size, origin) = self
             .renderer
             .as_ref()
-            .map_or((1.0_f32, 1.0_f32), Renderer::cell_size);
+            .map_or(((1.0_f32, 1.0_f32), (0.0_f32, 0.0_f32)), |r| {
+                (r.cell_size(), r.content_origin_px())
+            });
         let (rows, cols) = self.term.size();
-        pixel_to_cell(self.mouse_pos, cell_size, (rows, cols))
+        pixel_to_cell(self.mouse_pos, origin, cell_size, (rows, cols))
     }
 
     /// Translate the current pointer position into a stable selection
@@ -618,8 +622,36 @@ impl Toastty {
         Some(word_bounds_in_row(row, col))
     }
 
+    /// Push the configured window padding + `extend_background` mode into
+    /// the renderer, scaling the logical pads to physical px via the SAME
+    /// `.round()` rule as [`content_rect_from_padding`] / [`scaled_pads`]
+    /// so the renderer origin, the `EdgeBleed` pad, and the grid inset are
+    /// byte-identical. The setters force `needs_full_clear` only on an
+    /// actual change, so re-pushing unchanged config (reload / resize) is
+    /// cheap and does not spuriously repaint.
+    ///
+    /// Must run AFTER `self.scale_factor` is captured (else the pads scale
+    /// by the stale 1.0 default).
+    fn push_padding_to_renderer(&mut self) {
+        let pad = &self.config.window.padding;
+        let (pt, pr, pb, pl) = scaled_pads(
+            (pad.top, pad.right, pad.bottom, pad.left),
+            self.scale_factor,
+        );
+        let mode = extend_background(self.config.window.extend_background);
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_padding(pt, pr, pb, pl); // top, right, bottom, left (physical px)
+            r.set_extend_background(mode);
+        }
+    }
+
     /// Recompute the cell grid from the current pixel size and apply it
     /// to both [`Term`] and [`Pty`].
+    ///
+    /// The grid is inset by the configured window padding: the cell grid
+    /// and the PTY winsize pixel fields report the **content** dims (the
+    /// surface minus padding), not the full surface. The renderer keeps
+    /// the full surface size via `resize()`.
     fn resync_grid(&mut self) {
         let Some(renderer) = self.renderer.as_ref() else {
             return;
@@ -628,8 +660,13 @@ impl Toastty {
         if cell_w <= 0.0 || cell_h <= 0.0 {
             return;
         }
-        let (px_w, px_h) = self.physical_size;
-        let (cols, rows) = grid_dims_from_pixels(px_w, px_h, cell_w, cell_h);
+        let pad = &self.config.window.padding;
+        let (_ox, _oy, content_w, content_h) = content_rect_from_padding(
+            self.physical_size,
+            (pad.top, pad.right, pad.bottom, pad.left),
+            self.scale_factor,
+        );
+        let (cols, rows) = grid_dims_from_pixels(content_w, content_h, cell_w, cell_h);
         self.term.resize(rows, cols);
         // Re-plumb cell pixel size: font swap (M4b reload) can change
         // it, and CSI 16 t queries arriving post-resize need the
@@ -638,8 +675,8 @@ impl Toastty {
         let (cpw, cph) = (cell_w as u16, cell_h as u16);
         self.term.set_cell_pixel_size(cpw, cph);
         if let Some(pty) = self.pty.as_mut() {
-            let pixel_width = u16::try_from(px_w).unwrap_or(u16::MAX);
-            let pixel_height = u16::try_from(px_h).unwrap_or(u16::MAX);
+            let pixel_width = u16::try_from(content_w).unwrap_or(u16::MAX);
+            let pixel_height = u16::try_from(content_h).unwrap_or(u16::MAX);
             if let Err(e) = pty.resize(WinSize {
                 rows,
                 cols,
@@ -773,15 +810,11 @@ impl Toastty {
             self.scaled_font_px(),
         );
 
-        // Compute initial grid from cell size + physical size.
-        let (cell_w, cell_h) = renderer.cell_size();
-        let (cols, rows) = grid_dims_from_pixels(size.0, size.1, cell_w, cell_h);
-        self.term.resize(rows, cols);
-
         // Plumb the renderer's cell pixel size + theme bg into Term so
         // CSI 16 t / OSC 11 queries reply with the right values. Apps
         // like yazi gate kitty-graphics rendering on these answers and
         // fall back to colored cells when the queries time out.
+        let (cell_w, cell_h) = renderer.cell_size();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let (cpw, cph) = (cell_w as u16, cell_h as u16);
         self.term.set_cell_pixel_size(cpw, cph);
@@ -793,6 +826,18 @@ impl Toastty {
         ];
         self.term.set_default_bg(bg_rgb);
 
+        // Install the renderer so `push_padding_to_renderer` / `resync_grid`
+        // can borrow it, then push the window padding + extend_background
+        // mode and compute the initial grid through the single content-aware
+        // grid path (so the first frame's grid + PTY winsize already reflect
+        // the padding inset). The PTY isn't spawned yet, so `resync_grid`'s
+        // pty-resize branch is a no-op here — it only sizes Term — and the
+        // rows/cols we read back below feed the spawn.
+        self.renderer = Some(renderer);
+        self.push_padding_to_renderer();
+        self.resync_grid();
+        let (rows, cols) = self.term.size();
+
         // Spawn the PTY. CLI command override (xterm-style `-e`,
         // `kitty <cmd>`, etc.) wins over the configured shell.
         let (program, args) = resolve_command(self.command_override.take(), &self.config.shell);
@@ -801,8 +846,16 @@ impl Toastty {
         // launched from `/`).
         let working_dir = self.cli_working_dir.take().unwrap_or_else(initial_cwd);
         info!(?program, ?args, ?working_dir, rows, cols, "spawning shell");
-        let pixel_width = u16::try_from(size.0).unwrap_or(u16::MAX);
-        let pixel_height = u16::try_from(size.1).unwrap_or(u16::MAX);
+        // PTY winsize pixel fields report the CONTENT dims (surface minus
+        // padding), matching `resync_grid`.
+        let pad = &self.config.window.padding;
+        let (_ox, _oy, content_w, content_h) = content_rect_from_padding(
+            self.physical_size,
+            (pad.top, pad.right, pad.bottom, pad.left),
+            self.scale_factor,
+        );
+        let pixel_width = u16::try_from(content_w).unwrap_or(u16::MAX);
+        let pixel_height = u16::try_from(content_h).unwrap_or(u16::MAX);
         // TERM: until `terminfo/toastty.terminfo` is installed via
         // `tic -x`, advertise `xterm-256color`. That's a near-superset
         // of what we currently implement (256-color + truecolor + alt
@@ -874,7 +927,8 @@ impl Toastty {
             }
         };
 
-        self.renderer = Some(renderer);
+        // `self.renderer` was installed earlier (before the grid sync); only
+        // the window / pty / reader remain to be stored here.
         self.window = Some(window);
         self.pty = Some(pty);
         self.reader = Some(reader);
@@ -939,6 +993,10 @@ impl Toastty {
             osc_52_read: self.config.security.osc_52_read,
             osc_52_write: self.config.security.osc_52_write,
         });
+        // Padding / extend_background are safe to live-apply (render + grid
+        // only, no surface reconfigure). Push them before the grid sync so
+        // the recomputed grid reflects any padding change.
+        self.push_padding_to_renderer();
         // Font swap may have changed the cell size; recompute the grid
         // so columns/rows still match the window pixels.
         self.resync_grid();
@@ -1440,12 +1498,14 @@ impl Toastty {
 
     /// Look up the OSC 8 hyperlink URL at pixel `(x, y)`, if any.
     fn hyperlink_under_cursor(&self, position: (f64, f64)) -> Option<String> {
-        let cell_size = self.renderer.as_ref()?.cell_size();
+        let renderer = self.renderer.as_ref()?;
+        let cell_size = renderer.cell_size();
+        let origin = renderer.content_origin_px();
         let (rows, cols) = self.term.size();
         // `pixel_to_cell` returns 1-based (col, row). Convert to
         // 0-based with a saturating sub so column 1 / row 1 map to
         // (0, 0) instead of underflowing.
-        let (col_1based, row_1based) = pixel_to_cell(position, cell_size, (rows, cols));
+        let (col_1based, row_1based) = pixel_to_cell(position, origin, cell_size, (rows, cols));
         let col = col_1based.checked_sub(1)?;
         let row = row_1based.checked_sub(1)?;
         let row_ref = self.term.row(row);
@@ -1841,15 +1901,30 @@ impl App for Toastty {
                     // the contract.
                     r.invalidate_framebuffer();
                 }
+                // Re-push padding before the grid sync: the content clamp
+                // depends on the surface size (not just scale), so this runs
+                // unconditionally on every resize. The setters force a full
+                // clear only on an actual change.
+                self.push_padding_to_renderer();
                 self.resync_grid();
                 // DECSET 2048 — emit an in-band resize report so apps
                 // that opted in see the new geometry in order with
                 // everything else on the PTY (no SIGWINCH race). The
                 // encoder returns None when 2048 is off, so we don't
                 // touch the PTY in the default case.
+                //
+                // The pixel fields report the CONTENT dims (surface minus
+                // padding), matching `resync_grid` — NOT the full-surface
+                // `width`/`height` event locals.
                 let (rows, cols) = self.term.size();
-                let pixel_w = u16::try_from(width).unwrap_or(u16::MAX);
-                let pixel_h = u16::try_from(height).unwrap_or(u16::MAX);
+                let pad = &self.config.window.padding;
+                let (_ox, _oy, content_w, content_h) = content_rect_from_padding(
+                    self.physical_size,
+                    (pad.top, pad.right, pad.bottom, pad.left),
+                    self.scale_factor,
+                );
+                let pixel_w = u16::try_from(content_w).unwrap_or(u16::MAX);
+                let pixel_h = u16::try_from(content_h).unwrap_or(u16::MAX);
                 if let Some(bytes) = encode_resize_report(
                     rows,
                     cols,

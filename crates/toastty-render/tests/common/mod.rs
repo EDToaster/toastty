@@ -192,6 +192,7 @@ pub(crate) fn render_term_offscreen(term: &Term, width: u32, height: u32) -> Rgb
             ],
             cursor_rect: toastty_render::text::instance::cursor_pixel_rect(term, cell_size),
             cursor_color: theme.cursor,
+            content_origin: [0.0; 4],
         };
 
         text_pipeline.upload(&device, &queue, globals, &instances);

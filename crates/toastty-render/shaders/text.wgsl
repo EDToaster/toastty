@@ -34,6 +34,9 @@ struct Globals {
     // inside `cursor_rect`, so the glyph stays maximally legible
     // against the cursor block.
     cursor_color: vec4<f32>,
+    // (origin_x_px, origin_y_px, _, _) — window-padding inset. Added to
+    // px,py in the vertex shader before the px->NDC map.
+    content_origin: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -75,8 +78,8 @@ fn vs_main(
     let cy = f32((vid >> 1u) & 1u);
 
     // Position in pixels.
-    let px = inst.pos.x + cx * inst.size.x;
-    let py = inst.pos.y + cy * inst.size.y;
+    let px = inst.pos.x + cx * inst.size.x + globals.content_origin.x;
+    let py = inst.pos.y + cy * inst.size.y + globals.content_origin.y;
 
     // Convert to clip-space [-1, 1]. y is flipped (pixel y=0 = top of
     // screen, clip y=+1 = top of screen).

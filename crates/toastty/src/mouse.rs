@@ -76,14 +76,29 @@ fn mod_bits(modifiers: Modifiers) -> u32 {
 // canonical assignment: Shift=4, Alt=8, Control=16 — same as Alacritty.
 
 /// Convert pixel `(x, y)` to 1-based `(col, row)`, clamped to the grid.
+///
+/// `origin` is the content rect's top-left in physical px (`(pad_left,
+/// pad_top)` — the window-padding inset). It is subtracted before dividing
+/// by the cell size, so a click anywhere in the left/top padding gutter
+/// produces a negative local coordinate that the `.max(0.0)` floor collapses
+/// to cell 1, and a click in the right/bottom gutter produces a large
+/// quotient that the existing `.min(cols/rows)` clamp folds onto the last
+/// cell. No extra branches are needed for the padding clamp.
 #[must_use]
-pub fn pixel_to_cell(pixel: (f64, f64), cell_size: (f32, f32), grid: (u16, u16)) -> (u16, u16) {
+pub fn pixel_to_cell(
+    pixel: (f64, f64),
+    origin: (f32, f32),
+    cell_size: (f32, f32),
+    grid: (u16, u16),
+) -> (u16, u16) {
     let (cw, ch) = cell_size;
     if cw <= 0.0 || ch <= 0.0 {
         return (1, 1);
     }
-    let col = ((pixel.0 / f64::from(cw)).floor().max(0.0) as u32) + 1;
-    let row = ((pixel.1 / f64::from(ch)).floor().max(0.0) as u32) + 1;
+    let local_x = pixel.0 - f64::from(origin.0);
+    let local_y = pixel.1 - f64::from(origin.1);
+    let col = ((local_x / f64::from(cw)).floor().max(0.0) as u32) + 1;
+    let row = ((local_y / f64::from(ch)).floor().max(0.0) as u32) + 1;
     let (rows, cols) = grid;
     let col = col.min(u32::from(cols.max(1))) as u16;
     let row = row.min(u32::from(rows.max(1))) as u16;
@@ -251,26 +266,81 @@ mod tests {
     #[test]
     fn pixel_to_cell_basic() {
         // 16x32 cells, pixel (40, 70) -> col 3 (1+floor(40/16)), row 3
-        // (1+floor(70/32)).
-        assert_eq!(pixel_to_cell((40.0, 70.0), (16.0, 32.0), (24, 80)), (3, 3));
+        // (1+floor(70/32)). Zero origin.
+        assert_eq!(
+            pixel_to_cell((40.0, 70.0), (0.0, 0.0), (16.0, 32.0), (24, 80)),
+            (3, 3)
+        );
     }
 
     #[test]
     fn pixel_to_cell_clamps_to_grid() {
         assert_eq!(
-            pixel_to_cell((9999.0, 9999.0), (16.0, 32.0), (10, 20)),
+            pixel_to_cell((9999.0, 9999.0), (0.0, 0.0), (16.0, 32.0), (10, 20)),
             (20, 10)
         );
     }
 
     #[test]
     fn pixel_to_cell_origin_is_one_one() {
-        assert_eq!(pixel_to_cell((0.0, 0.0), (10.0, 20.0), (24, 80)), (1, 1));
+        assert_eq!(
+            pixel_to_cell((0.0, 0.0), (0.0, 0.0), (10.0, 20.0), (24, 80)),
+            (1, 1)
+        );
     }
 
     #[test]
     fn pixel_to_cell_zero_cell_size_returns_one_one() {
-        assert_eq!(pixel_to_cell((40.0, 70.0), (0.0, 0.0), (24, 80)), (1, 1));
+        assert_eq!(
+            pixel_to_cell((40.0, 70.0), (0.0, 0.0), (0.0, 0.0), (24, 80)),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn pixel_to_cell_accounts_for_origin() {
+        // origin (20, 10): a click at (60, 90) is local (40, 80) → col 3,
+        // row 6 (1+floor(40/16), 1+floor(80/16)).
+        assert_eq!(
+            pixel_to_cell((60.0, 90.0), (20.0, 10.0), (16.0, 16.0), (24, 80)),
+            (3, 6)
+        );
+    }
+
+    #[test]
+    fn click_in_left_top_padding_clamps_to_first_cell() {
+        // Anywhere inside the left/top gutter (x < origin.x, y < origin.y) →
+        // negative local → collapses to (1, 1).
+        let origin = (20.0, 10.0);
+        assert_eq!(
+            pixel_to_cell((5.0, 3.0), origin, (16.0, 16.0), (24, 80)),
+            (1, 1)
+        );
+        // Exactly on the origin is the first cell's top-left corner → (1, 1).
+        assert_eq!(
+            pixel_to_cell((20.0, 10.0), origin, (16.0, 16.0), (24, 80)),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn click_in_right_bottom_padding_clamps_to_last_cell() {
+        // A click far past the content into the right/bottom gutter clamps
+        // to the last cell (cols=24, rows=10).
+        assert_eq!(
+            pixel_to_cell((100_000.0, 100_000.0), (20.0, 10.0), (16.0, 16.0), (10, 24)),
+            (24, 10)
+        );
+    }
+
+    #[test]
+    fn zero_origin_matches_legacy_behavior() {
+        // With origin (0,0) the result is identical to the pre-padding
+        // contract: pixel (40,70), 16x32 cells → (3, 3).
+        assert_eq!(
+            pixel_to_cell((40.0, 70.0), (0.0, 0.0), (16.0, 32.0), (24, 80)),
+            (3, 3)
+        );
     }
 
     #[test]

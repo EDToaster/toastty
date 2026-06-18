@@ -60,6 +60,7 @@ fn build_term_instances_into(
     theme: &Theme,
     ext_palette: &[[f32; 4]; 256],
     row_glyphs: &[Option<LineGlyphs>],
+    bleed: EdgeBleed,
 ) {
     crate::text::instance::build_instances_into(
         out,
@@ -72,12 +73,14 @@ fn build_term_instances_into(
             lg.get(col, ch)
         },
         |line_id, col| term.is_cell_selected(line_id, col),
+        bleed,
     );
 }
 
 /// Append partial-redraw instances for `term` into `out` using the
 /// per-cell damage signal. Backed by
 /// [`crate::text::instance::build_dirty_instances_into`].
+#[allow(clippy::too_many_arguments)]
 fn build_term_dirty_instances_into(
     out: &mut Vec<CellInstance>,
     term: &Term,
@@ -86,6 +89,7 @@ fn build_term_dirty_instances_into(
     ext_palette: &[[f32; 4]; 256],
     cursor_visible: bool,
     row_glyphs: &[Option<LineGlyphs>],
+    bleed: EdgeBleed,
 ) {
     crate::text::instance::build_dirty_instances_into(
         out,
@@ -100,6 +104,7 @@ fn build_term_dirty_instances_into(
             lg.get(col, ch)
         },
         |line_id, col| term.is_cell_selected(line_id, col),
+        bleed,
     );
 }
 
@@ -322,6 +327,20 @@ pub struct Renderer {
     /// enabled, the button is painted in `corner` each frame the view is
     /// scrolled back (see [`Self::draw_scroll_button`]).
     scroll_button: Option<ScrollButtonCorner>,
+    /// Window-padding insets in **physical px** (the binary pre-scales
+    /// logical px by `scale_factor`). The content grid is inset by these
+    /// from the full surface (`config.width`/`config.height`, which always
+    /// stay full-surface — see the surface-size contract). The content
+    /// origin is `(pad_left, pad_top)`, fed into every pipeline's
+    /// `content_origin` uniform.
+    pad_top: u32,
+    pad_right: u32,
+    pad_bottom: u32,
+    pad_left: u32,
+    /// Edge-cell background extension ("overscan/bleed") mode. Resolved
+    /// against `Term::is_alt_active()` per frame to a `bool` gate fed into
+    /// the instance builders' [`crate::text::instance::EdgeBleed`].
+    extend_background: ExtendBackground,
 }
 
 /// Which corner the scroll-to-bottom button is anchored to. Render-side
@@ -335,6 +354,33 @@ pub enum ScrollButtonCorner {
     /// Bottom-left corner.
     BottomLeft,
 }
+
+/// Edge-cell background extension ("overscan/bleed") mode. Render-side
+/// mirror of `toastty_config::ExtendBackground` (the render crate does not
+/// depend on the config crate — the binary bridges the two, same as it
+/// does for `Theme` / [`ScrollButtonCorner`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtendBackground {
+    /// Never bleed edge-cell backgrounds into the padding gutter.
+    Never,
+    /// Always bleed.
+    Always,
+    /// Bleed only while the alternate screen is active (full-page TUIs).
+    AltScreen,
+}
+
+impl ExtendBackground {
+    /// Resolve to a per-frame `bool` gate. `alt` is `Term::is_alt_active()`.
+    #[must_use]
+    fn active(self, alt: bool) -> bool {
+        matches!(self, ExtendBackground::Always)
+            || (matches!(self, ExtendBackground::AltScreen) && alt)
+    }
+}
+
+/// Re-export the edge-bleed parameter struct so the binary and tests can
+/// name it. Defined next to `CellInstance` in `text::instance`.
+pub use crate::text::instance::EdgeBleed;
 
 /// Build the scratch render target. Same dims/format as the surface;
 /// `RENDER_ATTACHMENT` so we can draw into it, `COPY_SRC` so we can
@@ -720,6 +766,11 @@ impl Renderer {
             // frames pick up the cascade rule.
             scratch_stale: true,
             scroll_button: None,
+            pad_top: 0,
+            pad_right: 0,
+            pad_bottom: 0,
+            pad_left: 0,
+            extend_background: ExtendBackground::Never,
         })
     }
 
@@ -993,6 +1044,69 @@ impl Renderer {
         self.scroll_button = corner;
     }
 
+    /// Content origin in physical px: `(x = pad_left, y = pad_top)`. This
+    /// is the single source of truth fed into every pipeline's
+    /// `content_origin` uniform. Internal `[f32; 2]` form.
+    #[must_use]
+    fn content_origin(&self) -> [f32; 2] {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            [self.pad_left as f32, self.pad_top as f32]
+        }
+    }
+
+    /// Public content-origin getter (physical px, `(x = pad_left, y =
+    /// pad_top)`) for the mouse hit-test path. Single source of truth
+    /// shared by rendering and hit-testing — the binary reads it back
+    /// rather than re-deriving the origin.
+    #[must_use]
+    pub fn content_origin_px(&self) -> (f32, f32) {
+        let o = self.content_origin();
+        (o[0], o[1])
+    }
+
+    /// Content (grid) pixel dims = the full surface (`config.width`/
+    /// `config.height`, which always stay full-surface — see the
+    /// surface-size contract) minus the stored physical pads. Clamped so a
+    /// huge padding still leaves at least one cell. `cell` is the cell
+    /// pixel size `(w, h)`. Derived on demand; never cached.
+    #[must_use]
+    fn content_dims(&self, cell: (f32, f32)) -> (f32, f32) {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            let cw = (self.config.width as f32 - (self.pad_left + self.pad_right) as f32)
+                .max(cell.0.max(1.0));
+            let ch = (self.config.height as f32 - (self.pad_top + self.pad_bottom) as f32)
+                .max(cell.1.max(1.0));
+            (cw, ch)
+        }
+    }
+
+    /// Set the window-padding insets in **physical px** (`top, right,
+    /// bottom, left` order — matches `PaddingConfig` / `EdgeBleed::pad`).
+    /// Forces a full clear only on an actual change (so a config reload
+    /// re-push of unchanged padding does not spuriously repaint).
+    pub fn set_padding(&mut self, top: u32, right: u32, bottom: u32, left: u32) {
+        if (self.pad_top, self.pad_right, self.pad_bottom, self.pad_left)
+            != (top, right, bottom, left)
+        {
+            self.pad_top = top;
+            self.pad_right = right;
+            self.pad_bottom = bottom;
+            self.pad_left = left;
+            self.needs_full_clear = true;
+        }
+    }
+
+    /// Set the edge-cell background-extension mode. Forces a full clear
+    /// only on an actual change.
+    pub fn set_extend_background(&mut self, mode: ExtendBackground) {
+        if self.extend_background != mode {
+            self.extend_background = mode;
+            self.needs_full_clear = true;
+        }
+    }
+
     /// Append the instances for a full-width, multi-line overlay banner
     /// to `instances`, bottom-anchored to the viewport. Used by the config
     /// error banner. (The close-confirmation dialog uses the centered,
@@ -1140,12 +1254,21 @@ impl Renderer {
         clippy::too_many_arguments,
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
+        clippy::cast_sign_loss,
+        clippy::similar_names
     )]
     fn draw_close_dialog(
         queue: &Queue,
-        width: u32,
-        height: u32,
+        // Full physical surface size — the scrim dims the WHOLE window.
+        surface_w: u32,
+        surface_h: u32,
+        // Content area size — the box is centered on the content.
+        content_w: u32,
+        content_h: u32,
+        // Content origin (physical px): the scrim is emitted in pre-origin
+        // space at `-origin` so that after the content_origin uniform adds
+        // `+origin` it spans `[0,0]..[surface_w, surface_h]`.
+        origin: [f32; 2],
         instances: &mut Vec<CellInstance>,
         text: &mut TextState,
         message: &str,
@@ -1160,15 +1283,22 @@ impl Renderer {
         /// Interior vertical padding, in blank rows, above and below the text.
         const PAD_Y: usize = 1;
 
-        let viewport_w = width as f32;
-        let viewport_h = height as f32;
+        let surface_wf = surface_w as f32;
+        let surface_hf = surface_h as f32;
+        let content_wf = content_w as f32;
+        let content_hf = content_h as f32;
         let cell_w = cell_size.0;
         let cell_h = cell_size.1;
 
-        // Dim backdrop: one translucent black quad over the whole viewport.
+        // Dim backdrop: one translucent black quad over the WHOLE window
+        // (not just the content area) so the gutter is dimmed too — a
+        // content-only scrim would leave bled edge colors at full
+        // brightness around a dimmed modal. Emit pre-origin at `-origin`
+        // so the content_origin uniform's `+origin` lands it at the full
+        // surface `[0,0]..[surface_w, surface_h]`.
         instances.push(CellInstance {
-            pos: [0.0, 0.0],
-            size: [viewport_w, viewport_h],
+            pos: [-origin[0], -origin[1]],
+            size: [surface_wf, surface_hf],
             uv_min: [0.0, 0.0],
             uv_max: [0.0, 0.0],
             fg,
@@ -1179,10 +1309,11 @@ impl Renderer {
 
         // Compose the box rows (border + padding + content), sized from
         // the widest content line. The top border row is exactly the box
-        // width, so derive `box_cols` from it.
+        // width, so derive `box_cols` from it. Centered on the CONTENT
+        // area (positions flow through the content_origin uniform).
         let rows = compose_dialog_rows(message, PAD_X, PAD_Y);
-        let cols = (viewport_w / cell_w).floor().max(1.0) as u32;
-        let vrows = (viewport_h / cell_h).floor().max(1.0) as u32;
+        let cols = (content_wf / cell_w).floor().max(1.0) as u32;
+        let vrows = (content_hf / cell_h).floor().max(1.0) as u32;
         let box_cols = rows.first().map_or(0, |r| r.chars().count()) as u32;
         let box_rows = rows.len() as u32;
 
@@ -1341,15 +1472,18 @@ impl Renderer {
             return None;
         }
         let cell_size = self.cell_size();
-        let (left_col, top_row) = Self::scroll_button_cell_origin(
-            self.config.width,
-            self.config.height,
-            cell_size,
-            corner,
-        )?;
+        // The button anchors to the content corner (the painted positions
+        // flow through the content_origin uniform). This rect is
+        // physical-space (hit-tested against raw mouse px), so bake the
+        // origin in here on the CPU.
+        let (cdw, cdh) = self.content_dims(cell_size);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (left_col, top_row) =
+            Self::scroll_button_cell_origin(cdw as u32, cdh as u32, cell_size, corner)?;
         let (cw, ch) = cell_size;
-        let x0 = left_col as f32 * cw;
-        let y0 = top_row as f32 * ch;
+        let origin = self.content_origin();
+        let x0 = left_col as f32 * cw + origin[0];
+        let y0 = top_row as f32 * ch + origin[1];
         Some([
             x0,
             y0,
@@ -1749,6 +1883,29 @@ impl Renderer {
         }
 
         let theme = self.theme;
+        // Resolve the edge-bleed gate once here, where `Term` and config
+        // meet. `pad` ordering is [top, right, bottom, left] (matching
+        // EdgeBleed::{TOP,RIGHT,BOTTOM,LEFT} / set_padding) — distinct
+        // from content_origin's (x=left, y=top). Computed by value (all
+        // Copy) before the `text` borrow so it doesn't conflict.
+        #[allow(clippy::cast_precision_loss)]
+        let bleed = EdgeBleed {
+            enabled: self.extend_background.active(term.is_alt_active()),
+            pad: [
+                self.pad_top as f32,
+                self.pad_right as f32,
+                self.pad_bottom as f32,
+                self.pad_left as f32,
+            ],
+        };
+        // Precompute the content dims/origin + full surface here, before
+        // the `&mut self.text` borrow below — the overlay/scroll-button
+        // call sites can't call `self.content_dims()`/`content_origin()`
+        // (which borrow `&self`) while `text` aliases `self.text`. All by
+        // value (Copy).
+        let content_origin = self.content_origin();
+        let content_dims = self.content_dims(cell_size);
+        let surface_dims = (self.config.width, self.config.height);
         // Build instances using the cached row glyphs. Reuse the
         // scratch vec across frames. We have to temporarily extract
         // the scratch out of TextState because the builders need to
@@ -1788,6 +1945,7 @@ impl Renderer {
                 &theme,
                 ext_palette,
                 &text.line_cache,
+                bleed,
             );
             if !cursor_visible {
                 instances.pop();
@@ -1801,6 +1959,7 @@ impl Renderer {
                 ext_palette,
                 cursor_visible,
                 &text.line_cache,
+                bleed,
             );
         }
         if let Some(t) = t_bi {
@@ -1825,8 +1984,9 @@ impl Renderer {
             let lg = text
                 .rasterizer
                 .shape_line(&self.queue, overlay, term.grapheme_cluster_mode());
-            #[allow(clippy::cast_precision_loss)]
-            let viewport_w = self.config.width as f32;
+            // Anchor to the content top-right (flows through the
+            // content_origin uniform), so use content width here.
+            let viewport_w = content_dims.0;
             let cell_w = cell_size.0;
             let cell_h = cell_size.1;
             let overlay_bg = [0.0, 0.0, 0.0, 0.85];
@@ -1885,10 +2045,14 @@ impl Renderer {
                 mix(theme.bg[2], theme.fg[2], 0.16),
                 0.95,
             ];
+            // Anchor the button to the content corner: pass content dims
+            // (the positions flow through the content_origin uniform).
+            let (cdw, cdh) = content_dims;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             Self::draw_scroll_button(
                 &self.queue,
-                self.config.width,
-                self.config.height,
+                cdw as u32,
+                cdh as u32,
                 &mut instances,
                 text,
                 corner,
@@ -1908,12 +2072,16 @@ impl Renderer {
         if let Some(banner) = self.error_banner.as_deref() {
             let banner_bg = [0.42, 0.03, 0.03, 0.95];
             let banner_fg = [1.0, 1.0, 1.0, 1.0];
-            // Bottom-anchored: top-y is the viewport height minus the
-            // banner's total line height (clamped non-negative).
+            // Bottom-anchored to the content area: top-y is the content
+            // height minus the banner's total line height (clamped
+            // non-negative). Positions flow through the content_origin
+            // uniform, so pass content dims.
+            let (cdw, cdh) = content_dims;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             Self::draw_banner(
                 &self.queue,
-                self.config.width,
-                self.config.height,
+                cdw as u32,
+                cdh as u32,
                 &mut instances,
                 text,
                 banner,
@@ -1935,10 +2103,16 @@ impl Renderer {
             let scrim = [0.0, 0.0, 0.0, 0.5];
             let panel_bg = [0.12, 0.14, 0.20, 0.98];
             let panel_fg = [0.95, 0.96, 0.98, 1.0];
+            // Scrim covers the FULL surface; the box centers on content.
+            let (cdw, cdh) = content_dims;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             Self::draw_close_dialog(
                 &self.queue,
-                self.config.width,
-                self.config.height,
+                surface_dims.0,
+                surface_dims.1,
+                cdw as u32,
+                cdh as u32,
+                content_origin,
                 &mut instances,
                 text,
                 prompt,
@@ -2146,13 +2320,32 @@ impl Renderer {
                 label: Some("toastty-render encoder (term)"),
             });
 
+        // Content origin (physical px) added to every quad in the vertex
+        // shader before the px->NDC map. `viewport_and_atlas.xy` MUST stay
+        // full-surface (the px->NDC divisor) so grown edge quads map past
+        // the content area into the gutter rather than being rescaled.
+        // Reuse the value precomputed before the `text` borrow.
+        let origin = content_origin; // [pad_left, pad_top]
+
         // Cursor rect + color travel via the Globals UBO so the glyph
         // fragment shader can recolor any glyph pixel that overlaps the
         // cursor block. When the cursor is hidden we pass an all-zero
         // rect (degenerate) so the shader's strict-inside test never
         // matches — the glyph keeps its normal fg.
+        //
+        // `fs_glyph` compares raw `in.clip.xy` (post-origin framebuffer
+        // px) against `cursor_rect`, so the rect is pre-offset by `origin`
+        // here on the CPU (NOT in the shader). A hidden cursor stays
+        // `[0; 4]` (degenerate; the origin shift is irrelevant on a
+        // zero-area rect).
         let cursor_rect = if cursor_visible {
-            crate::text::instance::cursor_pixel_rect(term, cell_size)
+            let r = crate::text::instance::cursor_pixel_rect(term, cell_size);
+            [
+                r[0] + origin[0],
+                r[1] + origin[1],
+                r[2] + origin[0],
+                r[3] + origin[1],
+            ]
         } else {
             [0.0; 4]
         };
@@ -2166,6 +2359,7 @@ impl Renderer {
             ],
             cursor_rect,
             cursor_color: self.theme.cursor,
+            content_origin: [origin[0], origin[1], 0.0, 0.0],
         };
 
         // damage.all is the M8 corrective-flush path: cascade it into
@@ -2273,6 +2467,7 @@ impl Renderer {
                     &mut rp,
                     &self.image_instances_below_bg,
                     viewport,
+                    origin,
                 );
             }
 
@@ -2300,6 +2495,7 @@ impl Renderer {
                     &self.rgp_cache,
                     viewport,
                     cell_size,
+                    (origin[0], origin[1]),
                 );
             }
 
@@ -2312,6 +2508,7 @@ impl Renderer {
                     &mut rp,
                     &self.image_instances_below,
                     viewport,
+                    origin,
                 );
             }
 
@@ -2328,6 +2525,7 @@ impl Renderer {
                     &mut rp,
                     &self.image_instances_above,
                     viewport,
+                    origin,
                 );
             }
         }
@@ -2760,6 +2958,7 @@ mod tests {
             false, // cursor_visible == OFF frame
             |_, _, _, _| None,
             |_, _| false,
+            crate::text::instance::EdgeBleed::default(),
         );
 
         // No cursor instance must be present (visible=false).

@@ -17,7 +17,10 @@ use super::instance::ImageInstance;
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct ImageGlobals {
     pub viewport: [f32; 2],
-    pub tex_dims: [f32; 2],
+    /// `(origin_x_px, origin_y_px)` — window-padding inset. Added to the
+    /// quad position in the vertex shader before the px->NDC map. (Was
+    /// the unused `tex_dims` field.)
+    pub content_origin: [f32; 2],
 }
 
 /// The image rendering pipeline + per-image texture cache.
@@ -261,7 +264,9 @@ impl ImagePipeline {
     /// to a contiguous slice (e.g. below-text or above-text). One draw
     /// per instance (we rebind the texture between draws).
     ///
-    /// `viewport` is `(width, height)` in pixels.
+    /// `viewport` is `(width, height)` in pixels (full surface).
+    /// `content_origin` is `(origin_x_px, origin_y_px)` — the window-padding
+    /// inset added in the vertex shader before the px->NDC map.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -269,6 +274,7 @@ impl ImagePipeline {
         pass: &mut wgpu::RenderPass<'_>,
         instances: &[ImageInstance],
         viewport: (f32, f32),
+        content_origin: [f32; 2],
     ) {
         if instances.is_empty() {
             return;
@@ -276,7 +282,7 @@ impl ImagePipeline {
         // Upload globals.
         let globals = ImageGlobals {
             viewport: [viewport.0, viewport.1],
-            tex_dims: [0.0, 0.0],
+            content_origin,
         };
         queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
