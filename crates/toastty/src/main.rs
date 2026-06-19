@@ -49,7 +49,7 @@ use toastty::paste::wrap_for_paste;
 use toastty::pty_log::{Direction, PtyLogger};
 use toastty::shell::resolve_command;
 use toastty::theme_bridge::{
-    extend_background, grid_align, scroll_button_corner, theme_from_config,
+    extend_background, extend_background_when, grid_align, scroll_button_corner, theme_from_config,
 };
 
 /// Target wake-up cadence while the scrollback viewport is animating.
@@ -640,11 +640,13 @@ impl Toastty {
             (pad.top, pad.right, pad.bottom, pad.left),
             self.scale_factor,
         );
-        let mode = extend_background(self.config.window.extend_background);
+        let when = extend_background_when(self.config.window.extend_background_when);
+        let ext = extend_background(self.config.window.extend_background);
         let align = grid_align(self.config.window.grid_align);
         if let Some(r) = self.renderer.as_mut() {
             r.set_padding(pt, pr, pb, pl); // top, right, bottom, left (physical px)
-            r.set_extend_background(mode);
+            r.set_extend_background_when(when);
+            r.set_extend_background(ext);
             r.set_grid_align(align);
         }
     }

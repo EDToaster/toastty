@@ -8,7 +8,7 @@
 //! resulting `Vec<CellInstance>` to the vertex buffer.
 
 use bytemuck::{Pod, Zeroable};
-use toastty_term::{Cell, Color as TColor, CursorShape, Damage, PLACEHOLDER, Style, Term};
+use toastty_term::{Cell, Color as TColor, CursorShape, Damage, PLACEHOLDER, Row, Style, Term};
 
 /// Flag bit: instance is the text-cursor block (forces inverse rendering,
 /// no glyph sample).
@@ -56,33 +56,76 @@ pub struct CellInstance {
     pub pad: [u32; 3],
 }
 
-/// Edge-background extension ("overscan/bleed") parameters.
-///
-/// When `enabled`, edge-cell background quads are grown outward in
-/// pre-origin space so they reach the physical window edge through the
-/// padding gutter (the shader adds `content_origin` afterward). A
-/// `default()` value (`enabled = false`, zero pad) is a no-op, so callers
-/// that don't care about bleed pass `EdgeBleed::default()`.
-///
-/// The `pad` ordering is `[top, right, bottom, left]` (matching
-/// `PaddingConfig` / `set_padding`); this is intentionally distinct from
-/// the `content_origin` `(x = left, y = top)` convention — do NOT "fix"
-/// them into agreement.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct EdgeBleed {
-    /// Physical-px padding `[top, right, bottom, left]`.
-    pub pad: [f32; 4],
-    /// Pre-resolved gate: `mode == Always || (mode == AltScreen &&
-    /// term.is_alt_active())`. Resolved by `render_term` where `Term` and
-    /// config meet, keeping this leaf code trivially unit-testable.
-    pub enabled: bool,
+/// Index into a `pad: [f32; 4]` array — ordering `[top, right, bottom,
+/// left]` (matching `PaddingConfig` / `set_padding`). Intentionally
+/// distinct from the `content_origin` `(x = left, y = top)` convention —
+/// do NOT "fix" them into agreement.
+const PAD_TOP: usize = 0;
+const PAD_RIGHT: usize = 1;
+const PAD_BOTTOM: usize = 2;
+const PAD_LEFT: usize = 3;
+
+/// Per-axis edge-extension rule. Render-side mirror of
+/// `toastty_config::ExtendCondition`; the binary bridges the two so the
+/// render crate stays free of a config dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExtendCondition {
+    /// Never extend along this axis.
+    Never,
+    /// Extend only when the whole edge row/column is a non-default
+    /// "solid" background band.
+    SolidLine,
+    /// Always extend along this axis.
+    #[default]
+    Always,
 }
 
-impl EdgeBleed {
-    const TOP: usize = 0;
-    const RIGHT: usize = 1;
-    const BOTTOM: usize = 2;
-    const LEFT: usize = 3;
+impl ExtendCondition {
+    /// Resolve to a concrete gate. `solid` is whether the relevant edge
+    /// row (horizontal) / column (vertical) is entirely non-default bg —
+    /// only consulted for [`ExtendCondition::SolidLine`].
+    #[inline]
+    #[must_use]
+    fn gate(self, solid: bool) -> bool {
+        match self {
+            ExtendCondition::Never => false,
+            ExtendCondition::SolidLine => solid,
+            ExtendCondition::Always => true,
+        }
+    }
+}
+
+/// Edge-background extension ("overscan/bleed") parameters.
+///
+/// When extension is gated on for a given cell's row/column, that cell's
+/// background quad is grown outward in pre-origin space so it reaches the
+/// physical window edge through the padding gutter (the shader adds
+/// `content_origin` afterward). A `default()` value (`active = false`,
+/// zero pad) is a no-op, so callers that don't care about bleed pass
+/// `EdgeBleed::default()`.
+///
+/// The two axes are independent:
+/// - `horizontal` gates the **left/right** grow, decided per-row.
+/// - `vertical` gates the **top/bottom** grow, decided per-column via
+///   [`EdgeBleed::col_fills`].
+///
+/// The `pad` ordering is `[top, right, bottom, left]` — see [`PAD_TOP`] &c.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct EdgeBleed<'a> {
+    /// Physical-px padding `[top, right, bottom, left]`.
+    pub pad: [f32; 4],
+    /// Global gate — the `extend_background_when` rule pre-resolved
+    /// against `term.is_alt_active()`. When `false`, nothing bleeds.
+    pub active: bool,
+    /// Left/right rule. `SolidLine` is keyed per-row on whether the row
+    /// is entirely non-default bg (computed in the builder).
+    pub horizontal: ExtendCondition,
+    /// Top/bottom rule. `SolidLine` is keyed per-column via `col_fills`.
+    pub vertical: ExtendCondition,
+    /// Per-column "this column is entirely non-default bg" flags, indexed
+    /// by column. Consulted only when `vertical == SolidLine`; pass `&[]`
+    /// otherwise.
+    pub col_fills: &'a [bool],
 }
 
 /// Grow an edge cell's background quad outward into the padding gutter so
@@ -100,6 +143,12 @@ impl EdgeBleed {
 /// space**: the full builder iterates RENDER space (`top_row =
 /// pixel_extra`); the dirty builder iterates CONTENT-row space via
 /// `iter_rows()` (`top_row = 0`).
+///
+/// `bleed_h` / `bleed_v` are the already-resolved per-axis gates for this
+/// cell's row/column (`active && condition`): `bleed_h` controls the
+/// left/right grow, `bleed_v` the top/bottom grow. They are resolved by
+/// the caller (which has the row cells / `col_fills` in hand) so this leaf
+/// stays trivially unit-testable.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn extend_edge_quad(
@@ -111,29 +160,58 @@ fn extend_edge_quad(
     rows: u16,
     top_row: u16,
     is_wide: bool,
-    bleed: EdgeBleed,
+    pad: [f32; 4],
+    bleed_h: bool,
+    bleed_v: bool,
 ) -> ([f32; 2], [f32; 2]) {
-    if !bleed.enabled {
-        return (pos, size);
+    if bleed_h {
+        if c == 0 {
+            pos[0] -= pad[PAD_LEFT];
+            size[0] += pad[PAD_LEFT];
+        }
+        // A width-2 primary occupies cols-2 (continuation at cols-1) — OR
+        // it into the last-column check so it still bleeds right.
+        let touches_right =
+            c == cols.saturating_sub(1) || (is_wide && c + 1 == cols.saturating_sub(1));
+        if touches_right {
+            size[0] += pad[PAD_RIGHT];
+        }
     }
-    if c == 0 {
-        pos[0] -= bleed.pad[EdgeBleed::LEFT];
-        size[0] += bleed.pad[EdgeBleed::LEFT];
-    }
-    // A width-2 primary occupies cols-2 (continuation at cols-1) — OR it
-    // into the last-column check so it still bleeds right.
-    let touches_right = c == cols.saturating_sub(1) || (is_wide && c + 1 == cols.saturating_sub(1));
-    if touches_right {
-        size[0] += bleed.pad[EdgeBleed::RIGHT];
-    }
-    if r == top_row {
-        pos[1] -= bleed.pad[EdgeBleed::TOP];
-        size[1] += bleed.pad[EdgeBleed::TOP];
-    }
-    if r == rows.saturating_sub(1) {
-        size[1] += bleed.pad[EdgeBleed::BOTTOM];
+    if bleed_v {
+        if r == top_row {
+            pos[1] -= pad[PAD_TOP];
+            size[1] += pad[PAD_TOP];
+        }
+        if r == rows.saturating_sub(1) {
+            size[1] += pad[PAD_BOTTOM];
+        }
     }
     (pos, size)
+}
+
+/// True if `cell` paints a solid, non-default background band — the
+/// per-cell predicate behind the `SolidLine` extend rule.
+///
+/// Under SGR reverse the cell's *effective* background is the resolved
+/// foreground (see [`resolve_cell_colors`]), which is a distinct solid
+/// color from the theme background even when `fg` is `Default` — so a
+/// reverse cell always counts as filled (status lines drawn with
+/// `\x1b[7m` are exactly the "solid band" case this rule targets).
+/// Without reverse, the cell is filled iff its `bg` token is not
+/// [`TColor::Default`].
+#[inline]
+#[must_use]
+pub fn cell_fills_bg(cell: &Cell) -> bool {
+    cell.style.flags.reverse || cell.style.bg != TColor::Default
+}
+
+/// True if **every** column `0..cols` of `row` paints a non-default
+/// background (the per-row predicate behind horizontal `SolidLine`). A
+/// missing cell counts as default bg (not solid).
+#[inline]
+#[must_use]
+fn row_is_solid(row: &Row, cols: u16) -> bool {
+    (0..cols as usize).all(|c| row.cells.get(c).is_some_and(cell_fills_bg))
 }
 
 /// Slack (px) below which a sub-pixel uncovered strip at the content
@@ -654,7 +732,7 @@ pub fn build_instances_into<F, S>(
     ext_palette: Option<&[[f32; 4]; 256]>,
     mut locate_glyph: F,
     mut is_selected: S,
-    bleed: EdgeBleed,
+    bleed: EdgeBleed<'_>,
     content_h: f32,
 ) where
     F: FnMut(u16, u16, char, &Style) -> Option<GlyphSlot>,
@@ -697,6 +775,14 @@ pub fn build_instances_into<F, S>(
         // very top of an unscrolled tiny grid; the cell still renders
         // but selection is treated as off.
         let line_id = line_id_for_render_row(bottom_id, rows, view_offset_lines, pixel_extra, r);
+        // Horizontal (left/right) bleed gate for this whole row. `SolidLine`
+        // scans the row once; `Always`/`Never` short-circuit.
+        let bleed_h = bleed.active
+            && match bleed.horizontal {
+                ExtendCondition::Never => false,
+                ExtendCondition::Always => true,
+                ExtendCondition::SolidLine => row_is_solid(row, cols),
+            };
         for c in 0..cols {
             let Some(cell) = row.cells.get(c as usize) else {
                 continue;
@@ -737,6 +823,11 @@ pub fn build_instances_into<F, S>(
             // gutter for edge cells. Full builder iterates RENDER space,
             // so the content-top row is `pixel_extra`. Only the bg quad
             // grows — glyph/underline/cursor keep natural geometry.
+            // Vertical (top/bottom) gate is keyed per-column on `col_fills`.
+            let bleed_v = bleed.active
+                && bleed
+                    .vertical
+                    .gate(bleed.col_fills.get(c as usize).copied().unwrap_or(false));
             let (bg_pos, bg_size) = extend_edge_quad(
                 pos,
                 [bg_w, cell_h],
@@ -746,7 +837,9 @@ pub fn build_instances_into<F, S>(
                 rows,
                 pixel_extra,
                 is_wide,
-                bleed,
+                bleed.pad,
+                bleed_h,
+                bleed_v,
             );
             out.push(CellInstance {
                 pos: bg_pos,
@@ -883,7 +976,7 @@ pub fn build_dirty_instances_into<F, S>(
     cursor_visible: bool,
     mut locate_glyph: F,
     mut is_selected: S,
-    bleed: EdgeBleed,
+    bleed: EdgeBleed<'_>,
 ) where
     F: FnMut(u16, u16, char, &Style) -> Option<GlyphSlot>,
     S: FnMut(u64, u16) -> bool,
@@ -946,6 +1039,16 @@ pub fn build_dirty_instances_into<F, S>(
     for (r, row_damage) in damage.iter_rows() {
         let row = term.view_row(r);
         let line_id = line_id_for_render_row(bottom_id, rows, view_offset_lines, pixel_extra, r);
+        // Horizontal (left/right) bleed gate for this row — same rule as
+        // the full builder. When a row's `SolidLine` status *flips*,
+        // `render_term` forces a full clear, so the dirty path only runs
+        // while the status is stable.
+        let bleed_h = bleed.active
+            && match bleed.horizontal {
+                ExtendCondition::Never => false,
+                ExtendCondition::Always => true,
+                ExtendCondition::SolidLine => row_is_solid(row, cols),
+            };
         // Stack-allocated iter enum instead of `Box<dyn Iterator>`:
         // boxing was a per-dirty-row heap allocation on the render
         // hot path. Same `all_cols` vs sparse-list dispatch as before.
@@ -989,8 +1092,23 @@ pub fn build_dirty_instances_into<F, S>(
             // default bg, erasing stale bleed. CRITICAL: the dirty
             // builder iterates CONTENT-row space via `iter_rows()`, so
             // the content-top row is `0`, NOT `pixel_extra`.
-            let (bg_pos, bg_size) =
-                extend_edge_quad(pos, [bg_w, cell_h], c, r, cols, rows, 0, is_wide, bleed);
+            let bleed_v = bleed.active
+                && bleed
+                    .vertical
+                    .gate(bleed.col_fills.get(c as usize).copied().unwrap_or(false));
+            let (bg_pos, bg_size) = extend_edge_quad(
+                pos,
+                [bg_w, cell_h],
+                c,
+                r,
+                cols,
+                rows,
+                0,
+                is_wide,
+                bleed.pad,
+                bleed_h,
+                bleed_v,
+            );
             out.push(CellInstance {
                 pos: bg_pos,
                 size: bg_size,
@@ -1305,6 +1423,25 @@ mod tests {
         let mut c = Cell::BLANK;
         c.hyperlink_id = std::num::NonZeroU16::new(1);
         assert!(!is_blank_for_render(&c));
+    }
+
+    #[test]
+    fn cell_fills_bg_truth_table() {
+        // Default blank → not filled.
+        assert!(!cell_fills_bg(&Cell::BLANK));
+        // Non-default bg → filled.
+        let mut c = Cell::BLANK;
+        c.style.bg = TColor::Red;
+        assert!(cell_fills_bg(&c));
+        // Reverse with default fg/bg → filled (paints fg-as-bg, a solid
+        // band — the status-line case).
+        let mut c = Cell::BLANK;
+        c.style.flags.reverse = true;
+        assert!(cell_fills_bg(&c));
+        // Non-default fg WITHOUT reverse does not fill the background.
+        let mut c = Cell::BLANK;
+        c.style.fg = TColor::Red;
+        assert!(!cell_fills_bg(&c));
     }
 
     #[test]
@@ -2177,10 +2314,15 @@ mod tests {
     const PAD_B: f32 = 4.0;
     const PAD_L: f32 = 5.0;
 
-    fn bleed_on() -> EdgeBleed {
+    /// Bleed both axes unconditionally (`active`, both `Always`). The
+    /// per-axis `SolidLine` rules are exercised separately below.
+    fn bleed_on() -> EdgeBleed<'static> {
         EdgeBleed {
             pad: [PAD_T, PAD_R, PAD_B, PAD_L],
-            enabled: true,
+            active: true,
+            horizontal: ExtendCondition::Always,
+            vertical: ExtendCondition::Always,
+            col_fills: &[],
         }
     }
 
@@ -2232,12 +2374,12 @@ mod tests {
             .collect()
     }
 
-    fn full_build(t: &Term, bleed: EdgeBleed) -> Vec<CellInstance> {
+    fn full_build(t: &Term, bleed: EdgeBleed<'_>) -> Vec<CellInstance> {
         // Grid-exact content height → no trailing partial bottom row.
         full_build_h(t, bleed, f32::from(t.size().0) * 16.0)
     }
 
-    fn full_build_h(t: &Term, bleed: EdgeBleed, content_h: f32) -> Vec<CellInstance> {
+    fn full_build_h(t: &Term, bleed: EdgeBleed<'_>, content_h: f32) -> Vec<CellInstance> {
         let mut out = Vec::new();
         super::build_instances_into(
             &mut out,
@@ -2263,7 +2405,8 @@ mod tests {
             &t,
             EdgeBleed {
                 pad: [PAD_T, PAD_R, PAD_B, PAD_L],
-                enabled: false,
+                active: false,
+                ..Default::default()
             },
         );
         assert_eq!(off, with_disabled, "disabled bleed must be a no-op");
@@ -2436,9 +2579,117 @@ mod tests {
         assert_eq!(cursor.size, [8.0, 16.0], "cursor must not grow");
     }
 
+    // ----- Per-axis + solid-line gating ------------------------------------
+
+    /// Bleed with explicit per-axis rules (always `active`). `col_fills`
+    /// is the per-column "solid bg" slice consulted by vertical `SolidLine`.
+    fn bleed_axes(
+        horizontal: ExtendCondition,
+        vertical: ExtendCondition,
+        col_fills: &[bool],
+    ) -> EdgeBleed<'_> {
+        EdgeBleed {
+            pad: [PAD_T, PAD_R, PAD_B, PAD_L],
+            active: true,
+            horizontal,
+            vertical,
+            col_fills,
+        }
+    }
+
+    #[test]
+    fn axes_are_independent_horizontal_only() {
+        // horizontal=Always, vertical=Never: edge cells grow left/right but
+        // never up/down. Top-left corner grows LEFT only.
+        let t = red_grid(3, 3);
+        let v = full_build(
+            &t,
+            bleed_axes(ExtendCondition::Always, ExtendCondition::Never, &[]),
+        );
+        let q = bg_quads(&v);
+        assert_eq!(q[0].pos, [0.0 - PAD_L, 0.0], "grew left, not up");
+        assert_eq!(q[0].size, [8.0 + PAD_L, 16.0]);
+    }
+
+    #[test]
+    fn horizontal_solid_line_bleeds_only_full_rows() {
+        // Row 0 is a solid red band; row 1 has a default-bg gap in the
+        // middle. With horizontal=SolidLine only row 0's edge cells grow.
+        let mut t = Term::new(2, 3, 0);
+        feed(&mut t, b"\x1b[41m   "); // row 0: three red cells
+        feed(&mut t, b"\r\n");
+        feed(&mut t, b"\x1b[41m "); // row 1, c0: red
+        feed(&mut t, b"\x1b[49m "); // row 1, c1: default bg (the gap)
+        feed(&mut t, b"\x1b[41m "); // row 1, c2: red
+        let v = full_build(
+            &t,
+            bleed_axes(ExtendCondition::SolidLine, ExtendCondition::Never, &[]),
+        );
+        let q = bg_quads(&v);
+        // Row 0 (solid) c0 grows left.
+        let r0c0 = q
+            .iter()
+            .find(|i| i.pos[1].abs() < 1e-3 && i.pos[0] < 0.0)
+            .expect("solid row's left edge must grow");
+        assert_eq!(r0c0.pos, [0.0 - PAD_L, 0.0]);
+        assert_eq!(r0c0.size, [8.0 + PAD_L, 16.0]);
+        // Row 1 (not solid) c0 does NOT grow.
+        let r1c0 = q
+            .iter()
+            .find(|i| (i.pos[1] - 16.0).abs() < 1e-3 && i.pos[0].abs() < 1e-3)
+            .expect("row 1 c0 still emits a quad");
+        assert_eq!(r1c0.pos, [0.0, 16.0], "non-solid row must not grow left");
+        assert_eq!(r1c0.size, [8.0, 16.0]);
+    }
+
+    #[test]
+    fn vertical_solid_line_uses_col_fills() {
+        // vertical=SolidLine with col_fills = [true, false, true]: columns
+        // 0 and 2 grow up/down, column 1 does not. horizontal=Never so no
+        // left/right grow muddies the assertions.
+        let t = red_grid(3, 3);
+        let col_fills = [true, false, true];
+        let v = full_build(
+            &t,
+            bleed_axes(
+                ExtendCondition::Never,
+                ExtendCondition::SolidLine,
+                &col_fills,
+            ),
+        );
+        let q = bg_quads(&v); // 3x3, row-major
+        // Top row: c0/c2 grow up, c1 does not.
+        assert_eq!(q[0].pos, [0.0, 0.0 - PAD_T], "col 0 solid → grows up");
+        assert_eq!(q[0].size, [8.0, 16.0 + PAD_T]);
+        assert_eq!(q[1].pos, [8.0, 0.0], "col 1 not solid → no grow");
+        assert_eq!(q[1].size, [8.0, 16.0]);
+        assert_eq!(q[2].pos, [2.0 * 8.0, 0.0 - PAD_T], "col 2 solid → grows up");
+        // Bottom row col 0 grows down.
+        assert_eq!(q[6].pos, [0.0, 2.0 * 16.0]);
+        assert_eq!(q[6].size, [8.0, 16.0 + PAD_B]);
+    }
+
+    #[test]
+    fn inactive_gate_ignores_axis_rules() {
+        // active=false must be a no-op even with Always on both axes.
+        let t = red_grid(2, 2);
+        let off = full_build(&t, EdgeBleed::default());
+        let inactive = full_build(
+            &t,
+            EdgeBleed {
+                pad: [PAD_T, PAD_R, PAD_B, PAD_L],
+                active: false,
+                horizontal: ExtendCondition::Always,
+                vertical: ExtendCondition::Always,
+                col_fills: &[],
+            },
+        );
+        assert_eq!(off, inactive);
+    }
+
     // ----- Dirty builder edge bleed ----------------------------------------
 
-    fn dirty_build(t: &Term, damage: &Damage, bleed: EdgeBleed) -> Vec<CellInstance> {
+    fn dirty_build(t: &Term, damage: &Damage, bleed: EdgeBleed<'_>) -> Vec<CellInstance> {
         let mut out = Vec::new();
         super::build_dirty_instances_into(
             &mut out,
@@ -2468,6 +2719,45 @@ mod tests {
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].pos, [0.0 - PAD_L, 0.0 - PAD_T]);
         assert_eq!(q[0].size, [8.0 + PAD_L, 16.0 + PAD_T]);
+    }
+
+    #[test]
+    fn dirty_solid_line_honors_row_and_col_fills() {
+        // The dirty path resolves the same per-axis gates as the full
+        // builder: horizontal `SolidLine` from the row's cells (inline),
+        // vertical `SolidLine` from `col_fills`. red_grid → row 0 is solid.
+        let t = red_grid(2, 3);
+        let mut damage = Damage::new(2);
+        damage.clear();
+        damage.rows[0].mark(0); // top-left corner
+
+        // col 0 solid → both axes grow.
+        let both = dirty_build(
+            &t,
+            &damage,
+            bleed_axes(
+                ExtendCondition::SolidLine,
+                ExtendCondition::SolidLine,
+                &[true, true, true],
+            ),
+        );
+        let qb = bg_quads(&both);
+        assert_eq!(qb[0].pos, [0.0 - PAD_L, 0.0 - PAD_T]);
+        assert_eq!(qb[0].size, [8.0 + PAD_L, 16.0 + PAD_T]);
+
+        // col 0 NOT solid → vertical gate off; horizontal still grows left.
+        let h_only = dirty_build(
+            &t,
+            &damage,
+            bleed_axes(
+                ExtendCondition::SolidLine,
+                ExtendCondition::SolidLine,
+                &[false, true, true],
+            ),
+        );
+        let qh = bg_quads(&h_only);
+        assert_eq!(qh[0].pos, [0.0 - PAD_L, 0.0], "no vertical grow for col 0");
+        assert_eq!(qh[0].size, [8.0 + PAD_L, 16.0]);
     }
 
     #[test]

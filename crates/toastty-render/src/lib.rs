@@ -61,7 +61,7 @@ fn build_term_instances_into(
     theme: &Theme,
     ext_palette: &[[f32; 4]; 256],
     row_glyphs: &[Option<LineGlyphs>],
-    bleed: EdgeBleed,
+    bleed: EdgeBleed<'_>,
     content_h: f32,
 ) {
     crate::text::instance::build_instances_into(
@@ -92,7 +92,7 @@ fn build_term_dirty_instances_into(
     ext_palette: &[[f32; 4]; 256],
     cursor_visible: bool,
     row_glyphs: &[Option<LineGlyphs>],
-    bleed: EdgeBleed,
+    bleed: EdgeBleed<'_>,
 ) {
     crate::text::instance::build_dirty_instances_into(
         out,
@@ -340,14 +340,27 @@ pub struct Renderer {
     pad_right: u32,
     pad_bottom: u32,
     pad_left: u32,
-    /// Edge-cell background extension ("overscan/bleed") mode. Resolved
-    /// against `Term::is_alt_active()` per frame to a `bool` gate fed into
-    /// the instance builders' [`crate::text::instance::EdgeBleed`].
+    /// Global gate for edge-cell background extension ("overscan/bleed").
+    /// Resolved against `Term::is_alt_active()` per frame into the
+    /// `active` flag of the instance builders' [`EdgeBleed`].
+    extend_background_when: ExtendBackgroundWhen,
+    /// Per-axis edge-extension rule (left/right vs top/bottom). Fed into
+    /// the builders' [`EdgeBleed`] alongside `extend_background_when`.
     extend_background: ExtendBackground,
     /// How the cell grid is aligned within the content area when the
     /// window isn't a whole number of cells (the floor-divide leftover).
     /// Shifts `content_origin` and the per-edge bleed split.
     grid_align: GridAlign,
+    /// Previous frame's per-row "solid bg" flags (content-row space),
+    /// cached so a flip in a row's horizontal `SolidLine` status can force
+    /// a full clear (the dirty path can't see non-dirty edge cells). Empty
+    /// unless `extend_background.horizontal == SolidLine`.
+    solid_rows_prev: Vec<bool>,
+    /// Previous frame's per-column "solid bg" flags. Same role as
+    /// `solid_rows_prev` for vertical `SolidLine`. Also reused as the
+    /// `col_fills` slice handed to the builders. Empty unless
+    /// `extend_background.vertical == SolidLine`.
+    solid_cols_prev: Vec<bool>,
 }
 
 /// Which corner the scroll-to-bottom button is anchored to. Render-side
@@ -362,27 +375,39 @@ pub enum ScrollButtonCorner {
     BottomLeft,
 }
 
-/// Edge-cell background extension ("overscan/bleed") mode. Render-side
-/// mirror of `toastty_config::ExtendBackground` (the render crate does not
-/// depend on the config crate — the binary bridges the two, same as it
-/// does for `Theme` / [`ScrollButtonCorner`]).
+/// Global gate for edge-cell background extension ("overscan/bleed").
+/// Render-side mirror of `toastty_config::ExtendBackgroundWhen` (the render
+/// crate does not depend on the config crate — the binary bridges the two,
+/// same as it does for `Theme` / [`ScrollButtonCorner`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExtendBackground {
+pub enum ExtendBackgroundWhen {
     /// Never bleed edge-cell backgrounds into the padding gutter.
     Never,
-    /// Always bleed.
+    /// Bleed whenever the per-axis [`ExtendBackground`] rule allows.
     Always,
     /// Bleed only while the alternate screen is active (full-page TUIs).
     AltScreen,
 }
 
-impl ExtendBackground {
+impl ExtendBackgroundWhen {
     /// Resolve to a per-frame `bool` gate. `alt` is `Term::is_alt_active()`.
     #[must_use]
     fn active(self, alt: bool) -> bool {
-        matches!(self, ExtendBackground::Always)
-            || (matches!(self, ExtendBackground::AltScreen) && alt)
+        matches!(self, ExtendBackgroundWhen::Always)
+            || (matches!(self, ExtendBackgroundWhen::AltScreen) && alt)
     }
+}
+
+/// Per-axis edge-background extension rule. Render-side mirror of
+/// `toastty_config::ExtendBackground`. Combined with
+/// [`ExtendBackgroundWhen`]: an edge cell bleeds along an axis iff the gate
+/// is active AND that axis's [`ExtendCondition`] is met.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExtendBackground {
+    /// Left/right gutters, decided per-row.
+    pub horizontal: ExtendCondition,
+    /// Top/bottom gutters, decided per-column.
+    pub vertical: ExtendCondition,
 }
 
 /// How the cell grid is aligned within the content area when the window
@@ -447,7 +472,7 @@ fn grid_overflow_px(
 
 /// Re-export the edge-bleed parameter struct so the binary and tests can
 /// name it. Defined next to `CellInstance` in `text::instance`.
-pub use crate::text::instance::EdgeBleed;
+pub use crate::text::instance::{EdgeBleed, ExtendCondition};
 
 /// Build the scratch render target. Same dims/format as the surface;
 /// `RENDER_ATTACHMENT` so we can draw into it, `COPY_SRC` so we can
@@ -837,7 +862,10 @@ impl Renderer {
             pad_right: 0,
             pad_bottom: 0,
             pad_left: 0,
-            extend_background: ExtendBackground::Never,
+            extend_background_when: ExtendBackgroundWhen::Never,
+            extend_background: ExtendBackground::default(),
+            solid_rows_prev: Vec::new(),
+            solid_cols_prev: Vec::new(),
             grid_align: GridAlign::TopLeft,
         })
     }
@@ -1192,8 +1220,18 @@ impl Renderer {
         }
     }
 
-    /// Set the edge-cell background-extension mode. Forces a full clear
-    /// only on an actual change.
+    /// Set the global edge-cell background-extension gate
+    /// (`extend_background_when`). Forces a full clear only on an actual
+    /// change.
+    pub fn set_extend_background_when(&mut self, when: ExtendBackgroundWhen) {
+        if self.extend_background_when != when {
+            self.extend_background_when = when;
+            self.needs_full_clear = true;
+        }
+    }
+
+    /// Set the per-axis edge-cell background-extension rule. Forces a full
+    /// clear only on an actual change.
     pub fn set_extend_background(&mut self, mode: ExtendBackground) {
         if self.extend_background != mode {
             self.extend_background = mode;
@@ -2010,20 +2048,74 @@ impl Renderer {
         // split evenly, matching the centered origin. Same `grid_overflow`
         // the origin uses, so the two stay consistent.
         let ([rem_w, rem_h], [lead_x, lead_y]) = self.grid_overflow(cell_size);
-        // Resolve the edge-bleed gate once here, where `Term` and config
-        // meet. `pad` ordering is [top, right, bottom, left] (matching
-        // EdgeBleed::{TOP,RIGHT,BOTTOM,LEFT} / set_padding) — distinct
-        // from content_origin's (x=left, y=top). Computed by value (all
-        // Copy) before the `text` borrow so it doesn't conflict.
+        // Resolve the global edge-bleed gate once here, where `Term` and
+        // config meet.
+        let bleed_active = self.extend_background_when.active(term.is_alt_active());
+        let ext = self.extend_background;
+        // The `SolidLine` rule needs to know which edge rows/columns are an
+        // all-non-default-bg "solid band". Scan the visible grid once, but
+        // only for the axes that actually use `SolidLine`. A row's/column's
+        // solid status flipping changes whether its edge cells bleed — and
+        // the dirty path can't repaint non-dirty edge cells — so when these
+        // flags differ from last frame we force a full clear. `solid_cols`
+        // doubles as the `col_fills` slice handed to the builders.
+        let need_rows = bleed_active && ext.horizontal == ExtendCondition::SolidLine;
+        let need_cols = bleed_active && ext.vertical == ExtendCondition::SolidLine;
+        let (solid_rows, solid_cols) = if need_rows || need_cols {
+            let (rows, cols) = term.size();
+            let mut solid_rows = vec![false; if need_rows { rows as usize } else { 0 }];
+            let mut solid_cols = vec![true; if need_cols { cols as usize } else { 0 }];
+            for r in 0..rows {
+                let row = term.view_row(r);
+                let mut row_all = true;
+                // Index loop: one pass updates both the per-row reduce
+                // (`row_all`) and the per-column reduce (`solid_cols[c]`).
+                #[allow(clippy::needless_range_loop)]
+                for c in 0..cols as usize {
+                    let filled = row
+                        .cells
+                        .get(c)
+                        .is_some_and(crate::text::instance::cell_fills_bg);
+                    if !filled {
+                        row_all = false;
+                        if need_cols {
+                            solid_cols[c] = false;
+                        }
+                    }
+                }
+                if need_rows {
+                    solid_rows[r as usize] = row_all;
+                }
+            }
+            (solid_rows, solid_cols)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        if (need_rows && solid_rows != self.solid_rows_prev)
+            || (need_cols && solid_cols != self.solid_cols_prev)
+        {
+            self.needs_full_clear = true;
+        }
+        self.solid_rows_prev = solid_rows;
+        self.solid_cols_prev = solid_cols;
+        // `pad` ordering is [top, right, bottom, left] (matching
+        // PAD_TOP/RIGHT/BOTTOM/LEFT / set_padding) — distinct from
+        // content_origin's (x=left, y=top). Each edge's bleed distance is
+        // `padding + its share of the floor-divide leftover`. Computed by
+        // value (all Copy except the `col_fills` borrow of a disjoint
+        // field) before the `text` borrow so it doesn't conflict.
         #[allow(clippy::cast_precision_loss)]
         let bleed = EdgeBleed {
-            enabled: self.extend_background.active(term.is_alt_active()),
             pad: [
                 self.pad_top as f32 + lead_y,
                 self.pad_right as f32 + (rem_w - lead_x),
                 self.pad_bottom as f32 + (rem_h - lead_y),
                 self.pad_left as f32 + lead_x,
             ],
+            active: bleed_active,
+            horizontal: ext.horizontal,
+            vertical: ext.vertical,
+            col_fills: &self.solid_cols_prev,
         };
         // Precompute the content origin + full surface here, before the
         // `&mut self.text` borrow below — the overlay/scroll-button call

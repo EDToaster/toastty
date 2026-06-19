@@ -16,20 +16,74 @@ pub enum ConfirmClose {
     Always,
 }
 
-/// When to paint each edge cell's background outward into the window
-/// padding (overscan/bleed), so a full-page TUI's colors reach the
-/// physical window edge.
+/// Global gate for edge-cell background extension (overscan/bleed): when
+/// the feature is active *at all*. The per-axis [`ExtendBackground`] rule
+/// then decides which edge rows/columns actually bleed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
-pub enum ExtendBackground {
+pub enum ExtendBackgroundWhen {
     /// Never bleed — the padding always shows the base theme background.
     #[default]
     Never,
-    /// Always bleed the edge cells into the padding.
+    /// Bleed whenever the per-axis rule allows.
     Always,
     /// Bleed only while the alternate screen is active (serializes as
-    /// `"alt-screen"`).
+    /// `"alt-screen"`) — full-page TUIs.
     AltScreen,
+}
+
+/// Per-axis rule for *whether* a given edge row/column bleeds, once
+/// [`ExtendBackgroundWhen`] has gated the feature on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExtendCondition {
+    /// Never extend along this axis.
+    Never,
+    /// Extend only when the whole edge row (horizontal axis) or column
+    /// (vertical axis) is painted with a non-default background — the
+    /// "solid band" case (powerlines, full-width prompt/status lines)
+    /// where the band color is a good padding color. Serializes as
+    /// `"solid-line"`.
+    SolidLine,
+    /// Always extend along this axis.
+    #[default]
+    Always,
+}
+
+/// Per-axis edge-background extension rule. Combined with
+/// [`ExtendBackgroundWhen`]: an edge cell bleeds along an axis iff the
+/// `when` gate is active **and** that axis's condition is met.
+///
+/// - `horizontal` controls the **left/right** gutters, decided per-row
+///   (a row's edge cells bleed left/right).
+/// - `vertical` controls the **top/bottom** gutters, decided per-column
+///   (a column's edge cells bleed up/down).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExtendBackground {
+    /// Left/right gutters (per-row).
+    pub horizontal: ExtendCondition,
+    /// Top/bottom gutters (per-column).
+    pub vertical: ExtendCondition,
+}
+
+impl ExtendBackground {
+    /// Schema defaults — bleed along both axes whenever the `when` gate
+    /// is active (so flipping only `extend_background_when` reproduces the
+    /// old "bleed every edge" behavior).
+    #[must_use]
+    pub fn defaults() -> Self {
+        Self {
+            horizontal: ExtendCondition::Always,
+            vertical: ExtendCondition::Always,
+        }
+    }
+}
+
+impl Default for ExtendBackground {
+    fn default() -> Self {
+        Self::defaults()
+    }
 }
 
 /// How to align the cell grid within the content area when the window
@@ -97,11 +151,15 @@ pub struct WindowConfig {
     /// When to prompt for confirmation before closing the window
     /// (mirrors kitty's `confirm_os_window_close`).
     pub confirm_close: ConfirmClose,
-    /// When to bleed each edge cell's background into the padding.
-    pub extend_background: ExtendBackground,
+    /// Global gate for edge-cell background extension (overscan/bleed).
+    pub extend_background_when: ExtendBackgroundWhen,
     /// How to align the cell grid when it doesn't exactly fill the
     /// content area (partial trailing row/column).
     pub grid_align: GridAlign,
+    /// Per-axis edge-background extension rule. A table — declared before
+    /// `padding` but after every scalar so the `[window.extend_background]`
+    /// / `[window.padding]` sub-tables and TOML field ordering round-trip.
+    pub extend_background: ExtendBackground,
     /// Cell-grid inset (logical px) per side. Declared LAST so a partial
     /// `[window.padding]` sub-table and TOML field ordering round-trip.
     pub padding: PaddingConfig,
@@ -117,8 +175,9 @@ impl WindowConfig {
             height: 800,
             vsync: true,
             confirm_close: ConfirmClose::IfRunningProgram,
-            extend_background: ExtendBackground::Never,
+            extend_background_when: ExtendBackgroundWhen::Never,
             grid_align: GridAlign::TopLeft,
+            extend_background: ExtendBackground::defaults(),
             padding: PaddingConfig::defaults(),
         }
     }
@@ -155,8 +214,12 @@ mod tests {
             height: 1080,
             vsync: false,
             confirm_close: ConfirmClose::Always,
-            extend_background: ExtendBackground::Always,
+            extend_background_when: ExtendBackgroundWhen::AltScreen,
             grid_align: GridAlign::Centered,
+            extend_background: ExtendBackground {
+                horizontal: ExtendCondition::SolidLine,
+                vertical: ExtendCondition::Never,
+            },
             padding: PaddingConfig {
                 top: 1,
                 right: 2,
@@ -192,6 +255,87 @@ mod tests {
     #[test]
     fn grid_align_invalid_value_rejected() {
         let r: Result<WindowConfig, _> = toml::from_str("grid_align = \"middle\"\n");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn extend_background_when_defaults_to_never() {
+        assert_eq!(
+            WindowConfig::defaults().extend_background_when,
+            ExtendBackgroundWhen::Never
+        );
+    }
+
+    #[test]
+    fn extend_background_defaults_to_both_always() {
+        let d = WindowConfig::defaults().extend_background;
+        assert_eq!(d.horizontal, ExtendCondition::Always);
+        assert_eq!(d.vertical, ExtendCondition::Always);
+    }
+
+    #[test]
+    fn extend_background_when_round_trips_each_variant() {
+        for variant in [
+            ExtendBackgroundWhen::Never,
+            ExtendBackgroundWhen::Always,
+            ExtendBackgroundWhen::AltScreen,
+        ] {
+            let w = WindowConfig {
+                extend_background_when: variant,
+                ..WindowConfig::defaults()
+            };
+            let t = toml::to_string(&w).unwrap();
+            let p: WindowConfig = toml::from_str(&t).unwrap();
+            assert_eq!(p, w);
+        }
+    }
+
+    #[test]
+    fn extend_background_when_serializes_alt_screen_kebab() {
+        let t = toml::to_string(&WindowConfig {
+            extend_background_when: ExtendBackgroundWhen::AltScreen,
+            ..WindowConfig::defaults()
+        })
+        .unwrap();
+        assert!(t.contains("extend_background_when = \"alt-screen\""), "{t}");
+    }
+
+    #[test]
+    fn extend_background_subtable_parses_and_partial_fills_default() {
+        // Only `horizontal` given → `vertical` keeps its `Always` default.
+        let cfg: WindowConfig =
+            toml::from_str("[extend_background]\nhorizontal = \"solid-line\"\n").unwrap();
+        assert_eq!(cfg.extend_background.horizontal, ExtendCondition::SolidLine);
+        assert_eq!(cfg.extend_background.vertical, ExtendCondition::Always);
+        // Untouched scalar fields keep their defaults.
+        assert_eq!(cfg.width, 1280);
+    }
+
+    #[test]
+    fn extend_condition_serializes_solid_line_kebab() {
+        let t = toml::to_string(&WindowConfig {
+            extend_background: ExtendBackground {
+                horizontal: ExtendCondition::SolidLine,
+                vertical: ExtendCondition::Never,
+            },
+            ..WindowConfig::defaults()
+        })
+        .unwrap();
+        assert!(t.contains("horizontal = \"solid-line\""), "{t}");
+        assert!(t.contains("vertical = \"never\""), "{t}");
+    }
+
+    #[test]
+    fn extend_condition_invalid_value_rejected() {
+        let r: Result<WindowConfig, _> =
+            toml::from_str("[extend_background]\nhorizontal = \"sometimes\"\n");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn extend_background_unknown_key_rejected() {
+        let r: Result<WindowConfig, _> =
+            toml::from_str("[extend_background]\ndiagonal = \"always\"\n");
         assert!(r.is_err());
     }
 

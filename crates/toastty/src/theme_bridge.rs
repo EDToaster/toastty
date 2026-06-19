@@ -6,9 +6,13 @@
 //! copy of the same function; the binary's copy is the canonical one.
 
 use toastty_config::ExtendBackground as CfgExtend;
+use toastty_config::ExtendBackgroundWhen as CfgWhen;
+use toastty_config::ExtendCondition as CfgCond;
 use toastty_config::GridAlign as CfgGridAlign;
 use toastty_config::{ScrollButtonConfig, ScrollButtonPosition, ThemeConfig};
 use toastty_render::ExtendBackground as RExtend;
+use toastty_render::ExtendBackgroundWhen as RWhen;
+use toastty_render::ExtendCondition as RCond;
 use toastty_render::GridAlign as RGridAlign;
 use toastty_render::ScrollButtonCorner;
 use toastty_render::text::instance::Theme;
@@ -27,16 +31,37 @@ pub fn scroll_button_corner(cfg: &ScrollButtonConfig) -> Option<ScrollButtonCorn
     })
 }
 
-/// Map the `[window]` `extend_background` config knob to the renderer's
-/// edge-bleed enum. Mirrors [`scroll_button_corner`]: the binary bridges the
-/// two enums so `toastty-config` stays a leaf crate (no `toastty-render` dep)
-/// and `toastty-render` defines its own copy.
+/// Map the `[window]` `extend_background_when` config knob (the global
+/// bleed gate) to the renderer's enum. Mirrors [`scroll_button_corner`]:
+/// the binary bridges the two enums so `toastty-config` stays a leaf crate
+/// (no `toastty-render` dep) and `toastty-render` defines its own copy.
 #[must_use]
-pub fn extend_background(mode: CfgExtend) -> RExtend {
-    match mode {
-        CfgExtend::Never => RExtend::Never,
-        CfgExtend::Always => RExtend::Always,
-        CfgExtend::AltScreen => RExtend::AltScreen,
+pub fn extend_background_when(when: CfgWhen) -> RWhen {
+    match when {
+        CfgWhen::Never => RWhen::Never,
+        CfgWhen::Always => RWhen::Always,
+        CfgWhen::AltScreen => RWhen::AltScreen,
+    }
+}
+
+/// Map a single per-axis [`CfgCond`] to the renderer's [`RCond`].
+#[must_use]
+fn extend_condition(cond: CfgCond) -> RCond {
+    match cond {
+        CfgCond::Never => RCond::Never,
+        CfgCond::SolidLine => RCond::SolidLine,
+        CfgCond::Always => RCond::Always,
+    }
+}
+
+/// Map the `[window.extend_background]` per-axis config table to the
+/// renderer's struct. Same leaf-crate bridging as
+/// [`extend_background_when`].
+#[must_use]
+pub fn extend_background(ext: CfgExtend) -> RExtend {
+    RExtend {
+        horizontal: extend_condition(ext.horizontal),
+        vertical: extend_condition(ext.vertical),
     }
 }
 
@@ -107,10 +132,32 @@ mod tests {
     }
 
     #[test]
-    fn extend_background_maps_each_variant() {
-        assert_eq!(extend_background(CfgExtend::Never), RExtend::Never);
-        assert_eq!(extend_background(CfgExtend::Always), RExtend::Always);
-        assert_eq!(extend_background(CfgExtend::AltScreen), RExtend::AltScreen);
+    fn extend_background_when_maps_each_variant() {
+        assert_eq!(extend_background_when(CfgWhen::Never), RWhen::Never);
+        assert_eq!(extend_background_when(CfgWhen::Always), RWhen::Always);
+        assert_eq!(extend_background_when(CfgWhen::AltScreen), RWhen::AltScreen);
+    }
+
+    #[test]
+    fn extend_condition_maps_each_variant() {
+        assert_eq!(extend_condition(CfgCond::Never), RCond::Never);
+        assert_eq!(extend_condition(CfgCond::SolidLine), RCond::SolidLine);
+        assert_eq!(extend_condition(CfgCond::Always), RCond::Always);
+    }
+
+    #[test]
+    fn extend_background_maps_both_axes() {
+        let mapped = extend_background(CfgExtend {
+            horizontal: CfgCond::SolidLine,
+            vertical: CfgCond::Never,
+        });
+        assert_eq!(
+            mapped,
+            RExtend {
+                horizontal: RCond::SolidLine,
+                vertical: RCond::Never,
+            }
+        );
     }
 
     #[test]

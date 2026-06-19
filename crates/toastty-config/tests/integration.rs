@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use toastty_config::{
-    Color, Config, ConfigError, ConfigSource, CursorShape, ExtendBackground, GridAlign,
-    PaddingConfig,
+    Color, Config, ConfigError, ConfigSource, CursorShape, ExtendBackground, ExtendBackgroundWhen,
+    ExtendCondition, GridAlign, PaddingConfig,
 };
 
 #[test]
@@ -21,7 +21,17 @@ fn fully_populated_fixture_parses_via_load_from_path() {
     assert_eq!(cfg.theme.palette[15], Color::from_hex("#ffffff").unwrap());
 
     // Window padding + extend_background + grid_align from the fixture.
-    assert_eq!(cfg.window.extend_background, ExtendBackground::AltScreen);
+    assert_eq!(
+        cfg.window.extend_background_when,
+        ExtendBackgroundWhen::AltScreen
+    );
+    assert_eq!(
+        cfg.window.extend_background,
+        ExtendBackground {
+            horizontal: ExtendCondition::SolidLine,
+            vertical: ExtendCondition::Never,
+        }
+    );
     assert_eq!(cfg.window.grid_align, GridAlign::Centered);
     assert_eq!(
         cfg.window.padding,

@@ -38,8 +38,12 @@ width             = 1280
 height            = 800
 vsync             = true
 confirm_close     = "always"
-extend_background = "alt-screen"
+extend_background_when = "alt-screen"
 grid_align        = "centered"
+
+[window.extend_background]
+horizontal = "solid-line"
+vertical   = "never"
 
 [window.padding]
 top    = 8
