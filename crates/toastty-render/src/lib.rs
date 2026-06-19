@@ -437,7 +437,11 @@ fn grid_overflow_px(
     let rem_h = rem(content.1, cell.1);
     (
         [rem_w, rem_h],
-        [rem_w * leading_fraction, rem_h * leading_fraction],
+        [
+            // Force integer offset and remainder
+            (rem_w * leading_fraction).floor(),
+            (rem_h * leading_fraction).floor(),
+        ],
     )
 }
 
