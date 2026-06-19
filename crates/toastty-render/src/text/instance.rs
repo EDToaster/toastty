@@ -136,6 +136,45 @@ fn extend_edge_quad(
     (pos, size)
 }
 
+/// Slack (px) below which a sub-pixel uncovered strip at the content
+/// bottom is not worth an extra rendered row.
+const COVER_EPS: f32 = 0.5;
+
+/// Number of viewport rows the full builder renders this frame.
+///
+/// This is the `rows` content rows, plus:
+/// - one *top* partial row when fractionally scrolled (`view_pixel > 0`,
+///   the row that hangs above `y = 0` — historically `pixel_extra`), and
+/// - one *bottom* partial row when the content area is taller than a whole
+///   number of cells, so the trailing sliver that the floor-divided grid
+///   leaves uncovered still draws (text scrolling through it, and its bg).
+///
+/// `content_h` is the content-area height in physical px (window height
+/// minus vertical padding). When it's an exact multiple of `cell_h` (and
+/// not fractionally scrolled) this returns `rows`, i.e. the legacy count.
+///
+/// The leftover below the last whole row is always `< cell_h`, so at most
+/// one extra bottom row is ever needed; the result is capped at `rows + 2`
+/// (one top + one bottom) to keep the row-shape cache bound tight.
+#[must_use]
+pub fn rows_to_render(rows: u16, view_pixel: f32, cell_h: f32, content_h: f32) -> u16 {
+    let pixel_extra: u16 = u16::from(view_pixel > 0.0);
+    let base = rows.saturating_add(pixel_extra);
+    if cell_h <= 0.0 {
+        return base;
+    }
+    let y_translate = if pixel_extra > 0 {
+        view_pixel - cell_h
+    } else {
+        0.0
+    };
+    // Pixel-space bottom edge already covered by `base` rows.
+    let covered = f32::from(base) * cell_h + y_translate;
+    let bottom_extra = u16::from(covered + COVER_EPS < content_h);
+    base.saturating_add(bottom_extra)
+        .min(rows.saturating_add(2))
+}
+
 impl CellInstance {
     /// Construct a glyphless background-only instance.
     #[must_use]
@@ -565,6 +604,10 @@ where
 {
     let (rows, cols) = term.size();
     let mut out: Vec<CellInstance> = Vec::with_capacity(usize::from(rows) * usize::from(cols));
+    // Grid-exact content height → no extra bottom partial row (legacy
+    // behavior). Callers that want the trailing partial row covered go
+    // through `build_instances_into` with the real content height.
+    let content_h = f32::from(rows) * cell_size.1;
     build_instances_into(
         &mut out,
         term,
@@ -574,6 +617,7 @@ where
         locate_glyph,
         |_, _| false,
         EdgeBleed::default(),
+        content_h,
     );
     out
 }
@@ -611,6 +655,7 @@ pub fn build_instances_into<F, S>(
     mut locate_glyph: F,
     mut is_selected: S,
     bleed: EdgeBleed,
+    content_h: f32,
 ) where
     F: FnMut(u16, u16, char, &Style) -> Option<GlyphSlot>,
     S: FnMut(u64, u16) -> bool,
@@ -627,7 +672,11 @@ pub fn build_instances_into<F, S>(
     // needed and the y-translate is 0.
     let view_pixel = term.view_offset_pixel();
     let pixel_extra: u16 = if view_pixel > 0.0 { 1 } else { 0 };
-    let rows_rendered = rows + pixel_extra;
+    // Render through the trailing partial row at the bottom when the
+    // content area isn't a whole number of cells tall, so text (and bg)
+    // draws in the floor-divided grid's leftover sliver — e.g. content
+    // scrolling up through it. See [`rows_to_render`].
+    let rows_rendered = rows_to_render(rows, view_pixel, cell_h, content_h);
     let y_translate: f32 = if pixel_extra > 0 {
         view_pixel - cell_h
     } else {
@@ -843,6 +892,13 @@ pub fn build_dirty_instances_into<F, S>(
     // count as a full frame, and the renderer's `needs_full_clear` is
     // already set to true for this frame.
     if damage.all {
+        // The dirty path is never taken during fractional scroll (a
+        // viewport change forces `needs_full_clear`, which routes through
+        // the full builder directly), so the trailing bottom partial row
+        // is always blank here — pass a grid-exact content height so no
+        // extra (blank) row is emitted.
+        let (rows, _) = term.size();
+        let content_h = f32::from(rows) * cell_size.1;
         build_instances_into(
             out,
             term,
@@ -852,6 +908,7 @@ pub fn build_dirty_instances_into<F, S>(
             locate_glyph,
             is_selected,
             bleed,
+            content_h,
         );
         if !cursor_visible {
             // Drop the trailing cursor instance the full builder
@@ -1824,6 +1881,7 @@ mod tests {
             |_, _, _, _| None,
             |_, _| false,
             EdgeBleed::default(),
+            f32::from(t.size().0) * 16.0,
         );
         let mut dirty = Vec::new();
         super::build_dirty_instances_into(
@@ -2175,6 +2233,11 @@ mod tests {
     }
 
     fn full_build(t: &Term, bleed: EdgeBleed) -> Vec<CellInstance> {
+        // Grid-exact content height → no trailing partial bottom row.
+        full_build_h(t, bleed, f32::from(t.size().0) * 16.0)
+    }
+
+    fn full_build_h(t: &Term, bleed: EdgeBleed, content_h: f32) -> Vec<CellInstance> {
         let mut out = Vec::new();
         super::build_instances_into(
             &mut out,
@@ -2185,6 +2248,7 @@ mod tests {
             |_, _, _, _| None,
             |_, _| false,
             bleed,
+            content_h,
         );
         out
     }
@@ -2360,6 +2424,7 @@ mod tests {
             },
             |_, _| false,
             bleed_on(),
+            1.0 * 16.0, // grid-exact: 1 row × 16px
         );
         // Glyph quad: identified by having a glyph (uv_min != uv_max).
         let glyph = out
@@ -2465,5 +2530,93 @@ mod tests {
         let dirty = dirty_build(&t, &damage, bleed_on());
         let full = full_build(&t, bleed_on());
         assert_eq!(bg_quads(&dirty), bg_quads(&full));
+    }
+
+    // ----- Trailing partial bottom row (rows_to_render) --------------------
+
+    #[test]
+    fn rows_to_render_exact_multiple_at_rest_is_rows() {
+        // content_h == rows*cell_h, no scroll → no extra rows (legacy).
+        assert_eq!(rows_to_render(10, 0.0, 16.0, 10.0 * 16.0), 10);
+    }
+
+    #[test]
+    fn rows_to_render_partial_at_rest_adds_one_bottom_row() {
+        // Half a cell of leftover at the content bottom → one extra row.
+        assert_eq!(rows_to_render(10, 0.0, 16.0, 10.0 * 16.0 + 8.0), 11);
+    }
+
+    #[test]
+    fn rows_to_render_fractional_scroll_adds_top_row_only() {
+        // Fractional scroll (8px) with exact-multiple content: the top
+        // partial row is added, but the rendered rows already cover the
+        // bottom (covered == rows*16 + 8 ≥ content_h) so no bottom row.
+        assert_eq!(rows_to_render(10, 8.0, 16.0, 10.0 * 16.0), 11);
+    }
+
+    #[test]
+    fn rows_to_render_fractional_scroll_plus_partial_adds_both() {
+        // Fractional scroll AND a bottom remainder larger than the scroll
+        // offset → both the top and bottom partial rows (rows + 2).
+        assert_eq!(rows_to_render(10, 8.0, 16.0, 10.0 * 16.0 + 10.0), 12);
+    }
+
+    #[test]
+    fn rows_to_render_capped_at_rows_plus_two() {
+        // A degenerate content height can't push the count past rows + 2.
+        assert_eq!(rows_to_render(10, 8.0, 16.0, 10_000.0), 12);
+    }
+
+    #[test]
+    fn rows_to_render_degenerate_cell_height_is_base() {
+        // cell_h <= 0 → just the base count (no division).
+        assert_eq!(rows_to_render(10, 0.0, 0.0, 999.0), 10);
+        assert_eq!(rows_to_render(10, 8.0, 0.0, 999.0), 11);
+    }
+
+    #[test]
+    fn rows_to_render_subpixel_leftover_ignored() {
+        // A leftover below COVER_EPS isn't worth an extra row.
+        assert_eq!(rows_to_render(10, 0.0, 16.0, 10.0 * 16.0 + 0.25), 10);
+    }
+
+    #[test]
+    fn partial_bottom_row_renders_scrollback_content() {
+        // 3 visible rows over red scrollback, scrolled back one whole line
+        // so the render row at index == rows holds real content. A content
+        // height of 3.5 cells must emit that trailing partial bottom row's
+        // quads at y == rows*cell_h (it's blank/uncovered without the fix).
+        let mut t = Term::new(3, 4, 100);
+        feed(&mut t, b"\x1b[41m"); // red bg
+        let total = 6u16; // more rows than fit → scrollback below the view
+        for r in 0..total {
+            for _ in 0..4 {
+                feed(&mut t, b" ");
+            }
+            if r + 1 < total {
+                feed(&mut t, b"\r\n");
+            }
+        }
+        t.scroll_view_by(1, 0.0, 16.0); // one whole line into history
+        t.force_snap_view();
+        assert_eq!(t.view_offset_pixel(), 0.0, "whole-line scroll, no sub-px");
+
+        // content_h = 3*16 + 8 (half a cell of leftover).
+        let with_partial = full_build_h(&t, EdgeBleed::default(), 3.0 * 16.0 + 8.0);
+        assert!(
+            bg_quads(&with_partial)
+                .iter()
+                .any(|q| (q.pos[1] - 3.0 * 16.0).abs() < 1e-3),
+            "trailing partial bottom row (y == rows*cell_h) must emit quads"
+        );
+
+        // Grid-exact content height → that row is NOT rendered.
+        let grid_exact = full_build_h(&t, EdgeBleed::default(), 3.0 * 16.0);
+        assert!(
+            !bg_quads(&grid_exact)
+                .iter()
+                .any(|q| (q.pos[1] - 3.0 * 16.0).abs() < 1e-3),
+            "grid-exact height must not render a row at y == rows*cell_h"
+        );
     }
 }

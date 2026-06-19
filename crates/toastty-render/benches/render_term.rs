@@ -190,6 +190,7 @@ impl Harness {
             },
             |_, _| false,
             EdgeBleed::default(),
+            f32::from(term.size().0) * cell_size.1,
         );
         let instances = &self.instances;
 
@@ -331,6 +332,7 @@ impl Harness {
             },
             |_, _| false,
             EdgeBleed::default(),
+            f32::from(term.size().0) * cell_size.1,
         );
         let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
         let n_instances = self.instances.len();

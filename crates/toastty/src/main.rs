@@ -48,7 +48,9 @@ use toastty::mouse::{
 use toastty::paste::wrap_for_paste;
 use toastty::pty_log::{Direction, PtyLogger};
 use toastty::shell::resolve_command;
-use toastty::theme_bridge::{extend_background, scroll_button_corner, theme_from_config};
+use toastty::theme_bridge::{
+    extend_background, grid_align, scroll_button_corner, theme_from_config,
+};
 
 /// Target wake-up cadence while the scrollback viewport is animating.
 /// 16 ms ≈ 60 Hz — fast enough to feel smooth on macOS trackpad
@@ -639,9 +641,11 @@ impl Toastty {
             self.scale_factor,
         );
         let mode = extend_background(self.config.window.extend_background);
+        let align = grid_align(self.config.window.grid_align);
         if let Some(r) = self.renderer.as_mut() {
             r.set_padding(pt, pr, pb, pl); // top, right, bottom, left (physical px)
             r.set_extend_background(mode);
+            r.set_grid_align(align);
         }
     }
 
@@ -993,9 +997,9 @@ impl Toastty {
             osc_52_read: self.config.security.osc_52_read,
             osc_52_write: self.config.security.osc_52_write,
         });
-        // Padding / extend_background are safe to live-apply (render + grid
-        // only, no surface reconfigure). Push them before the grid sync so
-        // the recomputed grid reflects any padding change.
+        // Padding / extend_background / grid_align are safe to live-apply
+        // (render + grid only, no surface reconfigure). Push them before the
+        // grid sync so the recomputed grid reflects any padding change.
         self.push_padding_to_renderer();
         // Font swap may have changed the cell size; recompute the grid
         // so columns/rows still match the window pixels.

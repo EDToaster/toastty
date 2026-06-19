@@ -1001,7 +1001,18 @@ impl Term {
         // scrollback budget, and apps using alt screen typically have
         // their own pager UI.
         if self.alt_active {
-            return self.active_grid().row(idx);
+            let g = self.active_grid();
+            // Guard out-of-range indices: the renderer may probe one row
+            // past the bottom (the trailing partial row when the content
+            // area isn't a whole number of cells tall). `Grid::row` is a
+            // ring-buffer index with no bounds check, so for the alt grid
+            // (`cap == visible_rows`) `row(visible_rows)` would wrap to the
+            // top row. Fall back to the blank row, matching the primary
+            // path below.
+            if idx < g.visible_rows() {
+                return g.row(idx);
+            }
+            return &self.blank_row;
         }
         let lines = self.viewport.current_lines;
         // When there's a sub-row offset we render one extra row at the
@@ -4741,6 +4752,29 @@ mod tests {
         assert_eq!(t.cursor(), saved_before);
         assert_eq!(row_text(&t, 0), "abcd");
         assert_eq!(row_text(&t, 1).trim_end(), "efgh");
+    }
+
+    #[test]
+    fn alt_view_row_past_bottom_is_blank_not_wrapped() {
+        // Regression: the renderer probes one row past the bottom (the
+        // trailing partial row when the content area isn't a whole number
+        // of cells tall). `Grid::row` is an unchecked ring index, and the
+        // alt grid has `cap == visible_rows`, so `view_row(rows)` used to
+        // wrap to the TOP row — the partial bottom row showed a duplicate
+        // of row 0. It must be blank instead.
+        let mut t = Term::new(3, 4, 4);
+        feed(&mut t, b"\x1b[?1049h"); // enter alt
+        assert!(t.is_alt_active());
+        feed(&mut t, b"TOP\r\n\r\nBOT"); // distinct top + bottom content
+        let (rows, _) = t.size();
+        let top: String = t.view_row(0).cells.iter().map(|c| c.ch).collect();
+        assert!(top.starts_with("TOP"), "row 0 should hold the top text");
+        // The row one past the bottom must NOT be a wrapped copy of row 0.
+        let past: String = t.view_row(rows).cells.iter().map(|c| c.ch).collect();
+        assert!(
+            past.trim_end().is_empty(),
+            "view_row(rows) in alt mode must be blank, got {past:?}"
+        );
     }
 
     #[test]

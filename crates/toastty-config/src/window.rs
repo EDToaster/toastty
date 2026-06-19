@@ -32,6 +32,21 @@ pub enum ExtendBackground {
     AltScreen,
 }
 
+/// How to align the cell grid within the content area when the window
+/// isn't an exact multiple of the cell size (so the floor-divided grid
+/// leaves a sub-cell sliver on the right/bottom).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum GridAlign {
+    /// Pin the grid to the top-left; the leftover sliver sits on the
+    /// right and bottom edges (serializes as `"top-left"`).
+    #[default]
+    TopLeft,
+    /// Center the grid; the leftover is split evenly across opposite
+    /// edges.
+    Centered,
+}
+
 /// Window padding (cell-grid inset) in logical pixels, per side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -84,6 +99,9 @@ pub struct WindowConfig {
     pub confirm_close: ConfirmClose,
     /// When to bleed each edge cell's background into the padding.
     pub extend_background: ExtendBackground,
+    /// How to align the cell grid when it doesn't exactly fill the
+    /// content area (partial trailing row/column).
+    pub grid_align: GridAlign,
     /// Cell-grid inset (logical px) per side. Declared LAST so a partial
     /// `[window.padding]` sub-table and TOML field ordering round-trip.
     pub padding: PaddingConfig,
@@ -100,6 +118,7 @@ impl WindowConfig {
             vsync: true,
             confirm_close: ConfirmClose::IfRunningProgram,
             extend_background: ExtendBackground::Never,
+            grid_align: GridAlign::TopLeft,
             padding: PaddingConfig::defaults(),
         }
     }
@@ -137,6 +156,7 @@ mod tests {
             vsync: false,
             confirm_close: ConfirmClose::Always,
             extend_background: ExtendBackground::Always,
+            grid_align: GridAlign::Centered,
             padding: PaddingConfig {
                 top: 1,
                 right: 2,
@@ -147,6 +167,32 @@ mod tests {
         let t = toml::to_string(&w).unwrap();
         let p: WindowConfig = toml::from_str(&t).unwrap();
         assert_eq!(p, w);
+    }
+
+    #[test]
+    fn grid_align_defaults_to_top_left() {
+        assert_eq!(WindowConfig::defaults().grid_align, GridAlign::TopLeft);
+    }
+
+    #[test]
+    fn grid_align_parses_and_serializes_kebab_case() {
+        let cfg: WindowConfig = toml::from_str("grid_align = \"centered\"\n").unwrap();
+        assert_eq!(cfg.grid_align, GridAlign::Centered);
+        // Untouched fields keep their defaults.
+        assert_eq!(cfg.width, 1280);
+
+        let t = toml::to_string(&WindowConfig {
+            grid_align: GridAlign::TopLeft,
+            ..WindowConfig::defaults()
+        })
+        .unwrap();
+        assert!(t.contains("grid_align = \"top-left\""), "{t}");
+    }
+
+    #[test]
+    fn grid_align_invalid_value_rejected() {
+        let r: Result<WindowConfig, _> = toml::from_str("grid_align = \"middle\"\n");
+        assert!(r.is_err());
     }
 
     #[test]

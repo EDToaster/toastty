@@ -39,6 +39,7 @@ height            = 800
 vsync             = true
 confirm_close     = "always"
 extend_background = "alt-screen"
+grid_align        = "centered"
 
 [window.padding]
 top    = 8

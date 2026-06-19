@@ -6,8 +6,10 @@
 //! copy of the same function; the binary's copy is the canonical one.
 
 use toastty_config::ExtendBackground as CfgExtend;
+use toastty_config::GridAlign as CfgGridAlign;
 use toastty_config::{ScrollButtonConfig, ScrollButtonPosition, ThemeConfig};
 use toastty_render::ExtendBackground as RExtend;
+use toastty_render::GridAlign as RGridAlign;
 use toastty_render::ScrollButtonCorner;
 use toastty_render::text::instance::Theme;
 
@@ -35,6 +37,16 @@ pub fn extend_background(mode: CfgExtend) -> RExtend {
         CfgExtend::Never => RExtend::Never,
         CfgExtend::Always => RExtend::Always,
         CfgExtend::AltScreen => RExtend::AltScreen,
+    }
+}
+
+/// Map the `[window]` `grid_align` config knob to the renderer's
+/// alignment enum. Same leaf-crate bridging as [`extend_background`].
+#[must_use]
+pub fn grid_align(mode: CfgGridAlign) -> RGridAlign {
+    match mode {
+        CfgGridAlign::TopLeft => RGridAlign::TopLeft,
+        CfgGridAlign::Centered => RGridAlign::Centered,
     }
 }
 
@@ -99,6 +111,12 @@ mod tests {
         assert_eq!(extend_background(CfgExtend::Never), RExtend::Never);
         assert_eq!(extend_background(CfgExtend::Always), RExtend::Always);
         assert_eq!(extend_background(CfgExtend::AltScreen), RExtend::AltScreen);
+    }
+
+    #[test]
+    fn grid_align_maps_each_variant() {
+        assert_eq!(grid_align(CfgGridAlign::TopLeft), RGridAlign::TopLeft);
+        assert_eq!(grid_align(CfgGridAlign::Centered), RGridAlign::Centered);
     }
 
     #[test]

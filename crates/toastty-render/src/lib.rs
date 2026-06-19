@@ -53,6 +53,7 @@ use crate::text::pipeline::{GlobalsUbo, TextPipeline};
 /// slots from the line cache; missing entries fall through to a
 /// background-only instance (the next frame, after re-shape, will fill
 /// in the glyph).
+#[allow(clippy::too_many_arguments)]
 fn build_term_instances_into(
     out: &mut Vec<CellInstance>,
     term: &Term,
@@ -61,6 +62,7 @@ fn build_term_instances_into(
     ext_palette: &[[f32; 4]; 256],
     row_glyphs: &[Option<LineGlyphs>],
     bleed: EdgeBleed,
+    content_h: f32,
 ) {
     crate::text::instance::build_instances_into(
         out,
@@ -74,6 +76,7 @@ fn build_term_instances_into(
         },
         |line_id, col| term.is_cell_selected(line_id, col),
         bleed,
+        content_h,
     );
 }
 
@@ -341,6 +344,10 @@ pub struct Renderer {
     /// against `Term::is_alt_active()` per frame to a `bool` gate fed into
     /// the instance builders' [`crate::text::instance::EdgeBleed`].
     extend_background: ExtendBackground,
+    /// How the cell grid is aligned within the content area when the
+    /// window isn't a whole number of cells (the floor-divide leftover).
+    /// Shifts `content_origin` and the per-edge bleed split.
+    grid_align: GridAlign,
 }
 
 /// Which corner the scroll-to-bottom button is anchored to. Render-side
@@ -376,6 +383,62 @@ impl ExtendBackground {
         matches!(self, ExtendBackground::Always)
             || (matches!(self, ExtendBackground::AltScreen) && alt)
     }
+}
+
+/// How the cell grid is aligned within the content area when the window
+/// isn't an exact multiple of the cell size. Render-side mirror of
+/// `toastty_config::GridAlign` (the binary bridges the two, same as
+/// [`ExtendBackground`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GridAlign {
+    /// Pin the grid to the content origin (`pad_left`, `pad_top`); the
+    /// floor-divide leftover sits on the right/bottom edges.
+    #[default]
+    TopLeft,
+    /// Center the grid in the content area; the leftover is split evenly
+    /// across opposite edges.
+    Centered,
+}
+
+impl GridAlign {
+    /// Fraction of the per-axis leftover placed on the *leading* (left /
+    /// top) edge. The trailing edge gets the rest. `TopLeft` → 0 (all
+    /// trailing); `Centered` → 0.5 (split evenly).
+    #[must_use]
+    fn leading_fraction(self) -> f32 {
+        match self {
+            GridAlign::TopLeft => 0.0,
+            GridAlign::Centered => 0.5,
+        }
+    }
+}
+
+/// Pure geometry behind [`Renderer::grid_overflow`].
+///
+/// Returns `(rem, lead)`: `rem = [rem_w, rem_h]` is the sub-cell leftover
+/// the floor-divided grid (`floor(content / cell)` cells) leaves over each
+/// axis, and `lead = rem * leading_fraction` is the share assigned to the
+/// leading (left/top) edge. A non-positive cell dimension yields zero
+/// leftover for that axis (degenerate guard — no division).
+#[must_use]
+fn grid_overflow_px(
+    content: (f32, f32),
+    cell: (f32, f32),
+    leading_fraction: f32,
+) -> ([f32; 2], [f32; 2]) {
+    let rem = |c: f32, cell: f32| -> f32 {
+        if cell > 0.0 {
+            c - (c / cell).floor() * cell
+        } else {
+            0.0
+        }
+    };
+    let rem_w = rem(content.0, cell.0);
+    let rem_h = rem(content.1, cell.1);
+    (
+        [rem_w, rem_h],
+        [rem_w * leading_fraction, rem_h * leading_fraction],
+    )
 }
 
 /// Re-export the edge-bleed parameter struct so the binary and tests can
@@ -771,6 +834,7 @@ impl Renderer {
             pad_bottom: 0,
             pad_left: 0,
             extend_background: ExtendBackground::Never,
+            grid_align: GridAlign::TopLeft,
         })
     }
 
@@ -1044,21 +1108,47 @@ impl Renderer {
         self.scroll_button = corner;
     }
 
-    /// Content origin in physical px: `(x = pad_left, y = pad_top)`. This
-    /// is the single source of truth fed into every pipeline's
-    /// `content_origin` uniform. Internal `[f32; 2]` form.
+    /// Floor-divide leftover and per-axis leading-edge offset for the
+    /// current content area, cell size, and [`GridAlign`].
+    ///
+    /// Returns `(rem, lead)` where `rem = [rem_w, rem_h]` is the sub-cell
+    /// sliver the floor-divided grid leaves uncovered, and `lead =
+    /// [lead_x, lead_y]` is how far the grid's leading (left/top) edge is
+    /// pushed in from the content origin: `0` for `TopLeft`, `rem/2` for
+    /// `Centered`. The trailing edge gets `rem - lead`.
+    ///
+    /// Cell-size-derived (no `Term` needed) so the mouse hit-test path can
+    /// call it; `cols/rows = floor(content / cell)` matches the grid the
+    /// binary sizes via `grid_dims_from_pixels`.
+    #[must_use]
+    fn grid_overflow(&self, cell: (f32, f32)) -> ([f32; 2], [f32; 2]) {
+        grid_overflow_px(
+            self.content_dims(cell),
+            cell,
+            self.grid_align.leading_fraction(),
+        )
+    }
+
+    /// Content origin in physical px fed into every pipeline's
+    /// `content_origin` uniform. `(pad_left, pad_top)` plus the
+    /// [`GridAlign`] leading offset (zero unless the grid is centered).
+    /// Internal `[f32; 2]` form.
     #[must_use]
     fn content_origin(&self) -> [f32; 2] {
+        let (_, lead) = self.grid_overflow(self.cell_size());
         #[allow(clippy::cast_precision_loss)]
         {
-            [self.pad_left as f32, self.pad_top as f32]
+            [
+                self.pad_left as f32 + lead[0],
+                self.pad_top as f32 + lead[1],
+            ]
         }
     }
 
-    /// Public content-origin getter (physical px, `(x = pad_left, y =
-    /// pad_top)`) for the mouse hit-test path. Single source of truth
-    /// shared by rendering and hit-testing — the binary reads it back
-    /// rather than re-deriving the origin.
+    /// Public content-origin getter (physical px) for the mouse hit-test
+    /// path. Single source of truth shared by rendering and hit-testing —
+    /// the binary reads it back rather than re-deriving the origin (so a
+    /// centered grid's offset is honored by hit-testing too).
     #[must_use]
     pub fn content_origin_px(&self) -> (f32, f32) {
         let o = self.content_origin();
@@ -1103,6 +1193,16 @@ impl Renderer {
     pub fn set_extend_background(&mut self, mode: ExtendBackground) {
         if self.extend_background != mode {
             self.extend_background = mode;
+            self.needs_full_clear = true;
+        }
+    }
+
+    /// Set how the cell grid is aligned within the content area. Forces a
+    /// full clear only on an actual change (the origin shift moves every
+    /// cell, so a partial redraw can't overpaint the old positions).
+    pub fn set_grid_align(&mut self, align: GridAlign) {
+        if self.grid_align != align {
+            self.grid_align = align;
             self.needs_full_clear = true;
         }
     }
@@ -1777,6 +1877,11 @@ impl Renderer {
         };
 
         let (rows, _) = term.size();
+        // Content (grid) pixel dims drive both how many rows we shape +
+        // render (the trailing partial bottom row) and the edge-bleed
+        // extent. Computed before the `&mut self.text` borrow below so the
+        // `&self` method calls don't conflict.
+        let content_dims = self.content_dims(self.cell_size());
         let cell_size;
         let atlas_dims;
         {
@@ -1784,21 +1889,28 @@ impl Renderer {
             cell_size = text.rasterizer.cell_size();
             atlas_dims = text.rasterizer.atlas_dims();
 
-            // Resize the row-shape cache. We always allocate one extra
-            // slot beyond `rows` so the renderer can shape the partial
-            // top row during sub-pixel scrolling without reallocating.
-            // Growth is dirty (new entries are `None`); shrinking just
-            // drops old slots.
-            let cache_len = rows as usize + 1;
+            // Resize the row-shape cache. We allocate two extra slots
+            // beyond `rows`: one for the partial *top* row during sub-pixel
+            // scrolling, one for the partial *bottom* row when the content
+            // area isn't a whole number of cells tall. Sizing for the worst
+            // case avoids reallocation churn as the scroll offset crosses
+            // cell boundaries. Growth is dirty (new entries are `None`);
+            // shrinking just drops old slots.
+            let cache_len = rows as usize + 2;
             if text.line_cache.len() != cache_len {
                 text.line_cache.resize(cache_len, None);
             }
 
-            // Number of rows to actually render this frame: one extra
-            // when there's a sub-row pixel offset (the partial top row
-            // that hangs above y=0).
-            let pixel_extra: u16 = if term.view_offset_pixel() > 0.0 { 1 } else { 0 };
-            let rows_rendered = rows + pixel_extra;
+            // Number of rows to render this frame: content rows, plus the
+            // partial top row (sub-row pixel offset) and the trailing
+            // partial bottom row (floor-divided grid leftover). See
+            // [`crate::text::instance::rows_to_render`].
+            let rows_rendered = crate::text::instance::rows_to_render(
+                rows,
+                term.view_offset_pixel(),
+                cell_size.1,
+                content_dims.1,
+            );
 
             // Re-shape only dirty rows; reuse cached `LineGlyphs` for
             // the rest. The atlas itself never shrinks, so a clean row's
@@ -1883,6 +1995,17 @@ impl Renderer {
         }
 
         let theme = self.theme;
+        // Floor-divided grid leftover: the content area can be wider/taller
+        // than a whole number of cells, leaving an uncovered sliver. When
+        // bleed is on, the edge cells must reach the *window* edge, not
+        // just the next cell boundary — so each edge's bleed distance is
+        // `padding + its share of the leftover`. The leading (left/top)
+        // share is the `GridAlign` offset already baked into the content
+        // origin; the trailing (right/bottom) share is the rest. For
+        // `TopLeft` the whole leftover is trailing; for `Centered` it's
+        // split evenly, matching the centered origin. Same `grid_overflow`
+        // the origin uses, so the two stay consistent.
+        let ([rem_w, rem_h], [lead_x, lead_y]) = self.grid_overflow(cell_size);
         // Resolve the edge-bleed gate once here, where `Term` and config
         // meet. `pad` ordering is [top, right, bottom, left] (matching
         // EdgeBleed::{TOP,RIGHT,BOTTOM,LEFT} / set_padding) — distinct
@@ -1892,19 +2015,18 @@ impl Renderer {
         let bleed = EdgeBleed {
             enabled: self.extend_background.active(term.is_alt_active()),
             pad: [
-                self.pad_top as f32,
-                self.pad_right as f32,
-                self.pad_bottom as f32,
-                self.pad_left as f32,
+                self.pad_top as f32 + lead_y,
+                self.pad_right as f32 + (rem_w - lead_x),
+                self.pad_bottom as f32 + (rem_h - lead_y),
+                self.pad_left as f32 + lead_x,
             ],
         };
-        // Precompute the content dims/origin + full surface here, before
-        // the `&mut self.text` borrow below — the overlay/scroll-button
-        // call sites can't call `self.content_dims()`/`content_origin()`
-        // (which borrow `&self`) while `text` aliases `self.text`. All by
-        // value (Copy).
+        // Precompute the content origin + full surface here, before the
+        // `&mut self.text` borrow below — the overlay/scroll-button call
+        // sites can't call `self.content_origin()` (which borrows `&self`)
+        // while `text` aliases `self.text`. `content_dims` is computed
+        // above the shape loop. All by value (Copy).
         let content_origin = self.content_origin();
-        let content_dims = self.content_dims(cell_size);
         let surface_dims = (self.config.width, self.config.height);
         // Build instances using the cached row glyphs. Reuse the
         // scratch vec across frames. We have to temporarily extract
@@ -1946,6 +2068,7 @@ impl Renderer {
                 ext_palette,
                 &text.line_cache,
                 bleed,
+                content_dims.1,
             );
             if !cursor_visible {
                 instances.pop();
@@ -3044,5 +3167,75 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    // ----- Grid alignment geometry -----------------------------------------
+
+    #[test]
+    fn grid_align_leading_fraction() {
+        assert_eq!(GridAlign::default(), GridAlign::TopLeft);
+        assert_eq!(GridAlign::TopLeft.leading_fraction(), 0.0);
+        assert_eq!(GridAlign::Centered.leading_fraction(), 0.5);
+    }
+
+    #[test]
+    fn grid_overflow_top_left_puts_all_leftover_trailing() {
+        // 805×605 content, 10×20 cells → 80×30 grid, leftover (5, 5).
+        let (rem, lead) = grid_overflow_px((805.0, 605.0), (10.0, 20.0), 0.0);
+        assert!((rem[0] - 5.0).abs() < 1e-3, "rem_w");
+        assert!((rem[1] - 5.0).abs() < 1e-3, "rem_h");
+        // TopLeft: nothing on the leading edge.
+        assert_eq!(lead, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn grid_overflow_centered_splits_leftover() {
+        let (rem, lead) = grid_overflow_px((805.0, 605.0), (10.0, 20.0), 0.5);
+        assert!((rem[0] - 5.0).abs() < 1e-3);
+        assert!((rem[1] - 5.0).abs() < 1e-3);
+        // Centered: half the leftover leads, half trails.
+        assert!((lead[0] - 2.5).abs() < 1e-3, "lead_x");
+        assert!((lead[1] - 2.5).abs() < 1e-3, "lead_y");
+    }
+
+    #[test]
+    fn grid_overflow_exact_multiple_is_zero() {
+        let (rem, lead) = grid_overflow_px((800.0, 600.0), (10.0, 20.0), 0.5);
+        assert_eq!(rem, [0.0, 0.0]);
+        assert_eq!(lead, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn grid_overflow_degenerate_cell_is_zero() {
+        // Zero cell size must not divide-by-zero / produce NaN.
+        let (rem, lead) = grid_overflow_px((805.0, 605.0), (0.0, 0.0), 0.5);
+        assert_eq!(rem, [0.0, 0.0]);
+        assert_eq!(lead, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn grid_overflow_edges_reach_window_on_both_sides() {
+        // The invariant the bleed relies on: leading bleed + grid span +
+        // trailing bleed == content span + both pads == surface span, for
+        // ANY alignment. Verify for TopLeft and Centered.
+        const PAD_L: f32 = 4.0;
+        const PAD_R: f32 = 7.0;
+        let content_w = 805.0_f32;
+        let cell_w = 10.0_f32;
+        let cols = (content_w / cell_w).floor(); // 80
+        let surface_w = content_w + PAD_L + PAD_R;
+        for frac in [0.0_f32, 0.5] {
+            let ([rem_w, _], [lead_x, _]) =
+                grid_overflow_px((content_w, 600.0), (cell_w, 20.0), frac);
+            // Origin offset from window left = pad_left + leading share.
+            let left_bleed = PAD_L + lead_x;
+            // Trailing share + right pad.
+            let right_bleed = PAD_R + (rem_w - lead_x);
+            let spanned = left_bleed + cols * cell_w + right_bleed;
+            assert!(
+                (spanned - surface_w).abs() < 1e-3,
+                "frac={frac}: spanned {spanned} != surface {surface_w}"
+            );
+        }
     }
 }
