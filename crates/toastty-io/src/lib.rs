@@ -20,6 +20,7 @@
 
 use std::io::{self, ErrorKind, Read};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use mio::unix::SourceFd;
@@ -244,6 +245,185 @@ fn drain_into_proxy<S: EventSink>(file: &mut std::fs::File, sink: &S) -> DrainRe
 
 fn is_eio(e: &io::Error) -> bool {
     e.raw_os_error() == Some(libc::EIO)
+}
+
+// ============================================================================
+// PTY writer
+// ============================================================================
+
+/// Handle to the background PTY-writer thread. Enqueue bytes with
+/// [`PtyWriter::send`]; a dedicated thread drains the queue to the PTY
+/// master in order.
+///
+/// Why a thread instead of writing on the caller's thread: the PTY master
+/// is non-blocking (the reader dups it and sets `O_NONBLOCK`, and `dup`
+/// shares the open file description, so the write fd is non-blocking too).
+/// A single `write()` to the tty accepts at most one input-ring's worth of
+/// bytes (~1 KiB on macOS) and returns a short count — the rest is lost if
+/// the caller ignores it. That silently truncated large pastes, dropping
+/// the bracketed-paste terminator `\x1b[201~` and wedging the app in
+/// paste-collect mode. Looping the write on the UI thread would instead
+/// freeze the window whenever the child stalls its stdin. This thread does
+/// the looping off the UI thread: it writes all queued bytes in order,
+/// parking on `poll(POLLOUT)` when the ring is full, so delivery is
+/// complete and ordered without ever blocking rendering.
+#[derive(Debug)]
+pub struct PtyWriter {
+    /// `Option` so `Drop` can drop the `Sender` — closing the channel and
+    /// unblocking the thread's `rx.iter()` — *before* joining. Joining
+    /// first would deadlock: the thread parks in `recv` until the channel
+    /// closes, but the channel only closes when this field drops.
+    tx: Option<Sender<Vec<u8>>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl PtyWriter {
+    /// Enqueue `bytes` for delivery to the PTY. Never blocks. Bytes are
+    /// written in call order; each call's payload is written contiguously.
+    /// A no-op if the writer thread has already exited (PTY closed).
+    pub fn send(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let Some(tx) = self.tx.as_ref() else {
+            return;
+        };
+        if tx.send(bytes.to_vec()).is_err() {
+            warn!("pty-writer thread gone; dropping {} bytes", bytes.len());
+        }
+    }
+}
+
+impl Drop for PtyWriter {
+    fn drop(&mut self) {
+        // Close the channel FIRST so the thread's `rx.iter()` returns and
+        // the loop exits; then join. (If the thread is instead parked in
+        // `poll(POLLOUT)` mid-write because the child stalled, closing the
+        // PTY — which the caller does before dropping us — delivers POLLHUP
+        // and unblocks it too.)
+        self.tx.take();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Spawn the background writer thread for the PTY master `fd`.
+///
+/// Like the reader, this dups `fd` so it owns its own copy. Returns a
+/// [`PtyWriter`] handle whose [`send`](PtyWriter::send) enqueues bytes.
+///
+/// # Errors
+///
+/// Returns `io::Error` only if the initial `dup` fails. Once running, a
+/// terminal write error (e.g. `EIO` after the child exits) makes the
+/// thread exit; further `send`s become no-ops.
+pub fn spawn_pty_writer(fd: BorrowedFd<'_>) -> io::Result<PtyWriter> {
+    let raw = fd.as_raw_fd();
+    // SAFETY: `raw` is a valid open fd from the caller's `BorrowedFd`.
+    let duped_raw = unsafe { libc::dup(raw) };
+    if duped_raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `duped_raw` is a fresh fd we own from the libc::dup above.
+    let owned = unsafe { OwnedFd::from_raw_fd(duped_raw) };
+
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let handle = thread::Builder::new()
+        .name("toastty-io::pty-writer".into())
+        .spawn(move || write_loop(owned, &rx))?;
+
+    Ok(PtyWriter {
+        tx: Some(tx),
+        handle: Some(handle),
+    })
+}
+
+fn write_loop(owned: OwnedFd, rx: &Receiver<Vec<u8>>) {
+    let raw = owned.as_raw_fd();
+    debug!("toastty-io::pty-writer started");
+    // Blocks until the next payload is queued; ends when the Sender drops.
+    for chunk in rx.iter() {
+        if !write_all_blocking(raw, &chunk) {
+            // Terminal error (PTY closed). Drain remaining sends without
+            // writing so producers don't wedge on a full channel, then exit.
+            debug!("pty-writer: master closed; exiting");
+            return;
+        }
+    }
+    debug!("toastty-io::pty-writer stopped");
+}
+
+/// Write every byte of `buf` to the non-blocking fd `raw`, parking on
+/// `poll(POLLOUT)` whenever the tty input ring is full. Returns `false` on
+/// a terminal error (the caller should stop), `true` once all bytes land.
+fn write_all_blocking(raw: i32, buf: &[u8]) -> bool {
+    let mut off = 0;
+    while off < buf.len() {
+        // SAFETY: raw is a valid open fd; the slice is in-bounds.
+        let n = unsafe {
+            libc::write(
+                raw,
+                buf[off..].as_ptr().cast(),
+                buf.len() - off,
+            )
+        };
+        if n > 0 {
+            off += n as usize;
+            continue;
+        }
+        if n == 0 {
+            // Shouldn't happen for a tty; treat as no progress and wait.
+            if !wait_writable(raw) {
+                return false;
+            }
+            continue;
+        }
+        let err = io::Error::last_os_error();
+        match err.kind() {
+            ErrorKind::WouldBlock => {
+                if !wait_writable(raw) {
+                    return false;
+                }
+            }
+            ErrorKind::Interrupted => {}
+            _ => {
+                // EIO once the slave is gone, or any other hard error.
+                warn!("pty-writer write failed: {err}");
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Block until `raw` is writable (or hung up). Returns `false` if the fd
+/// hung up / errored so the caller can stop.
+fn wait_writable(raw: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: raw,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: pfd points to one valid pollfd; -1 == wait indefinitely.
+        let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            warn!("pty-writer poll failed: {err}");
+            return false;
+        }
+        // POLLHUP / POLLERR / POLLNVAL mean the master is gone.
+        if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            return false;
+        }
+        if pfd.revents & libc::POLLOUT != 0 {
+            return true;
+        }
+    }
 }
 
 #[cfg(test)]

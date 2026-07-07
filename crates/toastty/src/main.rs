@@ -240,6 +240,13 @@ struct Toastty {
     /// `JoinHandle` for the mio reader; held so we don't drop it. The
     /// thread exits on its own when the PTY closes or the proxy goes away.
     reader: Option<std::thread::JoinHandle<()>>,
+    /// Background writer that drains queued bytes to the PTY master in
+    /// order. Routing writes through here (instead of a direct
+    /// `Pty::write`) guarantees the whole payload lands even when the
+    /// non-blocking master's input ring is full — a single `write()` caps
+    /// at ~1 KiB, so large pastes were silently truncated, losing the
+    /// bracketed-paste terminator. See [`toastty_io::PtyWriter`].
+    pty_writer: Option<toastty_io::PtyWriter>,
     /// Most recent physical pixel size — kept so we can re-derive the
     /// cell grid on resize.
     physical_size: (u32, u32),
@@ -386,6 +393,7 @@ impl Toastty {
             term,
             pty: None,
             reader: None,
+            pty_writer: None,
             physical_size: initial_size,
             // Real value is read from the window in `init_impl`; 1.0 is a
             // safe pre-window default.
@@ -481,10 +489,13 @@ impl Toastty {
 
     fn write_pty(&mut self, bytes: &[u8]) {
         self.pty_log.log(Direction::ToApp, bytes);
-        if let Some(pty) = self.pty.as_ref()
-            && let Err(e) = pty.write(bytes)
-        {
-            warn!("pty write failed: {e}");
+        // Enqueue on the writer thread rather than calling `Pty::write`
+        // directly: the master is non-blocking, so a lone `write()` only
+        // accepts one tty-ring's worth (~1 KiB) and drops the rest. The
+        // writer loops over short writes off the UI thread, so the full
+        // payload — bracketed-paste terminator included — always lands.
+        if let Some(w) = self.pty_writer.as_ref() {
+            w.send(bytes);
         }
     }
 
@@ -933,11 +944,23 @@ impl Toastty {
             }
         };
 
+        // Spawn the writer thread on the same master fd. All PTY writes
+        // (keystrokes, pastes, OSC replies, mouse reports) funnel through
+        // it so no payload is ever truncated by the non-blocking master.
+        let writer = match toastty_io::spawn_pty_writer(pty.master_fd()) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!("pty writer spawn failed: {e}");
+                return;
+            }
+        };
+
         // `self.renderer` was installed earlier (before the grid sync); only
         // the window / pty / reader remain to be stored here.
         self.window = Some(window);
         self.pty = Some(pty);
         self.reader = Some(reader);
+        self.pty_writer = Some(writer);
 
         // Install hot-reload watcher on the resolved config path
         // (even if the file doesn't currently exist — the parent dir
