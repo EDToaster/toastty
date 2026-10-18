@@ -29,6 +29,8 @@ pub mod image;
 pub mod rgp;
 pub mod surface_format;
 pub mod text;
+#[cfg(test)]
+mod test_gpu;
 
 use std::time::{Duration, Instant};
 

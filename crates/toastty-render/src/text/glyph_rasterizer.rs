@@ -1359,29 +1359,11 @@ fn upload_glyph_pixels(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{instance_descriptor, instance_flags_for_tests};
-    use pollster::block_on;
-    use wgpu::{DeviceDescriptor, PowerPreference, RequestAdapterOptions};
 
     const TEST_FONT: &[u8] = include_bytes!("../../fonts/FiraMono-Medium.ttf");
 
     fn make_rasterizer() -> (Device, Queue, GlyphRasterizer) {
-        let instance = wgpu::Instance::new(instance_descriptor(instance_flags_for_tests()));
-        let adapter = block_on(instance.request_adapter(&RequestAdapterOptions {
-            power_preference: PowerPreference::LowPower,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        }))
-        .expect("no GPU adapter for test");
-        let (device, queue) = block_on(adapter.request_device(&DeviceDescriptor {
-            label: Some("char_cache test device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
-            memory_hints: wgpu::MemoryHints::Performance,
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            trace: wgpu::Trace::Off,
-        }))
-        .expect("device request failed");
+        let (device, queue) = crate::test_gpu::device_and_queue();
         let rasterizer = GlyphRasterizer::new(
             &device,
             16.0,

@@ -7,8 +7,8 @@
 #![allow(dead_code)] // each integration test file uses a subset
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use image::RgbaImage;
 use image_compare::Algorithm;
@@ -32,25 +32,36 @@ pub(crate) const SNAPSHOT_DIR: &str = "tests/snapshots";
 /// (which requires a real window surface).
 const TEST_FONT: &[u8] = include_bytes!("../../fonts/FiraMono-Medium.ttf");
 
+/// One device per test binary. Tests in a file run on parallel threads,
+/// and creating several wgpu instances/devices at once intermittently
+/// segfaults Mesa's software Vulkan driver (lavapipe) on headless CI.
+fn shared_device() -> (wgpu::Device, wgpu::Queue) {
+    static GPU: OnceLock<(wgpu::Device, wgpu::Queue)> = OnceLock::new();
+    GPU.get_or_init(|| {
+        let instance = wgpu::Instance::new(instance_descriptor(instance_flags_for_tests()));
+        let adapter = block_on(instance.request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::LowPower,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))
+        .expect("no GPU adapter");
+        block_on(adapter.request_device(&DeviceDescriptor {
+            label: Some("text-snapshot device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            trace: wgpu::Trace::Off,
+        }))
+        .expect("device request")
+    })
+    .clone()
+}
+
 /// Render `term` into a `width × height` RGBA8 image, headless.
 #[allow(clippy::too_many_lines)] // test harness — clarity > brevity
 pub(crate) fn render_term_offscreen(term: &Term, width: u32, height: u32) -> RgbaImage {
-    let instance = wgpu::Instance::new(instance_descriptor(instance_flags_for_tests()));
-    let adapter = block_on(instance.request_adapter(&RequestAdapterOptions {
-        power_preference: PowerPreference::LowPower,
-        force_fallback_adapter: false,
-        compatible_surface: None,
-    }))
-    .expect("no GPU adapter");
-    let (device, queue) = block_on(adapter.request_device(&DeviceDescriptor {
-        label: Some("text-snapshot device"),
-        required_features: wgpu::Features::empty(),
-        required_limits: wgpu::Limits::downlevel_defaults(),
-        memory_hints: wgpu::MemoryHints::Performance,
-        experimental_features: wgpu::ExperimentalFeatures::disabled(),
-        trace: wgpu::Trace::Off,
-    }))
-    .expect("device request");
+    let (device, queue) = shared_device();
 
     // Offscreen render target. RGBA8 (not sRGB) so saved PNG bytes are
     // directly comparable across runs without sRGB-decode drift.
