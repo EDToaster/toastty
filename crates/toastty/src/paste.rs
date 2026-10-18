@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn empty_string_unbracketed() {
-        assert!(wrap_for_paste("", false).is_empty());
+        assert_eq!(wrap_for_paste("", false), Vec::<u8>::new());
     }
 
     #[test]
