@@ -17,7 +17,9 @@ struct Chip {
     scale: f32,
     // Global opacity (fade in / out), 0..1.
     alpha: f32,
-    _pad: f32,
+    // Icon: 0 = down chevron (scroll-to-bottom), 1 = copy (two
+    // overlapping rounded squares, the rich block "Copy Markdown" chip).
+    icon_kind: f32,
     fill: vec4<f32>,
     border: vec4<f32>,
     icon: vec4<f32>,
@@ -62,6 +64,12 @@ fn seg_dist(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
     return length(pa - ba * h);
 }
 
+// Signed distance to a rounded box of half-size `b`, corner radius `r`.
+fn round_box(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
+    let q = abs(p) - b + vec2<f32>(r, r);
+    return length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
 // Straight-alpha "src over dst" on premultiplied accumulators.
 fn over(dst: vec4<f32>, rgb: vec3<f32>, a: f32) -> vec4<f32> {
     return vec4<f32>(rgb * a + dst.rgb * (1.0 - a), a + dst.a * (1.0 - a));
@@ -87,7 +95,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let b = vec2<f32>(0.0, s * 0.5) + o;
     let c = vec2<f32>(s, -s * 0.5) + o;
     let hw = 0.9 * chip.scale;
-    let cd = min(seg_dist(rel, a, b), seg_dist(rel, b, c)) - hw;
+    var cd = min(seg_dist(rel, a, b), seg_dist(rel, b, c)) - hw;
+    if chip.icon_kind > 0.5 {
+        // Copy icon: a front square outline and the visible part of a
+        // back one, offset up-left.
+        let h = chip.radius * 0.26;
+        let off = chip.radius * 0.13;
+        let rr = chip.radius * 0.07;
+        let front = abs(round_box(rel - vec2<f32>(off, off), vec2<f32>(h, h), rr)) - hw;
+        let back_sd = round_box(rel + vec2<f32>(off, off), vec2<f32>(h, h), rr);
+        let front_fill = round_box(rel - vec2<f32>(off, off), vec2<f32>(h, h), rr);
+        // Hide the back outline where the front square covers it.
+        let back = max(abs(back_sd) - hw, -(front_fill - hw));
+        cd = min(front, back);
+    }
     let icon = clamp(0.5 - cd, 0.0, 1.0) * disc;
 
     var acc = vec4<f32>(chip.fill.rgb * chip.fill.a * disc, chip.fill.a * disc);

@@ -393,6 +393,14 @@ pub struct Renderer {
     /// The chip was composited into the previous frame, so its pixels
     /// must be cleared even if it is now fully faded out.
     chip_drawn_last: bool,
+    /// Rich block "Copy Markdown" chip: the view row where the hovered
+    /// block's first visible row is drawn (`None` = hidden).
+    rich_chip: Option<u16>,
+    /// Pointer is over the "Copy Markdown" chip.
+    rich_chip_hover: bool,
+    /// Separate chip pipeline (own uniform buffer) for the copy chip, so
+    /// it can be drawn in the same pass as the scroll chip.
+    rich_chip_pipeline: Option<ChipPipeline>,
     /// Window-padding insets in **physical px** (the binary pre-scales
     /// logical px by `scale_factor`). The content grid is inset by these
     /// from the full surface (`config.width`/`config.height`, which always
@@ -1010,6 +1018,9 @@ impl Renderer {
             chip_hover: false,
             chip_fade: ChipFade::default(),
             chip_drawn_last: false,
+            rich_chip: None,
+            rich_chip_hover: false,
+            rich_chip_pipeline: None,
             pad_top: 0,
             pad_right: 0,
             pad_bottom: 0,
@@ -1099,6 +1110,9 @@ impl Renderer {
         // pipeline shares the swapchain format.
         if self.image_pipeline.is_none() {
             self.image_pipeline = Some(ImagePipeline::new(&self.device, self.config.format));
+        }
+        if self.rich_chip_pipeline.is_none() {
+            self.rich_chip_pipeline = Some(ChipPipeline::new(&self.device, self.config.format));
         }
         if self.chip_pipeline.is_none() {
             self.chip_pipeline = Some(ChipPipeline::new(&self.device, self.config.format));
@@ -1924,6 +1938,41 @@ impl Renderer {
         chip::chip_geometry(self.content_origin(), dims, self.ui_scale, corner)
     }
 
+    /// Show the rich block "Copy Markdown" chip for a block whose first
+    /// visible row is view row `top_row` (`None` hides it); `hovered`
+    /// brightens it. Returns `true` when anything changed (redraw).
+    pub fn set_rich_chip(&mut self, top_row: Option<u16>, hovered: bool) -> bool {
+        let hovered = hovered && top_row.is_some();
+        if top_row == self.rich_chip && hovered == self.rich_chip_hover {
+            return false;
+        }
+        self.rich_chip = top_row;
+        self.rich_chip_hover = hovered;
+        self.needs_full_clear = true;
+        true
+    }
+
+    fn rich_chip_geometry(&self, term: &Term) -> Option<chip::ChipGeometry> {
+        let row = self.rich_chip?;
+        let cell = self.cell_size();
+        let view_pixel = term.view_offset_pixel();
+        let y_translate = if view_pixel > 0.0 {
+            view_pixel - cell.1
+        } else {
+            0.0
+        };
+        let top = f32::from(row) * cell.1 + y_translate;
+        let dims = self.content_dims(cell);
+        chip::copy_chip_geometry(self.content_origin(), dims, self.ui_scale, top)
+    }
+
+    /// Hit rect `[x0, y0, x1, y1]` (physical px) of the "Copy Markdown"
+    /// chip, when shown. See [`Self::set_rich_chip`].
+    #[must_use]
+    pub fn rich_chip_rect(&self, term: &Term) -> Option<[f32; 4]> {
+        self.rich_chip_geometry(term).map(|g| g.hit_rect)
+    }
+
     /// Pixel-space hit rect `[x0, y0, x1, y1]` of the scroll-to-bottom
     /// chip when it is currently visible — i.e. enabled via
     /// [`Self::set_scroll_button`] AND `term` is scrolled back into the
@@ -2184,6 +2233,10 @@ impl Renderer {
         // partial (LoadOp::Load) frame would stack them on last frame's
         // pixels. Repaint everything while blocks are (or just were) shown.
         if rich_active || self.rich_drawn_last {
+            self.needs_full_clear = true;
+            term.mark_all_dirty();
+        }
+        if self.rich_chip.is_some() {
             self.needs_full_clear = true;
             term.mark_all_dirty();
         }
@@ -3106,6 +3159,17 @@ impl Renderer {
             {
                 let colors = chip::chip_colors(self.theme.bg, self.theme.fg, self.chip_hover);
                 let uniform = ChipUniform::new(viewport, &geom, self.ui_scale, chip_alpha, &colors);
+                chip_pipe.render(&self.queue, &mut rp, &uniform);
+            }
+
+            // 7. rich block "Copy Markdown" chip.
+            if self.close_prompt.is_none()
+                && let Some(chip_pipe) = self.rich_chip_pipeline.as_ref()
+                && let Some(geom) = self.rich_chip_geometry(term)
+            {
+                let colors = chip::chip_colors(self.theme.bg, self.theme.fg, self.rich_chip_hover);
+                let uniform = ChipUniform::new(viewport, &geom, self.ui_scale, 1.0, &colors)
+                    .with_icon(chip::pipeline::ICON_COPY);
                 chip_pipe.render(&self.queue, &mut rp, &uniform);
             }
         }
