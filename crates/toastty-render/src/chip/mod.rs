@@ -74,6 +74,41 @@ pub fn chip_geometry(
     })
 }
 
+/// Gap between the "Copy Markdown" chip and the block's top / the
+/// content's right edge, in logical px.
+pub const COPY_CHIP_MARGIN: f32 = 6.0;
+
+/// Where the rich block "Copy Markdown" chip goes: the top-right corner
+/// of the block, whose first visible row starts `block_top` px below
+/// the content top (negative when it begins above the viewport, in
+/// which case the chip sticks to the content top). `None` when the
+/// content area can't fit it.
+#[must_use]
+pub fn copy_chip_geometry(
+    origin: [f32; 2],
+    dims: (f32, f32),
+    scale: f32,
+    block_top: f32,
+) -> Option<ChipGeometry> {
+    if !(scale.is_finite() && scale > 0.0 && block_top.is_finite()) {
+        return None;
+    }
+    let radius = CHIP_DIAMETER * 0.5 * scale;
+    let margin = COPY_CHIP_MARGIN * scale;
+    let need = 2.0 * (radius + margin);
+    if !(dims.0 >= need && dims.1 >= need) {
+        return None;
+    }
+    let cx = origin[0] + dims.0 - margin - radius;
+    let cy = origin[1] + block_top.max(0.0) + margin + radius;
+    let reach = radius + CHIP_HIT_SLOP * scale;
+    Some(ChipGeometry {
+        center: [cx, cy],
+        radius,
+        hit_rect: [cx - reach, cy - reach, cx + reach, cy + reach],
+    })
+}
+
 /// Straight-alpha colours for the chip's fill, ring and chevron.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ChipColors {
@@ -220,6 +255,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(g.center, [5.0 + 10.0 + 14.0, 7.0 + 200.0 - 24.0]);
+    }
+
+    #[test]
+    fn copy_chip_sits_at_block_top_right() {
+        let g = copy_chip_geometry([4.0, 2.0], (800.0, 480.0), 1.0, 32.0).unwrap();
+        assert_eq!(
+            g.center,
+            [4.0 + 800.0 - 6.0 - 14.0, 2.0 + 32.0 + 6.0 + 14.0]
+        );
+        // A block starting above the viewport pins the chip to the top.
+        let g = copy_chip_geometry([0.0, 0.0], (800.0, 480.0), 2.0, -50.0).unwrap();
+        assert_eq!(g.center, [800.0 - 12.0 - 28.0, 12.0 + 28.0]);
+        assert!(copy_chip_geometry([0.0, 0.0], (30.0, 480.0), 1.0, 0.0).is_none());
+        assert!(copy_chip_geometry([0.0, 0.0], (800.0, 480.0), 1.0, f32::NAN).is_none());
     }
 
     #[test]

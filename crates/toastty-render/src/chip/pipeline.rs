@@ -10,6 +10,11 @@ use std::num::NonZeroU64;
 use super::{ChipColors, ChipGeometry};
 
 /// Mirror of the WGSL `Chip` uniform (80 bytes, std140-compatible).
+/// Down chevron (scroll-to-bottom chip).
+pub const ICON_CHEVRON: f32 = 0.0;
+/// Two overlapping squares (rich block "Copy Markdown" chip).
+pub const ICON_COPY: f32 = 1.0;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct ChipUniform {
@@ -18,7 +23,8 @@ pub struct ChipUniform {
     pub radius: f32,
     pub scale: f32,
     pub alpha: f32,
-    pub pad: f32,
+    /// Icon selector: [`ICON_CHEVRON`] or [`ICON_COPY`].
+    pub icon_kind: f32,
     pub fill: [f32; 4],
     pub border: [f32; 4],
     pub icon: [f32; 4],
@@ -40,11 +46,18 @@ impl ChipUniform {
             radius: geom.radius,
             scale,
             alpha: alpha.clamp(0.0, 1.0),
-            pad: 0.0,
+            icon_kind: ICON_CHEVRON,
             fill: colors.fill,
             border: colors.border,
             icon: colors.icon,
         }
+    }
+
+    /// Same uniform with a different icon.
+    #[must_use]
+    pub fn with_icon(mut self, icon_kind: f32) -> Self {
+        self.icon_kind = icon_kind;
+        self
     }
 }
 

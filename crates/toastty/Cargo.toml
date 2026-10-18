@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22"
 # `wayland-data-control` makes arboard use the native Wayland clipboard
 # (wl_data_control) when WAYLAND_DISPLAY is set, falling back to X11
 # otherwise. Without it arboard only speaks X11, which can't read a
@@ -30,6 +31,7 @@ webbrowser = "1"
 
 toastty-config.workspace = true
 toastty-io.workspace = true
+toastty-markdown.workspace = true
 toastty-parser.workspace = true
 toastty-protocols.workspace = true
 toastty-pty.workspace = true

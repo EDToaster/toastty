@@ -18,6 +18,8 @@ pub mod font_zoom;
 pub mod geometry;
 pub mod keyboard;
 pub mod links;
+pub mod markdown;
+pub mod md_cmd;
 pub mod mouse;
 pub mod paste;
 pub mod pty_log;

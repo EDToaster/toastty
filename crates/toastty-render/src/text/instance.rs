@@ -943,7 +943,7 @@ where
 /// `bottom_id - shift - (rows - 1 - r)` math and returns `None` when
 /// the computed id would underflow (a defensive guard — under normal
 /// operation `bottom_id` is initialized so this never happens).
-fn line_id_for_render_row(
+pub(crate) fn line_id_for_render_row(
     bottom_id: u64,
     rows_total: u16,
     view_offset_lines: u32,
@@ -1137,7 +1137,9 @@ pub fn build_instances_into_opts<F, S>(
                 cell_size,
                 fg,
                 bg,
-                cell.hyperlink_id.is_some()
+                // Rich-block rows draw their own link styling in the
+                // image; only the hovered span gets the underline.
+                (cell.hyperlink_id.is_some() && row.rich.is_none())
                     || line_id.is_some_and(|l| term.is_link_hovered(l, c)),
                 opts,
             );
@@ -1403,7 +1405,9 @@ pub fn build_dirty_instances_into_opts<F, S>(
                 cell_size,
                 fg,
                 bg,
-                cell.hyperlink_id.is_some()
+                // Rich-block rows draw their own link styling in the
+                // image; only the hovered span gets the underline.
+                (cell.hyperlink_id.is_some() && row.rich.is_none())
                     || line_id.is_some_and(|l| term.is_link_hovered(l, c)),
                 opts,
             );

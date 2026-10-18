@@ -4469,10 +4469,12 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "base64",
  "notify",
  "pollster",
  "toastty-config",
  "toastty-io",
+ "toastty-markdown",
  "toastty-parser",
  "toastty-protocols",
  "toastty-pty",
