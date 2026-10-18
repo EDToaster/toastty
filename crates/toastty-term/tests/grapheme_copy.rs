@@ -218,7 +218,7 @@ fn ascii_after_zwj_starts_new_cell() {
 #[test]
 fn non_joining_wide_char_after_zwj_tail_starts_new_cell() {
     // CJK after ZWJ: UAX #29 breaks (GB11 needs ExtPict on both sides).
-    let mut t = run(4, 20, "\u{1F468}\u{200D}\u{4F60}");
+    let t = run(4, 20, "\u{1F468}\u{200D}\u{4F60}");
     assert_eq!(t.row(0).cells[2].ch, '\u{4F60}');
     assert_eq!(t.cursor().col, 4);
 }

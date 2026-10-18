@@ -520,7 +520,7 @@ impl GlyphRasterizer {
     }
 
     /// Color face to steer `base + VS16` toward, when the default fallback
-    /// would draw `base` from a monochrome face (❤ U+2764 is in DejaVu, so
+    /// would draw `base` from a monochrome face (❤ U+2764 is in `DejaVu`, so
     /// `❤\u{FE0F}` otherwise renders as a text heart).
     ///
     /// Only used under DECSET 2027, where the grid gives a VS16 cluster
