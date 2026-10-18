@@ -14,14 +14,59 @@ enum ApcState {
     /// Inside APC and the last byte was 0x1B; if next is `\` we end
     /// the APC, otherwise the ESC was data.
     ApcAfterEsc,
+    /// Inside an OSC string (`ESC ]`) that vte is buffering; `len`
+    /// counts the payload bytes forwarded so far so we can enforce
+    /// [`MAX_OSC_LEN`].
+    Osc { len: usize },
+    /// An OSC overran [`MAX_OSC_LEN`] and was aborted; discard bytes
+    /// until the string's terminator so its tail isn't printed.
+    OscDiscard,
+}
+
+/// Upper bound on one OSC string's payload, in bytes.
+///
+/// vte 0.15 (with its default `std` feature) accumulates OSC bytes in
+/// an unbounded `Vec` until a terminator arrives, so an endless
+/// unterminated `ESC ]` (a `cat`'d binary, a hostile remote) grows
+/// memory without limit. We count OSC bytes in front of vte and abort
+/// the sequence once it passes this cap. 8 MiB is far above any real
+/// title / hyperlink / palette string and leaves room for OSC 52
+/// clipboard writes of ~6 MiB of text (base64 overhead is 4/3).
+pub const MAX_OSC_LEN: usize = 8 * 1024 * 1024;
+
+/// Performer that drops every event; used to reset vte's state after
+/// aborting an oversized OSC without dispatching the truncated string.
+struct NullPerform;
+
+impl vte::Perform for NullPerform {}
+
+/// First byte that ends an OSC string in vte 0.15: BEL, CAN, SUB or
+/// ESC (vte terminates on any ESC; `ESC \` is the ST form).
+fn osc_terminator(bytes: &[u8]) -> Option<usize> {
+    let a = memchr::memchr3(0x07, 0x18, 0x1B, bytes);
+    let b = memchr::memchr(0x1A, &bytes[..a.unwrap_or(bytes.len())]);
+    b.or(a)
 }
 
 /// Top-level parser. Pre-scans the byte stream for APC sequences
-/// (which vte 0.15 drops) and forwards everything else to vte.
-#[derive(Default)]
+/// (which vte 0.15 drops) and forwards everything else to vte. Also
+/// tracks OSC strings so their length can be capped (see
+/// [`MAX_OSC_LEN`]).
 pub struct Parser {
     vte: vte::Parser,
     apc: ApcState,
+    /// OSC payload cap; [`MAX_OSC_LEN`] outside tests.
+    max_osc_len: usize,
+}
+
+impl Default for Parser {
+    fn default() -> Self {
+        Self {
+            vte: vte::Parser::default(),
+            apc: ApcState::default(),
+            max_osc_len: MAX_OSC_LEN,
+        }
+    }
 }
 
 impl std::fmt::Debug for Parser {
@@ -35,6 +80,15 @@ impl std::fmt::Debug for Parser {
 impl Parser {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Parser with a custom OSC length cap (tests use a tiny one).
+    #[cfg(test)]
+    fn with_max_osc_len(max_osc_len: usize) -> Self {
+        Self {
+            max_osc_len,
+            ..Self::default()
+        }
     }
 
     /// Feed bytes through the parser. Calls handler methods on
@@ -63,6 +117,10 @@ impl Parser {
                     if byte == b'_' {
                         perform.apc_start();
                         self.apc = ApcState::Apc;
+                    } else if byte == b']' {
+                        self.vte
+                            .advance(&mut VteAdapter { inner: perform }, &[0x1B, byte]);
+                        self.apc = ApcState::Osc { len: 0 };
                     } else {
                         // Replay ESC + this byte to vte.
                         self.vte
@@ -110,8 +168,62 @@ impl Parser {
                         }
                     }
                 }
+                ApcState::Osc { len } => bytes = self.advance_osc(perform, bytes, len),
+                ApcState::OscDiscard => bytes = self.discard_osc(bytes),
             }
         }
+    }
+
+    /// `ApcState::Osc` step: forward OSC bytes to vte while counting
+    /// them, aborting the string if it outgrows `max_osc_len`. Returns
+    /// the unconsumed input.
+    fn advance_osc<'b, P: Perform + ?Sized>(
+        &mut self,
+        perform: &mut P,
+        bytes: &'b [u8],
+        len: usize,
+    ) -> &'b [u8] {
+        let term = osc_terminator(bytes);
+        let body = term.unwrap_or(bytes.len());
+        if len + body > self.max_osc_len {
+            // Too long: make vte drop what it has buffered (CAN aborts
+            // the string; the null performer swallows the truncated
+            // dispatch) and skip the rest of this OSC.
+            self.vte.advance(&mut NullPerform, &[0x18]);
+            self.apc = ApcState::OscDiscard;
+            return &bytes[body..];
+        }
+        if body > 0 {
+            self.vte
+                .advance(&mut VteAdapter { inner: perform }, &bytes[..body]);
+        }
+        let Some(pos) = term else {
+            self.apc = ApcState::Osc { len: len + body };
+            return &[];
+        };
+        if bytes[pos] == 0x1B {
+            // Possibly ST; let the ESC peek logic replay it.
+            self.apc = ApcState::AfterEsc;
+        } else {
+            self.vte
+                .advance(&mut VteAdapter { inner: perform }, &bytes[pos..=pos]);
+            self.apc = ApcState::Ground;
+        }
+        &bytes[pos + 1..]
+    }
+
+    /// `ApcState::OscDiscard` step: drop bytes up to and including the
+    /// aborted OSC's terminator. Returns the unconsumed input.
+    fn discard_osc<'b>(&mut self, bytes: &'b [u8]) -> &'b [u8] {
+        let Some(pos) = osc_terminator(bytes) else {
+            return &[];
+        };
+        self.apc = if bytes[pos] == 0x1B {
+            ApcState::AfterEsc
+        } else {
+            ApcState::Ground
+        };
+        &bytes[pos + 1..]
     }
 }
 
@@ -245,6 +357,70 @@ mod tests {
         let r = parse(b"\x1b]2;title\x07");
         assert_eq!(r.osc.len(), 1);
         assert_eq!(r.osc[0], vec![b"2".to_vec(), b"title".to_vec()]);
+    }
+
+    fn parse_capped(cap: usize, chunks: &[&[u8]]) -> Recorder {
+        let mut p = Parser::with_max_osc_len(cap);
+        let mut r = Recorder::default();
+        for c in chunks {
+            p.advance(&mut r, c);
+        }
+        r
+    }
+
+    #[test]
+    fn default_osc_cap_is_max_osc_len() {
+        assert_eq!(Parser::new().max_osc_len, MAX_OSC_LEN);
+    }
+
+    #[test]
+    fn osc_at_cap_dispatches_across_chunks() {
+        // "52;c;aGk=" is 9 bytes; split mid-payload and ST-terminated.
+        let r = parse_capped(9, &[b"\x1b]52;c", b";aGk=", b"\x1b\\x"]);
+        assert_eq!(
+            r.osc,
+            vec![vec![b"52".to_vec(), b"c".to_vec(), b"aGk=".to_vec()]]
+        );
+        assert_eq!(r.text, "x");
+        // BEL / CAN / SUB terminators still dispatch.
+        for t in [0x07u8, 0x18, 0x1A] {
+            let r = parse_capped(9, &[b"\x1b]52;c;aGk=", &[t], b"y"]);
+            assert_eq!(r.osc.len(), 1, "terminator {t:#x}");
+            assert_eq!(r.text, "y");
+        }
+    }
+
+    #[test]
+    fn oversized_osc_is_dropped_and_tail_discarded() {
+        // One byte over the cap, BEL-terminated: no dispatch, and the
+        // remainder of the string never prints.
+        let r = parse_capped(8, &[b"\x1b]52;c;aGk=", b"zzzz", b"zz\x07ok"]);
+        assert!(r.osc.is_empty());
+        assert_eq!(r.text, "ok");
+        assert!(r.execs.is_empty(), "abort CAN must not leak: {:?}", r.execs);
+        // ST-terminated variant, overflow detected in a single chunk.
+        let r = parse_capped(4, &[b"\x1b]0;long title\x1b\\ok"]);
+        assert!(r.osc.is_empty());
+        assert_eq!(r.text, "ok");
+        // An endless unterminated OSC stays discarded across chunks;
+        // the next OSC after a terminator parses normally.
+        let mut p = Parser::with_max_osc_len(16);
+        let mut r = Recorder::default();
+        p.advance(&mut r, b"\x1b]52;c;");
+        for _ in 0..100 {
+            p.advance(&mut r, b"QUFBQUFBQUFB");
+        }
+        assert!(r.text.is_empty());
+        p.advance(&mut r, b"\x18\x1b]2;t\x07z");
+        assert_eq!(r.osc, vec![vec![b"2".to_vec(), b"t".to_vec()]]);
+        assert_eq!(r.text, "z");
+    }
+
+    #[test]
+    fn osc_cap_resets_per_sequence() {
+        // Two back-to-back OSCs each under the cap but together over it.
+        let r = parse_capped(7, &[b"\x1b]2;abcde\x07\x1b]2;fghij\x07"]);
+        assert_eq!(r.osc.len(), 2);
     }
 
     #[test]

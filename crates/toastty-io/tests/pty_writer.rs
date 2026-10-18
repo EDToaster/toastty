@@ -64,7 +64,8 @@ fn collect_until(rx: &mpsc::Receiver<UserEvent>, want: usize, max: Duration) -> 
 }
 
 /// Build a bracketed paste of `text_len` filler bytes wrapped in the
-/// DECSET 2004 markers, mirroring `toastty::paste::wrap_for_paste`.
+/// DECSET 2004 markers, mirroring `toastty::paste::wrap_for_paste` (whose
+/// sanitiser leaves plain printable filler like this untouched).
 fn bracketed_paste(text_len: usize) -> Vec<u8> {
     let mut v = Vec::with_capacity(6 + text_len + 6);
     v.extend_from_slice(b"\x1b[200~");

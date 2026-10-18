@@ -2184,7 +2184,7 @@ dependencies = [
 
 [[package]]
 name = "molecule-viewer"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -4367,7 +4367,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "toastty"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4389,7 +4389,7 @@ dependencies = [
 
 [[package]]
 name = "toastty-config"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -4399,7 +4399,7 @@ dependencies = [
 
 [[package]]
 name = "toastty-graphics"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "flate2",
@@ -4414,7 +4414,7 @@ dependencies = [
 
 [[package]]
 name = "toastty-io"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "mio",
@@ -4425,7 +4425,7 @@ dependencies = [
 
 [[package]]
 name = "toastty-parser"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "memchr",
  "proptest",
@@ -4436,7 +4436,7 @@ dependencies = [
 
 [[package]]
 name = "toastty-protocols"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "thiserror 2.0.18",
@@ -4447,7 +4447,7 @@ dependencies = [
 
 [[package]]
 name = "toastty-pty"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "rustix 1.1.4",
@@ -4457,7 +4457,7 @@ dependencies = [
 
 [[package]]
 name = "toastty-render"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -4480,13 +4480,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unic-emoji-char",
+ "unicode-segmentation",
  "unicode-width",
  "wgpu",
 ]
 
 [[package]]
 name = "toastty-term"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "proptest",
@@ -4498,12 +4499,13 @@ dependencies = [
  "toastty-protocols",
  "toastty-pty",
  "tracing",
+ "unicode-segmentation",
  "unicode-width",
 ]
 
 [[package]]
 name = "toastty-window"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bitflags 2.11.1",
  "raw-window-handle",

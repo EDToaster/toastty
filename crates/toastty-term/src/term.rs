@@ -6,11 +6,13 @@
 
 use std::time::Instant;
 
+use toastty_protocols::unicode_core::cluster_cell_width;
 use unicode_width::UnicodeWidthChar;
 
 use crate::cell::{Cell, Color, Style};
 use crate::cursor::Cursor;
 use crate::damage::Damage;
+use crate::extra::{CellExtra, ExtraTable, MAX_GRAPHEME_EXTRA_BYTES};
 use crate::grid::Grid;
 use toastty_config::CursorShape;
 use toastty_graphics::kitty::handler::{KittyHandler, KittySink};
@@ -27,22 +29,31 @@ use toastty_graphics::rgp::scene::{RgpAsset, RgpScene};
 use toastty_graphics::sixel::{SIXEL_MAX_COLORS, SixelDcs, SixelHandler};
 use toastty_graphics::{ImageData, ImageGrid, ImageRegistry, Placement};
 use toastty_parser::{Params, Perform};
+pub use toastty_protocols::clipboard::{ClipboardTarget, ClipboardTargets};
 
 /// Width of a hard tab. Eight is the canonical default; once we expose
 /// tab-stop manipulation (HTS/TBC) this becomes per-column state.
 const TAB_WIDTH: u16 = 8;
 
-/// Mouse reporting protocol selected via DECSET 1000/1002/1003.
+/// Mouse reporting protocol selected via DECSET 9/1000/1002/1003.
 ///
 /// Apps opt in via the matching DECSET; the binary uses
 /// [`Term::mouse_mode`] to decide which events to forward as CSI sequences.
+/// The four tracking modes are mutually exclusive (xterm keeps a single
+/// `send_mouse_pos` value): setting one replaces whichever was active, and
+/// resetting *any* of them turns reporting off.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MouseProtocol {
     /// Mouse reporting off (default).
     #[default]
     Off,
-    /// DECSET 1000 — report button presses + releases only.
-    X10,
+    /// DECSET 9 — X10 compatibility: report button *presses* only, with
+    /// no modifier bits and no release / motion / wheel events (xterm
+    /// ctlseqs "X10 compatibility mode").
+    X10Compat,
+    /// DECSET 1000 — "normal" (VT200) tracking: presses + releases,
+    /// including modifier bits and wheel buttons.
+    Normal,
     /// DECSET 1002 — report button presses + releases + motion while a
     /// button is held (drag).
     ButtonMotion,
@@ -50,13 +61,38 @@ pub enum MouseProtocol {
     AnyMotion,
 }
 
-/// Combined mouse mode state — protocol + whether SGR (1006) encoding is
-/// active. `sgr_encoding` doesn't change which events fire, just how they
-/// are serialised.
+/// Coordinate encoding for mouse reports, selected via DECSET
+/// 1005 / 1006 / 1015.
+///
+/// The encodings are mutually exclusive, exactly as in xterm
+/// (`charproc.c`, `srm_*_EXT_MODE_MOUSE`): "rather than choose an
+/// arbitrary precedence among the coordinate modes, they are mutually
+/// exclusive. For consistency, a reset is only effective against the
+/// matching mode." So the most recently *set* encoding wins, and
+/// `CSI ? 1015 l` while 1006 is active leaves SGR in place.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MouseEncoding {
+    /// No extension: legacy X11 `CSI M Cb Cx Cy`, one byte per value
+    /// (value + 32). Coordinates are limited to 223.
+    #[default]
+    Default,
+    /// DECSET 1005 — like [`Self::Default`] but values ≥ 96 are sent as
+    /// two-byte UTF-8, extending the coordinate limit to 2015.
+    Utf8,
+    /// DECSET 1006 — SGR: `CSI < Cb ; Cx ; Cy M|m`, decimal, unlimited,
+    /// with distinct press (`M`) / release (`m`) finals.
+    Sgr,
+    /// DECSET 1015 — urxvt: `CSI Cb ; Cx ; Cy M`, decimal, unlimited, but
+    /// `Cb` keeps the +32 offset and releases are button 3 like legacy.
+    Urxvt,
+}
+
+/// Combined mouse mode state — protocol + coordinate encoding. `encoding`
+/// doesn't change which events fire, just how they are serialised.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MouseMode {
     pub protocol: MouseProtocol,
-    pub sgr_encoding: bool,
+    pub encoding: MouseEncoding,
 }
 
 impl MouseMode {
@@ -221,6 +257,11 @@ pub struct Term {
     /// [`Term::print_char`] until the next `OSC 8 ; ; ST` (closer) or
     /// a new `OSC 8 ; ... ; url` (which switches to a fresh id).
     current_hyperlink: Option<crate::cell::HyperlinkId>,
+    /// Intern table for per-cell extras: grapheme-cluster tails
+    /// (combining marks, ZWJ / VS sequences) and tab-start markers.
+    /// Cells hold a `NonZeroU16` id into it; see `extra.rs`. Shared by
+    /// the primary and alt grids, reset by RIS (which wipes both).
+    extras: ExtraTable,
     /// FIFO of OSC 52 clipboard requests waiting on the binary to
     /// service through `arboard`. Drained by [`Term::drain_clipboard_requests`].
     clipboard_requests: Vec<ClipboardRequest>,
@@ -322,9 +363,15 @@ pub struct Term {
     /// Active mouse text selection, if any. Endpoints are pinned to
     /// `line_id` so the selection survives `scroll_up`/`scroll_down`
     /// and survives scrollback eviction (the renderer just stops
-    /// highlighting the evicted rows). Cleared on resize, alt-screen
-    /// flip, and most "screen contents fundamentally changed" paths.
+    /// highlighting the evicted rows). Addresses the *active* grid, so
+    /// it works on the alt screen too. Cleared on resize, alt-screen
+    /// flip (either direction), RIS, and — once committed — when its
+    /// rows' content changes (see [`Term::revalidate_selection`]).
     selection: Option<crate::selection::Selection>,
+    /// Per-row content fingerprints of a *committed* selection (mouse
+    /// released), keyed by line id. `None` while a drag is in progress
+    /// or when there's no selection. See [`Term::commit_selection`].
+    selection_snapshot: Option<Vec<(u64, u64)>>,
     /// DECSTBM top/bottom margins (0-indexed, inclusive). Default spans
     /// the full visible region: `(0, rows - 1)`. `CSI Ps;Ps r` updates
     /// these; resize and RIS reset to the full region. Only LF / RI /
@@ -390,12 +437,22 @@ pub(crate) struct PlaceholderCell {
 /// serviced by the binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardRequest {
-    /// Replace the system clipboard with `data`.
-    Set { data: Vec<u8> },
-    /// Read the system clipboard and reply via
-    /// [`Term::push_pty_reply`] with a `selection`-tagged OSC 52
-    /// response.
-    Query { selection: Vec<u8> },
+    /// Replace the selection buffer(s) in `targets` with `data`.
+    Set {
+        data: Vec<u8>,
+        targets: ClipboardTargets,
+    },
+    /// Clear the selection buffer(s) in `targets` (xterm: an empty or
+    /// non-base64 payload clears the selection).
+    Clear { targets: ClipboardTargets },
+    /// Read `target` and reply via [`Term::push_pty_reply`] with a
+    /// `selection`-tagged OSC 52 response. `bell_terminated` records
+    /// whether the request ended in BEL so the reply can mirror it.
+    Query {
+        selection: Vec<u8>,
+        target: ClipboardTarget,
+        bell_terminated: bool,
+    },
 }
 
 /// Security flags mirrored on `Term` from
@@ -484,6 +541,7 @@ impl Term {
             palette_revision: 0,
             hyperlinks: Vec::new(),
             current_hyperlink: None,
+            extras: ExtraTable::default(),
             clipboard_requests: Vec::new(),
             security: SecurityFlags::default(),
             apc_buffer: Vec::new(),
@@ -512,6 +570,7 @@ impl Term {
             rgp_handler: RgpHandler::new(),
             rgp_scene: RgpScene::new(),
             selection: None,
+            selection_snapshot: None,
             scroll_top: 0,
             scroll_bot: rows - 1,
             modify_other_keys: 0,
@@ -674,6 +733,73 @@ impl Term {
         // Ids are 1-based: `NonZeroU16::new(1)` indexes `hyperlinks[0]`.
         let idx = id.get() as usize - 1;
         self.hyperlinks.get(idx).map(String::as_str)
+    }
+
+    /// Resolve a cell's [`CellExtra`] (grapheme tail or tab marker), if
+    /// it has one.
+    #[must_use]
+    pub fn cell_extra(&self, cell: &Cell) -> Option<&CellExtra> {
+        self.extras.get(cell.extra?)
+    }
+
+    /// The codepoints that follow `cell.ch` in the cell's grapheme
+    /// cluster (`""` for the common single-codepoint cell). The renderer
+    /// appends this after `cell.ch` when building a row's shaping text so
+    /// combining marks / ZWJ sequences / VS16 are drawn, not just copied.
+    #[must_use]
+    pub fn grapheme_tail(&self, cell: &Cell) -> &str {
+        self.extras.grapheme_tail(cell.extra)
+    }
+
+    /// Append the text cell `cells[col]` contributes to copied text and
+    /// return the column to continue from (`col + 1` normally).
+    ///
+    /// - Continuation cells (trailing half of a wide cluster) contribute
+    ///   nothing — the primary already carries the cluster.
+    /// - NUL (the `Cell::default()` filler) copies as a space.
+    /// - A grapheme cell copies as `ch` followed by its stored tail, so
+    ///   decomposed accents, ZWJ emoji and variation selectors survive.
+    /// - A tab-start cell whose whole tab run (`[col, col + span)`) is
+    ///   still blank and lies inside `[col, end)` copies as one literal
+    ///   `\t` and skips the run (kitty / Ghostty behaviour). If anything
+    ///   has since been written into the run, or the selection cuts it,
+    ///   the cells copy as the spaces they now display.
+    fn append_cell_text(&self, cells: &[Cell], col: usize, end: usize, out: &mut String) -> usize {
+        let Some(cell) = cells.get(col) else {
+            return end;
+        };
+        if cell.is_continuation {
+            return col + 1;
+        }
+        match self.cell_extra(cell) {
+            Some(CellExtra::Tab(span)) => {
+                let run_end = col + usize::from(*span);
+                let intact = run_end <= end
+                    && cells
+                        .get(col..run_end)
+                        .is_some_and(|run| run.iter().all(|c| self.is_tab_run_blank(c)));
+                if intact {
+                    out.push('\t');
+                    return run_end;
+                }
+                out.push(' ');
+            }
+            extra => {
+                out.push(if cell.ch == '\0' { ' ' } else { cell.ch });
+                if let Some(CellExtra::Grapheme(tail)) = extra {
+                    out.push_str(tail);
+                }
+            }
+        }
+        col + 1
+    }
+
+    /// A cell a tab run may still cover: displays as blank and carries no
+    /// grapheme. (The run's own start cell carries the tab marker.)
+    fn is_tab_run_blank(&self, cell: &Cell) -> bool {
+        matches!(cell.ch, ' ' | '\0')
+            && !cell.is_continuation
+            && !matches!(self.cell_extra(cell), Some(CellExtra::Grapheme(_)))
     }
 
     /// Intern `url` into the hyperlink table and return its id. Dedups
@@ -1226,26 +1352,32 @@ impl Term {
         self.selection.as_ref()
     }
 
-    /// Monotonic id of the live bottom row on the primary grid. See
-    /// [`Grid::bottom_id`] for the model — the binary uses this to
-    /// pin selection endpoints to a stable line id.
+    /// Monotonic id of the live bottom row on the *active* grid. See
+    /// [`Grid::bottom_id`] for the model — the binary uses this to pin
+    /// selection endpoints to a stable line id and the renderer uses it
+    /// to map viewport rows back to line ids for the highlight.
+    ///
+    /// The primary and alt grids keep independent counters; the alt
+    /// grid has no scrollback, so its ids only ever address the
+    /// visible region. Selection is dropped on every screen switch
+    /// (see [`Term::enter_alt_screen`]) so ids from one grid are never
+    /// resolved against the other.
     #[must_use]
     pub fn bottom_id(&self) -> u64 {
-        self.primary.bottom_id()
+        self.active_grid().bottom_id()
     }
 
     /// Replace the active selection, dirty-marking every visible row
     /// the old and new selections touch so the renderer re-paints both
     /// the freshly-selected cells and the cells that were just
-    /// deselected. No-op on the alt screen (selection clears on alt
-    /// entry).
+    /// deselected. Works on both screens: endpoints address the active
+    /// grid. A freshly-set selection is "in progress" until
+    /// [`Term::commit_selection`] is called.
     pub fn set_selection(&mut self, sel: crate::selection::Selection) {
-        if self.alt_active {
-            return;
-        }
         let prev = self.selection;
         self.dirty_selection_rows(prev);
         self.selection = Some(sel);
+        self.selection_snapshot = None;
         self.dirty_selection_rows(Some(sel));
     }
 
@@ -1260,6 +1392,7 @@ impl Term {
         let old = sel;
         sel.set_active(active);
         self.selection = Some(sel);
+        self.selection_snapshot = None;
         // Dirty union of old and new selections so cells that left the
         // selection get repainted with their base bg.
         self.dirty_selection_rows(Some(old));
@@ -1270,6 +1403,7 @@ impl Term {
     /// the renderer repaints them without the selection tint.
     pub fn clear_selection(&mut self) {
         let prev = self.selection;
+        self.selection_snapshot = None;
         if prev.is_none() {
             return;
         }
@@ -1277,21 +1411,111 @@ impl Term {
         self.dirty_selection_rows(prev);
     }
 
+    /// Mark the current selection as *finished* (mouse released). The
+    /// highlight stays visible — like xterm / kitty / Ghostty — so a
+    /// later copy shortcut still has something to copy, but from now
+    /// on [`Term::revalidate_selection`] drops it as soon as the
+    /// selected text is no longer what the user picked: when a selected
+    /// row's content changes (the app redrew it, a full-screen pager
+    /// scrolled) or when any selected row is evicted from scrollback.
+    ///
+    /// Takes a fingerprint of every selected row that's currently on
+    /// screen; scrollback rows are immutable, so they don't need one.
+    pub fn commit_selection(&mut self) {
+        let Some(sel) = self.selection else {
+            self.selection_snapshot = None;
+            return;
+        };
+        let mut snap = Vec::new();
+        for line_id in self.visible_line_ids() {
+            if sel.rows_touched().contains(&line_id)
+                && let Some(row) = self.row_by_line_id(line_id)
+            {
+                snap.push((line_id, row_fingerprint(row)));
+            }
+        }
+        self.selection_snapshot = Some(snap);
+    }
+
+    /// Drop a committed selection whose content has changed underneath
+    /// it. Call after every batch of PTY output. No-op while a drag is
+    /// still in progress (the selection follows streaming output there
+    /// and an evicted head just copies the remaining rows — see
+    /// [`Term::extract_selection_text`]). Returns `true` when the
+    /// selection was cleared.
+    pub fn revalidate_selection(&mut self) -> bool {
+        let (Some(sel), Some(mut snap)) = (self.selection, self.selection_snapshot.take()) else {
+            return false;
+        };
+        // Any selected row evicted from scrollback → the selection no
+        // longer describes the text the user picked.
+        let mut stale = sel.ordered().0.line_id < self.active_grid().oldest_retained_id();
+        if !stale {
+            for line_id in self.visible_line_ids() {
+                if !sel.rows_touched().contains(&line_id) {
+                    continue;
+                }
+                let Some(row) = self.row_by_line_id(line_id) else {
+                    continue;
+                };
+                let fp = row_fingerprint(row);
+                match snap.iter().find(|(id, _)| *id == line_id) {
+                    Some(&(_, old)) if old != fp => {
+                        stale = true;
+                        break;
+                    }
+                    Some(_) => {}
+                    // A selected row that was in (immutable) scrollback
+                    // at commit time and has since rotated back on
+                    // screen (reverse index): adopt its current content
+                    // as the baseline.
+                    None => snap.push((line_id, fp)),
+                }
+            }
+        }
+        if stale {
+            self.clear_selection();
+            return true;
+        }
+        self.selection_snapshot = Some(snap);
+        false
+    }
+
+    /// Line ids of the active grid's visible region, top to bottom.
+    fn visible_line_ids(&self) -> std::ops::RangeInclusive<u64> {
+        let g = self.active_grid();
+        let bottom = g.bottom_id();
+        bottom.saturating_sub(u64::from(g.visible_rows().saturating_sub(1)))..=bottom
+    }
+
+    /// Drop the selection without dirty-marking (callers that are about
+    /// to repaint everything anyway: resize, RIS, screen switch).
+    fn drop_selection(&mut self) {
+        self.selection = None;
+        self.selection_snapshot = None;
+    }
+
     /// True iff `(line_id, col)` is currently selected. Cheap — a
     /// short-circuit on the `Option` and then a few comparisons. The
     /// renderer calls this once per cell per frame.
     ///
-    /// Selection is always treated as empty on the alt screen — the
-    /// alt grid has its own coordinate system and the binary clears
-    /// selection on alt entry anyway.
+    /// A width-2 character counts as selected when *either* half is
+    /// inside the selection, so a drag that starts or ends on the
+    /// right half of `日` still highlights (and copies) the whole
+    /// glyph — matching xterm / kitty.
     #[must_use]
     pub fn is_cell_selected(&self, line_id: u64, col: u16) -> bool {
-        if self.alt_active {
+        let Some(sel) = self.selection.as_ref() else {
+            return false;
+        };
+        if sel.contains(line_id, col) {
+            return true;
+        }
+        if !sel.rows_touched().contains(&line_id) {
             return false;
         }
-        self.selection
-            .as_ref()
-            .is_some_and(|s| s.contains(line_id, col))
+        self.row_by_line_id(line_id)
+            .is_some_and(|row| wide_partner_selected(sel, row, line_id, col))
     }
 
     /// Mark every viewport row that's touched by the given selection
@@ -1309,7 +1533,7 @@ impl Term {
         let cols = self.cols;
         let rows = self.rows;
         let scroll = u64::from(self.viewport.current_lines);
-        let bottom = self.primary.bottom_id();
+        let bottom = self.bottom_id();
         for vr in 0..rows {
             // viewport row vr → line_id of the row currently rendered
             // there. Same math as `line_id_for_render_row` in the
@@ -1325,85 +1549,194 @@ impl Term {
     }
 
     /// Extract the selected text. Returns `None` when there's no
-    /// selection. Joins across rows with `\n`, except that
-    /// soft-wrapped rows (where `row.soft_wrap == true`) join without
-    /// the newline so the user gets the logical line back as one
-    /// piece. Trailing whitespace is stripped per visual row. Block
-    /// selections produce one line per row, hard-truncated at the
-    /// selection's column bounds.
+    /// selection, or when every selected row has been evicted.
+    ///
+    /// - Rows join with `\n`, except that a soft-wrapped row
+    ///   (`row.soft_wrap`) joins the next one directly so the user gets
+    ///   the logical line back as one piece.
+    /// - Trailing whitespace is stripped only at *hard* line ends (and
+    ///   at the end of the selection). A soft-wrapped row's trailing
+    ///   spaces are real content — `abcd efgh` wrapped at 5 columns
+    ///   must copy back with its space.
+    /// - Block selections produce one line per row, truncated at the
+    ///   selection's column bounds and trimmed per row.
+    /// - Rows evicted from scrollback since the selection was made are
+    ///   skipped; the remaining rows are still copied.
     #[must_use]
     pub fn extract_selection_text(&self) -> Option<String> {
         use crate::selection::SelectionMode;
         let sel = self.selection.as_ref()?;
         let (first, last) = sel.ordered();
-        let cols = self.cols;
+        let block = matches!(sel.mode, SelectionMode::Block);
+        let start = first.line_id.max(self.active_grid().oldest_retained_id());
+        let end = last.line_id.min(self.bottom_id());
+        if start > end {
+            return None;
+        }
         let mut out = String::new();
-        for line_id in first.line_id..=last.line_id {
-            let row = self.primary_row_by_line_id(line_id)?;
-            // Determine column range for this row given selection mode.
-            let (start_col, end_col) = match sel.mode {
-                SelectionMode::Block => {
-                    let (a, b) = (first.col, last.col);
-                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                    (lo, hi.saturating_add(1).min(cols))
-                }
-                _ => {
-                    let s = if line_id == first.line_id {
-                        first.col
-                    } else {
-                        0
-                    };
-                    let e_inclusive = if line_id == last.line_id {
-                        last.col
-                    } else {
-                        cols.saturating_sub(1)
-                    };
-                    (s, e_inclusive.saturating_add(1).min(cols))
-                }
+        for line_id in start..=end {
+            let Some(row) = self.row_by_line_id(line_id) else {
+                continue;
             };
-            // Collect chars in [start_col, end_col), skipping continuation
-            // cells (they're the trailing half of a width-2 cluster — the
-            // primary cell already carries the char).
+            let is_last_row = line_id == end;
+            // Soft-wrapped rows in char/word/line mode join without a
+            // newline (the wrap is presentational, not logical).
+            let join_soft = !block && !is_last_row && row.soft_wrap;
+            // A wide char that didn't fit in the last column wrapped to
+            // the next row, leaving a blank pad cell behind; that pad is
+            // not part of the text.
+            let pad_col = if join_soft
+                && self
+                    .row_by_line_id(line_id + 1)
+                    .is_some_and(|next| next.cells.get(1).is_some_and(|c| c.is_continuation))
+            {
+                row.cells
+                    .len()
+                    .checked_sub(1)
+                    .filter(|&i| matches!(row.cells[i].ch, ' ' | '\0'))
+            } else {
+                None
+            };
+            // Selected cells in a row are one contiguous run (every mode,
+            // incl. the wide-char partner rule). Collect its text: full
+            // graphemes, intact tab runs as `\t` (see `append_cell_text`).
             let mut line_buf = String::new();
-            for col in start_col..end_col {
-                let Some(cell) = row.cells.get(col as usize) else {
-                    break;
-                };
-                if cell.is_continuation {
-                    continue;
+            let selected = |i: usize| {
+                let col = u16::try_from(i).unwrap_or(u16::MAX);
+                sel.contains(line_id, col) || wide_partner_selected(sel, row, line_id, col)
+            };
+            let len = row.cells.len();
+            if let (Some(lo), Some(hi)) =
+                ((0..len).find(|&i| selected(i)), (0..len).rev().find(|&i| selected(i)))
+            {
+                let mut col = lo;
+                while col <= hi {
+                    if Some(col) == pad_col {
+                        col += 1;
+                        continue;
+                    }
+                    col = self.append_cell_text(&row.cells, col, hi + 1, &mut line_buf);
                 }
-                // Treat NUL (the `Cell::default()` ch) as space; rows
-                // shorter than `cols` get padded with NUL cells.
-                let ch = if cell.ch == '\0' { ' ' } else { cell.ch };
-                line_buf.push(ch);
             }
-            // Strip trailing whitespace — conventional terminal-copy
-            // behaviour and matches every common terminal emulator.
-            while matches!(line_buf.chars().last(), Some(c) if c.is_whitespace()) {
-                line_buf.pop();
+            if !join_soft {
+                // Strip trailing whitespace at hard line ends —
+                // conventional terminal-copy behaviour (blank padding
+                // out to `cols` isn't text the user typed).
+                let trimmed = line_buf.trim_end().len();
+                line_buf.truncate(trimmed);
             }
             out.push_str(&line_buf);
-            // Row separator: hard newline between rows, except that
-            // soft-wrapped rows in char/word/line mode are joined
-            // without a newline (the soft wrap is a presentational
-            // line break, not a logical one). Block mode always
-            // separates rows with `\n`.
-            let is_last_row = line_id == last.line_id;
-            if !is_last_row {
-                let join_soft = !matches!(sel.mode, SelectionMode::Block) && row.soft_wrap;
-                if !join_soft {
-                    out.push('\n');
-                }
+            if !is_last_row && !join_soft {
+                out.push('\n');
             }
         }
         Some(out)
     }
 
-    /// Look up the primary-grid `Row` whose live `line_id` matches.
+    /// Line-id range `(first, last)` of the *logical* line containing
+    /// `line_id`: the row plus every neighbour joined to it by a soft
+    /// wrap. Triple-click selects this range (kitty / Ghostty /
+    /// Alacritty behaviour) rather than a single visual row. `None` for
+    /// an evicted line id.
+    #[must_use]
+    pub fn logical_line_bounds(&self, line_id: u64) -> Option<(u64, u64)> {
+        let mut hi_row = self.row_by_line_id(line_id)?;
+        let mut lo = line_id;
+        while let Some(prev_id) = lo.checked_sub(1)
+            && self.row_by_line_id(prev_id).is_some_and(|r| r.soft_wrap)
+        {
+            lo = prev_id;
+        }
+        let mut hi = line_id;
+        while hi_row.soft_wrap
+            && let Some(next) = self.row_by_line_id(hi + 1)
+        {
+            hi += 1;
+            hi_row = next;
+        }
+        Some((lo, hi))
+    }
+
+    /// Word containing `at`, as `(start, end)` inclusive positions.
+    /// `is_word` decides which characters belong to words (the binary
+    /// passes Unicode alphanumerics plus the configured
+    /// `selection.word_chars`). Words continue across soft wraps, so a
+    /// path broken by the right margin is still picked up whole. The
+    /// right half of a wide char classifies like its left half.
+    ///
+    /// When `at` isn't on a word character the result is `(at, at)` —
+    /// the caller falls back to a single-cell selection. `None` for an
+    /// evicted line id.
+    #[must_use]
+    pub fn word_bounds(
+        &self,
+        at: crate::selection::Pos,
+        is_word: impl Fn(char) -> bool,
+    ) -> Option<(crate::selection::Pos, crate::selection::Pos)> {
+        use crate::selection::Pos;
+        let char_at = |p: Pos| -> Option<char> {
+            let row = self.row_by_line_id(p.line_id)?;
+            let cell = row.cells.get(usize::from(p.col))?;
+            if cell.is_continuation && p.col > 0 {
+                return row.cells.get(usize::from(p.col) - 1).map(|c| c.ch);
+            }
+            Some(cell.ch)
+        };
+        let last_col = self.cols.saturating_sub(1);
+        let prev = |p: Pos| -> Option<Pos> {
+            if p.col > 0 {
+                return Some(Pos::new(p.line_id, p.col - 1));
+            }
+            let id = p.line_id.checked_sub(1)?;
+            self.row_by_line_id(id)
+                .filter(|r| r.soft_wrap)
+                .map(|_| Pos::new(id, last_col))
+        };
+        let next = |p: Pos| -> Option<Pos> {
+            if p.col < last_col {
+                return Some(Pos::new(p.line_id, p.col + 1));
+            }
+            if !self.row_by_line_id(p.line_id)?.soft_wrap {
+                return None;
+            }
+            self.row_by_line_id(p.line_id + 1)?;
+            Some(Pos::new(p.line_id + 1, 0))
+        };
+        let here = char_at(at)?;
+        if !is_word(here) {
+            return Some((at, at));
+        }
+        let mut lo = at;
+        while let Some(p) = prev(lo)
+            && char_at(p).is_some_and(&is_word)
+        {
+            lo = p;
+        }
+        let mut hi = at;
+        while let Some(p) = next(hi)
+            && char_at(p).is_some_and(&is_word)
+        {
+            hi = p;
+        }
+        Some((lo, hi))
+    }
+
+    /// Look up the active-grid `Row` whose live `line_id` matches.
     /// Walks via `Grid::locate` so we transparently hit either the
     /// visible region or scrollback. Returns `None` for an evicted
-    /// line id. Used by the binary to look up word boundaries during
-    /// drag selection and by the extractor to walk selection rows.
+    /// line id. On the alt screen this addresses the alt grid.
+    #[must_use]
+    pub fn row_by_line_id(&self, line_id: u64) -> Option<&crate::grid::Row> {
+        let g = self.active_grid();
+        match g.locate(line_id)? {
+            crate::grid::RowLocation::Visible(r) => Some(g.row(r)),
+            crate::grid::RowLocation::Scrollback(n) => g.scrollback_row(n),
+        }
+    }
+
+    /// Look up the primary-grid `Row` whose live `line_id` matches,
+    /// regardless of which screen is active. Returns `None` for an
+    /// evicted line id.
     #[must_use]
     pub fn primary_row_by_line_id(&self, line_id: u64) -> Option<&crate::grid::Row> {
         match self.primary.locate(line_id)? {
@@ -1461,7 +1794,7 @@ impl Term {
         // doesn't move under them. Resize moves rows around (and
         // potentially drops history); clear so we don't paint stale
         // highlights at the wrong (line_id, col).
-        self.selection = None;
+        self.drop_selection();
         // Image placements anchored past the new geometry become
         // phantoms (kitty clips placements on resize). Trim each to the
         // new rows/cols and drop any that no longer have any visible
@@ -1592,6 +1925,7 @@ impl Term {
             style,
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         };
         let row = grid.row_mut(bot);
         row.resize_cols(cols);
@@ -1649,6 +1983,7 @@ impl Term {
             style,
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         };
         let row = grid.row_mut(top);
         row.resize_cols(cols);
@@ -1771,10 +2106,16 @@ impl Term {
         }
 
         let cell_w = Self::char_cell_width(c);
-        // Zero-width chars (combining marks, controls) currently fall
-        // through as a no-op. A future pass can attach them to the
-        // previous cell's grapheme; for M8 we just drop them so the
-        // cursor doesn't advance into a dead cell.
+        // Grapheme clustering: a codepoint that continues the grapheme in
+        // the cell left of the cursor is appended to that cell instead of
+        // taking a new one (ASCII never extends a cluster, so the hot path
+        // skips this). See `try_extend_grapheme` for the rules.
+        if !c.is_ascii() && self.try_extend_grapheme(c, cell_w) {
+            return;
+        }
+        // A zero-width codepoint with nothing to attach to (column 0, a
+        // continuation-only left neighbour, the extras table full) is
+        // dropped so the cursor doesn't advance into a dead cell.
         if cell_w == 0 {
             return;
         }
@@ -1807,6 +2148,7 @@ impl Term {
             style: self.cursor.style,
             is_continuation: false,
             hyperlink_id: self.current_hyperlink,
+            extra: None,
         };
         let col = self.cursor.col;
         let row = self.cursor.row;
@@ -1826,6 +2168,7 @@ impl Term {
                 style: self.cursor.style,
                 is_continuation: true,
                 hyperlink_id: self.current_hyperlink,
+                extra: None,
             };
             self.active_grid_mut()
                 .row_mut(row)
@@ -1839,6 +2182,181 @@ impl Term {
             self.mark_cell(row, col + 1);
         }
         self.cursor.col += cell_w;
+    }
+
+    /// Record that an HT advanced the cursor over `[from, to)` on `row`, so
+    /// copy can reproduce the literal tab (bug #20; kitty and Ghostty do
+    /// the same, xterm copies spaces). Only done when every cell in the
+    /// run is blank — HT doesn't erase, so a tab over existing text must
+    /// keep copying that text. The marker lives on the run's first cell
+    /// as a [`CellExtra::Tab`]; anything later written into the run
+    /// replaces a cell (dropping the marker) or makes the run non-blank,
+    /// which `append_cell_text` checks at copy time.
+    fn mark_tab_run(&mut self, row: u16, from: u16, to: u16) {
+        if to <= from {
+            return;
+        }
+        let cells = &self.active_grid().row(row).cells;
+        let (a, b) = (usize::from(from), usize::from(to));
+        let Some(run) = cells.get(a..b) else {
+            return;
+        };
+        if !run
+            .iter()
+            .all(|c| c.extra.is_none() && matches!(c.ch, ' ' | '\0') && !c.is_continuation)
+        {
+            return;
+        }
+        let first = run[0];
+        let Some(id) = self.extras.intern(CellExtra::Tab(to - from)) else {
+            return;
+        };
+        let max_cols = self.cols;
+        let marked = Cell {
+            ch: ' ',
+            extra: Some(id),
+            ..first
+        };
+        self.active_grid_mut()
+            .row_mut(row)
+            .put(from, marked, max_cols);
+    }
+
+    /// Try to append `c` to the grapheme cluster of the cell just left of
+    /// the cursor (the cell the previous `print` wrote, or — after cursor
+    /// motion — whatever sits there, matching xterm's "combining char
+    /// attaches to the preceding cell"). Returns `true` if `c` was
+    /// consumed.
+    ///
+    /// Rules, in both DECSET 2027 states:
+    /// - **Zero-width codepoints** (`wcwidth == 0`: combining marks, ZWJ,
+    ///   ZWNJ, variation selectors, Hangul V/T jamo, …) always attach.
+    ///   They occupy no column of their own in the legacy model either,
+    ///   so this changes no cursor arithmetic — it just stops dropping
+    ///   them (bug: decomposed `é` copied as `e`).
+    /// - **After a ZWJ**, a codepoint that UAX #29 keeps in the same
+    ///   cluster (GB11: `ExtPict ZWJ × ExtPict`) attaches too, so a ZWJ
+    ///   emoji sequence like 👨‍👩‍👧 occupies the width of its first
+    ///   emoji (one 2-cell glyph) instead of three side-by-side emoji.
+    /// - **Emoji skin-tone modifiers** (U+1F3FB..=U+1F3FF, wcwidth 2) that
+    ///   UAX #29 keeps with their base (👍🏽) attach as well. The renderer
+    ///   always shapes base + modifier into one 2-cell glyph, so giving the
+    ///   modifier its own two cells left a hole that shifted every later
+    ///   glyph on the row out of its cell (they then failed the per-column
+    ///   lookup and the rest of the row rendered blank).
+    ///
+    /// Additionally, with **DECSET 2027** on, any codepoint that UAX #29
+    /// says continues the cluster attaches (regional-indicator pairs,
+    /// spacing marks, Indic conjuncts, …) — the app has declared it
+    /// segments by grapheme, per the Terminal Unicode Core spec.
+    ///
+    /// After attaching, the cluster's width is recomputed with the same
+    /// [`cluster_cell_width`] the renderer snaps glyphs with, so grid and
+    /// renderer agree. A cluster that grows from 1 to 2 cells (❤ + VS16
+    /// under 2027, ❤ + ZWJ + 🔥) gains a continuation cell and the cursor
+    /// advances one column; if the cell is in the last column there is no
+    /// room and it stays 1 cell wide. Clusters never shrink (VS15 after a
+    /// wide emoji keeps 2 cells) — that would mean moving the cursor back.
+    fn try_extend_grapheme(&mut self, c: char, cell_w: u16) -> bool {
+        use unicode_segmentation::UnicodeSegmentation;
+        let row = self.cursor.row;
+        let cur = self.cursor.col.min(self.cols);
+        if cur == 0 {
+            return false;
+        }
+        let mut col = cur - 1;
+        let cells = &self.active_grid().row(row).cells;
+        if cells
+            .get(usize::from(col))
+            .is_some_and(|c| c.is_continuation)
+            && col > 0
+        {
+            col -= 1;
+        }
+        let Some(&prev) = cells.get(usize::from(col)) else {
+            return false;
+        };
+        if prev.is_continuation || prev.ch == '\0' || prev.ch == crate::PLACEHOLDER {
+            return false;
+        }
+        let tail = self.extras.grapheme_tail(prev.extra);
+        let mut cluster = String::with_capacity(prev.ch.len_utf8() + tail.len() + c.len_utf8());
+        cluster.push(prev.ch);
+        cluster.push_str(tail);
+        let joins = cell_w == 0 || {
+            let after_zwj = tail.ends_with('\u{200D}');
+            // UAX #29 lets a modifier extend *any* base (`a🏽` is one
+            // grapheme), but only an emoji base renders as a single glyph;
+            // after a letter the modifier is a swatch of its own, so it
+            // keeps its own two cells. Emoji bases are wide (U+1F...) or in
+            // the narrow Misc Symbols / Dingbats blocks (☝ ✊ ✌).
+            let emoji_base = ('\u{2600}'..='\u{27BF}').contains(&prev.ch)
+                || cells
+                    .get(usize::from(col) + 1)
+                    .is_some_and(|c| c.is_continuation);
+            let emoji_modifier = emoji_base && ('\u{1F3FB}'..='\u{1F3FF}').contains(&c);
+            (self.grapheme_cluster_mode || after_zwj || emoji_modifier) && {
+                let mut probe = cluster.clone();
+                probe.push(c);
+                probe.graphemes(true).nth(1).is_none()
+            }
+        };
+        if !joins {
+            return false;
+        }
+        if tail.len() + c.len_utf8() > MAX_GRAPHEME_EXTRA_BYTES {
+            // Cluster at its length cap: swallow the codepoint (it belongs
+            // to this cluster, so it must not start a new cell) but don't
+            // store it.
+            return true;
+        }
+        let mut new_tail = String::with_capacity(tail.len() + c.len_utf8());
+        new_tail.push_str(tail);
+        new_tail.push(c);
+        cluster.push(c);
+        let Some(id) = self.extras.intern(CellExtra::Grapheme(new_tail.into())) else {
+            // Table full: fall back to the old behaviour for zero-width
+            // codepoints (dropped); a joining wide codepoint prints as
+            // its own cell.
+            return cell_w == 0;
+        };
+        let max_cols = self.cols;
+        let updated = Cell {
+            extra: Some(id),
+            ..prev
+        };
+        self.active_grid_mut()
+            .row_mut(row)
+            .put(col, updated, max_cols);
+        self.mark_cell(row, col);
+        // Width growth (1 → 2): only when the cursor sits right after the
+        // cell and there's a column to grow into.
+        let was_wide = self
+            .active_grid()
+            .row(row)
+            .cells
+            .get(usize::from(col) + 1)
+            .is_some_and(|c| c.is_continuation);
+        let grows = !was_wide
+            && cluster_cell_width(&cluster, self.grapheme_cluster_mode) >= 2
+            && cur == col + 1
+            && col + 1 < max_cols;
+        if grows {
+            self.clear_wide_orphans(row, col + 1, 1);
+            let cont = Cell {
+                ch: '\0',
+                style: prev.style,
+                is_continuation: true,
+                hyperlink_id: prev.hyperlink_id,
+                extra: None,
+            };
+            self.active_grid_mut()
+                .row_mut(row)
+                .put(col + 1, cont, max_cols);
+            self.mark_cell(row, col + 1);
+            self.cursor.col = col + 2;
+        }
+        true
     }
 
     /// Before writing `width` cells starting at `col`, blank the surviving
@@ -1862,6 +2380,7 @@ impl Term {
             style: self.cursor.style,
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         };
         let cells = &self.active_grid().row(row).cells;
         let left_orphan = col > 0 && cells.get(col as usize).is_some_and(|c| c.is_continuation);
@@ -2476,6 +2995,7 @@ impl Term {
             style,
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         };
         for c in &mut row.cells[(cols_u - n_u)..cols_u] {
             *c = blank;
@@ -2510,6 +3030,7 @@ impl Term {
             style,
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         };
         for c in &mut row.cells[col_u..(col_u + n_u)] {
             *c = blank;
@@ -2568,6 +3089,7 @@ impl Term {
             style,
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         };
         for r in cur_row..(cur_row + n) {
             let row = grid.row_mut(r);
@@ -2625,6 +3147,7 @@ impl Term {
             style,
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         };
         for r in (region_end - n)..region_end {
             let row = grid.row_mut(r);
@@ -2763,6 +3286,38 @@ impl Term {
         }
     }
 
+    /// DECSET / DECRST for the mouse modes.
+    ///
+    /// Tracking modes (9 / 1000 / 1002 / 1003) share one slot like
+    /// xterm's `send_mouse_pos`: set replaces whichever was active, reset
+    /// of any of them turns reporting off. The coordinate encodings
+    /// (1005 UTF-8 / 1006 SGR / 1015 urxvt) are likewise mutually
+    /// exclusive: set selects, reset only clears the matching mode
+    /// (xterm `charproc.c`, `srm_*_EXT_MODE_MOUSE`).
+    fn set_mouse_private_mode(&mut self, code: u16, enable: bool) {
+        let protocol = match code {
+            9 => MouseProtocol::X10Compat,
+            1000 => MouseProtocol::Normal,
+            1002 => MouseProtocol::ButtonMotion,
+            1003 => MouseProtocol::AnyMotion,
+            _ => {
+                let enc = match code {
+                    1005 => MouseEncoding::Utf8,
+                    1006 => MouseEncoding::Sgr,
+                    // 1015; the caller only routes mouse modes here.
+                    _ => MouseEncoding::Urxvt,
+                };
+                if enable {
+                    self.mouse_mode.encoding = enc;
+                } else if self.mouse_mode.encoding == enc {
+                    self.mouse_mode.encoding = MouseEncoding::Default;
+                }
+                return;
+            }
+        };
+        self.mouse_mode.protocol = if enable { protocol } else { MouseProtocol::Off };
+    }
+
     /// Resolve the DECRPM status for a private mode `ps`. Returns one
     /// of the VT-spec codes documented at the `CSI ? Ps $ p` handler:
     /// 0 (unknown), 1 (set), 2 (reset). Modes we model but don't have
@@ -2772,11 +3327,14 @@ impl Term {
     fn decrqm_status(&self, ps: u16) -> u16 {
         let is_set = match ps {
             25 => self.cursor_visible,
-            1000 => matches!(self.mouse_mode.protocol, MouseProtocol::X10),
+            9 => matches!(self.mouse_mode.protocol, MouseProtocol::X10Compat),
+            1000 => matches!(self.mouse_mode.protocol, MouseProtocol::Normal),
             1002 => matches!(self.mouse_mode.protocol, MouseProtocol::ButtonMotion),
             1003 => matches!(self.mouse_mode.protocol, MouseProtocol::AnyMotion),
             1004 => self.report_focus,
-            1006 => self.mouse_mode.sgr_encoding,
+            1005 => matches!(self.mouse_mode.encoding, MouseEncoding::Utf8),
+            1006 => matches!(self.mouse_mode.encoding, MouseEncoding::Sgr),
+            1015 => matches!(self.mouse_mode.encoding, MouseEncoding::Urxvt),
             47 | 1047 | 1049 => self.alt_active,
             2004 => self.bracketed_paste,
             2026 => self.sync_output.active,
@@ -2846,37 +3404,14 @@ impl Term {
                         self.mark_cell(row, col);
                     }
                 }
-                // 1000 — X10 / VT200 button reporting (press + release).
-                1000 => {
-                    self.mouse_mode.protocol = if enable {
-                        MouseProtocol::X10
-                    } else {
-                        MouseProtocol::Off
-                    };
-                }
-                // 1002 — button-event tracking (press/release + drag).
-                1002 => {
-                    self.mouse_mode.protocol = if enable {
-                        MouseProtocol::ButtonMotion
-                    } else {
-                        MouseProtocol::Off
-                    };
-                }
-                // 1003 — any-event tracking (all motion regardless of buttons).
-                1003 => {
-                    self.mouse_mode.protocol = if enable {
-                        MouseProtocol::AnyMotion
-                    } else {
-                        MouseProtocol::Off
-                    };
+                // 9 / 1000 / 1002 / 1003 — mouse tracking; 1005 / 1006 /
+                // 1015 — mouse coordinate encodings.
+                9 | 1000 | 1002 | 1003 | 1005 | 1006 | 1015 => {
+                    self.set_mouse_private_mode(code, enable);
                 }
                 // 1004 — focus events.
                 1004 => {
                     self.report_focus = enable;
-                }
-                // 1006 — SGR extended mouse encoding.
-                1006 => {
-                    self.mouse_mode.sgr_encoding = enable;
                 }
                 // 2004 — bracketed paste.
                 2004 => {
@@ -2919,8 +3454,9 @@ impl Term {
         // Drop any selection from the primary grid — once we're on
         // alt, the user can't see the primary content anyway, and
         // selection state would resurface as a phantom highlight on
-        // exit if the primary's rows are then overwritten.
-        self.selection = None;
+        // exit if the primary's rows are then overwritten. Likewise a
+        // selection made on the alt screen is dropped on exit below.
+        self.drop_selection();
         self.saved_cursor = self.cursor;
         self.alt_active = true;
         self.alt.clear_visible(Style::RESET);
@@ -2946,6 +3482,10 @@ impl Term {
         if !self.alt_active {
             return;
         }
+        // A selection made on the alt screen addresses alt-grid line
+        // ids; resolving those against the primary grid would
+        // highlight unrelated rows.
+        self.drop_selection();
         self.alt_active = false;
         self.cursor = self.saved_cursor;
         self.clamp_cursor();
@@ -2985,6 +3525,9 @@ impl Term {
         self.decsc_saved = None;
         self.cursor_underline_color = None;
         self.current_hyperlink = None;
+        // Both grids were just rebuilt, so no cell references an extra
+        // any more — drop the table (the only point it can shrink).
+        self.extras = ExtraTable::default();
         // Scroll region back to the full screen.
         self.scroll_top = 0;
         self.scroll_bot = self.rows.saturating_sub(1);
@@ -3005,7 +3548,7 @@ impl Term {
         self.image_grid.clear();
         self.image_revision = self.image_revision.wrapping_add(1);
         // Drop any selection and re-shape everything.
-        self.selection = None;
+        self.drop_selection();
         self.damage.resize(self.rows);
         self.mark_all_dirty();
     }
@@ -3172,7 +3715,9 @@ impl Perform for Term {
                 let max_col = self.cols.saturating_sub(1);
                 let old_col = self.cursor.col.min(max_col);
                 let next = (self.cursor.col / TAB_WIDTH + 1) * TAB_WIDTH;
+                let from = self.cursor.col;
                 self.cursor.col = next.min(max_col);
+                self.mark_tab_run(row, from, self.cursor.col);
                 self.mark_cell(row, old_col);
                 self.mark_cell(row, self.cursor.col);
             }
@@ -3257,7 +3802,7 @@ impl Perform for Term {
     /// per-frame cursor pass already runs every frame; the title lives
     /// outside the grid entirely.
     #[allow(clippy::too_many_lines)] // each OSC arm is small but the table is wide.
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         // OSC must have at least one param: the code.
         let Some(code_bytes) = params.first() else {
             return;
@@ -3349,17 +3894,32 @@ impl Perform for Term {
                     joined.extend_from_slice(p);
                 }
                 if let Some(op) = toastty_protocols::clipboard::parse(&joined) {
+                    use toastty_protocols::clipboard::Osc52Op;
                     match op {
-                        toastty_protocols::clipboard::Osc52Op::Set { payload, .. } => {
-                            if self.security.osc_52_write {
-                                self.clipboard_requests
-                                    .push(ClipboardRequest::Set { data: payload });
+                        Osc52Op::Set { selection, payload } => {
+                            let targets = selection.write_targets();
+                            if self.security.osc_52_write && !targets.is_empty() {
+                                self.clipboard_requests.push(ClipboardRequest::Set {
+                                    data: payload,
+                                    targets,
+                                });
                             }
                         }
-                        toastty_protocols::clipboard::Osc52Op::Query { selection } => {
-                            if self.security.osc_52_read {
+                        Osc52Op::Clear { selection } => {
+                            let targets = selection.write_targets();
+                            if self.security.osc_52_write && !targets.is_empty() {
+                                self.clipboard_requests
+                                    .push(ClipboardRequest::Clear { targets });
+                            }
+                        }
+                        Osc52Op::Query { selection } => {
+                            if self.security.osc_52_read
+                                && let Some(target) = selection.read_target()
+                            {
                                 self.clipboard_requests.push(ClipboardRequest::Query {
                                     selection: selection.0,
+                                    target,
+                                    bell_terminated,
                                 });
                             }
                         }
@@ -4304,6 +4864,44 @@ fn mark_placement_dirty(t: &mut Term, p: &Placement) {
     }
 }
 
+/// True when the *other* half of the width-2 cluster at `col` is in
+/// `sel` — i.e. `col` is a continuation cell whose lead is selected,
+/// or a lead cell whose continuation is selected. Used so selecting
+/// either half of a wide char selects the whole char.
+fn wide_partner_selected(
+    sel: &crate::selection::Selection,
+    row: &crate::grid::Row,
+    line_id: u64,
+    col: u16,
+) -> bool {
+    let Some(cell) = row.cells.get(usize::from(col)) else {
+        return false;
+    };
+    if cell.is_continuation {
+        col > 0 && sel.contains(line_id, col - 1)
+    } else {
+        row.cells
+            .get(usize::from(col) + 1)
+            .is_some_and(|c| c.is_continuation)
+            && sel.contains(line_id, col + 1)
+    }
+}
+
+/// Cheap content fingerprint of a row (characters + wrap flag; style
+/// is ignored so an app re-highlighting the same text, or redrawing it
+/// identically, doesn't drop the selection). See
+/// [`Term::revalidate_selection`].
+fn row_fingerprint(row: &crate::grid::Row) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for c in &row.cells {
+        c.ch.hash(&mut h);
+        c.is_continuation.hash(&mut h);
+    }
+    row.soft_wrap.hash(&mut h);
+    h.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4973,14 +5571,38 @@ mod tests {
     }
 
     #[test]
-    fn mouse_mode_1000_x10() {
+    fn mouse_mode_1000_normal() {
         let mut t = Term::new(2, 4, 0);
         feed(&mut t, b"\x1b[?1000h");
-        assert_eq!(t.mouse_mode().protocol, MouseProtocol::X10);
+        assert_eq!(t.mouse_mode().protocol, MouseProtocol::Normal);
         assert!(t.mouse_mode().is_on());
         assert!(!t.mouse_mode().report_drag());
         feed(&mut t, b"\x1b[?1000l");
         assert_eq!(t.mouse_mode().protocol, MouseProtocol::Off);
+    }
+
+    #[test]
+    fn mouse_mode_9_x10_compat() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?9h");
+        assert_eq!(t.mouse_mode().protocol, MouseProtocol::X10Compat);
+        assert!(t.mouse_mode().is_on());
+        assert!(!t.mouse_mode().report_drag());
+        feed(&mut t, b"\x1b[?9$p");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?9;1$y");
+        feed(&mut t, b"\x1b[?9l\x1b[?9$p");
+        assert_eq!(t.mouse_mode().protocol, MouseProtocol::Off);
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?9;2$y");
+    }
+
+    #[test]
+    fn mouse_tracking_modes_replace_each_other() {
+        // xterm keeps one `send_mouse_pos`: the last set mode wins.
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?1003h\x1b[?1000h");
+        assert_eq!(t.mouse_mode().protocol, MouseProtocol::Normal);
+        feed(&mut t, b"\x1b[?1000$p\x1b[?1003$p");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?1000;1$y\x1b[?1003;2$y");
     }
 
     #[test]
@@ -5003,17 +5625,61 @@ mod tests {
     #[test]
     fn mouse_mode_1006_sgr_encoding() {
         let mut t = Term::new(2, 4, 0);
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Default);
         feed(&mut t, b"\x1b[?1006h");
-        assert!(t.mouse_mode().sgr_encoding);
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Sgr);
         feed(&mut t, b"\x1b[?1006l");
-        assert!(!t.mouse_mode().sgr_encoding);
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Default);
+    }
+
+    #[test]
+    fn mouse_mode_1005_and_1015_encodings() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?1005h");
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Utf8);
+        feed(&mut t, b"\x1b[?1015h");
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Urxvt);
+        feed(&mut t, b"\x1b[?1015l");
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Default);
+    }
+
+    #[test]
+    fn mouse_encodings_are_mutually_exclusive_like_xterm() {
+        // Last set wins; a reset only clears the matching mode.
+        let mut t = Term::new(2, 4, 0);
+        // crossterm's EnableMouseCapture order: ...1015h 1006h → SGR.
+        feed(&mut t, b"\x1b[?1015h\x1b[?1006h");
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Sgr);
+        // Resetting a non-active encoding is a no-op.
+        feed(&mut t, b"\x1b[?1015l\x1b[?1005l");
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Sgr);
+        // Reverse order → urxvt is the active one.
+        feed(&mut t, b"\x1b[?1015h");
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Urxvt);
+        feed(&mut t, b"\x1b[?1006l");
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Urxvt);
+        // DECRQM reports only the active encoding as set.
+        feed(&mut t, b"\x1b[?1005$p\x1b[?1006$p\x1b[?1015$p");
+        assert_eq!(
+            &t.drain_pty_replies()[..],
+            b"\x1b[?1005;2$y\x1b[?1006;2$y\x1b[?1015;1$y"
+        );
+        feed(&mut t, b"\x1b[?1005h\x1b[?1005$p");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?1005;1$y");
+    }
+
+    #[test]
+    fn ris_resets_mouse_mode_and_encoding() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?1002h\x1b[?1015h\x1bc");
+        assert_eq!(t.mouse_mode(), MouseMode::default());
     }
 
     #[test]
     fn mouse_mode_combined_1006_1002() {
         let mut t = Term::new(2, 4, 0);
         feed(&mut t, b"\x1b[?1002h\x1b[?1006h");
-        assert!(t.mouse_mode().sgr_encoding);
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Sgr);
         assert_eq!(t.mouse_mode().protocol, MouseProtocol::ButtonMotion);
     }
 
@@ -6656,10 +7322,16 @@ mod tests {
         feed(&mut t, b"\x1b]52;c;aGVsbG8=\x1b\\");
         let reqs = t.drain_clipboard_requests();
         assert_eq!(reqs.len(), 1);
-        match &reqs[0] {
-            ClipboardRequest::Set { data } => assert_eq!(data, b"hello"),
-            ClipboardRequest::Query { .. } => panic!("expected Set"),
-        }
+        assert_eq!(
+            reqs[0],
+            ClipboardRequest::Set {
+                data: b"hello".to_vec(),
+                targets: ClipboardTargets {
+                    clipboard: true,
+                    primary: false,
+                },
+            }
+        );
     }
 
     #[test]
@@ -6679,10 +7351,14 @@ mod tests {
         feed(&mut t, b"\x1b]52;c;?\x1b\\");
         let reqs = t.drain_clipboard_requests();
         assert_eq!(reqs.len(), 1);
-        match &reqs[0] {
-            ClipboardRequest::Query { selection } => assert_eq!(selection, b"c"),
-            ClipboardRequest::Set { .. } => panic!("expected Query"),
-        }
+        assert_eq!(
+            reqs[0],
+            ClipboardRequest::Query {
+                selection: b"c".to_vec(),
+                target: ClipboardTarget::Clipboard,
+                bell_terminated: false,
+            }
+        );
     }
 
     #[test]
@@ -6692,8 +7368,103 @@ mod tests {
             osc_52_read: true,
             osc_52_write: true,
         });
+        // Invalid base64 clears the selection (xterm) rather than
+        // writing garbage or being silently ignored.
         feed(&mut t, b"\x1b]52;c;!!\x1b\\");
+        assert_eq!(
+            t.drain_clipboard_requests(),
+            vec![ClipboardRequest::Clear {
+                targets: ClipboardTargets {
+                    clipboard: true,
+                    primary: false,
+                },
+            }]
+        );
+        // Missing data separator is malformed: dropped.
+        feed(&mut t, b"\x1b]52;c\x1b\\");
         assert!(t.drain_clipboard_requests().is_empty());
+    }
+
+    fn osc52_rw_term() -> Term {
+        let mut t = Term::new(2, 4, 0);
+        t.set_security(SecurityFlags {
+            osc_52_read: true,
+            osc_52_write: true,
+        });
+        t
+    }
+
+    #[test]
+    fn osc52_selection_param_routes_targets() {
+        let mut t = osc52_rw_term();
+        let set = |c, p| ClipboardRequest::Set {
+            data: b"hi".to_vec(),
+            targets: ClipboardTargets {
+                clipboard: c,
+                primary: p,
+            },
+        };
+        feed(&mut t, b"\x1b]52;p;aGk=\x07");
+        feed(&mut t, b"\x1b]52;cp;aGk=\x07");
+        feed(&mut t, b"\x1b]52;s;aGk=\x07");
+        feed(&mut t, b"\x1b]52;;aGk=\x07");
+        feed(&mut t, b"\x1b]52;c;aGk\x07"); // unpadded
+        assert_eq!(
+            t.drain_clipboard_requests(),
+            vec![
+                set(false, true),
+                set(true, true),
+                set(true, true),
+                set(true, true),
+                set(true, false),
+            ]
+        );
+        // Only unsupported buffers (secondary / cut buffer): no-op.
+        feed(&mut t, b"\x1b]52;q;aGk=\x07\x1b]52;0;\x07\x1b]52;q;?\x07");
+        assert!(t.drain_clipboard_requests().is_empty());
+    }
+
+    #[test]
+    fn osc52_empty_payload_clears_when_write_enabled() {
+        let mut t = osc52_rw_term();
+        feed(&mut t, b"\x1b]52;p;\x1b\\");
+        assert_eq!(
+            t.drain_clipboard_requests(),
+            vec![ClipboardRequest::Clear {
+                targets: ClipboardTargets {
+                    clipboard: false,
+                    primary: true,
+                },
+            }]
+        );
+        // Clearing is a write: gated by osc_52_write.
+        t.set_security(SecurityFlags {
+            osc_52_read: true,
+            osc_52_write: false,
+        });
+        feed(&mut t, b"\x1b]52;p;\x1b\\");
+        assert!(t.drain_clipboard_requests().is_empty());
+    }
+
+    #[test]
+    fn osc52_query_records_target_and_terminator() {
+        let mut t = osc52_rw_term();
+        feed(&mut t, b"\x1b]52;p;?\x07\x1b]52;c;?\x1b\\");
+        assert_eq!(
+            t.drain_clipboard_requests(),
+            vec![
+                ClipboardRequest::Query {
+                    selection: b"p".to_vec(),
+                    target: ClipboardTarget::Primary,
+                    bell_terminated: true,
+                },
+                ClipboardRequest::Query {
+                    selection: b"c".to_vec(),
+                    target: ClipboardTarget::Clipboard,
+                    bell_terminated: false,
+                },
+            ]
+        );
     }
 
     // ----- M11a: kitty APC integration -----

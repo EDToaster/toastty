@@ -27,7 +27,7 @@ use toastty_term::{
     ClipboardRequest, Pos, SecurityFlags, Selection, SelectionMode, Smoothing, Term,
 };
 use toastty_window::{
-    App, ControlSignal, Event, KeyState, LogicalKey, Modifiers, MouseButton, NamedKey,
+    App, ControlSignal, Event, KeyState, LogicalKey, Modifiers, MouseButton, NamedKey, PhysicalKey,
     ToasttyWindow, WindowHandle, WindowOptions, run,
 };
 use tracing::{debug, info, warn};
@@ -35,6 +35,7 @@ use tracing_subscriber::EnvFilter;
 
 use toastty::cli;
 use toastty::cli::CommandOverride;
+use toastty::clipboard::{self as sysclip, ClipboardTarget};
 use toastty::config_watcher::ConfigWatcher;
 use toastty::focus::encode_focus;
 use toastty::geometry::{
@@ -42,8 +43,8 @@ use toastty::geometry::{
 };
 use toastty::keyboard::encode_key;
 use toastty::mouse::{
-    MouseEventKind, classify_button_event, encode_mouse, pixel_to_cell, protocol_wants_event,
-    word_bounds_in_row,
+    MouseEventKind, classify_button_event, drag_autoscroll_dir, encode_mouse, pixel_to_cell,
+    protocol_wants_event,
 };
 use toastty::paste::wrap_for_paste;
 use toastty::pty_log::{Direction, PtyLogger};
@@ -56,6 +57,11 @@ use toastty::theme_bridge::{
 /// 16 ms ≈ 60 Hz — fast enough to feel smooth on macOS trackpad
 /// inertia frames without burning the event loop when idle.
 const VIEWPORT_ANIM_TICK: Duration = Duration::from_millis(16);
+
+/// Auto-scroll cadence while a selection drag is held past the top or
+/// bottom edge of the grid: one line per tick (~20 lines/s), roughly
+/// xterm's rate.
+const SELECTION_AUTOSCROLL_TICK: Duration = Duration::from_millis(50);
 
 /// Refresh cadence for the `TOASTTY_DEBUG` FPS overlay. Keeps the text
 /// visibly updating when the grid is idle (otherwise the renderer would
@@ -104,6 +110,12 @@ struct DragState {
     /// selection extends from the word/line *containing* this point;
     /// motion expands by re-evaluating boundaries against the new cell.
     origin: Pos,
+    /// True once a `Char`/`Block` drag has left its press cell. A
+    /// plain click never creates a selection, so it neither paints a
+    /// one-cell highlight nor overwrites the clipboard on release.
+    /// `Word`/`Line` (double/triple click) select on press and are
+    /// always `true`.
+    moved: bool,
 }
 
 /// Convert a config `SmoothingFunction` into the per-frame easing
@@ -270,6 +282,10 @@ struct Toastty {
     /// matching release). Used to fill the "button held" slot of motion
     /// reports under DECSET 1002.
     mouse_held: Option<MouseButton>,
+    /// Button whose press was consumed by Ctrl/Cmd+click link-opening.
+    /// Its matching release is swallowed too, so the foreground app
+    /// never sees an orphan release for a press it didn't receive.
+    link_click_button: Option<MouseButton>,
     /// Last (col, row) reported to the PTY via a motion event. Tracked
     /// so we only emit a motion report when the pointer crosses into a
     /// new cell — xterm convention, and avoids flooding the PTY with
@@ -279,6 +295,16 @@ struct Toastty {
     /// keeps a connection to the OS clipboard server; constructing it
     /// failed on the user's box is recoverable — we just log + skip.
     clipboard: Option<arboard::Clipboard>,
+    /// Keys whose *press* toastty consumed as a copy/paste shortcut.
+    /// Under the kitty keyboard protocol (flag 2, report events) the
+    /// matching release would otherwise reach the app as an orphan
+    /// (`ESC[118;1:3u` after Ctrl+Shift+V), so we swallow it too. Keyed
+    /// by [`key_identity`]; a handful of entries at most.
+    swallowed_releases: Vec<String>,
+    /// True when a middle-button press was consumed as a PRIMARY
+    /// paste, so its release isn't forwarded to a mouse-tracking app
+    /// (Shift+middle-click under tracking).
+    middle_paste_consumed: bool,
     /// Optional bidirectional PTY-byte logger, enabled by
     /// `TOASTTY_PTY_LOG=<path>`. No-op when the env var is unset.
     pty_log: PtyLogger,
@@ -361,6 +387,14 @@ struct Toastty {
     /// Number of clicks in the current multi-click streak: 0 between
     /// streaks, 1/2/3 within one. Wrapping above 3 cycles back to 1.
     click_count: u8,
+    /// Auto-scroll direction while a selection drag is held past the
+    /// grid's top (`1`, into history) or bottom (`-1`) edge; `0`
+    /// otherwise. Ticked from `Event::Redraw`.
+    selection_autoscroll: i32,
+    /// When the last auto-scroll step ran, to pace it at
+    /// [`SELECTION_AUTOSCROLL_TICK`] regardless of how often redraws
+    /// fire.
+    last_autoscroll_at: Option<Instant>,
 }
 
 impl Toastty {
@@ -401,8 +435,11 @@ impl Toastty {
             last_title: None,
             mouse_pos: (0.0, 0.0),
             mouse_held: None,
+            link_click_button: None,
             last_reported_cell: None,
             clipboard: None,
+            swallowed_releases: Vec::new(),
+            middle_paste_consumed: false,
             pty_log: PtyLogger::from_env(),
             alt_scroll_pixel_accum: 0.0,
             mouse_scroll_accum_y: 0.0,
@@ -423,6 +460,8 @@ impl Toastty {
             last_click_at: None,
             last_click_pos: None,
             click_count: 0,
+            selection_autoscroll: 0,
+            last_autoscroll_at: None,
         }
     }
 
@@ -451,32 +490,38 @@ impl Toastty {
         }
     }
 
-    /// Read the system clipboard and write it to the PTY, bracketed if the
-    /// foreground app has opted into DECSET 2004.
-    fn paste(&mut self) {
-        if self.pty.is_none() {
-            return;
-        }
-        // Lazy-init the clipboard handle. If init failed last time, retry —
-        // a transient failure (e.g. Wayland server hadn't bound the data
-        // device yet) shouldn't doom every paste for the rest of the
-        // session.
+    /// Lazy-init `self.clipboard`. If init failed last time, retry — a
+    /// transient failure (e.g. Wayland server hadn't bound the data
+    /// device yet) shouldn't doom every paste for the rest of the
+    /// session.
+    fn clipboard_handle(&mut self) -> Option<&mut arboard::Clipboard> {
         if self.clipboard.is_none() {
             match arboard::Clipboard::new() {
                 Ok(c) => self.clipboard = Some(c),
                 Err(e) => {
                     warn!("clipboard init failed: {e}");
-                    return;
+                    return None;
                 }
             }
         }
-        let Some(clipboard) = self.clipboard.as_mut() else {
+        self.clipboard.as_mut()
+    }
+
+    /// Read `target` (CLIPBOARD, or PRIMARY for middle-click /
+    /// Shift+Insert; PRIMARY falls back to the clipboard where the
+    /// platform has none) and write it to the PTY, bracketed if the
+    /// foreground app has opted into DECSET 2004.
+    fn paste_from(&mut self, target: ClipboardTarget) {
+        if self.pty.is_none() {
+            return;
+        }
+        let Some(clipboard) = self.clipboard_handle() else {
             return;
         };
-        let text = match clipboard.get_text() {
+        let text = match sysclip::get_text(clipboard, target) {
             Ok(s) => s,
             Err(e) => {
-                debug!("clipboard read failed: {e}");
+                debug!("clipboard read ({target:?}) failed: {e}");
                 return;
             }
         };
@@ -508,38 +553,45 @@ impl Toastty {
     /// render thread is invisible. (TODO if real workloads disagree:
     /// move clipboard I/O onto a dedicated worker thread.)
     fn service_clipboard_request(&mut self, req: &ClipboardRequest) {
-        if self.clipboard.is_none() {
-            match arboard::Clipboard::new() {
-                Ok(c) => self.clipboard = Some(c),
-                Err(e) => {
-                    warn!("clipboard init failed: {e}");
-                    return;
-                }
-            }
-        }
-        let Some(clipboard) = self.clipboard.as_mut() else {
+        let Some(clipboard) = self.clipboard_handle() else {
             return;
         };
         match req {
-            ClipboardRequest::Set { data } => {
+            ClipboardRequest::Set { data, targets } => {
                 // OSC 52 set must be UTF-8 text to round-trip through
                 // arboard's typed API; lossy-decode if the app sent
                 // garbage bytes.
-                let text = String::from_utf8_lossy(data);
-                if let Err(e) = clipboard.set_text(text.into_owned()) {
-                    warn!("clipboard write failed: {e}");
+                let text = String::from_utf8_lossy(data).into_owned();
+                for target in sysclip::effective_targets(*targets) {
+                    if let Err(e) = sysclip::set_text(clipboard, target, text.clone()) {
+                        warn!("clipboard write ({target:?}) failed: {e}");
+                    }
                 }
             }
-            ClipboardRequest::Query { selection } => {
-                let bytes = match clipboard.get_text() {
+            ClipboardRequest::Clear { targets } => {
+                for target in sysclip::effective_targets(*targets) {
+                    if let Err(e) = sysclip::clear(clipboard, target) {
+                        debug!("clipboard clear ({target:?}) failed: {e}");
+                    }
+                }
+            }
+            ClipboardRequest::Query {
+                selection,
+                target,
+                bell_terminated,
+            } => {
+                // An empty / non-text buffer replies with empty data
+                // rather than leaving the app waiting for an answer.
+                let bytes = match sysclip::get_text(clipboard, *target) {
                     Ok(s) => s.into_bytes(),
                     Err(e) => {
-                        debug!("clipboard read failed: {e}");
-                        return;
+                        debug!("clipboard read ({target:?}) failed: {e}");
+                        Vec::new()
                     }
                 };
                 let sel = toastty_protocols::clipboard::SelectionChars(selection.clone());
-                let reply = toastty_protocols::clipboard::encode_reply(&sel, &bytes);
+                let reply =
+                    toastty_protocols::clipboard::encode_reply(&sel, &bytes, *bell_terminated);
                 self.term.push_pty_reply(&reply);
             }
         }
@@ -599,40 +651,55 @@ impl Toastty {
         click_count: u8,
         modifiers: Modifiers,
     ) -> Selection {
-        let (_, cols) = self.term.size();
-        // Alt+drag → block selection (only meaningful for an initial
-        // single click; double/triple-click + alt also drops back to
-        // block, matching iTerm2 / kitty).
+        // Alt+drag or Ctrl+Alt+drag → block selection (only meaningful
+        // for an initial single click; double/triple-click + alt also
+        // drops back to block, matching iTerm2 / kitty). Ctrl+Alt is
+        // kitty's binding and the one to use under window managers
+        // (Openbox, Xfce, …) that grab Alt+drag to move windows.
         if modifiers.contains(Modifiers::ALT) {
             return Selection::new(origin, SelectionMode::Block);
         }
         match click_count {
             2 => {
                 // Word: expand origin to word boundaries.
-                let (lo, hi) = self
-                    .word_bounds_at(origin.line_id, origin.col)
-                    .unwrap_or((origin.col, origin.col));
-                let mut sel = Selection::new(Pos::new(origin.line_id, lo), SelectionMode::Word);
-                sel.set_active(Pos::new(origin.line_id, hi));
+                let (lo, hi) = self.word_bounds_at(origin);
+                let mut sel = Selection::new(lo, SelectionMode::Word);
+                sel.set_active(hi);
                 sel
             }
             3 => {
-                // Line: full row.
-                let end = cols.saturating_sub(1);
-                let mut sel = Selection::new(Pos::new(origin.line_id, 0), SelectionMode::Line);
-                sel.set_active(Pos::new(origin.line_id, end));
+                // Line: the whole logical (soft-wrapped) line.
+                let (lo, hi) = self.line_bounds_at(origin.line_id);
+                let mut sel = Selection::new(lo, SelectionMode::Line);
+                sel.set_active(hi);
                 sel
             }
             _ => Selection::new(origin, SelectionMode::Char),
         }
     }
 
-    /// Look up the visible word-boundary range given a `line_id`,
-    /// falling back to `None` for evicted rows. Used by both
-    /// press-time word expansion and drag-time word extension.
-    fn word_bounds_at(&self, line_id: u64, col: u16) -> Option<(u16, u16)> {
-        let row = self.term.primary_row_by_line_id(line_id)?;
-        Some(word_bounds_in_row(row, col))
+    /// Word containing `at` (inclusive start/end), using Unicode
+    /// alphanumerics plus the configured `selection.word_chars`. Words
+    /// continue across soft wraps. Falls back to `(at, at)` for
+    /// non-word cells and evicted rows. Used by both press-time word
+    /// expansion and drag-time word extension.
+    fn word_bounds_at(&self, at: Pos) -> (Pos, Pos) {
+        let sel_cfg = &self.config.selection;
+        self.term
+            .word_bounds(at, |c| sel_cfg.is_word_char(c))
+            .unwrap_or((at, at))
+    }
+
+    /// First and last cell of the logical line containing `line_id`
+    /// (every row joined to it by soft wraps). Falls back to the single
+    /// visual row for an evicted line id.
+    fn line_bounds_at(&self, line_id: u64) -> (Pos, Pos) {
+        let (_, cols) = self.term.size();
+        let (lo, hi) = self
+            .term
+            .logical_line_bounds(line_id)
+            .unwrap_or((line_id, line_id));
+        (Pos::new(lo, 0), Pos::new(hi, cols.saturating_sub(1)))
     }
 
     /// Push the configured window padding + `extend_background` mode into
@@ -735,6 +802,9 @@ impl Toastty {
             }
         }
         self.parser.advance(&mut self.term, bytes);
+        // A finished (released) selection whose rows were redrawn or
+        // evicted no longer describes what the user picked — drop it.
+        self.term.revalidate_selection();
         // OSC 0/1/2 may have changed the title — sync to the window
         // decoration. `sync_title` is a no-op when the title is
         // unchanged, so calling on every batch is cheap.
@@ -1169,9 +1239,11 @@ impl Toastty {
         ControlSignal::Continue
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_key(
         &mut self,
         logical: &LogicalKey,
+        physical: &PhysicalKey,
         text: Option<&str>,
         modifiers: Modifiers,
         state: KeyState,
@@ -1187,20 +1259,49 @@ impl Toastty {
             }
             return self.handle_close_prompt_key(logical, text);
         }
-        // Intercept paste binding *before* the regular encoder.
-        if state == KeyState::Pressed && is_paste_binding(logical, modifiers) {
-            self.paste();
-            return ControlSignal::RedrawIn(Duration::ZERO);
+        // Release of a key whose press we consumed as a shortcut: swallow
+        // it so kitty-protocol apps don't see an orphan release.
+        let key_id = key_identity(logical, physical);
+        if state == KeyState::Released
+            && let Some(i) = self.swallowed_releases.iter().position(|k| *k == key_id)
+        {
+            self.swallowed_releases.swap_remove(i);
+            return ControlSignal::Continue;
         }
-        // Copy current selection (if any) to the clipboard. Eats the
-        // keypress so the foreground app doesn't also see it.
+        // Intercept paste bindings *before* the regular encoder.
+        // Shift+Insert pastes PRIMARY on X11/Wayland (xterm, Alacritty),
+        // the clipboard elsewhere.
+        if state == KeyState::Pressed {
+            let source = if is_paste_binding(logical, modifiers) {
+                Some(ClipboardTarget::Clipboard)
+            } else if is_selection_paste_binding(logical, modifiers) {
+                Some(sysclip::selection_paste_source())
+            } else {
+                None
+            };
+            if let Some(source) = source {
+                self.paste_from(source);
+                self.swallow_release(key_id);
+                return ControlSignal::RedrawIn(Duration::ZERO);
+            }
+        }
+        // Copy current selection (if any) to the clipboard and eat the
+        // keypress. With nothing selected the shortcut is the app's to
+        // use (herdr's `copy_on_select = false` + Ctrl+Shift+C flow), but
+        // only when the kitty keyboard protocol makes it distinguishable:
+        // in legacy encoding Ctrl+Shift+C is byte-identical to Ctrl+C
+        // (SIGINT) and Cmd+C would type a bare `c`, so a reflexive copy
+        // press must not reach the app there.
         if state == KeyState::Pressed && is_copy_binding(logical, modifiers) {
-            if let Some(text) = self.term.extract_selection_text()
-                && !text.is_empty()
-            {
+            let text = self.term.extract_selection_text().filter(|t| !t.is_empty());
+            let have_selection = text.is_some();
+            if let Some(text) = text {
                 self.write_clipboard(text);
             }
-            return ControlSignal::RedrawIn(Duration::ZERO);
+            if copy_binding_consumes(have_selection, self.term.kitty_flags()) {
+                self.swallow_release(key_id);
+                return ControlSignal::RedrawIn(Duration::ZERO);
+            }
         }
         // Don't forward synthetic events — winit fires those on focus loss
         // to clear modifier state; reporting them to the PTY would desync
@@ -1290,9 +1391,10 @@ impl Toastty {
         // Local drag-select first: when we've started a selection,
         // every motion event extends it, even if the foreground app
         // would otherwise want the motion. (The selection only starts
-        // in the first place when `mouse_mode().is_on()` was false, so
-        // there's no conflict.)
+        // in the first place when `mouse_mode().is_on()` was false or
+        // Shift forced it, so the app never sees these motions.)
         if self.selecting.is_some() {
+            self.selection_autoscroll = self.autoscroll_dir_at(position.1);
             self.extend_selection_to_cursor();
             return ControlSignal::RedrawIn(Duration::ZERO);
         }
@@ -1342,28 +1444,62 @@ impl Toastty {
         {
             return ControlSignal::RedrawIn(Duration::ZERO);
         }
-        // OSC 8 click-to-open: Cmd-Left on macOS / Ctrl-Left elsewhere
-        // on press only. Consume the event so the mouse encoder doesn't
-        // also forward it to the foreground app.
-        if state == KeyState::Pressed && is_open_link_binding(button, modifiers) {
-            if let Some(url) = self.hyperlink_under_cursor(position)
-                && let Err(e) = webbrowser::open(&url)
-            {
-                warn!("open URL failed: {e}");
-            }
+        // OSC 8 click-to-open: Cmd-Left on macOS / Ctrl-Left elsewhere.
+        // Only consume the press when there's actually a hyperlink under
+        // the pointer; otherwise Ctrl/Cmd+click must reach the app (or
+        // local selection) so its press/drag/release stay paired. When we
+        // do consume it, also eat the matching release and stop treating
+        // the button as held, so the app sees neither half of the click.
+        if state == KeyState::Released && self.link_click_button == Some(button) {
+            self.link_click_button = None;
             return ControlSignal::Continue;
         }
-        // Local text selection takes priority over PTY forwarding when
-        // the foreground app hasn't opted into mouse tracking. Only
-        // the left button drives selection; other buttons fall through
-        // to the existing encoder.
-        let mode = self.term.mouse_mode();
-        if !mode.is_on() && button == MouseButton::Left {
-            match state {
-                KeyState::Pressed => self.begin_or_extend_selection(modifiers),
-                KeyState::Released => self.finish_selection_drag(),
+        if state == KeyState::Pressed
+            && is_open_link_binding(button, modifiers)
+            && let Some(url) = self.hyperlink_under_cursor(position)
+        {
+            if let Err(e) = webbrowser::open(&url) {
+                warn!("open URL failed: {e}");
             }
+            self.link_click_button = Some(button);
+            self.mouse_held = None;
+            return ControlSignal::Continue;
+        }
+        let mode = self.term.mouse_mode();
+        // Middle-click pastes PRIMARY (clipboard on macOS) unless the app
+        // is tracking the mouse; Shift forces the paste, xterm-style.
+        if button == MouseButton::Middle && self.handle_middle_paste(state, mode.is_on(), modifiers)
+        {
             return ControlSignal::RedrawIn(Duration::ZERO);
+        }
+        // Local text selection takes priority over PTY forwarding when
+        // the foreground app hasn't opted into mouse tracking — or when
+        // Shift is held, which bypasses tracking (xterm convention,
+        // shared by kitty / Alacritty / WezTerm / Ghostty / iTerm2;
+        // herdr and tmux rely on it). Those events are handled here and
+        // never reach the app, Shift bit included. A release always
+        // goes to whoever got the press, even if Shift was let go
+        // mid-drag. Only the left button drives selection; other
+        // buttons fall through to the existing encoder.
+        if button == MouseButton::Left {
+            let local = match state {
+                KeyState::Pressed => !mode.is_on() || modifiers.contains(Modifiers::SHIFT),
+                KeyState::Released => self.selecting.is_some(),
+            };
+            if local {
+                match state {
+                    KeyState::Pressed => {
+                        self.begin_or_extend_selection(modifiers - Modifiers::SHIFT);
+                    }
+                    KeyState::Released => self.finish_selection_drag(),
+                }
+                return ControlSignal::RedrawIn(Duration::ZERO);
+            }
+            // A click the app consumes still dismisses a lingering
+            // highlight, like a click anywhere does without tracking.
+            if state == KeyState::Pressed {
+                self.term.clear_selection();
+            }
         }
         let kind = classify_button_event(button, state);
         if protocol_wants_event(mode, &kind) {
@@ -1408,8 +1544,13 @@ impl Toastty {
 
     /// Start a fresh selection (or step the multi-click counter) at
     /// the current cursor position. Called from `handle_mouse` on a
-    /// left-button press when the foreground app isn't tracking the
-    /// mouse.
+    /// left-button press when local selection applies (no mouse
+    /// tracking, or Shift held).
+    ///
+    /// Any previous selection is dismissed. A single click only arms
+    /// the drag: the selection is created once the pointer leaves the
+    /// press cell (see `extend_selection_to_cursor`), so clicking to
+    /// focus or dismiss never copies anything.
     fn begin_or_extend_selection(&mut self, modifiers: Modifiers) {
         let origin = self.current_selection_pos();
         let now = Instant::now();
@@ -1428,97 +1569,203 @@ impl Toastty {
         // For Alt+drag, selection mode is Block — capture the chosen
         // mode and the original origin so motion can extend correctly.
         let mode = sel.mode;
-        self.selecting = Some(DragState { mode, origin });
-        self.term.set_selection(sel);
+        let immediate = matches!(mode, SelectionMode::Word | SelectionMode::Line);
+        self.selecting = Some(DragState {
+            mode,
+            origin,
+            moved: immediate,
+        });
+        self.selection_autoscroll = 0;
+        if immediate {
+            self.term.set_selection(sel);
+        } else {
+            self.term.clear_selection();
+        }
+    }
+
+    /// Auto-scroll direction for a drag whose pointer is at window y
+    /// `y`. Only the primary screen has scrollback to move through.
+    fn autoscroll_dir_at(&self, y: f64) -> i32 {
+        let Some(r) = self.renderer.as_ref() else {
+            return 0;
+        };
+        if self.term.is_alt_active() {
+            return 0;
+        }
+        let (rows, _) = self.term.size();
+        let (_, top) = r.content_origin_px();
+        let content_h = f64::from(rows) * f64::from(r.cell_size().1);
+        drag_autoscroll_dir(y, f64::from(top), content_h)
+    }
+
+    /// One auto-scroll step for a drag held past the grid edge: scroll
+    /// the viewport a line toward the pointer and re-extend the
+    /// selection to the newly exposed edge row. Returns the delay until
+    /// the next step, or `None` when no auto-scroll is active.
+    fn tick_selection_autoscroll(&mut self, now: Instant) -> Option<Duration> {
+        if self.selecting.is_none() || self.selection_autoscroll == 0 {
+            self.last_autoscroll_at = None;
+            return None;
+        }
+        if let Some(at) = self.last_autoscroll_at {
+            let since = now.duration_since(at);
+            if since < SELECTION_AUTOSCROLL_TICK {
+                return Some(SELECTION_AUTOSCROLL_TICK.saturating_sub(since));
+            }
+        }
+        let cell_h = self.renderer.as_ref().map_or(0.0, |r| r.cell_size().1);
+        if cell_h > 0.0 {
+            self.term
+                .scroll_view_by(self.selection_autoscroll, 0.0, cell_h);
+            self.term.force_snap_view();
+            self.extend_selection_to_cursor();
+        }
+        self.last_autoscroll_at = Some(now);
+        Some(SELECTION_AUTOSCROLL_TICK)
     }
 
     /// Extend the in-flight selection to whichever cell the pointer
     /// currently sits over. Called from `handle_mouse_motion` while a
     /// drag is active.
     fn extend_selection_to_cursor(&mut self) {
-        let Some(drag) = self.selecting else {
+        let Some(mut drag) = self.selecting else {
             return;
         };
         let here = self.current_selection_pos();
+        if drag.moved && self.term.selection().is_none() {
+            // The term dropped the selection under us (screen switch,
+            // resize, RIS) — the origin no longer means anything.
+            self.selecting = None;
+            self.selection_autoscroll = 0;
+            return;
+        }
         match drag.mode {
             SelectionMode::Char | SelectionMode::Block => {
+                if !drag.moved {
+                    if here == drag.origin {
+                        return;
+                    }
+                    drag.moved = true;
+                    self.selecting = Some(drag);
+                    self.term
+                        .set_selection(Selection::new(drag.origin, drag.mode));
+                }
                 self.term.update_selection_active(here);
             }
             SelectionMode::Word => {
                 // Snap `here` to the word containing it, then extend
                 // anchor → active to the far edge so the selection
                 // grows by whole words on each side.
-                let (lo_here, hi_here) = self
-                    .word_bounds_at(here.line_id, here.col)
-                    .unwrap_or((here.col, here.col));
-                let (lo_origin, hi_origin) = self
-                    .word_bounds_at(drag.origin.line_id, drag.origin.col)
-                    .unwrap_or((drag.origin.col, drag.origin.col));
-                // Build a Selection with anchor at the further-from-here
-                // edge of the origin word, active at the further-from-
-                // origin edge of the here word.
+                let (lo_here, hi_here) = self.word_bounds_at(here);
+                let (lo_origin, hi_origin) = self.word_bounds_at(drag.origin);
                 let dragging_forward =
                     (here.line_id, here.col) >= (drag.origin.line_id, drag.origin.col);
-                let (anchor_col, active_col) = if dragging_forward {
+                let (anchor, active) = if dragging_forward {
                     (lo_origin, hi_here)
                 } else {
                     (hi_origin, lo_here)
                 };
-                let mut sel = Selection::new(
-                    Pos::new(drag.origin.line_id, anchor_col),
-                    SelectionMode::Word,
-                );
-                sel.set_active(Pos::new(here.line_id, active_col));
+                let mut sel = Selection::new(anchor, SelectionMode::Word);
+                sel.set_active(active);
                 self.term.set_selection(sel);
             }
             SelectionMode::Line => {
-                // Anchor at origin row col 0, active at here row col
-                // cols-1 (or vice versa).
-                let (_, cols) = self.term.size();
-                let end = cols.saturating_sub(1);
+                // Whole logical lines from the origin's to the
+                // pointer's, in drag direction.
+                let (lo_origin, hi_origin) = self.line_bounds_at(drag.origin.line_id);
+                let (lo_here, hi_here) = self.line_bounds_at(here.line_id);
                 let dragging_forward = here.line_id >= drag.origin.line_id;
-                let mut sel = Selection::new(
-                    Pos::new(drag.origin.line_id, if dragging_forward { 0 } else { end }),
-                    SelectionMode::Line,
-                );
-                sel.set_active(Pos::new(
-                    here.line_id,
-                    if dragging_forward { end } else { 0 },
-                ));
+                let (anchor, active) = if dragging_forward {
+                    (lo_origin, hi_here)
+                } else {
+                    (hi_origin, lo_here)
+                };
+                let mut sel = Selection::new(anchor, SelectionMode::Line);
+                sel.set_active(active);
                 self.term.set_selection(sel);
             }
         }
     }
 
-    /// Wrap up the drag on left-release: copy the selected text to the
-    /// system clipboard if non-empty, then drop the visible highlight
-    /// — the user signalled "I'm done picking" by releasing the
-    /// button, and the highlight lingering past that is visual noise.
+    /// Wrap up the drag on left-release. A plain click (no movement)
+    /// selects nothing and leaves the clipboard alone. Otherwise the
+    /// selected text goes to [`Self::selection_finished`] and the
+    /// highlight *stays* — like xterm / kitty / Ghostty — so the copy
+    /// shortcut still works afterwards. It's dismissed by the next
+    /// click, by typing, or when the selected rows change
+    /// (`Term::revalidate_selection`).
     fn finish_selection_drag(&mut self) {
-        if self.selecting.take().is_none() {
+        self.selection_autoscroll = 0;
+        let Some(drag) = self.selecting.take() else {
+            return;
+        };
+        if !drag.moved {
             return;
         }
         if let Some(text) = self.term.extract_selection_text()
             && !text.is_empty()
         {
-            self.write_clipboard(text);
+            self.selection_finished(text);
         }
-        self.term.clear_selection();
+        self.term.commit_selection();
     }
 
-    /// Lazy-init `self.clipboard` and write `text`. Mirrors the
-    /// paste-path init in `Self::paste`.
-    fn write_clipboard(&mut self, text: String) {
-        if self.clipboard.is_none() {
-            match arboard::Clipboard::new() {
-                Ok(c) => self.clipboard = Some(c),
-                Err(e) => {
-                    warn!("clipboard init failed: {e}");
-                    return;
-                }
-            }
+    /// The user finished a mouse selection whose text is `text`
+    /// (non-empty). Single hook for everything that should happen with
+    /// a completed selection: copy-on-select to PRIMARY (X11/Wayland)
+    /// and the CLIPBOARD.
+    fn selection_finished(&mut self, text: String) {
+        self.write_primary(&text);
+        self.write_clipboard(text);
+    }
+
+    /// Mirror a finished mouse selection into PRIMARY (X11/Wayland
+    /// select-to-copy, pasted by middle-click / Shift+Insert). No-op
+    /// where the platform has no PRIMARY.
+    fn write_primary(&mut self, text: &str) {
+        if !sysclip::HAS_PRIMARY {
+            return;
         }
-        if let Some(cb) = self.clipboard.as_mut()
+        if let Some(cb) = self.clipboard_handle()
+            && let Err(e) = sysclip::set_text(cb, ClipboardTarget::Primary, text.to_owned())
+        {
+            warn!("primary selection write failed: {e}");
+        }
+    }
+
+    /// Middle-button press/release: paste the selection buffer when
+    /// [`middle_click_pastes`] says so. Returns `true` when the event
+    /// was consumed (the press, and the release of a consumed press).
+    fn handle_middle_paste(
+        &mut self,
+        state: KeyState,
+        tracking: bool,
+        modifiers: Modifiers,
+    ) -> bool {
+        match state {
+            KeyState::Pressed => {
+                if !middle_click_pastes(tracking, modifiers) {
+                    return false;
+                }
+                self.middle_paste_consumed = true;
+                self.paste_from(sysclip::selection_paste_source());
+                true
+            }
+            KeyState::Released => std::mem::take(&mut self.middle_paste_consumed),
+        }
+    }
+
+    /// Remember that the press of `key_id` was consumed so its release
+    /// is swallowed too.
+    fn swallow_release(&mut self, key_id: String) {
+        if !self.swallowed_releases.contains(&key_id) {
+            self.swallowed_releases.push(key_id);
+        }
+    }
+
+    /// Write `text` to the CLIPBOARD (lazy-initialising the handle).
+    fn write_clipboard(&mut self, text: String) {
+        if let Some(cb) = self.clipboard_handle()
             && let Err(e) = cb.set_text(text)
         {
             warn!("clipboard write failed: {e}");
@@ -1996,6 +2243,8 @@ impl App for Toastty {
                     }
                 }
                 self.last_viewport_tick = Some(now);
+                // Selection drag held past the top/bottom edge.
+                let next_autoscroll = self.tick_selection_autoscroll(now);
 
                 // Refresh the debug overlay (FPS counter) BEFORE
                 // rendering so it lands on this frame. We retain frame
@@ -2079,21 +2328,25 @@ impl App for Toastty {
                 } else {
                     None
                 };
-                match min_deadline(min_deadline(next_blink, next_anim), next_debug) {
+                match min_deadline(
+                    min_deadline(min_deadline(next_blink, next_anim), next_debug),
+                    next_autoscroll,
+                ) {
                     Some(d) => ControlSignal::RedrawIn(d),
                     None => ControlSignal::Continue,
                 }
             }
             Event::Key {
                 logical,
+                physical,
                 text,
                 modifiers,
                 state,
                 repeat,
                 is_synthetic,
-                ..
             } => self.handle_key(
                 &logical,
+                &physical,
                 text.as_deref(),
                 modifiers,
                 state,
@@ -2248,6 +2501,42 @@ fn is_copy_binding(logical: &LogicalKey, modifiers: Modifiers) -> bool {
     false
 }
 
+/// True when a copy-shortcut press should be consumed rather than
+/// forwarded: always when there was a selection to copy; with nothing
+/// selected, only in legacy key encoding (`kitty_flags == 0`), where the
+/// app couldn't tell Ctrl+Shift+C from Ctrl+C anyway.
+fn copy_binding_consumes(have_selection: bool, kitty_flags: u8) -> bool {
+    have_selection || kitty_flags == 0
+}
+
+/// True when `(logical, modifiers)` is Shift+Insert — paste the
+/// selection buffer (PRIMARY on X11/Wayland, like xterm and Alacritty;
+/// the clipboard on macOS).
+fn is_selection_paste_binding(logical: &LogicalKey, modifiers: Modifiers) -> bool {
+    matches!(logical, LogicalKey::Named(NamedKey::Insert)) && modifiers == Modifiers::SHIFT
+}
+
+/// True when a middle-button press should paste the selection buffer:
+/// when the app isn't tracking the mouse, or with Shift held to
+/// override tracking (xterm convention). Otherwise the press is the
+/// app's.
+fn middle_click_pastes(tracking: bool, modifiers: Modifiers) -> bool {
+    !tracking || modifiers.contains(Modifiers::SHIFT)
+}
+
+/// Stable identity for matching a key release to its press. Prefers
+/// the physical key code, which survives modifiers being released first
+/// (`V` vs `v`); falls back to the lowercased logical key.
+fn key_identity(logical: &LogicalKey, physical: &PhysicalKey) -> String {
+    match physical {
+        PhysicalKey::Code(code) => code.clone(),
+        PhysicalKey::Unidentified => match logical {
+            LogicalKey::Character(c) => format!("char:{}", c.to_lowercase()),
+            other => format!("logical:{other:?}"),
+        },
+    }
+}
+
 /// True when `(logical, modifiers)` is a "paste from clipboard" binding.
 ///
 /// We accept both the macOS-canonical `Cmd+V` and the Linux-canonical
@@ -2279,6 +2568,52 @@ mod tests {
 
     fn ch(s: &str) -> LogicalKey {
         LogicalKey::Character(s.to_string())
+    }
+
+    #[test]
+    fn shift_insert_is_selection_paste() {
+        let ins = LogicalKey::Named(NamedKey::Insert);
+        assert!(is_selection_paste_binding(&ins, Modifiers::SHIFT));
+        assert!(!is_selection_paste_binding(&ins, Modifiers::empty()));
+        assert!(!is_selection_paste_binding(
+            &ins,
+            Modifiers::SHIFT | Modifiers::CONTROL
+        ));
+        assert!(!is_selection_paste_binding(&ch("v"), Modifiers::SHIFT));
+        // Shift+Insert isn't the clipboard paste binding.
+        assert!(!is_paste_binding(&ins, Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn middle_click_paste_rules() {
+        assert!(middle_click_pastes(false, Modifiers::empty()));
+        assert!(!middle_click_pastes(true, Modifiers::empty()));
+        assert!(middle_click_pastes(true, Modifiers::SHIFT));
+        assert!(middle_click_pastes(false, Modifiers::CONTROL));
+    }
+
+    #[test]
+    fn copy_binding_forwarded_only_without_selection_under_kitty() {
+        assert!(copy_binding_consumes(true, 0));
+        assert!(copy_binding_consumes(true, 7));
+        // Legacy encoding: Ctrl+Shift+C == Ctrl+C, so keep eating it.
+        assert!(copy_binding_consumes(false, 0));
+        // Kitty protocol: the app can tell it apart — forward it.
+        assert!(!copy_binding_consumes(false, 1));
+        assert!(!copy_binding_consumes(false, 7));
+    }
+
+    #[test]
+    fn key_identity_prefers_physical_code() {
+        let code = PhysicalKey::Code("KeyV".into());
+        assert_eq!(key_identity(&ch("V"), &code), key_identity(&ch("v"), &code));
+        assert_eq!(key_identity(&ch("V"), &code), "KeyV");
+        let un = PhysicalKey::Unidentified;
+        assert_eq!(key_identity(&ch("V"), &un), key_identity(&ch("v"), &un));
+        assert_ne!(
+            key_identity(&ch("v"), &un),
+            key_identity(&LogicalKey::Named(NamedKey::Insert), &un)
+        );
     }
 
     #[test]

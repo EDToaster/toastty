@@ -110,6 +110,28 @@ pub fn find_text_face(db: &fontdb::Database, ch: char) -> Option<String> {
     None
 }
 
+/// Family name of the first **color** face in the database that covers
+/// `ch` (the counterpart of [`find_text_face`], used to honor VS16), or
+/// `None` if no color font has the glyph.
+#[must_use]
+pub fn find_color_face(db: &fontdb::Database, ch: char) -> Option<String> {
+    for face in db.faces() {
+        let covers_as_color = db
+            .with_face_data(face.id, |data, index| {
+                let Some(font) = swash::FontRef::from_index(data, index as usize) else {
+                    return false;
+                };
+                (font.color_strikes().count() > 0 || font.color_palettes().count() > 0)
+                    && font.charmap().map(ch) != 0
+            })
+            .unwrap_or(false);
+        if covers_as_color {
+            return face.families.first().map(|(name, _)| name.clone());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

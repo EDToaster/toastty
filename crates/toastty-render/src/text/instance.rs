@@ -413,6 +413,75 @@ pub struct GlyphSlot {
     pub glyph_offset: [f32; 2],
     /// Pixel size of the glyph quad (matches the atlas region size).
     pub glyph_size: [f32; 2],
+    /// The cell this glyph was looked up for also has *secondary* glyphs
+    /// (combining marks, unligated ZWJ parts, …) to fetch with
+    /// [`secondary_glyph_key`]. Only ever set on a row's `LineGlyphs`
+    /// copy, so the common cell costs one bool test, not a lookup.
+    pub has_secondary: bool,
+}
+
+/// Number of secondary-glyph lookup keys (see [`secondary_glyph_key`]).
+pub const SECONDARY_GLYPH_KEYS: usize = 32;
+
+/// Lookup key for the `k`-th *secondary* glyph of a cell.
+///
+/// A multi-codepoint grapheme (base + combining marks, a ZWJ sequence the
+/// font has no ligature for, …) can shape to several glyphs that all
+/// belong to one cell. The builders' `locate_glyph(row, col, ch, style)`
+/// callback is keyed by the cell's `ch`, which only identifies the
+/// primary glyph, so the extra glyphs are looked up with these keys: the
+/// Unicode noncharacters U+FDD0..=U+FDEF, which are permanently reserved
+/// for process-internal use and never denote real text. `LineGlyphs::get`
+/// maps them to the cell's secondary glyphs in shaping order, with each
+/// slot's `glyph_offset` already including the glyph's position within
+/// the cell (mark attachment offsets etc.).
+#[must_use]
+pub fn secondary_glyph_key(k: usize) -> Option<char> {
+    if k >= SECONDARY_GLYPH_KEYS {
+        return None;
+    }
+    char::from_u32(0xFDD0 + u32::try_from(k).ok()?)
+}
+
+/// Inverse of [`secondary_glyph_key`].
+#[must_use]
+pub fn secondary_glyph_index(ch: char) -> Option<usize> {
+    let v = ch as u32;
+    (0xFDD0..0xFDD0 + SECONDARY_GLYPH_KEYS as u32)
+        .contains(&v)
+        .then(|| (v - 0xFDD0) as usize)
+}
+
+/// Emit the secondary glyphs (see [`secondary_glyph_key`]) of a cell whose
+/// primary glyph has [`GlyphSlot::has_secondary`] set.
+#[allow(clippy::too_many_arguments)]
+fn push_secondary_glyphs<F>(
+    out: &mut Vec<CellInstance>,
+    locate_glyph: &mut F,
+    r: u16,
+    c: u16,
+    cell: &Cell,
+    pos: [f32; 2],
+    fg: [f32; 4],
+    bg: [f32; 4],
+) where
+    F: FnMut(u16, u16, char, &Style) -> Option<GlyphSlot>,
+{
+    for key in (0..SECONDARY_GLYPH_KEYS).map_while(secondary_glyph_key) {
+        let Some(slot) = locate_glyph(r, c, key, &cell.style) else {
+            break;
+        };
+        out.push(CellInstance {
+            pos: [pos[0] + slot.glyph_offset[0], pos[1] + slot.glyph_offset[1]],
+            size: slot.glyph_size,
+            uv_min: slot.uv_min,
+            uv_max: slot.uv_max,
+            fg,
+            bg,
+            flags: if slot.is_color { FLAG_COLOR_GLYPH } else { 0 },
+            pad: [0; 3],
+        });
+    }
 }
 
 /// Default theme — used when [`TColor::Default`] is in play and the
@@ -866,7 +935,8 @@ pub fn build_instances_into<F, S>(
                 continue;
             }
 
-            if let Some(slot) = locate_glyph(r, c, cell.ch, &cell.style) {
+            let primary = locate_glyph(r, c, cell.ch, &cell.style);
+            if let Some(slot) = primary {
                 let flags = if slot.is_color { FLAG_COLOR_GLYPH } else { 0 };
                 // Glyph quad: position is cell + glyph bearing; size is
                 // the glyph's own pixel extent (matches the atlas
@@ -882,6 +952,9 @@ pub fn build_instances_into<F, S>(
                     flags,
                     pad: [0; 3],
                 });
+            }
+            if primary.is_some_and(|p| p.has_secondary) {
+                push_secondary_glyphs(out, &mut locate_glyph, r, c, cell, pos, fg, bg);
             }
 
             // Underline strip for SGR underline or OSC 8 hyperlink.
@@ -1132,7 +1205,8 @@ pub fn build_dirty_instances_into<F, S>(
                 continue;
             }
 
-            if let Some(slot) = locate_glyph(r, c, cell.ch, &cell.style) {
+            let primary = locate_glyph(r, c, cell.ch, &cell.style);
+            if let Some(slot) = primary {
                 let flags = if slot.is_color { FLAG_COLOR_GLYPH } else { 0 };
                 out.push(CellInstance {
                     pos: [pos[0] + slot.glyph_offset[0], pos[1] + slot.glyph_offset[1]],
@@ -1144,6 +1218,9 @@ pub fn build_dirty_instances_into<F, S>(
                     flags,
                     pad: [0; 3],
                 });
+            }
+            if primary.is_some_and(|p| p.has_secondary) {
+                push_secondary_glyphs(out, &mut locate_glyph, r, c, cell, pos, fg, bg);
             }
 
             // Underline strip for SGR underline or OSC 8 hyperlink. Emit
@@ -1358,6 +1435,7 @@ mod tests {
                     is_color: true,
                     glyph_offset: [0.0, 0.0],
                     glyph_size: [8.0, 16.0],
+                    has_secondary: false,
                 })
             },
         );
@@ -2563,6 +2641,7 @@ mod tests {
                     uv_min: [0.0, 0.0],
                     uv_max: [6.0, 12.0],
                     is_color: false,
+                    has_secondary: false,
                 })
             },
             |_, _| false,
@@ -2908,5 +2987,103 @@ mod tests {
                 .any(|q| (q.pos[1] - 3.0 * 16.0).abs() < 1e-3),
             "grid-exact height must not render a row at y == rows*cell_h"
         );
+    }
+
+    #[test]
+    fn secondary_glyph_keys_roundtrip_and_are_noncharacters() {
+        for k in 0..SECONDARY_GLYPH_KEYS {
+            let c = secondary_glyph_key(k).unwrap();
+            assert!(('\u{FDD0}'..='\u{FDEF}').contains(&c));
+            assert_eq!(secondary_glyph_index(c), Some(k));
+        }
+        assert_eq!(secondary_glyph_key(SECONDARY_GLYPH_KEYS), None);
+        assert_eq!(secondary_glyph_index('a'), None);
+        assert_eq!(secondary_glyph_index('\u{FDF0}'), None);
+    }
+
+    fn slot_at(x: f32, has_secondary: bool) -> GlyphSlot {
+        GlyphSlot {
+            uv_min: [0.0, 0.0],
+            uv_max: [1.0, 1.0],
+            is_color: false,
+            glyph_offset: [x, 0.0],
+            glyph_size: [1.0, 1.0],
+            has_secondary,
+        }
+    }
+
+    /// Locator for a cell `e` with two secondary glyphs at +3 / +4 px.
+    fn grapheme_locator(_r: u16, _c: u16, ch: char, _s: &Style) -> Option<GlyphSlot> {
+        match (ch, secondary_glyph_index(ch)) {
+            ('e', _) => Some(slot_at(0.0, true)),
+            (_, Some(0)) => Some(slot_at(3.0, false)),
+            (_, Some(1)) => Some(slot_at(4.0, false)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn full_builder_emits_secondary_glyphs() {
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, "e\u{301}".as_bytes());
+        let v = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            grapheme_locator,
+        );
+        // bg + primary + 2 secondaries + cursor.
+        let glyph_x: Vec<f32> = v
+            .iter()
+            .filter(|i| i.flags & (FLAG_NO_GLYPH | FLAG_CURSOR) == 0)
+            .map(|i| i.pos[0])
+            .collect();
+        assert_eq!(glyph_x, vec![0.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn dirty_builder_emits_secondary_glyphs() {
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, "e\u{301}".as_bytes());
+        let damage = t.damage().clone();
+        let mut out = Vec::new();
+        super::build_dirty_instances_into(
+            &mut out,
+            &t,
+            &damage,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            false,
+            grapheme_locator,
+            |_, _| false,
+            EdgeBleed::default(),
+        );
+        let glyphs = out
+            .iter()
+            .filter(|i| i.flags & (FLAG_NO_GLYPH | FLAG_CURSOR) == 0)
+            .count();
+        assert_eq!(glyphs, 3);
+    }
+
+    #[test]
+    fn no_secondary_lookup_without_flag() {
+        let mut t = Term::new(1, 4, 0);
+        feed(&mut t, b"ab");
+        let mut keys = 0;
+        let _ = build_instances(
+            &t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, ch, _| {
+                if secondary_glyph_index(ch).is_some() {
+                    keys += 1;
+                }
+                Some(slot_at(0.0, false))
+            },
+        );
+        assert_eq!(keys, 0);
     }
 }

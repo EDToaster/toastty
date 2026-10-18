@@ -4,6 +4,7 @@ A lightweight, GPU-accelerated terminal emulator in Rust.
 
 See [`docs/architecture.md`](./docs/architecture.md) for high-level design,
 [`docs/protocols.md`](./docs/protocols.md) for the protocol support matrix,
+[`docs/selection.md`](./docs/selection.md) for mouse selection behaviour,
 and [`docs/decisions/`](./docs/decisions/) for individual decision records
 with measurements.
 

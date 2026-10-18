@@ -42,6 +42,7 @@ fn fully_populated_fixture_parses_via_load_from_path() {
             left: 8,
         }
     );
+    assert_eq!(cfg.selection.word_chars, "_-./~:?&=%+#@");
 }
 
 #[test]

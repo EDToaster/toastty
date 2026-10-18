@@ -223,6 +223,7 @@ mod tests {
             style: Style::RESET,
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         }
     }
 
@@ -244,6 +245,7 @@ mod tests {
             },
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         }
     }
 

@@ -1999,6 +1999,13 @@ impl Renderer {
                         c.ch
                     };
                     text.line_text_scratch.push(ch);
+                    // The rest of a multi-codepoint grapheme (combining
+                    // marks, ZWJ tail, VS16) so it shapes as one cluster;
+                    // its extra glyphs come back as secondary glyphs of
+                    // this cell (see `instance::secondary_glyph_key`).
+                    if c.extra.is_some() && ch != ' ' {
+                        text.line_text_scratch.push_str(term.grapheme_tail(c));
+                    }
                 }
                 let lg = text.rasterizer.shape_line(
                     &self.queue,

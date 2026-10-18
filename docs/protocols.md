@@ -19,10 +19,11 @@ Tracking list of escape sequences, modes, and extensions toastty intends to supp
 
 | Protocol | Sequence / Mode | Notes |
 | --- | --- | --- |
-| SGR mouse reporting | DECSET 1006 (+ 1000/1002/1003) | Required by tmux, neovim, helix |
-| Bracketed paste | DECSET 2004 | |
+| Mouse reporting | DECSET 9 / 1000 / 1002 / 1003, encodings 1005 / 1006 / 1015 | SGR (1006) required by tmux, neovim, helix. Without an encoding mode, reports use legacy X11 `CSI M Cb Cx Cy` (coords > 223 sent as xterm's `0x00` past-end marker); 1005 = UTF-8, 1015 = urxvt. Encodings are mutually exclusive like xterm: last set wins, reset only clears the matching mode. DECSET 9 = X10 presses only, no modifiers |
+| Bracketed paste | DECSET 2004 | Pastes are sanitised in both modes (xterm `allowPasteControls: false`): C0 controls except HT/CR/LF, DEL and C1 are stripped, so embedded `ESC[200~`/`ESC[201~` can't be forged; CRLF/LF become CR |
 | Focus in/out events | DECSET 1004 | |
-| Clipboard | OSC 52 | Read + write; gate write behind config |
+| Clipboard | OSC 52 | Read + write, gated by `[security]`. Selection param: `c` clipboard, `p` PRIMARY (clipboard on macOS), `s`/empty both, `q`/`0-7` ignored; multiple chars combine, queries read the first supported one. Padded or unpadded base64; empty/invalid data clears the selection (xterm). Query replies mirror the request's BEL/ST terminator. OSC strings are capped at 8 MiB (`toastty_parser::MAX_OSC_LEN`) |
+| PRIMARY selection | X11 / Wayland | Finished mouse selections go to PRIMARY as well as the clipboard. Middle-click (when the app isn't tracking the mouse, or with Shift) and Shift+Insert paste PRIMARY; on macOS they paste the clipboard |
 | Hyperlinks | OSC 8 | |
 | Current working directory | OSC 7 | `file://` URL; lets new tabs inherit cwd |
 | Window/icon title | OSC 0 / 1 / 2 | Plus title stack (CSI 22/23) |
@@ -57,6 +58,21 @@ Image support strategy: **Kitty graphics protocol primary, Sixel fallback.** iTe
 | Ratty Graphics Protocol (RGP) | Experimental. Inline 3D objects via APC sequences; OBJ/GLB asset registration. We are an early adopter — goal is to seed ecosystem support beyond the reference Ratty implementation |
 
 > **APC framing caveat.** Both Kitty graphics and RGP use APC (`ESC _ ... ST`), and `vte 0.15.0` silently drops APC payloads — there is no `apc_dispatch` hook. toastty ships its own streaming APC scanner (~90 LoC). Handlers receive `start(header)` / `chunk(&[u8])` / `end()` rather than buffering whole payloads, which matters when an RGP `.glb` upload is 50 MB. See [decisions/streaming-apc.md](./decisions/streaming-apc.md).
+
+## Grapheme clusters and copied text
+
+How `Term::print` folds codepoints into cells (and therefore what copy and the renderer see):
+
+| Input | DECSET 2027 off (legacy wcwidth) | DECSET 2027 on |
+| --- | --- | --- |
+| Zero-width codepoints (combining marks, ZWJ, ZWNJ, VS15/VS16, Hangul V/T jamo) | Appended to the cell left of the cursor; no column used (same cursor arithmetic as wcwidth). Dropped only at column 0 | Same |
+| Emoji after a ZWJ (`👨‍👩‍👧`), skin-tone modifier after its base (`👍🏽`) | Joins the first emoji's cell: one 2-cell glyph | Same |
+| Other UAX #29 continuations (regional-indicator pairs, spacing marks, Indic conjuncts) | Own cell(s), per-codepoint wcwidth | Joins the cluster |
+| Cluster width | `cluster_cell_width` (the renderer's snap function), so a 1-cell base grows to 2 cells when e.g. `❤ + ZWJ + 🔥` (either mode) or `❤ + VS16` (2027 only) makes it wide — unless it sits in the last column. Clusters never shrink | |
+
+The trailing codepoints live in a per-terminal intern table referenced by a 2-byte id in `Cell`, so shifts, scrolling, reflow and erase keep them attached. Copy (`extract_selection_text`) emits each cell's full grapheme.
+
+**Tabs:** HT records the run of blank cells it advanced over. Copy emits a literal `\t` for the run while every cell in it is still blank and the selection covers the whole run (kitty and Ghostty behave the same; xterm copies spaces). Anything written into the run, or a selection that cuts it, copies the displayed spaces instead.
 
 ## Tier 4 — Niceties / later
 

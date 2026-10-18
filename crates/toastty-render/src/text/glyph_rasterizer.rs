@@ -50,6 +50,34 @@ struct PendingGlyph {
     /// would silently mark `=` as a permanent cache miss because it never
     /// appeared as a `p.ch`.
     cluster_chars: Vec<char>,
+    /// `Some(offset)` when this glyph is a *secondary* glyph of a
+    /// grapheme cluster (a combining mark, the 2nd+ glyph of an
+    /// unligated ZWJ sequence): it belongs to the cell at `col` and is
+    /// drawn at `offset` px from that cell's origin (on top of the
+    /// glyph's own bearing). `None` for primary glyphs.
+    secondary_offset: Option<[f32; 2]>,
+    /// The glyph's cluster is a multi-codepoint grapheme (contains a
+    /// zero-width codepoint). Such glyphs are never served from / barred
+    /// from `char_cache`: the cluster's first char may have been shaped
+    /// into a precomposed form (`e` + U+0301 → `é`), which must not be
+    /// cached as the standalone glyph of `e`.
+    in_grapheme: bool,
+}
+
+/// True when `cluster` is a multi-codepoint grapheme as stored by the
+/// term grid — i.e. it contains a zero-width codepoint (combining mark,
+/// ZWJ, variation selector, …). Ligature clusters (`!=`, `->`) are made of
+/// width-1 chars, one per cell, and keep the per-column handling.
+fn is_grapheme_cluster(cluster: &str) -> bool {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut chars = cluster.chars();
+    if chars.next().is_none() || chars.next().is_none() {
+        return false;
+    }
+    // Zero-width member (the grid always folds those into one cell), or a
+    // single extended grapheme (regional-indicator pair, emoji modifier
+    // sequence) — but not a run of separate graphemes (a ligature).
+    cluster.chars().any(|c| c.width() == Some(0)) || cluster.graphemes(true).nth(1).is_none()
 }
 
 /// Per-glyph cell-char assignment. For each glyph in shaping order, pick
@@ -112,6 +140,12 @@ pub struct LineGlyphs {
     /// (CJK / combining-mark continuation cells) leave those slots
     /// `None`, matching the old "key absent" semantics.
     pub by_column: Vec<ColumnSlot>,
+    /// Secondary glyphs of multi-glyph grapheme cells, as
+    /// `(column, slot)` in shaping order. `slot.glyph_offset` already
+    /// includes the glyph's pen position inside the cell. Looked up via
+    /// [`crate::text::instance::secondary_glyph_key`]; empty for the
+    /// overwhelmingly common line with no combining marks / ZWJ tails.
+    pub secondary: Vec<(u16, GlyphSlot)>,
 }
 
 impl LineGlyphs {
@@ -122,7 +156,27 @@ impl LineGlyphs {
     pub fn get(&self, col: u16, ch: char) -> Option<GlyphSlot> {
         match self.by_column.get(col as usize) {
             Some(Some((c, slot))) if *c == ch => Some(*slot),
-            _ => None,
+            _ => {
+                let k = crate::text::instance::secondary_glyph_index(ch)?;
+                self.secondary
+                    .iter()
+                    .filter(|(c, _)| *c == col)
+                    .nth(k)
+                    .map(|(_, slot)| *slot)
+            }
+        }
+    }
+
+    /// Append a secondary glyph for `col` (see [`Self::secondary`]).
+    ///
+    /// Flags the column's primary slot with `has_secondary` so the
+    /// instance builders know to fetch it; a secondary for a column with
+    /// no primary glyph is dropped (the builders only look secondaries up
+    /// behind a primary).
+    pub fn push_secondary(&mut self, col: u16, slot: GlyphSlot) {
+        if let Some(Some((_, primary))) = self.by_column.get_mut(col as usize) {
+            primary.has_secondary = true;
+            self.secondary.push((col, slot));
         }
     }
 
@@ -247,6 +301,10 @@ pub struct GlyphRasterizer {
     /// already covers). Keyed on the bare codepoint; variation-selected
     /// clusters are rare and computed live. See [`presentation`].
     presentation_override: HashMap<char, Option<String>>,
+    /// Per-char cache of the color face to force for `base + VS16` under
+    /// DECSET 2027 (see [`Self::vs16_color_family`]). `Some(None)` records
+    /// "no override needed / none available".
+    vs16_color_override: HashMap<char, Option<String>>,
     /// True iff the family name requested by the caller resolved to at
     /// least one face in the loaded font database. When false, cosmic-
     /// text will fall back to whatever the system considers a default
@@ -359,6 +417,7 @@ impl GlyphRasterizer {
             standalone_glyph_ids: HashMap::new(),
             isolation_buffer,
             presentation_override: HashMap::new(),
+            vs16_color_override: HashMap::new(),
             requested_family_available,
         }
     }
@@ -460,6 +519,30 @@ impl GlyphRasterizer {
         presentation::find_text_face(self.font_system.db(), base)
     }
 
+    /// Color face to steer `base + VS16` toward, when the default fallback
+    /// would draw `base` from a monochrome face (❤ U+2764 is in `DejaVu`, so
+    /// `❤\u{FE0F}` otherwise renders as a text heart).
+    ///
+    /// Only used under DECSET 2027, where the grid gives a VS16 cluster
+    /// two cells (`cluster_cell_width`) so the color glyph has room. In
+    /// legacy mode the cluster stays one cell wide (wcwidth), and the
+    /// monochrome text glyph is the one that fits it.
+    fn vs16_color_family(&mut self, base: char) -> Option<String> {
+        if let Some(cached) = self.vs16_color_override.get(&base) {
+            return cached.clone();
+        }
+        let result = self.default_resolved_font(base).and_then(|id| {
+            let db = self.font_system.db();
+            if presentation::face_is_color(db, id) {
+                None
+            } else {
+                presentation::find_color_face(db, base)
+            }
+        });
+        self.vs16_color_override.insert(base, result.clone());
+        result
+    }
+
     /// Font id cosmic-text's default fallback resolves `ch` to when shaped
     /// alone with the configured family. Used to detect when the default
     /// path lands on a color-emoji face. `None` if nothing renders.
@@ -492,6 +575,7 @@ impl GlyphRasterizer {
     fn compute_presentation_runs(
         &mut self,
         text: &str,
+        mode_2027_active: bool,
     ) -> Option<Vec<(usize, usize, Option<String>)>> {
         if !text.chars().any(presentation::is_candidate) {
             return None;
@@ -510,7 +594,11 @@ impl GlyphRasterizer {
             let next = indices.get(i + 1).map(|&(_, c)| c);
             let has_vs16 = next == Some(presentation::VS16);
             let has_vs15 = next == Some(presentation::VS15);
-            let fam = self.presentation_family(c, has_vs15, has_vs16);
+            let fam = if has_vs16 && mode_2027_active {
+                self.vs16_color_family(c)
+            } else {
+                self.presentation_family(c, has_vs15, has_vs16)
+            };
             any_override |= fam.is_some();
             choices.push(fam);
         }
@@ -538,8 +626,8 @@ impl GlyphRasterizer {
     /// before. When a line contains a text-presentation emoji that would
     /// otherwise resolve to a color face, we shape via rich-text spans that
     /// force the steered monochrome family for just those clusters.
-    fn shape_buffer_for_line(&mut self, text: &str) {
-        let runs = self.compute_presentation_runs(text);
+    fn shape_buffer_for_line(&mut self, text: &str, mode_2027_active: bool) {
+        let runs = self.compute_presentation_runs(text, mode_2027_active);
         let default_family = self.family_name.clone();
         let default_attrs = Attrs::new().family(Family::Name(&default_family));
         match &runs {
@@ -680,7 +768,7 @@ impl GlyphRasterizer {
     /// `char_cache_misses` with whatever cosmic-text resolves so that
     /// future calls with the same characters can take the fast path.
     fn shape_line_slow(&mut self, queue: &Queue, text: &str, mode_2027_active: bool) -> LineGlyphs {
-        self.shape_buffer_for_line(text);
+        self.shape_buffer_for_line(text, mode_2027_active);
 
         let cell_w = self.cell_size.0;
 
@@ -732,17 +820,51 @@ impl GlyphRasterizer {
                 .map(|(g, snap)| (g.start, g.end, (snap.x / cell_w).round() as u16))
                 .collect();
             let assignments = assign_glyph_chars(&glyph_clusters, run.text);
-            for ((g, &(_, _, col)), (ch, cluster_chars)) in run
+            // Grapheme clusters (base + zero-width codepoints, one grid
+            // cell): every glyph belongs to the cell of the cluster's
+            // first glyph. The first is the primary (keyed by the base
+            // char); the rest are secondary glyphs positioned relative to
+            // that cell — their snapped pen x within the cluster plus the
+            // shaper's mark-attachment offset (`x_offset` / `y_offset`,
+            // in em units, scaled by font size as `LayoutGlyph::physical`
+            // does).
+            let mut grapheme_base: Option<(usize, usize, u16)> = None;
+            for (((g, &(_, _, col)), (ch, cluster_chars)), snap) in run
                 .glyphs
                 .iter()
                 .zip(glyph_clusters.iter())
                 .zip(assignments.into_iter())
+                .zip(snapped.iter())
             {
+                let cluster_str = run.text.get(g.start..g.end).unwrap_or("");
+                let in_grapheme = is_grapheme_cluster(cluster_str);
+                let mut col = col;
+                let mut ch = ch;
+                let mut secondary_offset = None;
+                if in_grapheme {
+                    match grapheme_base {
+                        Some((s, e, base_col)) if s == g.start && e == g.end => {
+                            col = base_col;
+                            #[allow(clippy::cast_precision_loss)]
+                            let cell_x = f32::from(base_col) * cell_w;
+                            secondary_offset = Some([
+                                (snap.x - cell_x + g.font_size * g.x_offset).round(),
+                                (-g.font_size * g.y_offset).round(),
+                            ]);
+                        }
+                        _ => {
+                            grapheme_base = Some((g.start, g.end, col));
+                            ch = cluster_str.chars().next().unwrap_or(ch);
+                        }
+                    }
+                }
                 pending.push(PendingGlyph {
                     glyph: g.clone(),
                     col,
                     ch,
                     cluster_chars,
+                    secondary_offset,
+                    in_grapheme,
                 });
             }
         }
@@ -757,7 +879,25 @@ impl GlyphRasterizer {
         let mut out = LineGlyphs::default();
         for p in &pending {
             if let Some(slot) = self.ensure_atlas_slot(queue, &p.glyph) {
-                out.insert(p.col, p.ch, slot);
+                if let Some([dx, dy]) = p.secondary_offset {
+                    let mut slot = slot;
+                    slot.glyph_offset[0] += dx;
+                    slot.glyph_offset[1] += dy;
+                    out.push_secondary(p.col, slot);
+                } else {
+                    out.insert(p.col, p.ch, slot);
+                }
+                if p.in_grapheme {
+                    // Never cache (see `PendingGlyph::in_grapheme`), and
+                    // don't brand the chars uncacheable either: the line
+                    // already took the slow path because of its
+                    // zero-width chars, and the base char standalone
+                    // (`e`) is perfectly cacheable elsewhere.
+                    for c in &p.cluster_chars {
+                        produced_chars.insert(*c);
+                    }
+                    continue;
+                }
                 // Decide whether this glyph is safe to drop into
                 // `char_cache`. Requirements:
                 //   - cluster is exactly one char (no multi-char
@@ -989,6 +1129,7 @@ fn make_glyph_slot(slot: AtlasSlot, placement: GlyphPlacement) -> GlyphSlot {
         is_color: matches!(slot.layer, AtlasLayer::Color),
         glyph_offset: placement.offset,
         glyph_size: placement.size,
+        has_secondary: false,
     }
 }
 
@@ -1857,5 +1998,104 @@ mod tests {
             &[16, 32, 64, 128],
             "RGBA->BGRA, values unchanged"
         );
+    }
+
+    // ---- multi-glyph grapheme cells (audit bug #8) ---------------------
+
+    fn dummy_slot(x: f32) -> GlyphSlot {
+        GlyphSlot {
+            uv_min: [0.0, 0.0],
+            uv_max: [1.0, 1.0],
+            is_color: false,
+            glyph_offset: [x, 0.0],
+            glyph_size: [1.0, 1.0],
+            has_secondary: false,
+        }
+    }
+
+    #[test]
+    fn line_glyphs_secondary_lookup_by_key() {
+        use crate::text::instance::secondary_glyph_key;
+        let mut lg = LineGlyphs::default();
+        lg.insert(2, 'a', dummy_slot(0.0));
+        lg.push_secondary(2, dummy_slot(3.0));
+        lg.push_secondary(2, dummy_slot(4.0));
+        // Primary is flagged; secondaries come back in order.
+        assert!(lg.get(2, 'a').is_some_and(|s| s.has_secondary));
+        let k0 = secondary_glyph_key(0).unwrap();
+        let k1 = secondary_glyph_key(1).unwrap();
+        let k2 = secondary_glyph_key(2).unwrap();
+        assert_eq!(lg.get(2, k0).map(|s| s.glyph_offset[0]), Some(3.0));
+        assert_eq!(lg.get(2, k1).map(|s| s.glyph_offset[0]), Some(4.0));
+        assert_eq!(lg.get(2, k2), None);
+        // Other columns / ordinary chars don't see them.
+        assert_eq!(lg.get(3, k0), None);
+        assert_eq!(lg.get(2, 'b'), None);
+    }
+
+    #[test]
+    fn line_glyphs_secondary_without_primary_is_dropped() {
+        let mut lg = LineGlyphs::default();
+        lg.push_secondary(0, dummy_slot(1.0));
+        assert!(lg.secondary.is_empty());
+    }
+
+    #[test]
+    fn grapheme_cluster_classification() {
+        assert!(is_grapheme_cluster("e\u{301}"));
+        assert!(is_grapheme_cluster("\u{1F468}\u{200D}\u{1F469}"));
+        assert!(is_grapheme_cluster("\u{2764}\u{FE0F}"));
+        assert!(is_grapheme_cluster("\u{1F1EF}\u{1F1F5}")); // RI pair
+        assert!(is_grapheme_cluster("\u{1F44D}\u{1F3FD}")); // skin tone
+        // Ligatures (several graphemes) and singletons are not.
+        assert!(!is_grapheme_cluster("!="));
+        assert!(!is_grapheme_cluster("a"));
+        assert!(!is_grapheme_cluster(""));
+    }
+
+    /// A base + two combining marks with no precomposed form shapes to
+    /// several glyphs; all must land on the base's column (one primary +
+    /// secondaries) instead of the marks overwriting the base or drifting
+    /// a column right. And the base char must stay fast-path cacheable.
+    #[test]
+    fn combining_marks_become_secondary_glyphs_of_base_cell() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        let lg = rasterizer.shape_line(&queue, "a\u{308}\u{304}x", false);
+        let base = lg.get(0, 'a').expect("base glyph at col 0");
+        assert!(lg.get(1, 'x').is_some(), "following char keeps its column");
+        if base.has_secondary {
+            let k0 = crate::text::instance::secondary_glyph_key(0).unwrap();
+            let mark = lg.get(0, k0).expect("first mark");
+            // Marks sit over the base cell, not a cell to the right.
+            let cell_w = rasterizer.cell_size().0;
+            assert!(
+                mark.glyph_offset[0] < cell_w,
+                "mark offset {:?}",
+                mark.glyph_offset
+            );
+        }
+        assert!(!rasterizer.uncacheable_chars.contains(&'a'));
+        assert!(!rasterizer.uncacheable_chars.contains(&'x'));
+    }
+
+    /// VS16 under DECSET 2027 steers toward a color face when the default
+    /// fallback would pick a monochrome one. Host-tolerant: only asserts
+    /// when the host has a monochrome face for ❤ *and* a color face.
+    #[test]
+    fn vs16_under_2027_prefers_color_face() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        let heart = '\u{2764}';
+        let default_mono = rasterizer
+            .default_resolved_font(heart)
+            .is_some_and(|id| !presentation::face_is_color(rasterizer.font_system.db(), id));
+        let has_color = presentation::find_color_face(rasterizer.font_system.db(), heart).is_some();
+        let lg = rasterizer.shape_line(&queue, "\u{2764}\u{FE0F}", true);
+        if default_mono && has_color {
+            let slot = lg.get(0, heart).expect("heart glyph");
+            assert!(slot.is_color, "❤ + VS16 under 2027 must use a color face");
+        }
+        // Cached: a second shape takes the same decision without a scan.
+        assert!(rasterizer.vs16_color_override.contains_key(&heart));
+        let _ = rasterizer.shape_line(&queue, "\u{2764}\u{FE0F}", true);
     }
 }
