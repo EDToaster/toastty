@@ -270,6 +270,10 @@ struct Toastty {
     /// matching release). Used to fill the "button held" slot of motion
     /// reports under DECSET 1002.
     mouse_held: Option<MouseButton>,
+    /// Button whose press was consumed by Ctrl/Cmd+click link-opening.
+    /// Its matching release is swallowed too, so the foreground app
+    /// never sees an orphan release for a press it didn't receive.
+    link_click_button: Option<MouseButton>,
     /// Last (col, row) reported to the PTY via a motion event. Tracked
     /// so we only emit a motion report when the pointer crosses into a
     /// new cell — xterm convention, and avoids flooding the PTY with
@@ -401,6 +405,7 @@ impl Toastty {
             last_title: None,
             mouse_pos: (0.0, 0.0),
             mouse_held: None,
+            link_click_button: None,
             last_reported_cell: None,
             clipboard: None,
             pty_log: PtyLogger::from_env(),
@@ -1342,15 +1347,25 @@ impl Toastty {
         {
             return ControlSignal::RedrawIn(Duration::ZERO);
         }
-        // OSC 8 click-to-open: Cmd-Left on macOS / Ctrl-Left elsewhere
-        // on press only. Consume the event so the mouse encoder doesn't
-        // also forward it to the foreground app.
-        if state == KeyState::Pressed && is_open_link_binding(button, modifiers) {
-            if let Some(url) = self.hyperlink_under_cursor(position)
-                && let Err(e) = webbrowser::open(&url)
-            {
+        // OSC 8 click-to-open: Cmd-Left on macOS / Ctrl-Left elsewhere.
+        // Only consume the press when there's actually a hyperlink under
+        // the pointer; otherwise Ctrl/Cmd+click must reach the app (or
+        // local selection) so its press/drag/release stay paired. When we
+        // do consume it, also eat the matching release and stop treating
+        // the button as held, so the app sees neither half of the click.
+        if state == KeyState::Released && self.link_click_button == Some(button) {
+            self.link_click_button = None;
+            return ControlSignal::Continue;
+        }
+        if state == KeyState::Pressed
+            && is_open_link_binding(button, modifiers)
+            && let Some(url) = self.hyperlink_under_cursor(position)
+        {
+            if let Err(e) = webbrowser::open(&url) {
                 warn!("open URL failed: {e}");
             }
+            self.link_click_button = Some(button);
+            self.mouse_held = None;
             return ControlSignal::Continue;
         }
         // Local text selection takes priority over PTY forwarding when
