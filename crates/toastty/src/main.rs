@@ -38,6 +38,7 @@ use toastty::cli::CommandOverride;
 use toastty::clipboard::{self as sysclip, ClipboardTarget};
 use toastty::config_watcher::ConfigWatcher;
 use toastty::focus::encode_focus;
+use toastty::font_zoom::{FontZoom, ZoomAction, zoom_action};
 use toastty::geometry::{
     content_rect_from_padding, effective_font_size_px, grid_dims_from_pixels, scaled_pads,
 };
@@ -270,6 +271,12 @@ struct Toastty {
     /// also carries `ScaleFactorChanged`); a change triggers a font
     /// rebuild + grid resync.
     scale_factor: f64,
+    /// Runtime font zoom (Ctrl/Cmd + `=` / `-` / `0`). Its current
+    /// logical size replaces `font.size_px` as the input to
+    /// [`effective_font_size_px`], so zoom composes with `scale_factor`.
+    /// Rebased on config reload: a changed `font.size_px` resets it, any
+    /// other reload keeps it. See [`toastty::font_zoom`].
+    font_zoom: FontZoom,
     /// Last title we pushed to `winit::Window::set_title`. Tracked so
     /// we don't churn the compositor on every `PtyBytes` batch — only
     /// change the title when it actually differs.
@@ -423,6 +430,7 @@ impl Toastty {
             osc_52_read: config.security.osc_52_read,
             osc_52_write: config.security.osc_52_write,
         });
+        let font_zoom = FontZoom::new(config.font.size_px);
         Self {
             config,
             command_override,
@@ -438,6 +446,7 @@ impl Toastty {
             // Real value is read from the window in `init_impl`; 1.0 is a
             // safe pre-window default.
             scale_factor: 1.0,
+            font_zoom,
             last_title: None,
             mouse_pos: (0.0, 0.0),
             mouse_held: None,
@@ -783,11 +792,70 @@ impl Toastty {
         }
     }
 
-    /// Physical font size to feed the rasterizer: the logical
-    /// `font.size_px` scaled by the current monitor scale factor. See
-    /// [`effective_font_size_px`] and the `scale_factor` field.
+    /// Physical font size to feed the rasterizer: the logical size
+    /// (`font.size_px`, or the runtime zoom when active) scaled by the
+    /// current monitor scale factor. See [`effective_font_size_px`] and
+    /// the `scale_factor` / `font_zoom` fields.
     fn scaled_font_px(&self) -> f32 {
-        effective_font_size_px(self.config.font.size_px, self.scale_factor)
+        effective_font_size_px(self.font_zoom.current_px(), self.scale_factor)
+    }
+
+    /// Send the DECSET 2048 in-band resize report for the current grid,
+    /// if the app opted in, so it sees the new geometry in order with
+    /// everything else on the PTY (no SIGWINCH race). The encoder returns
+    /// `None` when 2048 is off, so the default case doesn't touch the PTY.
+    ///
+    /// The pixel fields report the CONTENT dims (surface minus padding),
+    /// matching `resync_grid`, not the full surface. Shared by window
+    /// resize, font zoom and font-changing config reloads.
+    fn report_inband_resize(&mut self) {
+        let (rows, cols) = self.term.size();
+        let pad = &self.config.window.padding;
+        let (_ox, _oy, content_w, content_h) = content_rect_from_padding(
+            self.physical_size,
+            (pad.top, pad.right, pad.bottom, pad.left),
+            self.scale_factor,
+        );
+        let pixel_w = u16::try_from(content_w).unwrap_or(u16::MAX);
+        let pixel_h = u16::try_from(content_h).unwrap_or(u16::MAX);
+        if let Some(bytes) =
+            encode_resize_report(rows, cols, pixel_h, pixel_w, self.term.inband_resize_mode())
+        {
+            self.write_pty(&bytes);
+        }
+    }
+
+    /// Apply a font-zoom shortcut: re-rasterise at the new size, keep the
+    /// window size, and regrid through the same path as a window resize
+    /// (`resync_grid`: Term reflow + PTY winsize with pixel size, then the
+    /// mode 2048 report). A no-op at the clamp limits or on reset while
+    /// unzoomed, so holding the key at a limit costs nothing.
+    ///
+    /// Uses `Renderer::set_font_size`, which keeps the font database and
+    /// pipelines and only rebuilds the size-dependent glyph state, so
+    /// repeated zooms neither stall nor grow memory.
+    fn apply_font_zoom(&mut self, action: ZoomAction) {
+        if !self.font_zoom.apply(action) {
+            return;
+        }
+        let font_px = self.scaled_font_px();
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_font_size(font_px, self.config.font.line_height);
+            r.invalidate_framebuffer();
+            info!(
+                "font zoom {action:?}: {}px logical (base {}px) @ {}× = {font_px}px physical, cell={:?}",
+                self.font_zoom.current_px(),
+                self.font_zoom.base_px(),
+                self.scale_factor,
+                r.cell_size(),
+            );
+        }
+        self.resync_grid();
+        self.report_inband_resize();
+        self.update_ime_cursor_area();
+        if let Some(w) = self.window.as_ref() {
+            w.request_redraw();
+        }
     }
 
     /// Feed a batch of PTY bytes through the parser. Returns whether a
@@ -1110,8 +1178,13 @@ impl Toastty {
         // grid sync so the recomputed grid reflects any padding change.
         self.push_padding_to_renderer();
         // Font swap may have changed the cell size; recompute the grid
-        // so columns/rows still match the window pixels.
+        // so columns/rows still match the window pixels, and tell 2048
+        // apps when it did (an unrelated reload sends nothing).
+        let grid_before = self.term.size();
         self.resync_grid();
+        if self.term.size() != grid_before {
+            self.report_inband_resize();
+        }
         if let Some(w) = self.window.as_ref() {
             w.request_redraw();
         }
@@ -1137,6 +1210,14 @@ impl Toastty {
         match Config::load_from_path(&path) {
             Ok(cfg) => {
                 self.config = cfg;
+                // A changed `font.size_px` is an explicit request for that
+                // size, so it resets the zoom; other reloads keep it.
+                if self.font_zoom.rebase(self.config.font.size_px) {
+                    info!(
+                        "font.size_px changed to {}px; font zoom reset",
+                        self.config.font.size_px
+                    );
+                }
                 self.apply_config_to_runtime();
                 self.set_banner(None);
                 info!("config reloaded from {}", path.display());
@@ -1297,6 +1378,22 @@ impl Toastty {
                 self.swallow_release(key_id);
                 return ControlSignal::RedrawIn(Duration::ZERO);
             }
+        }
+        // Font zoom (Ctrl/Cmd + `=` `+` `-` `0`, keypad `+` `-`). Always
+        // consumed, like kitty / Ghostty / WezTerm, regardless of the kitty
+        // keyboard flags: unlike copy there's no "nothing to do, let the
+        // app have it" state, and a zoom press must never leak half a
+        // chord to the app. Repeats keep zooming. Synthetic presses
+        // (winit replays held keys on focus-in) are ignored so focusing
+        // the window with Ctrl+= held doesn't zoom.
+        if state == KeyState::Pressed
+            && !is_synthetic
+            && let Some(action) =
+                zoom_action(logical, physical, modifiers, cfg!(target_os = "macos"))
+        {
+            self.apply_font_zoom(action);
+            self.swallow_release(key_id);
+            return ControlSignal::RedrawIn(Duration::ZERO);
         }
         // Copy current selection (if any) to the clipboard and eat the
         // keypress. With nothing selected the shortcut is the app's to
@@ -2271,33 +2368,8 @@ impl App for Toastty {
                 // clear only on an actual change.
                 self.push_padding_to_renderer();
                 self.resync_grid();
-                // DECSET 2048 — emit an in-band resize report so apps
-                // that opted in see the new geometry in order with
-                // everything else on the PTY (no SIGWINCH race). The
-                // encoder returns None when 2048 is off, so we don't
-                // touch the PTY in the default case.
-                //
-                // The pixel fields report the CONTENT dims (surface minus
-                // padding), matching `resync_grid` — NOT the full-surface
-                // `width`/`height` event locals.
-                let (rows, cols) = self.term.size();
-                let pad = &self.config.window.padding;
-                let (_ox, _oy, content_w, content_h) = content_rect_from_padding(
-                    self.physical_size,
-                    (pad.top, pad.right, pad.bottom, pad.left),
-                    self.scale_factor,
-                );
-                let pixel_w = u16::try_from(content_w).unwrap_or(u16::MAX);
-                let pixel_h = u16::try_from(content_h).unwrap_or(u16::MAX);
-                if let Some(bytes) = encode_resize_report(
-                    rows,
-                    cols,
-                    pixel_h,
-                    pixel_w,
-                    self.term.inband_resize_mode(),
-                ) {
-                    self.write_pty(&bytes);
-                }
+                // DECSET 2048 in-band resize report (content dims).
+                self.report_inband_resize();
                 ControlSignal::RedrawIn(Duration::ZERO)
             }
             Event::Redraw => {
