@@ -142,6 +142,10 @@ fn skin_tone_modifier_joins_its_base() {
     let mut t = run(4, 20, "a\u{1F3FD}|");
     assert_eq!(t.row(0).cells[1].ch, '\u{1F3FD}');
     assert_eq!(copy_row(&mut t, 0), "a\u{1F3FD}|");
+    // A narrow Dingbats base (✌) takes the modifier and grows to 2 cells.
+    let mut t = run(4, 20, "\u{270C}\u{1F3FD}|");
+    assert_eq!(cell_text(&t, 0, 0), "\u{270C}\u{1F3FD}");
+    assert_eq!(copy_row(&mut t, 0), "\u{270C}\u{1F3FD}|");
 }
 
 #[test]

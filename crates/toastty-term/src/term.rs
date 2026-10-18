@@ -2285,7 +2285,16 @@ impl Term {
         cluster.push_str(tail);
         let joins = cell_w == 0 || {
             let after_zwj = tail.ends_with('\u{200D}');
-            let emoji_modifier = ('\u{1F3FB}'..='\u{1F3FF}').contains(&c);
+            // UAX #29 lets a modifier extend *any* base (`a🏽` is one
+            // grapheme), but only an emoji base renders as a single glyph;
+            // after a letter the modifier is a swatch of its own, so it
+            // keeps its own two cells. Emoji bases are wide (U+1F...) or in
+            // the narrow Misc Symbols / Dingbats blocks (☝ ✊ ✌).
+            let emoji_base = ('\u{2600}'..='\u{27BF}').contains(&prev.ch)
+                || cells
+                    .get(usize::from(col) + 1)
+                    .is_some_and(|c| c.is_continuation);
+            let emoji_modifier = emoji_base && ('\u{1F3FB}'..='\u{1F3FF}').contains(&c);
             (self.grapheme_cluster_mode || after_zwj || emoji_modifier) && {
                 let mut probe = cluster.clone();
                 probe.push(c);
