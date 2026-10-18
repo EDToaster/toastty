@@ -60,11 +60,11 @@ Test input → expected result (xterm):
 
 ### Replies and queries
 
-- [ ] **P1 — XTGETTCAP `DCS + q <hex> ST`.**
+- [x] **P1 — XTGETTCAP `DCS + q <hex> ST`.** Done: per-name replies for `TN`, `Co`, `Tc`, `RGB`, `setrgbf`/`setrgbb`, `Ss`/`Se`, `Sync`, bracketed paste / focus caps, and `Ms` when OSC 52 writes are allowed (`toastty-term` `dcs_query`).
   - There's no reply today.
   - Neovim queries `Tc` / `RGB` / `setrgbf` to enable truecolor, and `TN` / `Ms` and others.
   - Answer the capabilities toastty implements; reply `DCS 0 + r ST` for unknown ones.
-- [ ] **P1 — DECRQSS `DCS $ q <Pt> ST`.**
+- [x] **P1 — DECRQSS `DCS $ q <Pt> ST`.** Done: `m` (xterm colon form), `r`, ` q`, `"p`, `t`, `$|`; others reply `DCS 0 $ r ST`.
   - There's no reply today.
   - Needed at least for `m` (SGR; apps probe truecolor by setting a colour and reading it back), `r` (DECSTBM) and ` q` (DECSCUSR).
 - [ ] **P1 — OSC 10 / 12 queries return hardcoded colours** (`d8d8d8`, `f2d94d`), not the active theme's fg and cursor. OSC 11 is correct.
@@ -82,7 +82,7 @@ Test input → expected result (xterm):
 
 ## 2. Truecolor signalling
 
-- [ ] **P0 — No truecolor signal to apps.**
+- [x] **P0 — No truecolor signal to apps.** Done: child env sets `COLORTERM=truecolor`, `TERM_PROGRAM=toastty`, `TERM_PROGRAM_VERSION`; XTGETTCAP / DECRQSS answered (neovim auto-enables `termguicolors`).
   - The child environment doesn't set `COLORTERM=truecolor`, and the XTGETTCAP / DECRQSS probes above go unanswered.
   - Neovim (auto `termguicolors`), bat, delta, helix, micro, ripgrep's `--colors` and others may fall back to 256 colours even though toastty renders 24-bit SGR fine.
   - Fix: set `COLORTERM=truecolor`, answer XTGETTCAP `Tc` / `RGB`, and answer DECRQSS `m`.

@@ -105,8 +105,15 @@ toastty|toastty terminal emulator,
 #
 # ----- Truecolor advertisement ---------------------------------------
 # Tc is the user-extension cap that tells curses-aware apps they can
-# emit `CSI 38;2;R;G;B m` / `CSI 48;2;R;G;B m` directly.
+# emit `CSI 38;2;R;G;B m` / `CSI 48;2;R;G;B m` directly. setrgbf /
+# setrgbb spell the sequences out (neovim and tmux accept either form).
+# The ncurses `RGB` boolean is deliberately NOT set here: with it,
+# ncurses reinterprets setaf/setab arguments as packed 24-bit values,
+# which would break the 256-colour setaf above. XTGETTCAP still answers
+# `RGB` (apps that query it only use it as a truecolor hint).
     Tc,
+    setrgbf=\E[38;2;%p1%d;%p2%d;%p3%dm,
+    setrgbb=\E[48;2;%p1%d;%p2%d;%p3%dm,
 #
 # ----- NOT supported (deliberately omitted) -------------------------
 # - kmous / XM mouse capabilities (M7)

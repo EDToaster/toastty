@@ -12,7 +12,7 @@ Tracking list of escape sequences, modes, and extensions toastty intends to supp
 | UTF-8 | Wide chars (East Asian width), combining marks |
 | PTY | `openpty()` on Unix; ConPTY on Windows (later) |
 | terminfo entry | Ship as `toastty` (plus `xterm-256color` fallback) |
-| SGR colors | 16 / 256 / 24-bit truecolor |
+| SGR colors | 16 / 256 / 24-bit truecolor. Signalled to apps via `COLORTERM=truecolor` (plus `TERM_PROGRAM=toastty`, `TERM_PROGRAM_VERSION`) in the child env, XTGETTCAP `Tc`/`RGB`/`setrgbf`/`setrgbb`, and DECRQSS `m` read-back |
 | Alternate screen buffer | DECSET 1049 |
 
 ## Tier 1 — Expected by modern apps
@@ -32,6 +32,7 @@ Tracking list of escape sequences, modes, and extensions toastty intends to supp
 | Cursor shape | DECSCUSR (CSI q) | Bar / block / underline + blink |
 | REP | CSI b | Repeat preceding character |
 | Mode query | DECRQM / DECRPM | Apps probe support |
+| Setting query | DECRQSS (`DCS $ q Pt ST`) | Replies `DCS 1 $ r <value><Pt> ST` for `m` (SGR, xterm form: leading `0`, extended colours as `38:5:N` / `38:2::R:G:B`), `r` (DECSTBM), ` q` (DECSCUSR), `"p` (DECSCL, `62;1`), `t` (rows), `$\|` (columns); anything else gets `DCS 0 $ r ST`. Bodies are capped at 4 KiB |
 
 ## Tier 2 — Modern extensions (the 2024–2026 wave)
 
@@ -43,7 +44,7 @@ Tracking list of escape sequences, modes, and extensions toastty intends to supp
 | Kitty keyboard protocol | CSI u + progressive enhancement flags | Push/pop via `CSI > flags u` / `CSI < u`. Neovim/helix/zellij use it |
 | Semantic prompts | OSC 133 (FinalTerm) | Powers prompt jumping, command status, shell integration |
 | ConEmu progress | OSC 9;4 | Surfaced in tab/taskbar UI |
-| XTGETTCAP | DCS + q ... ST | Programmatic terminfo query |
+| XTGETTCAP | DCS + q ... ST | Programmatic terminfo query. One reply per name, in order (kitty style; xterm packs them and stops at the first unknown): `DCS 1 + r <hex> ST` for booleans (`Tc`, `RGB`), `DCS 1 + r <hex>=<hex-value> ST` for strings/numbers, `DCS 0 + r <hex> ST` for unknown names, bare `DCS 0 + r ST` for bad hex. Answers `TN`/`name` (`xterm-256color`), `Co`/`colors` (256), `Tc`, `RGB`, `setrgbf`/`setrgbb`, `Ss`/`Se`, `Sync`, `BE`/`BD`/`PS`/`PE`, `fe`/`fd`/`kxIN`/`kxOUT`, and `Ms` only when `[security] osc_52_write` is on. `Smulx`/`Setulc` are not advertised (styled/coloured underlines aren't rendered). Bodies are capped at 4 KiB |
 | Extended color query | OSC 21 | Hex-format color queries |
 | Complex script placement | OSC 66 | Kitty extension for Indic/Arabic shaping width |
 
