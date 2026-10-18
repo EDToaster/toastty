@@ -42,8 +42,8 @@ use toastty::geometry::{
 };
 use toastty::keyboard::encode_key;
 use toastty::mouse::{
-    MouseEventKind, classify_button_event, encode_mouse, pixel_to_cell, protocol_wants_event,
-    word_bounds_in_row,
+    MouseEventKind, classify_button_event, drag_autoscroll_dir, encode_mouse, pixel_to_cell,
+    protocol_wants_event,
 };
 use toastty::paste::wrap_for_paste;
 use toastty::pty_log::{Direction, PtyLogger};
@@ -56,6 +56,11 @@ use toastty::theme_bridge::{
 /// 16 ms ≈ 60 Hz — fast enough to feel smooth on macOS trackpad
 /// inertia frames without burning the event loop when idle.
 const VIEWPORT_ANIM_TICK: Duration = Duration::from_millis(16);
+
+/// Auto-scroll cadence while a selection drag is held past the top or
+/// bottom edge of the grid: one line per tick (~20 lines/s), roughly
+/// xterm's rate.
+const SELECTION_AUTOSCROLL_TICK: Duration = Duration::from_millis(50);
 
 /// Refresh cadence for the `TOASTTY_DEBUG` FPS overlay. Keeps the text
 /// visibly updating when the grid is idle (otherwise the renderer would
@@ -104,6 +109,12 @@ struct DragState {
     /// selection extends from the word/line *containing* this point;
     /// motion expands by re-evaluating boundaries against the new cell.
     origin: Pos,
+    /// True once a `Char`/`Block` drag has left its press cell. A
+    /// plain click never creates a selection, so it neither paints a
+    /// one-cell highlight nor overwrites the clipboard on release.
+    /// `Word`/`Line` (double/triple click) select on press and are
+    /// always `true`.
+    moved: bool,
 }
 
 /// Convert a config `SmoothingFunction` into the per-frame easing
@@ -365,6 +376,14 @@ struct Toastty {
     /// Number of clicks in the current multi-click streak: 0 between
     /// streaks, 1/2/3 within one. Wrapping above 3 cycles back to 1.
     click_count: u8,
+    /// Auto-scroll direction while a selection drag is held past the
+    /// grid's top (`1`, into history) or bottom (`-1`) edge; `0`
+    /// otherwise. Ticked from `Event::Redraw`.
+    selection_autoscroll: i32,
+    /// When the last auto-scroll step ran, to pace it at
+    /// [`SELECTION_AUTOSCROLL_TICK`] regardless of how often redraws
+    /// fire.
+    last_autoscroll_at: Option<Instant>,
 }
 
 impl Toastty {
@@ -428,6 +447,8 @@ impl Toastty {
             last_click_at: None,
             last_click_pos: None,
             click_count: 0,
+            selection_autoscroll: 0,
+            last_autoscroll_at: None,
         }
     }
 
@@ -604,40 +625,55 @@ impl Toastty {
         click_count: u8,
         modifiers: Modifiers,
     ) -> Selection {
-        let (_, cols) = self.term.size();
-        // Alt+drag → block selection (only meaningful for an initial
-        // single click; double/triple-click + alt also drops back to
-        // block, matching iTerm2 / kitty).
+        // Alt+drag or Ctrl+Alt+drag → block selection (only meaningful
+        // for an initial single click; double/triple-click + alt also
+        // drops back to block, matching iTerm2 / kitty). Ctrl+Alt is
+        // kitty's binding and the one to use under window managers
+        // (Openbox, Xfce, …) that grab Alt+drag to move windows.
         if modifiers.contains(Modifiers::ALT) {
             return Selection::new(origin, SelectionMode::Block);
         }
         match click_count {
             2 => {
                 // Word: expand origin to word boundaries.
-                let (lo, hi) = self
-                    .word_bounds_at(origin.line_id, origin.col)
-                    .unwrap_or((origin.col, origin.col));
-                let mut sel = Selection::new(Pos::new(origin.line_id, lo), SelectionMode::Word);
-                sel.set_active(Pos::new(origin.line_id, hi));
+                let (lo, hi) = self.word_bounds_at(origin);
+                let mut sel = Selection::new(lo, SelectionMode::Word);
+                sel.set_active(hi);
                 sel
             }
             3 => {
-                // Line: full row.
-                let end = cols.saturating_sub(1);
-                let mut sel = Selection::new(Pos::new(origin.line_id, 0), SelectionMode::Line);
-                sel.set_active(Pos::new(origin.line_id, end));
+                // Line: the whole logical (soft-wrapped) line.
+                let (lo, hi) = self.line_bounds_at(origin.line_id);
+                let mut sel = Selection::new(lo, SelectionMode::Line);
+                sel.set_active(hi);
                 sel
             }
             _ => Selection::new(origin, SelectionMode::Char),
         }
     }
 
-    /// Look up the visible word-boundary range given a `line_id`,
-    /// falling back to `None` for evicted rows. Used by both
-    /// press-time word expansion and drag-time word extension.
-    fn word_bounds_at(&self, line_id: u64, col: u16) -> Option<(u16, u16)> {
-        let row = self.term.primary_row_by_line_id(line_id)?;
-        Some(word_bounds_in_row(row, col))
+    /// Word containing `at` (inclusive start/end), using Unicode
+    /// alphanumerics plus the configured `selection.word_chars`. Words
+    /// continue across soft wraps. Falls back to `(at, at)` for
+    /// non-word cells and evicted rows. Used by both press-time word
+    /// expansion and drag-time word extension.
+    fn word_bounds_at(&self, at: Pos) -> (Pos, Pos) {
+        let sel_cfg = &self.config.selection;
+        self.term
+            .word_bounds(at, |c| sel_cfg.is_word_char(c))
+            .unwrap_or((at, at))
+    }
+
+    /// First and last cell of the logical line containing `line_id`
+    /// (every row joined to it by soft wraps). Falls back to the single
+    /// visual row for an evicted line id.
+    fn line_bounds_at(&self, line_id: u64) -> (Pos, Pos) {
+        let (_, cols) = self.term.size();
+        let (lo, hi) = self
+            .term
+            .logical_line_bounds(line_id)
+            .unwrap_or((line_id, line_id));
+        (Pos::new(lo, 0), Pos::new(hi, cols.saturating_sub(1)))
     }
 
     /// Push the configured window padding + `extend_background` mode into
@@ -740,6 +776,9 @@ impl Toastty {
             }
         }
         self.parser.advance(&mut self.term, bytes);
+        // A finished (released) selection whose rows were redrawn or
+        // evicted no longer describes what the user picked — drop it.
+        self.term.revalidate_selection();
         // OSC 0/1/2 may have changed the title — sync to the window
         // decoration. `sync_title` is a no-op when the title is
         // unchanged, so calling on every batch is cheap.
@@ -1295,9 +1334,10 @@ impl Toastty {
         // Local drag-select first: when we've started a selection,
         // every motion event extends it, even if the foreground app
         // would otherwise want the motion. (The selection only starts
-        // in the first place when `mouse_mode().is_on()` was false, so
-        // there's no conflict.)
+        // in the first place when `mouse_mode().is_on()` was false or
+        // Shift forced it, so the app never sees these motions.)
         if self.selecting.is_some() {
+            self.selection_autoscroll = self.autoscroll_dir_at(position.1);
             self.extend_selection_to_cursor();
             return ControlSignal::RedrawIn(Duration::ZERO);
         }
@@ -1369,16 +1409,34 @@ impl Toastty {
             return ControlSignal::Continue;
         }
         // Local text selection takes priority over PTY forwarding when
-        // the foreground app hasn't opted into mouse tracking. Only
-        // the left button drives selection; other buttons fall through
-        // to the existing encoder.
+        // the foreground app hasn't opted into mouse tracking — or when
+        // Shift is held, which bypasses tracking (xterm convention,
+        // shared by kitty / Alacritty / WezTerm / Ghostty / iTerm2;
+        // herdr and tmux rely on it). Those events are handled here and
+        // never reach the app, Shift bit included. A release always
+        // goes to whoever got the press, even if Shift was let go
+        // mid-drag. Only the left button drives selection; other
+        // buttons fall through to the existing encoder.
         let mode = self.term.mouse_mode();
-        if !mode.is_on() && button == MouseButton::Left {
-            match state {
-                KeyState::Pressed => self.begin_or_extend_selection(modifiers),
-                KeyState::Released => self.finish_selection_drag(),
+        if button == MouseButton::Left {
+            let local = match state {
+                KeyState::Pressed => !mode.is_on() || modifiers.contains(Modifiers::SHIFT),
+                KeyState::Released => self.selecting.is_some(),
+            };
+            if local {
+                match state {
+                    KeyState::Pressed => {
+                        self.begin_or_extend_selection(modifiers - Modifiers::SHIFT);
+                    }
+                    KeyState::Released => self.finish_selection_drag(),
+                }
+                return ControlSignal::RedrawIn(Duration::ZERO);
             }
-            return ControlSignal::RedrawIn(Duration::ZERO);
+            // A click the app consumes still dismisses a lingering
+            // highlight, like a click anywhere does without tracking.
+            if state == KeyState::Pressed {
+                self.term.clear_selection();
+            }
         }
         let kind = classify_button_event(button, state);
         if protocol_wants_event(mode, &kind) {
@@ -1423,8 +1481,13 @@ impl Toastty {
 
     /// Start a fresh selection (or step the multi-click counter) at
     /// the current cursor position. Called from `handle_mouse` on a
-    /// left-button press when the foreground app isn't tracking the
-    /// mouse.
+    /// left-button press when local selection applies (no mouse
+    /// tracking, or Shift held).
+    ///
+    /// Any previous selection is dismissed. A single click only arms
+    /// the drag: the selection is created once the pointer leaves the
+    /// press cell (see `extend_selection_to_cursor`), so clicking to
+    /// focus or dismiss never copies anything.
     fn begin_or_extend_selection(&mut self, modifiers: Modifiers) {
         let origin = self.current_selection_pos();
         let now = Instant::now();
@@ -1443,82 +1506,153 @@ impl Toastty {
         // For Alt+drag, selection mode is Block — capture the chosen
         // mode and the original origin so motion can extend correctly.
         let mode = sel.mode;
-        self.selecting = Some(DragState { mode, origin });
-        self.term.set_selection(sel);
+        let immediate = matches!(mode, SelectionMode::Word | SelectionMode::Line);
+        self.selecting = Some(DragState {
+            mode,
+            origin,
+            moved: immediate,
+        });
+        self.selection_autoscroll = 0;
+        if immediate {
+            self.term.set_selection(sel);
+        } else {
+            self.term.clear_selection();
+        }
+    }
+
+    /// Auto-scroll direction for a drag whose pointer is at window y
+    /// `y`. Only the primary screen has scrollback to move through.
+    fn autoscroll_dir_at(&self, y: f64) -> i32 {
+        let Some(r) = self.renderer.as_ref() else {
+            return 0;
+        };
+        if self.term.is_alt_active() {
+            return 0;
+        }
+        let (rows, _) = self.term.size();
+        let (_, top) = r.content_origin_px();
+        let content_h = f64::from(rows) * f64::from(r.cell_size().1);
+        drag_autoscroll_dir(y, f64::from(top), content_h)
+    }
+
+    /// One auto-scroll step for a drag held past the grid edge: scroll
+    /// the viewport a line toward the pointer and re-extend the
+    /// selection to the newly exposed edge row. Returns the delay until
+    /// the next step, or `None` when no auto-scroll is active.
+    fn tick_selection_autoscroll(&mut self, now: Instant) -> Option<Duration> {
+        if self.selecting.is_none() || self.selection_autoscroll == 0 {
+            self.last_autoscroll_at = None;
+            return None;
+        }
+        if let Some(at) = self.last_autoscroll_at {
+            let since = now.duration_since(at);
+            if since < SELECTION_AUTOSCROLL_TICK {
+                return Some(SELECTION_AUTOSCROLL_TICK.saturating_sub(since));
+            }
+        }
+        let cell_h = self.renderer.as_ref().map_or(0.0, |r| r.cell_size().1);
+        if cell_h > 0.0 {
+            self.term
+                .scroll_view_by(self.selection_autoscroll, 0.0, cell_h);
+            self.term.force_snap_view();
+            self.extend_selection_to_cursor();
+        }
+        self.last_autoscroll_at = Some(now);
+        Some(SELECTION_AUTOSCROLL_TICK)
     }
 
     /// Extend the in-flight selection to whichever cell the pointer
     /// currently sits over. Called from `handle_mouse_motion` while a
     /// drag is active.
     fn extend_selection_to_cursor(&mut self) {
-        let Some(drag) = self.selecting else {
+        let Some(mut drag) = self.selecting else {
             return;
         };
         let here = self.current_selection_pos();
+        if drag.moved && self.term.selection().is_none() {
+            // The term dropped the selection under us (screen switch,
+            // resize, RIS) — the origin no longer means anything.
+            self.selecting = None;
+            self.selection_autoscroll = 0;
+            return;
+        }
         match drag.mode {
             SelectionMode::Char | SelectionMode::Block => {
+                if !drag.moved {
+                    if here == drag.origin {
+                        return;
+                    }
+                    drag.moved = true;
+                    self.selecting = Some(drag);
+                    self.term
+                        .set_selection(Selection::new(drag.origin, drag.mode));
+                }
                 self.term.update_selection_active(here);
             }
             SelectionMode::Word => {
                 // Snap `here` to the word containing it, then extend
                 // anchor → active to the far edge so the selection
                 // grows by whole words on each side.
-                let (lo_here, hi_here) = self
-                    .word_bounds_at(here.line_id, here.col)
-                    .unwrap_or((here.col, here.col));
-                let (lo_origin, hi_origin) = self
-                    .word_bounds_at(drag.origin.line_id, drag.origin.col)
-                    .unwrap_or((drag.origin.col, drag.origin.col));
-                // Build a Selection with anchor at the further-from-here
-                // edge of the origin word, active at the further-from-
-                // origin edge of the here word.
+                let (lo_here, hi_here) = self.word_bounds_at(here);
+                let (lo_origin, hi_origin) = self.word_bounds_at(drag.origin);
                 let dragging_forward =
                     (here.line_id, here.col) >= (drag.origin.line_id, drag.origin.col);
-                let (anchor_col, active_col) = if dragging_forward {
+                let (anchor, active) = if dragging_forward {
                     (lo_origin, hi_here)
                 } else {
                     (hi_origin, lo_here)
                 };
-                let mut sel = Selection::new(
-                    Pos::new(drag.origin.line_id, anchor_col),
-                    SelectionMode::Word,
-                );
-                sel.set_active(Pos::new(here.line_id, active_col));
+                let mut sel = Selection::new(anchor, SelectionMode::Word);
+                sel.set_active(active);
                 self.term.set_selection(sel);
             }
             SelectionMode::Line => {
-                // Anchor at origin row col 0, active at here row col
-                // cols-1 (or vice versa).
-                let (_, cols) = self.term.size();
-                let end = cols.saturating_sub(1);
+                // Whole logical lines from the origin's to the
+                // pointer's, in drag direction.
+                let (lo_origin, hi_origin) = self.line_bounds_at(drag.origin.line_id);
+                let (lo_here, hi_here) = self.line_bounds_at(here.line_id);
                 let dragging_forward = here.line_id >= drag.origin.line_id;
-                let mut sel = Selection::new(
-                    Pos::new(drag.origin.line_id, if dragging_forward { 0 } else { end }),
-                    SelectionMode::Line,
-                );
-                sel.set_active(Pos::new(
-                    here.line_id,
-                    if dragging_forward { end } else { 0 },
-                ));
+                let (anchor, active) = if dragging_forward {
+                    (lo_origin, hi_here)
+                } else {
+                    (hi_origin, lo_here)
+                };
+                let mut sel = Selection::new(anchor, SelectionMode::Line);
+                sel.set_active(active);
                 self.term.set_selection(sel);
             }
         }
     }
 
-    /// Wrap up the drag on left-release: copy the selected text to the
-    /// system clipboard if non-empty, then drop the visible highlight
-    /// — the user signalled "I'm done picking" by releasing the
-    /// button, and the highlight lingering past that is visual noise.
+    /// Wrap up the drag on left-release. A plain click (no movement)
+    /// selects nothing and leaves the clipboard alone. Otherwise the
+    /// selected text goes to [`Self::selection_finished`] and the
+    /// highlight *stays* — like xterm / kitty / Ghostty — so the copy
+    /// shortcut still works afterwards. It's dismissed by the next
+    /// click, by typing, or when the selected rows change
+    /// (`Term::revalidate_selection`).
     fn finish_selection_drag(&mut self) {
-        if self.selecting.take().is_none() {
+        self.selection_autoscroll = 0;
+        let Some(drag) = self.selecting.take() else {
+            return;
+        };
+        if !drag.moved {
             return;
         }
         if let Some(text) = self.term.extract_selection_text()
             && !text.is_empty()
         {
-            self.write_clipboard(text);
+            self.selection_finished(text);
         }
-        self.term.clear_selection();
+        self.term.commit_selection();
+    }
+
+    /// The user finished a mouse selection whose text is `text`
+    /// (non-empty). Single hook for everything that should happen with
+    /// a completed selection: today copy-on-select to the CLIPBOARD; an
+    /// X11/Wayland PRIMARY owner belongs here too.
+    fn selection_finished(&mut self, text: String) {
+        self.write_clipboard(text);
     }
 
     /// Lazy-init `self.clipboard` and write `text`. Mirrors the
@@ -2011,6 +2145,8 @@ impl App for Toastty {
                     }
                 }
                 self.last_viewport_tick = Some(now);
+                // Selection drag held past the top/bottom edge.
+                let next_autoscroll = self.tick_selection_autoscroll(now);
 
                 // Refresh the debug overlay (FPS counter) BEFORE
                 // rendering so it lands on this frame. We retain frame
@@ -2094,7 +2230,10 @@ impl App for Toastty {
                 } else {
                     None
                 };
-                match min_deadline(min_deadline(next_blink, next_anim), next_debug) {
+                match min_deadline(
+                    min_deadline(min_deadline(next_blink, next_anim), next_debug),
+                    next_autoscroll,
+                ) {
                     Some(d) => ControlSignal::RedrawIn(d),
                     None => ControlSignal::Continue,
                 }
