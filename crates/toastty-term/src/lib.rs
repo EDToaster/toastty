@@ -34,9 +34,10 @@ pub use damage::{Damage, RowDamage};
 pub use grid::{Grid, Row, RowLocation};
 pub use selection::{Pos, Selection, SelectionMode};
 pub use term::{
-    ClipboardRequest, KITTY_FLAG_DISAMBIGUATE, KITTY_FLAG_REPORT_ALL_AS_ESC,
-    KITTY_FLAG_REPORT_ALTERNATE, KITTY_FLAG_REPORT_EVENTS, KITTY_FLAG_REPORT_TEXT, MouseEncoding,
-    MouseMode, MouseProtocol, PromptMark, PromptMarkKind, SecurityFlags, Term,
+    ClipboardRequest, ClipboardTarget, ClipboardTargets, KITTY_FLAG_DISAMBIGUATE,
+    KITTY_FLAG_REPORT_ALL_AS_ESC, KITTY_FLAG_REPORT_ALTERNATE, KITTY_FLAG_REPORT_EVENTS,
+    KITTY_FLAG_REPORT_TEXT, MouseEncoding, MouseMode, MouseProtocol, PromptMark, PromptMarkKind,
+    SecurityFlags, Term,
 };
 pub use viewport::{Smoothing, Viewport};
 

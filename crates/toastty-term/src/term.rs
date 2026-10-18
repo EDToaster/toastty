@@ -27,6 +27,7 @@ use toastty_graphics::rgp::scene::{RgpAsset, RgpScene};
 use toastty_graphics::sixel::{SIXEL_MAX_COLORS, SixelDcs, SixelHandler};
 use toastty_graphics::{ImageData, ImageGrid, ImageRegistry, Placement};
 use toastty_parser::{Params, Perform};
+pub use toastty_protocols::clipboard::{ClipboardTarget, ClipboardTargets};
 
 /// Width of a hard tab. Eight is the canonical default; once we expose
 /// tab-stop manipulation (HTS/TBC) this becomes per-column state.
@@ -429,12 +430,22 @@ pub(crate) struct PlaceholderCell {
 /// serviced by the binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardRequest {
-    /// Replace the system clipboard with `data`.
-    Set { data: Vec<u8> },
-    /// Read the system clipboard and reply via
-    /// [`Term::push_pty_reply`] with a `selection`-tagged OSC 52
-    /// response.
-    Query { selection: Vec<u8> },
+    /// Replace the selection buffer(s) in `targets` with `data`.
+    Set {
+        data: Vec<u8>,
+        targets: ClipboardTargets,
+    },
+    /// Clear the selection buffer(s) in `targets` (xterm: an empty or
+    /// non-base64 payload clears the selection).
+    Clear { targets: ClipboardTargets },
+    /// Read `target` and reply via [`Term::push_pty_reply`] with a
+    /// `selection`-tagged OSC 52 response. `bell_terminated` records
+    /// whether the request ended in BEL so the reply can mirror it.
+    Query {
+        selection: Vec<u8>,
+        target: ClipboardTarget,
+        bell_terminated: bool,
+    },
 }
 
 /// Security flags mirrored on `Term` from
@@ -3512,7 +3523,7 @@ impl Perform for Term {
     /// per-frame cursor pass already runs every frame; the title lives
     /// outside the grid entirely.
     #[allow(clippy::too_many_lines)] // each OSC arm is small but the table is wide.
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         // OSC must have at least one param: the code.
         let Some(code_bytes) = params.first() else {
             return;
@@ -3604,17 +3615,32 @@ impl Perform for Term {
                     joined.extend_from_slice(p);
                 }
                 if let Some(op) = toastty_protocols::clipboard::parse(&joined) {
+                    use toastty_protocols::clipboard::Osc52Op;
                     match op {
-                        toastty_protocols::clipboard::Osc52Op::Set { payload, .. } => {
-                            if self.security.osc_52_write {
-                                self.clipboard_requests
-                                    .push(ClipboardRequest::Set { data: payload });
+                        Osc52Op::Set { selection, payload } => {
+                            let targets = selection.write_targets();
+                            if self.security.osc_52_write && !targets.is_empty() {
+                                self.clipboard_requests.push(ClipboardRequest::Set {
+                                    data: payload,
+                                    targets,
+                                });
                             }
                         }
-                        toastty_protocols::clipboard::Osc52Op::Query { selection } => {
-                            if self.security.osc_52_read {
+                        Osc52Op::Clear { selection } => {
+                            let targets = selection.write_targets();
+                            if self.security.osc_52_write && !targets.is_empty() {
+                                self.clipboard_requests
+                                    .push(ClipboardRequest::Clear { targets });
+                            }
+                        }
+                        Osc52Op::Query { selection } => {
+                            if self.security.osc_52_read
+                                && let Some(target) = selection.read_target()
+                            {
                                 self.clipboard_requests.push(ClipboardRequest::Query {
                                     selection: selection.0,
+                                    target,
+                                    bell_terminated,
                                 });
                             }
                         }
@@ -7027,10 +7053,16 @@ mod tests {
         feed(&mut t, b"\x1b]52;c;aGVsbG8=\x1b\\");
         let reqs = t.drain_clipboard_requests();
         assert_eq!(reqs.len(), 1);
-        match &reqs[0] {
-            ClipboardRequest::Set { data } => assert_eq!(data, b"hello"),
-            ClipboardRequest::Query { .. } => panic!("expected Set"),
-        }
+        assert_eq!(
+            reqs[0],
+            ClipboardRequest::Set {
+                data: b"hello".to_vec(),
+                targets: ClipboardTargets {
+                    clipboard: true,
+                    primary: false,
+                },
+            }
+        );
     }
 
     #[test]
@@ -7050,10 +7082,14 @@ mod tests {
         feed(&mut t, b"\x1b]52;c;?\x1b\\");
         let reqs = t.drain_clipboard_requests();
         assert_eq!(reqs.len(), 1);
-        match &reqs[0] {
-            ClipboardRequest::Query { selection } => assert_eq!(selection, b"c"),
-            ClipboardRequest::Set { .. } => panic!("expected Query"),
-        }
+        assert_eq!(
+            reqs[0],
+            ClipboardRequest::Query {
+                selection: b"c".to_vec(),
+                target: ClipboardTarget::Clipboard,
+                bell_terminated: false,
+            }
+        );
     }
 
     #[test]
@@ -7063,8 +7099,103 @@ mod tests {
             osc_52_read: true,
             osc_52_write: true,
         });
+        // Invalid base64 clears the selection (xterm) rather than
+        // writing garbage or being silently ignored.
         feed(&mut t, b"\x1b]52;c;!!\x1b\\");
+        assert_eq!(
+            t.drain_clipboard_requests(),
+            vec![ClipboardRequest::Clear {
+                targets: ClipboardTargets {
+                    clipboard: true,
+                    primary: false,
+                },
+            }]
+        );
+        // Missing data separator is malformed: dropped.
+        feed(&mut t, b"\x1b]52;c\x1b\\");
         assert!(t.drain_clipboard_requests().is_empty());
+    }
+
+    fn osc52_rw_term() -> Term {
+        let mut t = Term::new(2, 4, 0);
+        t.set_security(SecurityFlags {
+            osc_52_read: true,
+            osc_52_write: true,
+        });
+        t
+    }
+
+    #[test]
+    fn osc52_selection_param_routes_targets() {
+        let mut t = osc52_rw_term();
+        let set = |c, p| ClipboardRequest::Set {
+            data: b"hi".to_vec(),
+            targets: ClipboardTargets {
+                clipboard: c,
+                primary: p,
+            },
+        };
+        feed(&mut t, b"\x1b]52;p;aGk=\x07");
+        feed(&mut t, b"\x1b]52;cp;aGk=\x07");
+        feed(&mut t, b"\x1b]52;s;aGk=\x07");
+        feed(&mut t, b"\x1b]52;;aGk=\x07");
+        feed(&mut t, b"\x1b]52;c;aGk\x07"); // unpadded
+        assert_eq!(
+            t.drain_clipboard_requests(),
+            vec![
+                set(false, true),
+                set(true, true),
+                set(true, true),
+                set(true, true),
+                set(true, false),
+            ]
+        );
+        // Only unsupported buffers (secondary / cut buffer): no-op.
+        feed(&mut t, b"\x1b]52;q;aGk=\x07\x1b]52;0;\x07\x1b]52;q;?\x07");
+        assert!(t.drain_clipboard_requests().is_empty());
+    }
+
+    #[test]
+    fn osc52_empty_payload_clears_when_write_enabled() {
+        let mut t = osc52_rw_term();
+        feed(&mut t, b"\x1b]52;p;\x1b\\");
+        assert_eq!(
+            t.drain_clipboard_requests(),
+            vec![ClipboardRequest::Clear {
+                targets: ClipboardTargets {
+                    clipboard: false,
+                    primary: true,
+                },
+            }]
+        );
+        // Clearing is a write: gated by osc_52_write.
+        t.set_security(SecurityFlags {
+            osc_52_read: true,
+            osc_52_write: false,
+        });
+        feed(&mut t, b"\x1b]52;p;\x1b\\");
+        assert!(t.drain_clipboard_requests().is_empty());
+    }
+
+    #[test]
+    fn osc52_query_records_target_and_terminator() {
+        let mut t = osc52_rw_term();
+        feed(&mut t, b"\x1b]52;p;?\x07\x1b]52;c;?\x1b\\");
+        assert_eq!(
+            t.drain_clipboard_requests(),
+            vec![
+                ClipboardRequest::Query {
+                    selection: b"p".to_vec(),
+                    target: ClipboardTarget::Primary,
+                    bell_terminated: true,
+                },
+                ClipboardRequest::Query {
+                    selection: b"c".to_vec(),
+                    target: ClipboardTarget::Clipboard,
+                    bell_terminated: false,
+                },
+            ]
+        );
     }
 
     // ----- M11a: kitty APC integration -----
