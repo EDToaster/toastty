@@ -149,6 +149,8 @@ impl RichTextureCache {
         for &id in visible {
             if let Some(e) = self.entries.get_mut(&id) {
                 e.last_frame = frame;
+                // Keep the block warm in the store's LRU while on screen.
+                let _ = store.image(id);
                 continue;
             }
             let (Some(img), Some(rev)) = (store.image(id), store.block_revision(id)) else {
