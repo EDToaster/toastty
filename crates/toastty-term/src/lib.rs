@@ -27,6 +27,7 @@ mod extra;
 mod grid;
 mod link;
 mod reflow;
+mod rich;
 mod selection;
 mod term;
 mod viewport;
@@ -35,8 +36,13 @@ pub use cell::{Cell, Color, HyperlinkId, Style, StyleFlags, UnderlineStyle};
 pub use cursor::Cursor;
 pub use damage::{Damage, RowDamage};
 pub use extra::{CellExtra, CellExtraId, ExtraTable};
-pub use grid::{Grid, Row, RowLocation};
+pub use grid::{Grid, RelayoutFn, Row, RowLocation};
 pub use link::{LinkHit, LinkSource, LinkSpan, MAX_SCAN_ROWS};
+pub use rich::{
+    RICH_DEFAULT_BUDGET, RICH_MAX_ROWS, RichBlock, RichBlockId, RichBlockLayout, RichBlockStore,
+    RichEnv, RichImage, RichLayout, RichLayoutRequest, RichLinkSpan, RichPalette, RichParams,
+    RichRow, RichTextRun,
+};
 pub use selection::{Pos, Selection, SelectionMode};
 pub use term::{
     ClipboardRequest, ClipboardTarget, ClipboardTargets, KITTY_FLAG_DISAMBIGUATE,

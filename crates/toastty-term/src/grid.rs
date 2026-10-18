@@ -6,14 +6,22 @@
 //! pull cheap (decision #6).
 
 use crate::cell::{Cell, Style};
+use crate::rich::{RichBlockId, RichRow};
 use smallvec::SmallVec;
 
 /// A single row in the grid. `soft_wrap` indicates the row continues onto
 /// the next one (load-bearing for reflow — decision #6).
+///
+/// `rich` tags a row that shows one row of a rich block (OSC 7700). The
+/// tag travels with the row through scrolling, scrollback and reflow;
+/// erasing the row or writing a cell into it ([`Row::clear`],
+/// [`Row::erase`], [`Row::put`]) clears it, so an app drawing over a
+/// block wins.
 #[derive(Debug, Clone, Default)]
 pub struct Row {
     pub cells: SmallVec<[Cell; 16]>,
     pub soft_wrap: bool,
+    pub rich: Option<RichRow>,
 }
 
 impl Row {
@@ -28,6 +36,7 @@ impl Row {
         Self {
             cells,
             soft_wrap: false,
+            rich: None,
         }
     }
 
@@ -37,6 +46,7 @@ impl Row {
             *c = Cell::BLANK;
         }
         self.soft_wrap = false;
+        self.rich = None;
     }
 
     /// Resize the row in place. Growing fills with blanks; shrinking
@@ -54,6 +64,7 @@ impl Row {
     /// Out-of-range writes against a clamped column are a logic bug in
     /// the caller — we silently grow, but never beyond `max_cols`.
     pub fn put(&mut self, col: u16, cell: Cell, max_cols: u16) {
+        self.rich = None;
         let col = col as usize;
         if col >= self.cells.len() {
             let target = (col + 1).min(max_cols as usize);
@@ -66,6 +77,7 @@ impl Row {
 
     /// Erase cells in `[start, end)` (open at end) — used by EL handlers.
     pub fn erase(&mut self, start: u16, end: u16, style: Style) {
+        self.rich = None;
         let start = start as usize;
         let end = (end as usize).min(self.cells.len());
         if start >= end {
@@ -83,6 +95,10 @@ impl Row {
         }
     }
 }
+
+/// Re-layout callback for [`Grid::resize_reflow_with`]: block id and the
+/// block's current rows in, replacement rows (or `None` = keep) out.
+pub type RelayoutFn<'a> = dyn FnMut(RichBlockId, &[Row]) -> Option<Vec<Row>> + 'a;
 
 /// Ring-buffer grid: `cap` rows of `cols` cells each, with a moving head.
 ///
@@ -317,6 +333,7 @@ impl Grid {
                 extra: None,
             });
             row.soft_wrap = false;
+            row.rich = None;
         }
     }
 
@@ -412,6 +429,24 @@ impl Grid {
         cap: usize,
         cursor: (u16, u16),
     ) -> (u16, u16) {
+        self.resize_reflow_with(visible_rows, cols, cap, cursor, &mut |_, _| None)
+    }
+
+    /// [`Grid::resize_reflow`] with rich-block re-layout. Each contiguous
+    /// run of rows tagged with the same block is one unit: `relayout` is
+    /// called with the block id and the run's rows and returns the
+    /// replacement rows (already tagged), or `None` to keep the run as is
+    /// (each row truncated / padded to the new width, never rewrapped).
+    /// Plain rows between runs reflow exactly as in `resize_reflow`.
+    #[must_use]
+    pub fn resize_reflow_with(
+        &mut self,
+        visible_rows: u16,
+        cols: u16,
+        cap: usize,
+        cursor: (u16, u16),
+        relayout: &mut RelayoutFn<'_>,
+    ) -> (u16, u16) {
         let cap = cap.max(visible_rows as usize).max(1);
 
         // Collect retained rows oldest→newest: scrollback (oldest first)
@@ -431,7 +466,7 @@ impl Grid {
         // still yields a line for the cursor.
         let last_nonblank = retained
             .iter()
-            .rposition(|r| r.cells.iter().any(|c| *c != Cell::BLANK))
+            .rposition(|r| r.rich.is_some() || r.cells.iter().any(|c| *c != Cell::BLANK))
             .unwrap_or(0);
         let end = cursor_idx
             .max(last_nonblank)
@@ -439,7 +474,7 @@ impl Grid {
         retained.truncate(end + 1);
 
         let (flat, (cur_idx, cur_col)) =
-            crate::reflow::reflow_rows(&retained, cols, cursor_idx, cursor.1);
+            reflow_segments(&retained, cols, cursor_idx, cursor.1, relayout);
 
         // Lay the rewrapped rows into a fresh ring with `head = 0`, so
         // logical row `i` sits at slot `i` and scrollback row `n` at slot
@@ -495,6 +530,72 @@ impl Grid {
 
         (cursor_row, cur_col.min(cols))
     }
+}
+
+/// Split `rows` into plain segments (reflowed by
+/// [`crate::reflow::reflow_rows`]) and rich-block runs (handed to
+/// `relayout`), and concatenate the results. With no tagged rows this is
+/// exactly `reflow_rows` over the whole slice.
+fn reflow_segments(
+    rows: &[Row],
+    cols: u16,
+    cursor_idx: usize,
+    cursor_col: u16,
+    relayout: &mut RelayoutFn<'_>,
+) -> (Vec<Row>, (usize, u16)) {
+    let mut out: Vec<Row> = Vec::with_capacity(rows.len());
+    let mut cur = (0usize, 0u16);
+    let mut i = 0usize;
+    while i < rows.len() {
+        let start = i;
+        if let Some(tag) = rows[i].rich {
+            while i < rows.len() && rows[i].rich.map(|t| t.block) == Some(tag.block) {
+                i += 1;
+            }
+            let run = &rows[start..i];
+            let base = out.len();
+            if let Some(new_rows) = relayout(tag.block, run) {
+                out.extend(new_rows);
+            } else {
+                out.extend(run.iter().map(|r| {
+                    let mut r = r.clone();
+                    r.resize_cols(cols);
+                    r.soft_wrap = false;
+                    r
+                }));
+            }
+            if out.len() == base {
+                // A re-layout must never swallow the run entirely: keep a
+                // blank row so the cursor and neighbours stay put.
+                out.push(Row::blank(cols));
+            }
+            if (start..i).contains(&cursor_idx) {
+                let off = (cursor_idx - start).min(out.len() - base - 1);
+                cur = (base + off, cursor_col.min(cols));
+            }
+        } else {
+            while i < rows.len() && rows[i].rich.is_none() {
+                i += 1;
+            }
+            let has_cursor = (start..i).contains(&cursor_idx);
+            let want = if has_cursor {
+                cursor_idx - start
+            } else {
+                usize::MAX
+            };
+            let (seg, (ci, cc)) =
+                crate::reflow::reflow_rows(&rows[start..i], cols, want, cursor_col);
+            if has_cursor {
+                cur = (out.len() + ci, cc);
+            }
+            out.extend(seg);
+        }
+    }
+    if out.is_empty() {
+        out.push(Row::blank(cols));
+        cur = (0, 0);
+    }
+    (out, cur)
 }
 
 #[cfg(test)]

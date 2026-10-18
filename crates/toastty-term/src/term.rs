@@ -32,6 +32,8 @@ use toastty_graphics::{ImageData, ImageGrid, ImageRegistry, Placement};
 use toastty_parser::{Params, Perform};
 pub use toastty_protocols::clipboard::{ClipboardTarget, ClipboardTargets};
 
+mod rich_term;
+
 /// Width of a hard tab. Eight is the canonical default; once we expose
 /// tab-stop manipulation (HTS/TBC) this becomes per-column state.
 const TAB_WIDTH: u16 = 8;
@@ -397,6 +399,24 @@ pub struct Term {
     /// honoring this level for the legacy `CSI 27 ; mods ; code ~`
     /// reporting is future work.
     modify_other_keys: u8,
+    // ----- Rich blocks (OSC 7700) -----
+    /// Layout engine injected by the binary. `None` → OSC 7700 ignored.
+    rich_layout: Option<RichLayoutSlot>,
+    /// Block sources, params and images.
+    rich_store: crate::rich::RichBlockStore,
+    /// Font size + theme palette from the binary.
+    rich_env: crate::rich::RichEnv,
+    /// Geometry / palette changed since blocks were last laid out.
+    rich_dirty: bool,
+}
+
+/// Box around the injected layout so `Term` can stay `Debug`.
+pub(crate) struct RichLayoutSlot(pub(crate) Box<dyn crate::rich::RichBlockLayout>);
+
+impl std::fmt::Debug for RichLayoutSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RichLayoutSlot")
+    }
 }
 
 /// In-progress run of Kitty Unicode placeholder cells.
@@ -467,12 +487,29 @@ pub enum ClipboardRequest {
 /// Security flags mirrored on `Term` from
 /// [`toastty_config::SecurityConfig`]. Kept separate from the config
 /// struct so the term crate doesn't depend on config wire types.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SecurityFlags {
     /// Allow OSC 52 clipboard reads. Off by default.
     pub osc_52_read: bool,
     /// Allow OSC 52 clipboard writes. Off by default.
     pub osc_52_write: bool,
+    /// Render OSC 7700 rich blocks (Markdown). On by default; when off
+    /// the sequence is ignored.
+    pub markdown: bool,
+    /// Let rich blocks read local image files. Off by default.
+    pub markdown_local_files: bool,
+}
+
+impl Default for SecurityFlags {
+    fn default() -> Self {
+        Self {
+            osc_52_read: false,
+            osc_52_write: false,
+            markdown: true,
+            markdown_local_files: false,
+        }
+    }
 }
 
 /// One semantic prompt marker recorded from OSC 133.
@@ -585,6 +622,10 @@ impl Term {
             scroll_top: 0,
             scroll_bot: rows - 1,
             modify_other_keys: 0,
+            rich_layout: None,
+            rich_store: crate::rich::RichBlockStore::default(),
+            rich_env: crate::rich::RichEnv::default(),
+            rich_dirty: false,
         }
     }
 
@@ -687,7 +728,11 @@ impl Term {
     /// `CSI 16 t` (XTWINOPS) handler can report it back to apps.
     /// Called by the binary at startup and on resize.
     pub fn set_cell_pixel_size(&mut self, width: u16, height: u16) {
-        self.cell_pixel_size = (width.max(1), height.max(1));
+        let new = (width.max(1), height.max(1));
+        if new != self.cell_pixel_size {
+            self.rich_dirty = true;
+        }
+        self.cell_pixel_size = new;
     }
 
     /// Plumb the renderer's theme background color (sRGB bytes) into
@@ -732,6 +777,9 @@ impl Term {
     fn set_palette_override(&mut self, idx: u8, rgb: [u8; 3]) {
         self.palette_overrides[idx as usize] = Some(rgb);
         self.palette_revision = self.palette_revision.wrapping_add(1);
+        if idx < 16 {
+            self.rich_dirty = true;
+        }
         self.mark_all_dirty();
     }
 
@@ -818,17 +866,7 @@ impl Term {
     /// shares one id. Returns `None` if the table is full (65535
     /// distinct URLs in one session — practically unreachable).
     fn intern_hyperlink(&mut self, url: &str) -> Option<crate::cell::HyperlinkId> {
-        if let Some(pos) = self.hyperlinks.iter().position(|u| u == url) {
-            // Convert position (0-based) to 1-based NonZero id.
-            return crate::cell::HyperlinkId::new((pos + 1) as u16);
-        }
-        // Cap at u16::MAX - 1 (since ids start at 1).
-        if self.hyperlinks.len() >= (u16::MAX as usize) {
-            return None;
-        }
-        self.hyperlinks.push(url.to_string());
-        let id = u16::try_from(self.hyperlinks.len()).ok()?;
-        crate::cell::HyperlinkId::new(id)
+        rich_term::intern_url(&mut self.hyperlinks, url)
     }
 
     /// Most recent cwd advertised via OSC 7. Empty when the shell hasn't
@@ -1780,9 +1818,7 @@ impl Term {
         } else {
             (self.cursor.row, self.cursor.col)
         };
-        let (new_row, new_col) =
-            self.primary
-                .resize_reflow(rows, cols, primary_cap, primary_cursor);
+        let (new_row, new_col) = self.reflow_primary(rows, cols, primary_cap, primary_cursor);
         self.alt.resize(rows, cols, rows as usize);
         if self.alt_active {
             // The live cursor belongs to alt (clamped below); update the
@@ -1821,6 +1857,7 @@ impl Term {
         if self.image_grid.clip_to(rows, cols) {
             self.image_revision = self.image_revision.wrapping_add(1);
         }
+        self.gc_rich_blocks();
     }
 
     fn active_grid(&self) -> &Grid {
@@ -1952,6 +1989,7 @@ impl Term {
             *c = blank;
         }
         row.soft_wrap = false;
+        row.rich = None;
         for r in top..=bot {
             self.mark_row(r);
         }
@@ -2010,6 +2048,7 @@ impl Term {
             *c = blank;
         }
         row.soft_wrap = false;
+        row.rich = None;
         for r in top..=bot {
             self.mark_row(r);
         }
@@ -3011,6 +3050,9 @@ impl Term {
         let style = self.cursor.style;
         let n = u16::min(n, cols - cur_col);
         let row = self.active_grid_mut().row_mut(cur_row);
+        // Shifting cells is an app edit of the row: it no longer shows
+        // a rich block.
+        row.rich = None;
         let cols_u = cols as usize;
         let col_u = cur_col as usize;
         let n_u = n as usize;
@@ -3049,6 +3091,9 @@ impl Term {
         let style = self.cursor.style;
         let n = u16::min(n, cols - cur_col);
         let row = self.active_grid_mut().row_mut(cur_row);
+        // Shifting cells is an app edit of the row: it no longer shows
+        // a rich block.
+        row.rich = None;
         let cols_u = cols as usize;
         let col_u = cur_col as usize;
         let n_u = n as usize;
@@ -3131,6 +3176,7 @@ impl Term {
                 *c = blank;
             }
             row.soft_wrap = false;
+            row.rich = None;
         }
         for r in cur_row..region_end {
             self.mark_row(r);
@@ -3189,6 +3235,7 @@ impl Term {
                 *c = blank;
             }
             row.soft_wrap = false;
+            row.rich = None;
         }
         for r in cur_row..region_end {
             self.mark_row(r);
@@ -4062,6 +4109,9 @@ impl Perform for Term {
                     self.push_prompt_mark(mapped);
                 }
             }
+            // OSC 7700 — toastty rich blocks (Markdown). See
+            // `docs/markdown.md` and `term/rich_term.rs`.
+            7700 => self.osc_rich_block(params),
             // 1 = icon-title only — accepted but not acted on (we have
             // no tray icon). Folded into the wildcard arm: same body
             // either way.
@@ -7328,6 +7378,7 @@ mod tests {
         t.set_security(SecurityFlags {
             osc_52_read: false,
             osc_52_write: true,
+            ..SecurityFlags::default()
         });
         feed(&mut t, b"\x1bP+q4D73\x1b\\");
         assert!(t.drain_pty_replies().starts_with(b"\x1bP1+r4D73="));
@@ -7694,6 +7745,7 @@ mod tests {
         t.set_security(SecurityFlags {
             osc_52_read: false,
             osc_52_write: true,
+            ..SecurityFlags::default()
         });
         feed(&mut t, b"\x1b]52;c;aGVsbG8=\x1b\\");
         let reqs = t.drain_clipboard_requests();
@@ -7723,6 +7775,7 @@ mod tests {
         t.set_security(SecurityFlags {
             osc_52_read: true,
             osc_52_write: false,
+            ..SecurityFlags::default()
         });
         feed(&mut t, b"\x1b]52;c;?\x1b\\");
         let reqs = t.drain_clipboard_requests();
@@ -7743,6 +7796,7 @@ mod tests {
         t.set_security(SecurityFlags {
             osc_52_read: true,
             osc_52_write: true,
+            ..SecurityFlags::default()
         });
         // Invalid base64 clears the selection (xterm) rather than
         // writing garbage or being silently ignored.
@@ -7766,6 +7820,7 @@ mod tests {
         t.set_security(SecurityFlags {
             osc_52_read: true,
             osc_52_write: true,
+            ..SecurityFlags::default()
         });
         t
     }
@@ -7817,6 +7872,7 @@ mod tests {
         t.set_security(SecurityFlags {
             osc_52_read: true,
             osc_52_write: false,
+            ..SecurityFlags::default()
         });
         feed(&mut t, b"\x1b]52;p;\x1b\\");
         assert!(t.drain_clipboard_requests().is_empty());
