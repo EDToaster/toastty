@@ -995,6 +995,8 @@ impl Toastty {
                 pixel_width,
                 pixel_height,
             });
+        // COLORTERM=truecolor + TERM_PROGRAM{,_VERSION}; see `child_env`.
+        let spec = toastty::child_env::with_identity_env(spec);
         let pty = match Pty::spawn(&spec) {
             Ok(p) => p,
             Err(e) => {

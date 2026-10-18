@@ -9,6 +9,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod child_env;
 pub mod cli;
 pub mod clipboard;
 pub mod config_watcher;
