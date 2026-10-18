@@ -11,6 +11,7 @@ members = [
     "crates/toastty-graphics",
     "crates/toastty-render",
     "crates/toastty-config",
+    "crates/toastty-markdown",
     "demos/molecule-viewer",
 ]
 
@@ -77,6 +78,7 @@ toastty-protocols = { path = "crates/toastty-protocols" }
 toastty-graphics = { path = "crates/toastty-graphics" }
 toastty-render = { path = "crates/toastty-render" }
 toastty-config = { path = "crates/toastty-config" }
+toastty-markdown = { path = "crates/toastty-markdown" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

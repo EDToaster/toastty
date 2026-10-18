@@ -1,0 +1,17 @@
+[package]
+name = "toastty-markdown"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Lays out and rasterizes Markdown (with maths and Mermaid) into terminal rich blocks"
+
+[dependencies]
+cosmic-text.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+
+[lints]
+workspace = true
