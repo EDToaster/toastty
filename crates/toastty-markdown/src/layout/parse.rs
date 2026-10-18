@@ -255,7 +255,7 @@ impl Builder {
                     Some((_, _, _, d)) => *d += 1,
                     None => {
                         self.image =
-                            Some((dest_url.to_string(), String::new(), self.style(), depth))
+                            Some((dest_url.to_string(), String::new(), self.style(), depth));
                     }
                 }
                 return;

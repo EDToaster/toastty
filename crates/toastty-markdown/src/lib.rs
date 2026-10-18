@@ -111,7 +111,7 @@ pub struct LayoutParams {
     pub font_px: f32,
     pub theme: Theme,
     pub resources: ResourcePolicy,
-    /// Hard cap on rows (DoS guard). Content past it is cut and a
+    /// Hard cap on rows (denial-of-service guard). Content past it is cut and a
     /// "… truncated" line is drawn on the last row.
     pub max_rows: u16,
 }

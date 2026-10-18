@@ -45,9 +45,17 @@ fn main() {
         font_px: 16.0,
         theme: theme.clone(),
         resources: ResourcePolicy::default(),
-        max_rows: 2000,
+        max_rows: std::env::var("MD_MAX_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2000),
     };
-    let mut r = Renderer::hermetic();
+    // MD_SYSTEM_FONTS=1 uses the system fonts (Renderer::new).
+    let mut r = if std::env::var_os("MD_SYSTEM_FONTS").is_some() {
+        Renderer::new()
+    } else {
+        Renderer::hermetic()
+    };
     let t = std::time::Instant::now();
     let block = r.render(&src, &params).expect("render");
     let t1 = t.elapsed();

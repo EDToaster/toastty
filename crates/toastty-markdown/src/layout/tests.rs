@@ -670,3 +670,98 @@ fn hostile_inputs_do_not_panic() {
         let _ = render_with(&src, &p);
     }
 }
+
+/// Fake maths raster: a rounded, anti-aliased "formula" blob whose size
+/// tracks the source length, with a baseline for inline use.
+fn blob_math(tex: &str, display: bool, font_px: f32, c: Rgba) -> Result<Raster, String> {
+    if tex.contains("bad") {
+        return Err("parse error".into());
+    }
+    let w = (tex.len() as f32 * font_px * 0.5).max(font_px) as u32;
+    let h = if display {
+        (font_px * 2.6) as u32
+    } else {
+        (font_px * 1.3) as u32
+    };
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let edge = x.min(w - 1 - x).min(y).min(h - 1 - y);
+            let a = if edge == 0 { 90 } else { 255 };
+            let i = ((y * w + x) * 4) as usize;
+            pixels[i..i + 4].copy_from_slice(&[c[0], c[1] / 2, c[2], a]);
+        }
+    }
+    Ok(Raster {
+        width: w,
+        height: h,
+        pixels,
+        baseline: (!display).then_some(h * 3 / 4),
+    })
+}
+
+/// Opt-in visual dump: `MD_DUMP_DIR=/tmp/md-core cargo test -p toastty-markdown dump_`.
+#[test]
+fn dump_feature_renders() {
+    let Some(dir) = std::env::var_os("MD_DUMP_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = format!(
+        "## Maths and diagrams\n\nInline $a^2+b^2=c^2$ sits on the baseline, $bad$ falls back.\n\n$$\n\\sum_{{i=0}}^n i\n$$\n\n```mermaid\ngraph TD\n  A-->B\n```\n\n\
+> [!WARNING]\n> Alerts have a coloured title.\n\n> [!TIP]\n> Tips too.\n\n\
+| Name | Description |\n|---|---|\n| wrap | a long description that has to wrap inside its table cell because the table is far too wide |\n| short | ok |\n\n\
+Footnote reference[^n] and an ![remote image](https://x/y.png) and a local ![file](a.png) and ![data]({}).\n\n[^n]: The footnote text.\n\n\
+1. one\n2. two\n   - nested *italic* and ~~struck~~\n10. ten\n\n<details>raw html</details>\n",
+        super::images::tests::data_png(64, 24, [80, 160, 240, 255])
+    );
+    for (name, theme) in [("dark", Theme::default()), ("light", light())] {
+        for cols in [80u16, 40] {
+            let mut p = params(cols);
+            p.theme = theme.clone();
+            let b = with_backends(
+                blob_math,
+                |s, w, f, t| {
+                    let _ = (s, f);
+                    let (w, h) = (w.min(500), 160);
+                    let mut px = vec![0u8; (w * h * 4) as usize];
+                    for (i, p) in px.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                        let (x, y) = (i as u32 % w, i as u32 / w);
+                        let border = x < 2 || y < 2 || x >= w - 2 || y >= h - 2;
+                        *p = if border {
+                            t.fg
+                        } else {
+                            [t.ansi[4][0], t.ansi[4][1], t.ansi[4][2], 60]
+                        };
+                    }
+                    Ok(Raster {
+                        width: w,
+                        height: h,
+                        pixels: px,
+                        baseline: None,
+                    })
+                },
+                |r| r.render(&src, &p).unwrap(),
+            );
+            let mut px = b.image.pixels.clone();
+            for q in px.as_chunks_mut::<4>().0 {
+                let a = u32::from(q[3]);
+                for (c, bg) in q[..3].iter_mut().zip(theme.bg) {
+                    *c = ((u32::from(*c) * a + u32::from(bg) * (255 - a)) / 255) as u8;
+                }
+                q[3] = 255;
+            }
+            image::RgbaImage::from_raw(b.image.width, b.image.height, px)
+                .unwrap()
+                .save(dir.join(format!("features_{name}_{cols}.png")))
+                .unwrap();
+            let txt: Vec<String> = b.text.iter().map(|r| format!("{r:?}")).collect();
+            std::fs::write(
+                dir.join(format!("features_{name}_{cols}.txt")),
+                txt.join("\n"),
+            )
+            .unwrap();
+        }
+    }
+}

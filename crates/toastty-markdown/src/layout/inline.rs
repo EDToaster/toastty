@@ -38,6 +38,8 @@ pub(crate) struct SpanInfo {
     pub boxed: Boxed,
     /// Box background (inline code).
     pub bg: Rgba,
+    /// Baseline shift upwards in px (superscript footnote references).
+    pub rise: f32,
     pub link: Option<usize>,
 }
 
@@ -623,7 +625,10 @@ impl Shaped {
                             g.font_id,
                             g.id,
                             g.size,
-                            (ox + p.x + g.lead + g.x_off, (base - g.y_off).trunc()),
+                            (
+                                ox + p.x + g.lead + g.x_off,
+                                (base - info.rise - g.y_off).trunc(),
+                            ),
                             g.weight,
                             g.flags,
                         );

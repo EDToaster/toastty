@@ -62,6 +62,8 @@ const MAX_MATH_SRC: usize = 4 * 1024;
 const MAX_PARA_TEXT: usize = 256 * 1024;
 /// Table rows laid out (time guard).
 const MAX_TABLE_ROWS: usize = 4_000;
+/// Rasterized glyphs kept between renders.
+const MAX_CACHED_GLYPHS: usize = 16_384;
 
 pub(crate) type MathFn = fn(&str, bool, f32, Rgba) -> Result<Raster, String>;
 pub(crate) type MermaidFn = fn(&str, u32, f32, &Theme) -> Result<Raster, String>;
@@ -226,6 +228,9 @@ pub(crate) fn render(
         let col = (x0 / params.cell_w as f32).round() as u16;
         text.push(vec![TextRun { col, text: note }]);
     }
+    if caches.swash.image_cache.len() > MAX_CACHED_GLYPHS {
+        caches.swash.image_cache.clear();
+    }
     debug_assert_eq!(text.len(), usize::from(rows));
     Ok(RenderedBlock {
         rows,
@@ -381,6 +386,7 @@ impl Lay<'_> {
             boxed: Boxed::None,
             bg: self.pal.inline_code_bg,
             link: st.link,
+            rise: 0.0,
         }
     }
 
@@ -491,11 +497,12 @@ impl Lay<'_> {
                     }
                 }
                 Inline::Image { url, alt, style } => {
-                    self.image(&mut para, url, alt, *style, base, max_w)
+                    self.image(&mut para, url, alt, *style, base, max_w);
                 }
                 Inline::FootnoteRef(label, st) => {
                     let span = SpanInfo {
-                        size: (base.size * 0.8).round(),
+                        size: (base.size * 0.75).round(),
+                        rise: (base.size * 0.35).round(),
                         color: self.pal.link,
                         ..self.span(base, *st)
                     };
@@ -756,7 +763,7 @@ impl Lay<'_> {
             }
             Marker::Task(done) => {
                 let s = (f * 0.875).round();
-                let bx = (cx - s - f * 0.45).round();
+                let bx = (cx - s - f * 0.4).round();
                 let by = (b - xh / 2.0 - s / 2.0).round();
                 let r = (s * 0.2).round();
                 if *done {
@@ -950,6 +957,7 @@ impl Lay<'_> {
                     boxed: Boxed::None,
                     bg: self.pal.code_bg,
                     link: None,
+                    rise: 0.0,
                 };
                 para.text(clip(&t.text, &mut budget), span);
             }

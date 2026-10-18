@@ -55,17 +55,16 @@ pub(crate) struct Fonts {
 /// monospace family when it has such a face, else the bundled one.
 pub(crate) fn resolve(fonts: &mut FontSystem) -> Fonts {
     let db = fonts.db_mut();
-    let have_bundled = db.faces().any(|f| {
-        f.families.iter().any(|(n, _)| n == BUNDLED_SANS)
-            && f.post_script_name.starts_with("NotoSans-")
-    });
-    if !have_bundled {
-        for data in [NOTO_REGULAR, NOTO_BOLD, NOTO_ITALIC, NOTO_BOLD_ITALIC] {
+    for (ps_name, data) in [
+        ("NotoSans-Regular", NOTO_REGULAR),
+        ("NotoSans-Bold", NOTO_BOLD),
+        ("NotoSans-Italic", NOTO_ITALIC),
+        ("NotoSans-BoldItalic", NOTO_BOLD_ITALIC),
+        ("FiraMono-Medium", FIRA_MONO),
+    ] {
+        if !db.faces().any(|f| f.post_script_name == ps_name) {
             db.load_font_data(data.to_vec());
         }
-    }
-    if !db.faces().any(|f| f.post_script_name == "FiraMono-Medium") {
-        db.load_font_data(FIRA_MONO.to_vec());
     }
     let sans = pick(
         fonts,
