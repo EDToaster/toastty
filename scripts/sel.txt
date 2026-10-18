@@ -1,0 +1,3 @@
+single click here: KEEPME   double-click: café_x  ~/src/main.rs
+YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY wraps here
+wide: 日本語 text

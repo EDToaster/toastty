@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+# showclip [primary]  -- print selection contents with invisibles made visible
+import sys, subprocess, unicodedata
+sel = sys.argv[1] if len(sys.argv)>1 else "clipboard"
+b = subprocess.run(["xclip","-o","-selection",sel],capture_output=True).stdout
+t = b.decode("utf-8","backslashreplace")
+out=""
+for ch in t:
+    o=ord(ch); cat=unicodedata.category(ch)
+    if ch=="\n": out+="\x1b[36m\\n\x1b[0m\n          "
+    elif ch=="\t": out+="\x1b[36m\\t\x1b[0m"
+    elif ch=="\r": out+="\x1b[36m\\r\x1b[0m"
+    elif o<32 or o==127: out+=f"\x1b[31m^{chr((o+64)%128)}\x1b[0m"
+    elif cat in ("Mn","Me","Cf") or 0xfe00<=o<=0xfe0f: out+=f"{ch}\x1b[35m<U+{o:04X}>\x1b[0m"
+    else: out+=ch
+print(f"\x1b[1m{sel}:\x1b[0m [{out}]  ({len(b)} bytes)")
