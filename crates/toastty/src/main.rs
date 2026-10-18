@@ -286,6 +286,12 @@ struct Toastty {
     /// Its matching release is swallowed too, so the foreground app
     /// never sees an orphan release for a press it didn't receive.
     link_click_button: Option<MouseButton>,
+    /// Latest keyboard modifier state (from `ModifiersChanged` and
+    /// pointer events). Drives the Ctrl/Cmd link-hover underline.
+    link_modifiers: Modifiers,
+    /// Whether the pointing-hand cursor is currently shown (over a link
+    /// with the open-link modifier held). Avoids redundant cursor calls.
+    link_pointer: bool,
     /// Last (col, row) reported to the PTY via a motion event. Tracked
     /// so we only emit a motion report when the pointer crosses into a
     /// new cell — xterm convention, and avoids flooding the PTY with
@@ -436,6 +442,8 @@ impl Toastty {
             mouse_pos: (0.0, 0.0),
             mouse_held: None,
             link_click_button: None,
+            link_modifiers: Modifiers::empty(),
+            link_pointer: false,
             last_reported_cell: None,
             clipboard: None,
             swallowed_releases: Vec::new(),
@@ -1391,7 +1399,8 @@ impl Toastty {
     /// column/row boundary.
     fn handle_mouse_motion(&mut self, position: (f64, f64), modifiers: Modifiers) -> ControlSignal {
         self.mouse_pos = position;
-        let hover_changed = self.refresh_scroll_chip_hover();
+        self.link_modifiers = modifiers;
+        let hover_changed = self.refresh_scroll_chip_hover() | self.refresh_link_hover();
         let signal = self.handle_mouse_motion_inner(position, modifiers);
         if hover_changed && signal == ControlSignal::Continue {
             ControlSignal::RedrawIn(Duration::ZERO)
@@ -1488,10 +1497,10 @@ impl Toastty {
         }
         if state == KeyState::Pressed
             && is_open_link_binding(button, modifiers)
-            && let Some(url) = self.hyperlink_under_cursor(position)
+            && let Some(url) = self.link_under_pointer().map(|hit| hit.url)
         {
-            if let Err(e) = webbrowser::open(&url) {
-                warn!("open URL failed: {e}");
+            if let Err(e) = toastty::links::open_link(&url) {
+                warn!("open URL {url:?} failed: {e}");
             }
             self.link_click_button = Some(button);
             self.mouse_held = None;
@@ -1804,22 +1813,67 @@ impl Toastty {
         }
     }
 
-    /// Look up the OSC 8 hyperlink URL at pixel `(x, y)`, if any.
-    fn hyperlink_under_cursor(&self, position: (f64, f64)) -> Option<String> {
-        let renderer = self.renderer.as_ref()?;
-        let cell_size = renderer.cell_size();
-        let origin = renderer.content_origin_px();
+    /// Stable `(line_id, col)` of the cell under the pointer, or `None`
+    /// when the pointer is outside the cell grid (padding, the leftover
+    /// sliver). Honors the scrollback offset like selection does.
+    fn pointer_grid_pos(&self) -> Option<Pos> {
+        let r = self.renderer.as_ref()?;
+        let (cw, ch) = r.cell_size();
+        let (ox, oy) = r.content_origin_px();
         let (rows, cols) = self.term.size();
-        // `pixel_to_cell` returns 1-based (col, row). Convert to
-        // 0-based with a saturating sub so column 1 / row 1 map to
-        // (0, 0) instead of underflowing.
-        let (col_1based, row_1based) = pixel_to_cell(position, origin, cell_size, (rows, cols));
-        let col = col_1based.checked_sub(1)?;
-        let row = row_1based.checked_sub(1)?;
-        let row_ref = self.term.row(row);
-        let cell = row_ref.cells.get(col as usize)?;
-        let id = cell.hyperlink_id?;
-        self.term.hyperlink_url(id).map(str::to_string)
+        let x = self.mouse_pos.0 - f64::from(ox);
+        let y = self.mouse_pos.1 - f64::from(oy);
+        if x < 0.0
+            || y < 0.0
+            || x >= f64::from(cols) * f64::from(cw)
+            || y >= f64::from(rows) * f64::from(ch)
+        {
+            return None;
+        }
+        Some(self.current_selection_pos())
+    }
+
+    /// The link (OSC 8 first, then a URL detected in the text) under the
+    /// pointer, on the live screen or in scrollback.
+    fn link_under_pointer(&self) -> Option<toastty_term::LinkHit> {
+        self.term.link_at(self.pointer_grid_pos()?)
+    }
+
+    /// Recompute the Ctrl/Cmd link hover: with the open-link modifier
+    /// held and the pointer on a link, underline its whole span and show
+    /// the pointing-hand cursor; otherwise clear both. Runs on pointer
+    /// motion, modifier changes and new output (only while a hover is
+    /// shown), never per frame. Mouse tracking doesn't suppress it,
+    /// matching the click, which opens links even when an app tracks
+    /// the mouse. Returns `true` when the underline changed (redraw).
+    fn refresh_link_hover(&mut self) -> bool {
+        let want =
+            toastty::links::is_open_link_modifiers(self.link_modifiers) && self.selecting.is_none();
+        if !want && self.term.link_hover().is_none() && !self.link_pointer {
+            return false;
+        }
+        let span = if want {
+            self.link_under_pointer().map(|hit| hit.span)
+        } else {
+            None
+        };
+        self.set_link_hover(span)
+    }
+
+    /// Clear the link hover (scroll, focus loss, pointer leaving).
+    fn clear_link_hover(&mut self) -> bool {
+        self.set_link_hover(None)
+    }
+
+    fn set_link_hover(&mut self, span: Option<toastty_term::LinkSpan>) -> bool {
+        let pointer = span.is_some();
+        if pointer != self.link_pointer {
+            self.link_pointer = pointer;
+            if let Some(w) = self.window.as_ref() {
+                w.set_pointer_cursor(pointer);
+            }
+        }
+        self.term.set_link_hover(span)
     }
 
     fn handle_scroll(
@@ -2411,7 +2465,27 @@ impl App for Toastty {
                 if let Some(bytes) = encode_focus(focused, self.term.report_focus()) {
                     self.write_pty(bytes);
                 }
+                // Modifier state is unreliable across a focus change
+                // (the release may go to another window).
+                if !focused && self.clear_link_hover() {
+                    return ControlSignal::RedrawIn(Duration::ZERO);
+                }
                 ControlSignal::Continue
+            }
+            Event::ModifiersChanged(modifiers) => {
+                self.link_modifiers = modifiers;
+                if self.refresh_link_hover() {
+                    ControlSignal::RedrawIn(Duration::ZERO)
+                } else {
+                    ControlSignal::Continue
+                }
+            }
+            Event::PointerLeft => {
+                if self.clear_link_hover() {
+                    ControlSignal::RedrawIn(Duration::ZERO)
+                } else {
+                    ControlSignal::Continue
+                }
             }
             Event::Mouse {
                 button,
@@ -2428,9 +2502,24 @@ impl App for Toastty {
                 phase,
                 delta_x,
                 delta_y,
-            } => self.handle_scroll(kind, phase, delta_x, delta_y),
+            } => {
+                // The text under the pointer moves; drop the underline
+                // rather than leave it on the wrong cells.
+                let cleared = self.clear_link_hover();
+                let signal = self.handle_scroll(kind, phase, delta_x, delta_y);
+                if cleared && signal == ControlSignal::Continue {
+                    ControlSignal::RedrawIn(Duration::ZERO)
+                } else {
+                    signal
+                }
+            }
             Event::PtyBytes(bytes) => {
                 let fresh_bsu = self.handle_pty_bytes(&bytes);
+                // New output may have rewritten or moved the hovered
+                // link; re-resolve it (clears when it's gone).
+                if self.term.link_hover().is_some() {
+                    self.refresh_link_hover();
+                }
                 // If a BSU just went high we still want to wake the
                 // event loop, but at the watchdog deadline rather than
                 // immediately — `render_term` would just skip while the
@@ -2495,20 +2584,10 @@ fn linear_to_srgb_u8(x: f32) -> u8 {
 /// binding. On macOS it's `Cmd-Left`; on every other platform it's
 /// `Ctrl-Left` (matching iTerm2 / Alacritty conventions).
 fn is_open_link_binding(button: MouseButton, modifiers: Modifiers) -> bool {
-    if button != MouseButton::Left {
-        return false;
-    }
-    // M10-followup I2: require EXACT modifier set. `contains(SUPER)` was
-    // true for `Cmd+Shift+Left`, `Cmd+Alt+Left`, etc., so hyperlink open
-    // hijacked any combo that happened to include the platform's
-    // primary modifier. Tighten to equality so only the bare combo
-    // qualifies; users keep `Cmd+Shift+Left` / `Ctrl+Alt+Left` free for
-    // selection-extend, window manager shortcuts, etc.
-    if cfg!(target_os = "macos") {
-        modifiers == Modifiers::SUPER
-    } else {
-        modifiers == Modifiers::CONTROL
-    }
+    // M10-followup I2: require EXACT modifier set (lock bits aside), so
+    // `Cmd+Shift+Left` / `Ctrl+Alt+Left` stay free for selection-extend,
+    // window manager shortcuts, etc. See `is_open_link_modifiers`.
+    button == MouseButton::Left && toastty::links::is_open_link_modifiers(modifiers)
 }
 
 /// True when `(logical, modifiers)` is a "copy selection" binding.

@@ -16,6 +16,7 @@ pub mod config_watcher;
 pub mod focus;
 pub mod geometry;
 pub mod keyboard;
+pub mod links;
 pub mod mouse;
 pub mod paste;
 pub mod pty_log;
