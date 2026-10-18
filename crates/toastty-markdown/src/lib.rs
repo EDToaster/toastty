@@ -167,6 +167,7 @@ pub enum Error {
 /// needs. Create once and reuse: building one loads system fonts.
 pub struct Renderer {
     fonts: cosmic_text::FontSystem,
+    cache: layout::Caches,
 }
 
 impl std::fmt::Debug for Renderer {
@@ -176,29 +177,56 @@ impl std::fmt::Debug for Renderer {
 }
 
 impl Renderer {
-    /// Renderer using the system fonts plus the bundled fallbacks.
+    /// Renderer using the system fonts plus the bundled fallbacks
+    /// (Noto Sans for body text, Fira Mono for code). The system's
+    /// default sans-serif and monospace families are preferred when
+    /// they exist; the bundled faces are used otherwise.
     #[must_use]
     pub fn new() -> Self {
         Self::with_font_system(cosmic_text::FontSystem::new())
     }
 
-    /// Renderer over a caller-built font system. Tests use this with a
-    /// database holding only bundled fonts so output is identical on
-    /// every machine.
+    /// Renderer over the bundled fonts only (no system fonts), so the
+    /// output is identical on every machine. Used by tests and golden
+    /// snapshots.
     #[must_use]
-    pub fn with_font_system(fonts: cosmic_text::FontSystem) -> Self {
-        Self { fonts }
+    pub fn hermetic() -> Self {
+        let db = cosmic_text::fontdb::Database::new();
+        Self::with_font_system(cosmic_text::FontSystem::new_with_locale_and_db(
+            "en-US".into(),
+            db,
+        ))
+    }
+
+    /// Renderer over a caller-built font system. The bundled fonts are
+    /// added to it as fallbacks.
+    #[must_use]
+    pub fn with_font_system(mut fonts: cosmic_text::FontSystem) -> Self {
+        let cache = layout::Caches::new(&mut fonts);
+        Self { fonts, cache }
     }
 
     /// Lay out and rasterize `markdown`.
     ///
     /// # Errors
-    /// [`Error::Params`] for a zero-sized cell or zero columns.
-    pub fn render(&mut self, markdown: &str, params: &LayoutParams) -> Result<RenderedBlock, Error> {
+    /// [`Error::Params`] for a zero-sized cell, zero columns, or a block
+    /// too large to rasterize (wider than 32,768 px, cells taller than
+    /// 4,096 px).
+    pub fn render(
+        &mut self,
+        markdown: &str,
+        params: &LayoutParams,
+    ) -> Result<RenderedBlock, Error> {
         if params.cols == 0 || params.cell_w == 0 || params.cell_h == 0 {
             return Err(Error::Params("zero-sized grid"));
         }
-        layout::render(&mut self.fonts, markdown, params)
+        if params.width_px() > layout::MAX_WIDTH_PX || params.cell_h > layout::MAX_CELL_H {
+            return Err(Error::Params("block too large"));
+        }
+        if !(params.font_px.is_finite() && params.font_px > 0.0) {
+            return Err(Error::Params("invalid font size"));
+        }
+        layout::render(&mut self.fonts, &mut self.cache, markdown, params)
     }
 }
 

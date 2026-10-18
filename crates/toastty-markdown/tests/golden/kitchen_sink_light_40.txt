@@ -1,0 +1,51 @@
+rows 48
+  0
+  1 @1:"Toastty Markdown"
+  2
+  3 @1:"A fast, GPU-accelerated terminal that renders plain"
+  4 @1:"rich Markdown inline. Use toastty md README.md"
+  5 @1:"to try it, or read the docs."
+  6
+  7
+  8 @1:"Features"
+  9
+ 10 @2:"- Headings, bold, italic, inline code and links"
+ 11 @2:"- Nested lists:"
+ 12 @5:"- second level with a long item that needs to"
+ 13 @7:"wrap onto the next line nicely"
+ 14 @7:"- third level"
+ 15 @2:"- Ordered lists:"
+ 16 @4:"1. first"
+ 17 @4:"2. second"
+ 18
+ 19 @1:"Tasks"
+ 20
+ 21 @1:"[x] parse with pulldown-cmark"
+ 22 @1:"[ ] draw maths"
+ 23 @1:"[ ] draw diagrams"
+ 24 @1:"> Block quotes are drawn with a bar on the left"
+ 25 @1:"> and muted text."
+ 26
+ 27 @1:"> > Nested quotes work too."
+ 28
+ 29 @2:"// Highlighted with syntect."
+ 30 @2:"fn main() {"
+ 31 @2:"    let greeting = \"hello\";"
+ 32 @2:"    println!(\"{greeting}, world: {}\","
+ 33 @6:"42);"
+ 34 @2:"}"
+ 35
+ 36 @2:"Element | Status | Notes"
+ 37
+ 38 @2:"Tables | done | aligned columns"
+ 39
+ 40 @2:"Images | partial | data: URIs only"
+ 41
+ 42
+ 43 @1:"Smaller heading"
+ 44 @1:"Text after a rule, with an image placeholder:"
+ 45
+ 46 @1:"logo and an embedded image: gradient"
+ 47
+link row 5 cols 16..20 https://example.com/docs
+link row 10 cols 34..38 https://example.com
