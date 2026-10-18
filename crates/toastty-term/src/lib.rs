@@ -40,8 +40,8 @@ pub use grid::{Grid, RelayoutFn, Row, RowLocation};
 pub use link::{LinkHit, LinkSource, LinkSpan, MAX_SCAN_ROWS};
 pub use rich::{
     Osc7700, RICH_DEFAULT_BUDGET, RICH_MAX_ROWS, RichBlock, RichBlockId, RichBlockLayout,
-    RichBlockStore, RichEnv, RichImage, RichLayout, RichLayoutRequest, RichLinkSpan, RichPalette,
-    RichParams, RichRow, RichTextRun, parse_osc_7700,
+    RichBlockStore, RichEnv, RichImage, RichLayout, RichLayoutRequest, RichLinkSpan, RichPaint,
+    RichPalette, RichParams, RichRow, RichTextRun, parse_osc_7700,
 };
 pub use selection::{Pos, Selection, SelectionMode};
 pub use term::{

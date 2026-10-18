@@ -114,36 +114,124 @@ pub struct RichLinkSpan {
     pub url: String,
 }
 
-/// Straight-alpha RGBA8 image, row-major, top-down. Cheap to clone.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Paints bands of a block's image on demand.
+///
+/// The layout engine returns one of these instead of a finished image,
+/// so a re-layout (e.g. on every step of a window resize) costs no
+/// pixels: the renderer paints only the rows it is about to show.
+pub trait RichPaint: Send + Sync + std::fmt::Debug {
+    /// Straight-alpha RGBA8 for pixel rows `y0 .. y0 + h` of the image
+    /// (`width * h * 4` bytes, row-major, top-down). The caller keeps the
+    /// band inside the image. `None` when painting failed.
+    fn paint(&self, y0: u32, h: u32) -> Option<Vec<u8>>;
+
+    /// Approximate bytes this painter keeps alive (for the store budget).
+    fn byte_len(&self) -> u64;
+}
+
+/// A finished image held in memory (tests, simple engines).
+#[derive(Debug)]
+struct PixelsPaint {
+    width: u32,
+    pixels: Arc<[u8]>,
+}
+
+impl RichPaint for PixelsPaint {
+    fn paint(&self, y0: u32, h: u32) -> Option<Vec<u8>> {
+        let stride = self.width as usize * 4;
+        let start = y0 as usize * stride;
+        self.pixels
+            .get(start..start + h as usize * stride)
+            .map(<[u8]>::to_vec)
+    }
+
+    fn byte_len(&self) -> u64 {
+        self.pixels.len() as u64
+    }
+}
+
+/// A block image (straight-alpha RGBA8, row-major, top-down), painted
+/// lazily in bands. Cheap to clone.
+#[derive(Debug, Clone)]
 pub struct RichImage {
     pub width: u32,
     pub height: u32,
-    pub pixels: Arc<[u8]>,
+    /// Rows the painter can produce; rows past it read as transparent.
+    painted_height: u32,
+    painter: Arc<dyn RichPaint>,
 }
 
+impl PartialEq for RichImage {
+    fn eq(&self, other: &Self) -> bool {
+        self.width == other.width
+            && self.height == other.height
+            && self.painted_height == other.painted_height
+            && Arc::ptr_eq(&self.painter, &other.painter)
+    }
+}
+
+impl Eq for RichImage {}
+
 impl RichImage {
-    /// Bytes held by the pixel buffer.
+    /// An image `width` × `height` painted by `painter`.
     #[must_use]
-    pub fn byte_len(&self) -> u64 {
-        self.pixels.len() as u64
+    pub fn new(width: u32, height: u32, painter: Arc<dyn RichPaint>) -> Self {
+        Self {
+            width,
+            height,
+            painted_height: height,
+            painter,
+        }
     }
 
-    /// Copy of this image with exactly `height` rows: cropped, or padded
-    /// with transparent rows.
+    /// An image over finished pixels; `None` unless `pixels` is exactly
+    /// `width * height * 4` bytes.
     #[must_use]
-    pub fn with_height(&self, height: u32) -> Self {
-        if height == self.height {
-            return self.clone();
+    pub fn from_pixels(width: u32, height: u32, pixels: impl Into<Arc<[u8]>>) -> Option<Self> {
+        let pixels = pixels.into();
+        (pixels.len() as u64 == u64::from(width) * u64::from(height) * 4)
+            .then(|| Self::new(width, height, Arc::new(PixelsPaint { width, pixels })))
+    }
+
+    /// Approximate bytes held.
+    #[must_use]
+    pub fn byte_len(&self) -> u64 {
+        self.painter.byte_len()
+    }
+
+    /// Pixels of rows `y0 .. y0 + h` (clamped to the image), always
+    /// `width * clamped_h * 4` bytes. `None` when the band is empty or
+    /// the painter failed / returned the wrong size.
+    #[must_use]
+    pub fn paint(&self, y0: u32, h: u32) -> Option<Vec<u8>> {
+        let y0 = y0.min(self.height);
+        let h = h.min(self.height - y0);
+        if h == 0 || self.width == 0 {
+            return None;
         }
         let stride = self.width as usize * 4;
-        let mut px = vec![0u8; stride * height as usize];
-        let keep = stride * height.min(self.height) as usize;
-        px[..keep].copy_from_slice(&self.pixels[..keep.min(self.pixels.len())]);
+        let real = h.min(self.painted_height.saturating_sub(y0));
+        let mut px = if real > 0 {
+            let px = self.painter.paint(y0, real)?;
+            if px.len() != stride * real as usize {
+                return None;
+            }
+            px
+        } else {
+            Vec::new()
+        };
+        px.resize(stride * h as usize, 0);
+        Some(px)
+    }
+
+    /// This image presented with exactly `height` rows: cropped, or
+    /// padded with transparent rows. Paints nothing.
+    #[must_use]
+    pub fn with_height(&self, height: u32) -> Self {
         Self {
-            width: self.width,
             height,
-            pixels: px.into(),
+            painted_height: self.painted_height.min(height),
+            ..self.clone()
         }
     }
 }
@@ -494,11 +582,7 @@ mod tests {
     use super::*;
 
     fn img(bytes: usize) -> RichImage {
-        RichImage {
-            width: 1,
-            height: u32::try_from(bytes / 4).unwrap(),
-            pixels: vec![0u8; bytes].into(),
-        }
+        RichImage::from_pixels(1, u32::try_from(bytes / 4).unwrap(), vec![0u8; bytes]).unwrap()
     }
 
     fn params() -> RichParams {
@@ -618,15 +702,19 @@ mod tests {
 
     #[test]
     fn image_with_height_crops_and_pads() {
-        let i = RichImage {
-            width: 1,
-            height: 2,
-            pixels: vec![1, 1, 1, 1, 2, 2, 2, 2].into(),
-        };
-        assert_eq!(&*i.with_height(1).pixels, &[1, 1, 1, 1]);
+        let i = RichImage::from_pixels(1, 2, vec![1, 1, 1, 1, 2, 2, 2, 2]).unwrap();
+        assert_eq!(i.with_height(1).paint(0, 9).unwrap(), &[1, 1, 1, 1]);
         assert_eq!(
-            &*i.with_height(3).pixels,
+            i.with_height(3).paint(0, 3).unwrap(),
             &[1, 1, 1, 1, 2, 2, 2, 2, 0, 0, 0, 0]
         );
+        // Bands: the padded row alone, and a band straddling the edge.
+        assert_eq!(i.with_height(3).paint(2, 1).unwrap(), &[0, 0, 0, 0]);
+        assert_eq!(
+            i.with_height(3).paint(1, 5).unwrap(),
+            &[2, 2, 2, 2, 0, 0, 0, 0]
+        );
+        assert_eq!(i.paint(2, 1), None);
+        assert!(RichImage::from_pixels(2, 2, vec![0; 4]).is_none());
     }
 }

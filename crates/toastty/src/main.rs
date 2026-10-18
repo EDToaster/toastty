@@ -793,7 +793,13 @@ impl Toastty {
             self.scale_factor,
         );
         let (cols, rows) = grid_dims_from_pixels(content_w, content_h, cell_w, cell_h);
+        let t0 = std::time::Instant::now();
         self.term.resize(rows, cols);
+        tracing::debug!(
+            target: "resize_trace",
+            "term.resize {rows}x{cols} took={:.3}ms",
+            t0.elapsed().as_secs_f64() * 1e3
+        );
         // Re-plumb cell pixel size: font swap (M4b reload) can change
         // it, and CSI 16 t queries arriving post-resize need the
         // current value.
