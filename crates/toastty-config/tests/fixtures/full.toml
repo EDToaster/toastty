@@ -54,3 +54,6 @@ left   = 8
 [scroll_button]
 enabled  = true
 position = "bottom-right"
+
+[selection]
+word_chars = "_-./~:?&=%+#@"

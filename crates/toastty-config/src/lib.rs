@@ -28,6 +28,7 @@ mod font;
 mod scroll_button;
 mod scrollback;
 mod security;
+mod selection;
 mod shell;
 mod theme;
 mod window;
@@ -42,6 +43,7 @@ pub use font::FontConfig;
 pub use scroll_button::{ScrollButtonConfig, ScrollButtonPosition};
 pub use scrollback::{ScrollbackConfig, SmoothingFunction};
 pub use security::SecurityConfig;
+pub use selection::{DEFAULT_WORD_CHARS, SelectionConfig};
 pub use shell::ShellConfig;
 pub use theme::ThemeConfig;
 pub use window::{
@@ -67,6 +69,7 @@ pub struct Config {
     pub security: SecurityConfig,
     pub window: WindowConfig,
     pub scroll_button: ScrollButtonConfig,
+    pub selection: SelectionConfig,
 }
 
 impl Default for Config {
@@ -91,6 +94,7 @@ impl Config {
             security: SecurityConfig::defaults(),
             window: WindowConfig::defaults(),
             scroll_button: ScrollButtonConfig::defaults(),
+            selection: SelectionConfig::defaults(),
         }
     }
 
@@ -220,6 +224,14 @@ mod tests {
         assert!((cfg.font.line_height - 1.20).abs() < 1e-6);
         // Other sections still default.
         assert_eq!(cfg.cursor.shape, CursorShape::Block);
+    }
+
+    #[test]
+    fn selection_word_chars_parses_and_defaults() {
+        let cfg = Config::parse_str("[selection]\nword_chars = \"_\"\n").unwrap();
+        assert_eq!(cfg.selection.word_chars, "_");
+        assert_eq!(cfg.cursor.shape, CursorShape::Block);
+        assert_eq!(Config::defaults().selection.word_chars, DEFAULT_WORD_CHARS);
     }
 
     #[test]
