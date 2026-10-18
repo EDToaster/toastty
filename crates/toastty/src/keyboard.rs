@@ -285,6 +285,13 @@ fn encode_key_kitty(
         return None;
     }
 
+    // `modifiers` is the modifier state at the time of *this* event (winit
+    // refreshes it from the X11 core `state` field / XKB before every key
+    // event), which is what kitty reports too. So Ctrl held across the
+    // release of `c` gives `CSI 99;5:3u`, while releasing Ctrl first
+    // correctly gives `CSI 99;1:3u`. Note `xdotool key ctrl+c` releases
+    // Ctrl *before* `c` (verified with xev), so it always produces the
+    // latter — that is not a modifier-tracking bug.
     let m = kitty_modifiers(modifiers);
     let event_suffix = if report_events {
         Some(kitty_event_suffix(state, repeat))
@@ -803,6 +810,30 @@ mod tests {
         assert_eq!(press.as_deref(), Some(b"\x1b[97;5:1u".as_ref()));
         assert_eq!(repeat.as_deref(), Some(b"\x1b[97;5:2u".as_ref()));
         assert_eq!(release.as_deref(), Some(b"\x1b[97;5:3u".as_ref()));
+    }
+
+    #[test]
+    fn kitty_release_reports_modifiers_at_release_time() {
+        // Audit #14: Ctrl still held when `c` goes up -> Ctrl bit kept;
+        // Ctrl released first (what `xdotool key ctrl+c` does) -> none.
+        let held = enc_kitty(
+            &char_key("c"),
+            Some("c"),
+            Modifiers::CONTROL,
+            7,
+            KeyState::Released,
+            false,
+        );
+        assert_eq!(held.as_deref(), Some(b"\x1b[99;5:3u".as_ref()));
+        let gone = enc_kitty(
+            &char_key("c"),
+            Some("c"),
+            Modifiers::empty(),
+            7,
+            KeyState::Released,
+            false,
+        );
+        assert_eq!(gone.as_deref(), Some(b"\x1b[99;1:3u".as_ref()));
     }
 
     #[test]
