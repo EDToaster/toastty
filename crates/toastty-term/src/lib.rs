@@ -22,6 +22,7 @@
 mod cell;
 mod cursor;
 mod damage;
+mod dcs_query;
 mod extra;
 mod grid;
 mod reflow;

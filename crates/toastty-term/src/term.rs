@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::cell::{Cell, Color, Style};
 use crate::cursor::Cursor;
 use crate::damage::Damage;
+use crate::dcs_query::{DcsQuery, DcsQueryKind, QueryState};
 use crate::extra::{CellExtra, ExtraTable, MAX_GRAPHEME_EXTRA_BYTES};
 use crate::grid::Grid;
 use toastty_config::CursorShape;
@@ -281,6 +282,9 @@ pub struct Term {
     /// raw body bytes accumulated between `hook` (final byte `q`) and
     /// `unhook`. `None` outside a sixel DCS.
     sixel_pending: Option<SixelDcs>,
+    /// In-progress XTGETTCAP / DECRQSS query body (bounded). `None`
+    /// outside such a DCS. See [`crate::dcs_query`].
+    dcs_query: Option<DcsQuery>,
     /// DECSDM (mode 80) state. Per current xterm semantics, SET = "sixel
     /// display mode" (image is anchored, screen does NOT scroll to make
     /// room); RESET = sixel scrolling (the default, image viewers expect
@@ -548,6 +552,7 @@ impl Term {
             image_handler: KittyHandler::new(),
             sixel_handler: SixelHandler::default(),
             sixel_pending: None,
+            dcs_query: None,
             sixel_display_mode: false,
             sixel_cursor_right: false,
             // m7: default 320 MiB image cache cap (kitty spec recommends
@@ -2792,6 +2797,20 @@ impl Term {
         }
     }
 
+    /// Snapshot of the state XTGETTCAP / DECRQSS report on.
+    fn query_state(&self) -> QueryState {
+        QueryState {
+            style: self.cursor.style,
+            scroll_top: self.scroll_top,
+            scroll_bot: self.scroll_bot,
+            cursor_shape: self.cursor_shape,
+            cursor_blink: self.cursor_blink,
+            rows: self.rows,
+            cols: self.cols,
+            osc52_write: self.security.osc_52_write,
+        }
+    }
+
     /// Apply DECSCUSR (`CSI Ps SP q`). Mapping per xterm:
     ///
     /// | Ps     | Shape     | Blink |
@@ -4078,6 +4097,10 @@ impl Perform for Term {
         // Sixel = final byte `q` with NO intermediates. DECRQSS is `$q`
         // and other DCS queries carry intermediates — exclude them so we
         // don't capture a non-sixel DCS as a sixel body.
+        // A fresh DCS always replaces any query left over from an
+        // aborted one (vte calls `unhook` on CAN/SUB/ESC, so this is
+        // belt and braces).
+        self.dcs_query = DcsQueryKind::from_hook(intermediates, action).map(DcsQuery::new);
         if action == 'q' && intermediates.is_empty() {
             let mut it = params.iter();
             let mut next = || it.next().and_then(|sub| sub.first().copied());
@@ -4096,6 +4119,10 @@ impl Perform for Term {
         // more than any sane image; overflow leaves a truncated buffer
         // that fails decode cleanly in `unhook`.
         const SIXEL_BODY_CAP: usize = 64 * 1024 * 1024;
+        if let Some(q) = &mut self.dcs_query {
+            q.push(byte);
+            return;
+        }
         if let Some(s) = &mut self.sixel_pending
             && s.buf.len() < SIXEL_BODY_CAP
         {
@@ -4104,6 +4131,11 @@ impl Perform for Term {
     }
 
     fn unhook(&mut self) {
+        if let Some(q) = self.dcs_query.take() {
+            let reply = q.reply(&self.query_state());
+            self.pty_replies.extend_from_slice(&reply);
+            return;
+        }
         let Some(dcs) = self.sixel_pending.take() else {
             return;
         };
@@ -7048,6 +7080,142 @@ mod tests {
         let mut t = Term::new(2, 4, 0);
         feed(&mut t, b"\x1b[0c");
         assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?62;4;22c");
+    }
+
+    // ----- XTGETTCAP / DECRQSS (DCS queries) -------------------------------
+
+    #[test]
+    fn xtgettcap_neovim_truecolor_probe() {
+        // Neovim's `vim.tty.query({'Tc','RGB','setrgbf','setrgbb'})`.
+        let mut t = Term::new(4, 10, 0);
+        feed(
+            &mut t,
+            b"\x1bP+q5463;524742;73657472676266;73657472676262\x1b\\",
+        );
+        let reply = String::from_utf8(t.drain_pty_replies()).unwrap();
+        let parts: Vec<&str> = reply.split("\x1b\\").filter(|p| !p.is_empty()).collect();
+        assert_eq!(parts.len(), 4, "{reply:?}");
+        assert_eq!(parts[0], "\x1bP1+r5463");
+        assert_eq!(parts[1], "\x1bP1+r524742");
+        assert!(parts[2].starts_with("\x1bP1+r73657472676266="));
+        assert!(parts[3].starts_with("\x1bP1+r73657472676262="));
+        // Nothing printed to the grid.
+        assert_eq!(t.row(0).cells[0].ch, ' ');
+    }
+
+    #[test]
+    fn xtgettcap_unknown_and_invalid() {
+        let mut t = Term::new(4, 10, 0);
+        feed(&mut t, b"\x1bP+q536D756C78\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP0+r536D756C78\x1b\\");
+        feed(&mut t, b"\x1bP+qnothex\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP0+r\x1b\\");
+    }
+
+    #[test]
+    fn xtgettcap_ms_follows_security_flags() {
+        let mut t = Term::new(4, 10, 0);
+        feed(&mut t, b"\x1bP+q4D73\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP0+r4D73\x1b\\");
+        t.set_security(SecurityFlags {
+            osc_52_read: false,
+            osc_52_write: true,
+        });
+        feed(&mut t, b"\x1bP+q4D73\x1b\\");
+        assert!(t.drain_pty_replies().starts_with(b"\x1bP1+r4D73="));
+    }
+
+    #[test]
+    fn dcs_query_split_across_reads() {
+        let mut t = Term::new(4, 10, 0);
+        let mut p = Parser::new();
+        let input = b"\x1bP+q5463;524742\x1b\\";
+        for b in input {
+            p.advance(&mut t, std::slice::from_ref(b));
+        }
+        assert_eq!(
+            t.drain_pty_replies(),
+            b"\x1bP1+r5463\x1b\\\x1bP1+r524742\x1b\\"
+        );
+        // DECRQSS split mid-body and mid-terminator.
+        p.advance(&mut t, b"\x1bP$");
+        p.advance(&mut t, b"q m");
+        assert_eq!(t.drain_pty_replies(), b"");
+        p.advance(&mut t, b"\x1b");
+        p.advance(&mut t, b"\\");
+        // ` m` isn't a setting we know.
+        assert_eq!(t.drain_pty_replies(), b"\x1bP0$r\x1b\\");
+    }
+
+    #[test]
+    fn dcs_query_oversize_payload_is_bounded() {
+        let mut t = Term::new(4, 10, 0);
+        let mut input = b"\x1bP+q".to_vec();
+        let name = b"5463;";
+        while input.len() < 100_000 {
+            input.extend_from_slice(name);
+        }
+        input.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &input);
+        assert_eq!(t.drain_pty_replies(), b"\x1bP0+r\x1b\\");
+        // The terminal is back to normal afterwards.
+        feed(&mut t, b"ok");
+        assert_eq!(t.row(0).cells[0].ch, 'o');
+        feed(&mut t, b"\x1bP+q5463\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1+r5463\x1b\\");
+    }
+
+    #[test]
+    fn decrqss_sgr_reports_current_rendition() {
+        let mut t = Term::new(4, 10, 0);
+        // Neovim's probe: reset, set a truecolor bg, read it back.
+        feed(&mut t, b"\x1b[0m\x1b[48;2;1;2;3m\x1bP$qm\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1$r0;48:2::1:2:3m\x1b\\");
+        feed(&mut t, b"\x1b[0;1;7;38:5:200;41m\x1bP$qm\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1$r0;1;7;38:5:200;41m\x1b\\");
+        feed(&mut t, b"\x1b[m\x1bP$qm\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1$r0m\x1b\\");
+    }
+
+    #[test]
+    fn decrqss_decstbm_and_decscusr() {
+        let mut t = Term::new(10, 10, 0);
+        feed(&mut t, b"\x1bP$qr\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1$r1;10r\x1b\\");
+        feed(&mut t, b"\x1b[3;7r\x1bP$qr\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1$r3;7r\x1b\\");
+        feed(&mut t, b"\x1b[6 q\x1bP$q q\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1$r6 q\x1b\\");
+        feed(&mut t, b"\x1b[0 q\x1bP$q q\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1$r1 q\x1b\\");
+        feed(&mut t, b"\x1bP$qt\x1b\\\x1bP$q$|\x1b\\");
+        assert_eq!(
+            t.drain_pty_replies(),
+            b"\x1bP1$r10t\x1b\\\x1bP1$r10$|\x1b\\"
+        );
+        feed(&mut t, b"\x1bP$qs\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP0$r\x1b\\");
+    }
+
+    #[test]
+    fn dcs_queries_do_not_disturb_sixel() {
+        let mut t = Term::new(8, 8, 0);
+        // Query, then sixel, then query: sixel still decodes and the
+        // queries don't swallow its body (or vice versa).
+        feed(&mut t, b"\x1bP+q5463\x1b\\");
+        feed(&mut t, SIXEL_3X6);
+        feed(&mut t, b"\x1bP$qm\x1b\\");
+        assert_eq!(t.image_grid().iter().count(), 1);
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1+r5463\x1b\\\x1bP1$r0m\x1b\\");
+    }
+
+    #[test]
+    fn other_dcs_is_ignored() {
+        let mut t = Term::new(4, 10, 0);
+        // DECUDK-ish / tmux passthrough-ish DCS: no reply, no output.
+        feed(&mut t, b"\x1bP1;1|17/ab\x1b\\\x1bPtmux;x\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"");
+        assert_eq!(t.row(0).cells[0].ch, ' ');
     }
 
     // ----- Sixel (DCS) ------------------------------------------------------
