@@ -31,7 +31,7 @@ mod selection;
 mod term;
 mod viewport;
 
-pub use cell::{Cell, Color, HyperlinkId, Style, StyleFlags};
+pub use cell::{Cell, Color, HyperlinkId, Style, StyleFlags, UnderlineStyle};
 pub use cursor::Cursor;
 pub use damage::{Damage, RowDamage};
 pub use extra::{CellExtra, CellExtraId, ExtraTable};

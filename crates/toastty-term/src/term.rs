@@ -9,7 +9,7 @@ use std::time::Instant;
 use toastty_protocols::unicode_core::cluster_cell_width;
 use unicode_width::UnicodeWidthChar;
 
-use crate::cell::{Cell, Color, Style};
+use crate::cell::{Cell, Color, Style, StyleFlags, UnderlineStyle};
 use crate::cursor::Cursor;
 use crate::damage::Damage;
 use crate::dcs_query::{DcsQuery, DcsQueryKind, QueryState};
@@ -3287,6 +3287,16 @@ impl Term {
                     self.cursor_underline_color = None;
                     self.apply_sgr_param(0);
                 }
+                // Colon-form underline style `CSI 4:N m` (kitty / VTE
+                // styled underlines, ITU-T T.416 sub-parameter syntax).
+                // 4:0 = none, 4:1 single, 4:2 double, 4:3 curly,
+                // 4:4 dotted, 4:5 dashed. Unknown N leaves the current
+                // underline unchanged rather than falling back to SGR 4.
+                4 if slice.len() >= 2 => {
+                    if let Some(u) = UnderlineStyle::from_sgr_subparam(slice[1]) {
+                        self.cursor.style.flags.underline = u;
+                    }
+                }
                 v => self.apply_sgr_param(v),
             }
         }
@@ -3294,16 +3304,34 @@ impl Term {
 
     fn apply_sgr_param(&mut self, v: u16) {
         let style = &mut self.cursor.style;
+        let flags = &mut style.flags;
         match v {
             0 => *style = Style::RESET,
-            1 => style.flags.bold = true,
-            3 => style.flags.italic = true,
-            4 => style.flags.underline = true,
-            7 => style.flags.reverse = true,
-            22 => style.flags.bold = false,
-            23 => style.flags.italic = false,
-            24 => style.flags.underline = false,
-            27 => style.flags.reverse = false,
+            1 => flags.set(StyleFlags::BOLD, true),
+            2 => flags.set(StyleFlags::DIM, true),
+            3 => flags.set(StyleFlags::ITALIC, true),
+            4 => flags.underline = UnderlineStyle::Single,
+            // SGR 6 (rapid blink) is treated as SGR 5, like xterm,
+            // kitty and VTE: one blink cadence only.
+            5 | 6 => flags.set(StyleFlags::BLINK, true),
+            7 => flags.set(StyleFlags::REVERSE, true),
+            8 => flags.set(StyleFlags::HIDDEN, true),
+            9 => flags.set(StyleFlags::STRIKETHROUGH, true),
+            // ECMA-48 SGR 21 = doubly underlined (xterm, kitty, VTE,
+            // foot). The old Linux-console "bold off" meaning is not
+            // honoured; 22 is the portable way to clear bold.
+            21 => flags.underline = UnderlineStyle::Double,
+            // SGR 22 = "normal intensity": clears both bold and faint.
+            22 => flags.set(StyleFlags::BOLD | StyleFlags::DIM, false),
+            23 => flags.set(StyleFlags::ITALIC, false),
+            // 24 clears every underline style (single/double/curly/...).
+            24 => flags.underline = UnderlineStyle::None,
+            25 => flags.set(StyleFlags::BLINK, false),
+            27 => flags.set(StyleFlags::REVERSE, false),
+            28 => flags.set(StyleFlags::HIDDEN, false),
+            29 => flags.set(StyleFlags::STRIKETHROUGH, false),
+            53 => flags.set(StyleFlags::OVERLINE, true),
+            55 => flags.set(StyleFlags::OVERLINE, false),
             30..=37 => style.fg = ansi_color(v - 30, false),
             39 => style.fg = Color::Default,
             40..=47 => style.bg = ansi_color(v - 40, false),
@@ -5245,15 +5273,15 @@ mod tests {
         let s = t.row(0).cells[0].style;
         assert_eq!(s.fg, Color::Red);
         assert_eq!(s.bg, Color::Blue);
-        assert!(s.flags.bold);
-        assert!(s.flags.italic);
+        assert!(s.flags.bold());
+        assert!(s.flags.italic());
     }
 
     #[test]
     fn sgr_reset_clears_everything() {
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[1;31mA\x1b[0mB");
-        assert!(t.row(0).cells[0].style.flags.bold);
+        assert!(t.row(0).cells[0].style.flags.bold());
         assert_eq!(t.row(0).cells[1].style, Style::RESET);
     }
 
@@ -5271,15 +5299,189 @@ mod tests {
         let a = t.row(0).cells[0].style.flags;
         assert_eq!(
             a,
-            StyleFlags {
-                bold: true,
-                italic: true,
-                underline: true,
-                reverse: true
-            }
+            StyleFlags::EMPTY
+                .with(StyleFlags::BOLD | StyleFlags::ITALIC | StyleFlags::REVERSE)
+                .with_underline(UnderlineStyle::Single)
         );
         let b = t.row(0).cells[1].style.flags;
         assert_eq!(b, StyleFlags::default());
+    }
+
+    /// Flags of the cell at column `col` after feeding `bytes` into a
+    /// fresh 1x16 term.
+    fn sgr_flags_after(bytes: &[u8], col: usize) -> StyleFlags {
+        let mut t = Term::new(1, 16, 0);
+        feed(&mut t, bytes);
+        t.row(0).cells[col].style.flags
+    }
+
+    #[test]
+    fn sgr_each_new_attribute_sets_its_bit() {
+        let cases: [(&[u8], u8); 7] = [
+            (b"\x1b[2mx", StyleFlags::DIM),
+            (b"\x1b[5mx", StyleFlags::BLINK),
+            (b"\x1b[6mx", StyleFlags::BLINK),
+            (b"\x1b[8mx", StyleFlags::HIDDEN),
+            (b"\x1b[9mx", StyleFlags::STRIKETHROUGH),
+            (b"\x1b[53mx", StyleFlags::OVERLINE),
+            (b"\x1b[1mx", StyleFlags::BOLD),
+        ];
+        for (seq, bit) in cases {
+            let f = sgr_flags_after(seq, 0);
+            assert_eq!(f.bits(), bit, "{:?}", String::from_utf8_lossy(seq));
+            assert_eq!(f.underline, UnderlineStyle::None);
+        }
+    }
+
+    #[test]
+    fn sgr_rapid_blink_is_same_as_slow_blink() {
+        assert_eq!(
+            sgr_flags_after(b"\x1b[6mx", 0),
+            sgr_flags_after(b"\x1b[5mx", 0)
+        );
+    }
+
+    #[test]
+    fn sgr_combined_params_bold_dim_strike_overline() {
+        let f = sgr_flags_after(b"\x1b[1;2;9;53mx", 0);
+        assert!(f.bold() && f.dim() && f.strikethrough() && f.overline());
+        assert!(!f.italic() && !f.blink() && !f.hidden() && !f.reverse());
+        assert!(!f.has_underline());
+    }
+
+    #[test]
+    fn sgr_22_clears_both_bold_and_dim_only() {
+        let f = sgr_flags_after(b"\x1b[1;2;3;9mA\x1b[22mB", 1);
+        assert!(!f.bold() && !f.dim());
+        assert!(f.italic() && f.strikethrough(), "22 must not touch others");
+        // Dim alone is also cleared by 22.
+        assert!(!sgr_flags_after(b"\x1b[2mA\x1b[22mB", 1).dim());
+    }
+
+    #[test]
+    fn sgr_individual_resets_clear_only_their_attribute() {
+        let all = b"\x1b[1;2;3;4;5;7;8;9;53m";
+        let cases: [(&[u8], u8); 6] = [
+            (b"\x1b[23mx", StyleFlags::ITALIC),
+            (b"\x1b[25mx", StyleFlags::BLINK),
+            (b"\x1b[27mx", StyleFlags::REVERSE),
+            (b"\x1b[28mx", StyleFlags::HIDDEN),
+            (b"\x1b[29mx", StyleFlags::STRIKETHROUGH),
+            (b"\x1b[55mx", StyleFlags::OVERLINE),
+        ];
+        for (reset, bit) in cases {
+            let mut seq = all.to_vec();
+            seq.extend_from_slice(reset);
+            let f = sgr_flags_after(&seq, 0);
+            assert_eq!(
+                f.bits(),
+                0xFF & !bit,
+                "{:?}",
+                String::from_utf8_lossy(reset)
+            );
+            assert_eq!(f.underline, UnderlineStyle::Single, "underline survives");
+        }
+    }
+
+    #[test]
+    fn sgr_21_and_colon_4_2_are_double_underline() {
+        assert_eq!(
+            sgr_flags_after(b"\x1b[21mx", 0).underline,
+            UnderlineStyle::Double
+        );
+        assert_eq!(
+            sgr_flags_after(b"\x1b[4:2mx", 0).underline,
+            UnderlineStyle::Double
+        );
+        // The semicolon form `4;2` is SGR 4 + SGR 2 (single + dim), not
+        // a double underline.
+        let f = sgr_flags_after(b"\x1b[4;2mx", 0);
+        assert_eq!(f.underline, UnderlineStyle::Single);
+        assert!(f.dim());
+    }
+
+    #[test]
+    fn sgr_colon_underline_styles() {
+        let cases = [
+            (&b"\x1b[4:0mx"[..], UnderlineStyle::None),
+            (b"\x1b[4:1mx", UnderlineStyle::Single),
+            (b"\x1b[4:2mx", UnderlineStyle::Double),
+            (b"\x1b[4:3mx", UnderlineStyle::Curly),
+            (b"\x1b[4:4mx", UnderlineStyle::Dotted),
+            (b"\x1b[4:5mx", UnderlineStyle::Dashed),
+        ];
+        for (seq, want) in cases {
+            assert_eq!(sgr_flags_after(seq, 0).underline, want);
+        }
+        // 4:0 turns an existing underline off.
+        assert_eq!(
+            sgr_flags_after(b"\x1b[21mA\x1b[4:0mB", 1).underline,
+            UnderlineStyle::None
+        );
+        // Unknown style leaves the current underline untouched.
+        assert_eq!(
+            sgr_flags_after(b"\x1b[21mA\x1b[4:9mB", 1).underline,
+            UnderlineStyle::Double
+        );
+        assert_eq!(
+            sgr_flags_after(b"\x1b[4:9mx", 0).underline,
+            UnderlineStyle::None
+        );
+        // Colon sub-params mixed with ordinary params in one sequence.
+        let f = sgr_flags_after(b"\x1b[1;4:3;9mx", 0);
+        assert!(f.bold() && f.strikethrough());
+        assert_eq!(f.underline, UnderlineStyle::Curly);
+        // Plain 4 after a styled underline goes back to single.
+        assert_eq!(
+            sgr_flags_after(b"\x1b[4:3mA\x1b[4mB", 1).underline,
+            UnderlineStyle::Single
+        );
+    }
+
+    #[test]
+    fn sgr_24_clears_every_underline_style() {
+        for seq in [
+            &b"\x1b[4m"[..],
+            b"\x1b[21m",
+            b"\x1b[4:2m",
+            b"\x1b[4:3m",
+            b"\x1b[4:5m",
+        ] {
+            let mut v = seq.to_vec();
+            v.extend_from_slice(b"\x1b[24mx");
+            assert_eq!(sgr_flags_after(&v, 0).underline, UnderlineStyle::None);
+        }
+    }
+
+    #[test]
+    fn sgr_0_and_empty_reset_all_new_attributes() {
+        let set = b"\x1b[1;2;3;5;7;8;9;21;53;31;44m";
+        for reset in [&b"\x1b[0m"[..], b"\x1b[m"] {
+            let mut t = Term::new(1, 4, 0);
+            let mut v = set.to_vec();
+            v.push(b'A');
+            v.extend_from_slice(reset);
+            v.push(b'B');
+            feed(&mut t, &v);
+            let a = t.row(0).cells[0].style.flags;
+            assert_eq!(a.bits(), 0xFF & !StyleFlags::REVERSE | StyleFlags::REVERSE);
+            assert_eq!(a.underline, UnderlineStyle::Double);
+            assert_eq!(t.row(0).cells[1].style, Style::RESET);
+        }
+        // Reset mid-sequence, then set again.
+        let f = sgr_flags_after(b"\x1b[2;9;0;53mx", 0);
+        assert_eq!(f.bits(), StyleFlags::OVERLINE);
+    }
+
+    #[test]
+    fn hidden_cells_keep_their_text() {
+        // Conceal is a rendering attribute only: the grid keeps the
+        // characters, so selection/copy still yields them (xterm).
+        let mut t = Term::new(1, 8, 0);
+        feed(&mut t, b"\x1b[8msecret\x1b[28m!");
+        assert_eq!(row_text(&t, 0), "secret!");
+        assert!(t.row(0).cells[0].style.flags.hidden());
+        assert!(!t.row(0).cells[6].style.flags.hidden());
     }
 
     #[test]
@@ -5577,10 +5779,7 @@ mod tests {
         t.cursor.style = Style {
             fg: Color::Red,
             bg: Color::Default,
-            flags: StyleFlags {
-                bold: true,
-                ..StyleFlags::default()
-            },
+            flags: StyleFlags::EMPTY.with(StyleFlags::BOLD),
         };
         t.apply_sgr(&Params::default());
         assert_eq!(t.cursor.style, Style::RESET);
@@ -5930,7 +6129,7 @@ mod tests {
         // consumed: fg should be Red (untouched), NOT something else.
         assert_eq!(s.fg, Color::Red);
         // And no flag side effects from consuming `5`.
-        assert!(!s.flags.bold);
+        assert!(!s.flags.bold());
     }
 
     #[test]
@@ -5949,7 +6148,7 @@ mod tests {
         // `32` leaking through).
         assert_ne!(s.fg, Color::Green);
         // And bold must still be on (we didn't accidentally consume the 1).
-        assert!(s.flags.bold);
+        assert!(s.flags.bold());
     }
 
     #[test]
@@ -5962,7 +6161,7 @@ mod tests {
         let s = t.row(0).cells[0].style;
         assert_eq!(s.fg, Color::Indexed256(42));
         assert_eq!(s.bg, Color::Default);
-        assert!(s.flags.bold);
+        assert!(s.flags.bold());
     }
 
     #[test]
@@ -6008,7 +6207,7 @@ mod tests {
         feed(&mut t, b"\x1b[1;38;9;31mX");
         let s = t.row(0).cells[0].style;
         // Bold from before the introducer should stick.
-        assert!(s.flags.bold);
+        assert!(s.flags.bold());
         // The trailing `31` (red fg) must apply — the parser must have
         // bailed cleanly out of the malformed 38;9 sequence.
         assert_eq!(s.fg, Color::Red);
@@ -6022,7 +6221,7 @@ mod tests {
         let s = t.row(0).cells[1].style;
         assert_eq!(s.fg, Color::Default);
         assert_eq!(s.bg, Color::Blue);
-        assert!(s.flags.bold);
+        assert!(s.flags.bold());
     }
 
     #[test]
