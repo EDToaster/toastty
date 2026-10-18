@@ -147,6 +147,10 @@ fn writes_are_delivered_in_order() {
 /// of a ring-spanning payload returns a short count. If this ever stops
 /// truncating, the writer's poll-loop is no longer load-bearing — but until
 /// then, removing it reintroduces the paste bug.
+///
+/// The PTY buffer size is kernel-specific (about 1 KiB on macOS, ~13.8 KiB
+/// on Linux 6.x in raw mode), so the blob is 1 MiB — far beyond any
+/// platform's buffer — rather than a size that happens to overflow one.
 #[test]
 fn single_raw_write_truncates_confirming_the_hazard() {
     let spec = PtySpec::program("/bin/sleep").arg("30");
@@ -154,7 +158,7 @@ fn single_raw_write_truncates_confirming_the_hazard() {
     make_raw(pty.master_fd());
     pty.set_nonblocking(true).expect("nonblocking");
 
-    let blob = vec![b'x'; 8192];
+    let blob = vec![b'x'; 1 << 20];
     let accepted = pty.write(&blob).expect("write");
     assert!(
         accepted < blob.len(),
