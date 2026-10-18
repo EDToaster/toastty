@@ -5373,12 +5373,7 @@ mod tests {
             let mut seq = all.to_vec();
             seq.extend_from_slice(reset);
             let f = sgr_flags_after(&seq, 0);
-            assert_eq!(
-                f.bits(),
-                0xFF & !bit,
-                "{:?}",
-                String::from_utf8_lossy(reset)
-            );
+            assert_eq!(f.bits(), !bit, "{:?}", String::from_utf8_lossy(reset));
             assert_eq!(f.underline, UnderlineStyle::Single, "underline survives");
         }
     }
@@ -5464,7 +5459,7 @@ mod tests {
             v.push(b'B');
             feed(&mut t, &v);
             let a = t.row(0).cells[0].style.flags;
-            assert_eq!(a.bits(), 0xFF & !StyleFlags::REVERSE | StyleFlags::REVERSE);
+            assert_eq!(a.bits(), 0xFF, "every rendition bit set");
             assert_eq!(a.underline, UnderlineStyle::Double);
             assert_eq!(t.row(0).cells[1].style, Style::RESET);
         }

@@ -3454,21 +3454,21 @@ mod tests {
 
     #[test]
     fn strikethrough_and_overline_use_decoration_metrics() {
-        let m = DecorationMetrics::new(16.0, 12.0, None);
+        let metrics = DecorationMetrics::new(16.0, 12.0, None);
         let opts = CellRenderOpts {
             blink_on: true,
-            decor: Some(m),
+            decor: Some(metrics),
         };
         let v = build_sgr(&term_with(b"\x1b[9;53mA"), &opts, false);
-        let s = with_flag(&v, FLAG_STRIKETHROUGH);
-        assert_eq!(s.len(), 1);
-        assert_eq!(s[0].pos, [0.0, m.strike_y]);
-        assert_eq!(s[0].size, [8.0, m.thickness]);
-        assert!(s[0].flags & FLAG_NO_GLYPH != 0);
-        let o = with_flag(&v, FLAG_OVERLINE);
-        assert_eq!(o.len(), 1);
-        assert_eq!(o[0].pos, [0.0, 0.0]);
-        assert!(with_flag(&v, FLAG_UNDERLINE).is_empty());
+        let strike = with_flag(&v, FLAG_STRIKETHROUGH);
+        assert_eq!(strike.len(), 1);
+        assert_eq!(strike[0].pos, [0.0, metrics.strike_y]);
+        assert_eq!(strike[0].size, [8.0, metrics.thickness]);
+        assert!(strike[0].flags & FLAG_NO_GLYPH != 0);
+        let over = with_flag(&v, FLAG_OVERLINE);
+        assert_eq!(over.len(), 1);
+        assert_eq!(over[0].pos, [0.0, 0.0]);
+        assert_eq!(with_flag(&v, FLAG_UNDERLINE).len(), 0);
         // Decorations come after the glyph so they draw over it.
         let gi = v.iter().position(|i| i.flags & FLAG_NO_GLYPH == 0).unwrap();
         let si = v
@@ -3478,8 +3478,11 @@ mod tests {
         assert!(si > gi);
         // Without explicit metrics the fallback geometry is used.
         let v = build_sgr(&term_with(b"\x1b[9mA"), &CellRenderOpts::default(), false);
-        let f = DecorationMetrics::fallback(16.0);
-        assert_eq!(with_flag(&v, FLAG_STRIKETHROUGH)[0].pos[1], f.strike_y);
+        let fallback = DecorationMetrics::fallback(16.0);
+        assert_eq!(
+            with_flag(&v, FLAG_STRIKETHROUGH)[0].pos[1],
+            fallback.strike_y
+        );
     }
 
     #[test]
@@ -3521,7 +3524,7 @@ mod tests {
             &CellRenderOpts::default(),
             false,
         );
-        assert!(glyphs(&v).is_empty());
+        assert_eq!(glyphs(&v).len(), 0);
         assert_eq!(with_flag(&v, FLAG_STRIKETHROUGH).len(), 2);
         assert_eq!(with_flag(&v, FLAG_OVERLINE).len(), 2);
         assert_eq!(with_flag(&v, FLAG_UNDERLINE).len(), 2);
@@ -3559,7 +3562,7 @@ mod tests {
             &CellRenderOpts::default(),
             false,
         );
-        assert!(glyphs(&v).is_empty(), "no glyph for concealed text");
+        assert_eq!(glyphs(&v).len(), 0, "no glyph for concealed text");
         assert!(
             with_flag(&v, FLAG_DECORATION).is_empty(),
             "xterm draws decorations in bg"
@@ -3569,7 +3572,7 @@ mod tests {
         // Selection still highlights concealed cells.
         let v = build_sgr(&term_with(b"\x1b[8mA"), &CellRenderOpts::default(), true);
         assert_eq!(v.len(), 8, "every (selected) cell paints only its bg quad");
-        assert!(glyphs(&v).is_empty());
+        assert_eq!(glyphs(&v).len(), 0);
         assert_eq!(v[0].bg, Theme::default_dark().selection_bg);
         // Hidden hyperlink: underline hidden too.
         let v = build_sgr(
@@ -3577,7 +3580,7 @@ mod tests {
             &CellRenderOpts::default(),
             false,
         );
-        assert!(with_flag(&v, FLAG_UNDERLINE).is_empty());
+        assert_eq!(with_flag(&v, FLAG_UNDERLINE).len(), 0);
     }
 
     #[test]
@@ -3618,7 +3621,7 @@ mod tests {
                 .into_iter()
                 .filter(|i| i.pos[0] < 32.0)
                 .collect();
-            assert!(!full.is_empty());
+            assert_ne!(full.len(), 0);
             assert_eq!(full, dirty);
         }
     }

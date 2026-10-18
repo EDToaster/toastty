@@ -288,7 +288,7 @@ mod tests {
     fn strips_for_each_rendition() {
         let m = DecorationMetrics::new(19.0, 15.0, None);
         let e = StyleFlags::EMPTY;
-        assert!(strips(e, false, &m).is_empty());
+        assert_eq!(strips(e, false, &m).len(), 0);
         assert_eq!(
             strips(e.with_underline(UnderlineStyle::Single), false, &m),
             vec![(DecorationKind::Underline, (17.0, 2.0))]
