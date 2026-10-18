@@ -49,7 +49,7 @@ use crate::image::instance::{ImageInstance, build_image_instances, split_layers}
 use crate::image::pipeline::ImagePipeline;
 use crate::rgp::{GpuAssetCache, Rgp3dPipeline};
 use crate::text::glyph_rasterizer::{DEFAULT_LINE_HEIGHT_RATIO, GlyphRasterizer, LineGlyphs};
-use crate::text::instance::{CellInstance, Theme};
+use crate::text::instance::{CellInstance, CellRenderOpts, Theme};
 use crate::text::pipeline::{GlobalsUbo, TextPipeline};
 
 /// Append instances for `term` into `out`. The closure pulls glyph
@@ -66,8 +66,9 @@ fn build_term_instances_into(
     row_glyphs: &[Option<LineGlyphs>],
     bleed: EdgeBleed<'_>,
     content_h: f32,
+    opts: &CellRenderOpts,
 ) {
-    crate::text::instance::build_instances_into(
+    crate::text::instance::build_instances_into_opts(
         out,
         term,
         cell_size,
@@ -80,6 +81,7 @@ fn build_term_instances_into(
         |line_id, col| term.is_cell_selected(line_id, col),
         bleed,
         content_h,
+        opts,
     );
 }
 
@@ -96,8 +98,9 @@ fn build_term_dirty_instances_into(
     cursor_visible: bool,
     row_glyphs: &[Option<LineGlyphs>],
     bleed: EdgeBleed<'_>,
+    opts: &CellRenderOpts,
 ) {
-    crate::text::instance::build_dirty_instances_into(
+    crate::text::instance::build_dirty_instances_into_opts(
         out,
         term,
         term.damage(),
@@ -111,7 +114,40 @@ fn build_term_dirty_instances_into(
         },
         |line_id, col| term.is_cell_selected(line_id, col),
         bleed,
+        opts,
     );
+}
+
+/// Mark every visible SGR-blink cell dirty (text-blink tick). Rows come
+/// from the renderer's `row_blink` cache (render-row space, which is
+/// the damage space when not fractionally scrolled). During a
+/// fractional scroll the frame is a full redraw anyway, so just mark
+/// everything.
+fn mark_blinking_cells_dirty(term: &mut Term, row_blink: &[bool]) {
+    if term.view_offset_pixel() > 0.0 {
+        term.mark_all_dirty();
+        return;
+    }
+    let (rows, _) = term.size();
+    let mut cols: Vec<u16> = Vec::new();
+    for (r, _) in row_blink.iter().enumerate().filter(|(_, b)| **b) {
+        let Ok(r) = u16::try_from(r) else { break };
+        if r >= rows {
+            break;
+        }
+        cols.clear();
+        cols.extend(
+            term.view_row(r)
+                .cells
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.style.flags.blink())
+                .filter_map(|(c, _)| u16::try_from(c).ok()),
+        );
+        for &c in &cols {
+            term.mark_cell_dirty(r, c);
+        }
+    }
 }
 
 /// Normalize an IME preedit argument into stored state: `None` or an
@@ -230,6 +266,8 @@ pub struct Renderer {
     needs_full_clear: bool,
     /// Cursor blink state machine.
     blink: CursorBlink,
+    /// SGR 5 / 6 text-blink phase + `[text] blink` switch.
+    text_blink: TextBlink,
     /// Cached linear-light extended palette derived from the term's
     /// OSC 4 overrides and the built-in xterm 256-color table. Rebuilt
     /// when the term's `palette_revision()` differs from
@@ -664,6 +702,78 @@ impl CursorBlink {
     }
 }
 
+/// SGR 5 / 6 text-blink state. Mirrors the cursor blink: same
+/// [`CursorBlink`] phase machine and half-cycle, but its own phase, and
+/// only *armed* while blinking cells are on screen, so a screen with no
+/// blinking text keeps skipping idle frames and schedules no wake-ups
+/// (see [`Renderer::next_redraw_deadline`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TextBlink {
+    phase: CursorBlink,
+    /// `[text] blink` config switch.
+    enabled: bool,
+    /// `enabled` and a blinking cell was visible at the last frame.
+    active: bool,
+}
+
+impl TextBlink {
+    fn new(now: Instant) -> Self {
+        let mut phase = CursorBlink::new(now);
+        // Start disarmed so the first blinking cell sees a false→true
+        // edge and gets a full on-phase.
+        phase.prev_enabled = false;
+        Self {
+            phase,
+            enabled: true,
+            active: false,
+        }
+    }
+
+    /// Apply the config switch. Returns true if it changed. Disabling
+    /// forces the visible phase so blinking text is drawn steadily.
+    fn set_enabled(&mut self, enabled: bool) -> bool {
+        let changed = self.enabled != enabled;
+        self.enabled = enabled;
+        if !enabled {
+            self.active = false;
+            self.phase.prev_enabled = false;
+            self.phase.force_visible();
+        }
+        changed
+    }
+
+    /// True iff a phase flip is due this frame.
+    fn due(&self, now: Instant) -> bool {
+        self.phase.animation_due(self.active, now)
+    }
+
+    /// Time until the next flip, or `None` when disarmed.
+    fn next_deadline(&self, now: Instant) -> Option<Duration> {
+        self.phase.next_deadline(self.active, now)
+    }
+
+    fn tick(&mut self, now: Instant) {
+        self.phase.tick(now);
+    }
+
+    /// Re-arm from whether any blinking cell is on screen this frame.
+    /// A fresh arm starts a full visible half-cycle (same edge rule as
+    /// the cursor); disarming leaves the phase visible.
+    fn observe(&mut self, any_blinking: bool, now: Instant) {
+        let active = self.enabled && any_blinking;
+        self.phase.sync_enabled(active, now);
+        if !active {
+            self.phase.force_visible();
+        }
+        self.active = active;
+    }
+
+    /// Current phase: true = blinking text visible.
+    fn blink_on(&self) -> bool {
+        self.phase.visible
+    }
+}
+
 struct TextState {
     rasterizer: GlyphRasterizer,
     pipeline: TextPipeline,
@@ -677,6 +787,11 @@ struct TextState {
     /// kill the per-keystroke render cost — shape only dirty rows, reuse
     /// cached glyphs for the rest.
     line_cache: Vec<Option<LineGlyphs>>,
+    /// `row_blink[r]` is true when rendered row `r` holds a visible
+    /// SGR-blink cell. Parallel to `line_cache` and refreshed for the
+    /// same (dirty) rows, so finding blinking text costs nothing on
+    /// clean frames. Drives [`TextBlink`].
+    row_blink: Vec<bool>,
     /// Reusable instance buffer. Cleared (not freed) at the start of
     /// every `render_term` so the allocation survives across frames.
     instances_scratch: Vec<CellInstance>,
@@ -846,6 +961,7 @@ impl Renderer {
             // texture's initial contents are undefined.
             needs_full_clear: true,
             blink: CursorBlink::new(Instant::now()),
+            text_blink: TextBlink::new(Instant::now()),
             ext_palette: Box::new([[0.0, 0.0, 0.0, 1.0]; 256]),
             palette_revision_seen: u32::MAX,
             scratch_texture,
@@ -959,6 +1075,7 @@ impl Renderer {
             pipeline,
             bind_group,
             line_cache: Vec::new(),
+            row_blink: Vec::new(),
             instances_scratch: Vec::new(),
             line_text_scratch: String::new(),
         });
@@ -1035,6 +1152,22 @@ impl Renderer {
         self.blink.interval = d;
     }
 
+    /// Enable or disable SGR 5 / 6 blinking (`[text] blink`). When
+    /// disabled, blinking text is drawn steadily. Forces a full repaint
+    /// so text caught in the off-phase reappears.
+    pub fn set_text_blink(&mut self, enabled: bool) {
+        if self.text_blink.set_enabled(enabled) {
+            self.needs_full_clear = true;
+        }
+    }
+
+    /// True iff blinking text is currently in its visible phase (always
+    /// true when blink is disabled or nothing on screen blinks).
+    #[must_use]
+    pub fn text_blink_visible(&self) -> bool {
+        self.text_blink.blink_on()
+    }
+
     /// Current cursor blink half-cycle.
     #[must_use]
     pub fn cursor_blink_interval(&self) -> Duration {
@@ -1064,8 +1197,10 @@ impl Renderer {
             .chip_fade
             .animating(Instant::now())
             .then_some(Duration::from_millis(16));
+        // SGR blink: only while blinking cells were on screen last frame.
+        let text_blink = self.text_blink.next_deadline(Instant::now());
         // Whichever fires first wins. All are `Option<Duration>`.
-        [blink, rgp, chip].into_iter().flatten().min()
+        [blink, rgp, chip, text_blink].into_iter().flatten().min()
     }
 
     /// Set (or clear) a debug overlay string painted at the top-right
@@ -1819,6 +1954,9 @@ impl Renderer {
         // immediately fire a tick (which would flash the cursor).
         self.blink.sync_enabled(term.cursor_blink(), now);
         let cursor_animation_due = self.blink.animation_due(term.cursor_blink(), now);
+        // SGR 5 / 6 text blink: same gate, but only armed while blinking
+        // cells were visible on the previous frame (`TextBlink::observe`).
+        let text_blink_due = self.text_blink.due(now);
         // M12c: RGP animations force frames through the skip-submit
         // gate the same way cursor blink does. Tick BEFORE the
         // skip check so animation_phase_rad is current for this
@@ -1847,6 +1985,7 @@ impl Renderer {
             self.chip_fade.animating(now) || (chip_alpha > 0.0) != self.chip_drawn_last;
         if term.damage().is_empty()
             && !cursor_animation_due
+            && !text_blink_due
             && !rgp_animation_active
             && !chip_changed
             && !self.needs_full_clear
@@ -1885,6 +2024,17 @@ impl Renderer {
             let cur = term.cursor();
             term.mark_cell_dirty(cur.row, cur.col);
         }
+        // Text blink tick: flip the phase and mark every blinking cell
+        // dirty so the partial-redraw builder re-emits (on-phase) or
+        // drops (off-phase) its glyph and decorations over a fresh bg
+        // quad. `row_blink` is from the previous frame's shaping, which
+        // is exactly what's on screen.
+        if text_blink_due {
+            self.text_blink.tick(now);
+            if let Some(text) = self.text.as_ref() {
+                mark_blinking_cells_dirty(term, &text.row_blink);
+            }
+        }
         // If the term has blink disabled, the cursor must always be
         // visible. We don't update `last_at` because the blink state
         // is unobservable while disabled, and any future re-enable
@@ -1909,6 +2059,7 @@ impl Renderer {
         let content_dims = self.content_dims(self.cell_size());
         let cell_size;
         let atlas_dims;
+        let any_blink;
         {
             let text = self.text.as_mut().expect("text initialised above");
             cell_size = text.rasterizer.cell_size();
@@ -1925,6 +2076,7 @@ impl Renderer {
             if text.line_cache.len() != cache_len {
                 text.line_cache.resize(cache_len, None);
             }
+            text.row_blink.resize(cache_len, false);
 
             // Number of rows to render this frame: content rows, plus the
             // partial top row (sub-row pixel offset) and the trailing
@@ -1955,6 +2107,7 @@ impl Renderer {
                     continue;
                 }
                 let row = term.view_row(r);
+                text.row_blink[r as usize] = crate::text::instance::row_has_blink(row);
                 // Reuse the cross-row scratch String instead of
                 // allocating a fresh one per dirty row.
                 //
@@ -2002,6 +2155,7 @@ impl Renderer {
                 let ms = t.elapsed().as_secs_f64() * 1000.0;
                 tracing::info!(target: "render_trace", "shape rows={shaped} took={ms:.3}ms");
             }
+            any_blink = text.row_blink[..rows_rendered as usize].iter().any(|b| *b);
             // make_bind_group used to be rebuilt every frame "in case
             // the atlas textures grew". They don't grow inside the
             // render path — `queue.write_texture` makes uploads visible
@@ -2009,6 +2163,9 @@ impl Renderer {
             // `with_font_ex` until either resize or font swap rebuilds
             // it for real.
         }
+        // Arm / disarm the text-blink timer from what's on screen now,
+        // so idle frames with no blinking text schedule no wake-ups.
+        self.text_blink.observe(any_blink, now);
 
         // Cascade rule for the direct-to-swapchain optimization
         // (must run BEFORE the build-path decision below, otherwise
@@ -2137,6 +2294,10 @@ impl Renderer {
         let ext_palette: &[[f32; 4]; 256] = &self.ext_palette;
         let text = self.text.as_mut().expect("text init");
         let mut instances = std::mem::take(&mut text.instances_scratch);
+        let cell_opts = crate::text::instance::CellRenderOpts {
+            blink_on: self.text_blink.blink_on(),
+            decor: Some(text.rasterizer.decoration_metrics()),
+        };
         let t_bi = if trace {
             Some(std::time::Instant::now())
         } else {
@@ -2155,6 +2316,7 @@ impl Renderer {
                 &text.line_cache,
                 bleed,
                 content_dims.1,
+                &cell_opts,
             );
             if !cursor_visible {
                 instances.pop();
@@ -2169,6 +2331,7 @@ impl Renderer {
                 cursor_visible,
                 &text.line_cache,
                 bleed,
+                &cell_opts,
             );
         }
         if let Some(t) = t_bi {
@@ -2914,6 +3077,71 @@ mod tests {
             prev_enabled: true,
         };
         assert!(!blink.animation_due(true, now));
+    }
+
+    #[test]
+    fn text_blink_is_disarmed_until_blinking_cells_appear() {
+        let t0 = Instant::now();
+        let mut b = TextBlink::new(t0);
+        let later = t0 + Duration::from_secs(5);
+        assert!(!b.due(later));
+        assert!(b.next_deadline(later).is_none());
+        assert!(b.blink_on());
+        // Blinking text appears: armed, a full interval from now.
+        b.observe(true, later);
+        assert!(b.blink_on());
+        assert!(!b.due(later));
+        assert_eq!(b.next_deadline(later), Some(DEFAULT_CURSOR_BLINK_INTERVAL));
+        let flip = later + DEFAULT_CURSOR_BLINK_INTERVAL;
+        assert!(b.due(flip));
+        b.tick(flip);
+        assert!(!b.blink_on());
+        // Still on screen: stays armed and off.
+        b.observe(true, flip);
+        assert!(!b.blink_on());
+        assert!(b.next_deadline(flip).is_some());
+        // Blinking text gone: disarmed, phase forced visible, no wake-ups.
+        b.observe(false, flip);
+        assert!(b.blink_on());
+        assert!(!b.due(flip + Duration::from_secs(9)));
+        assert!(b.next_deadline(flip).is_none());
+    }
+
+    #[test]
+    fn text_blink_config_switch() {
+        let t0 = Instant::now();
+        let mut b = TextBlink::new(t0);
+        assert!(!b.set_enabled(true), "already enabled");
+        b.observe(true, t0);
+        b.tick(t0 + DEFAULT_CURSOR_BLINK_INTERVAL);
+        assert!(!b.blink_on());
+        assert!(b.set_enabled(false));
+        assert!(b.blink_on(), "disabling shows the text");
+        b.observe(true, t0);
+        assert!(b.next_deadline(t0).is_none(), "disabled never arms");
+        assert!(!b.due(t0 + Duration::from_secs(9)));
+        assert!(b.set_enabled(true));
+        b.observe(true, t0);
+        assert!(b.next_deadline(t0).is_some());
+    }
+
+    #[test]
+    fn mark_blinking_cells_dirty_marks_only_blink_cells() {
+        let mut t = Term::new(3, 6, 0);
+        let mut p = toastty_parser::Parser::new();
+        p.advance(
+            &mut t,
+            b"ab\x1b[5mcd\x1b[25mef\r\n\x1b[5m\xe4\xb8\xad\x1b[0m",
+        );
+        t.clear_damage();
+        mark_blinking_cells_dirty(&mut t, &[true, true, false, true, true]);
+        let d = t.damage();
+        let row0: Vec<u16> = d.rows[0].cols.iter().copied().collect();
+        assert_eq!(row0, vec![2, 3]);
+        let row1: Vec<u16> = d.rows[1].cols.iter().copied().collect();
+        // Wide blinking cluster: primary + continuation.
+        assert_eq!(row1, vec![0, 1]);
+        assert!(d.rows[2].is_empty());
     }
 
     #[test]

@@ -8,7 +8,8 @@
 //   - cell position + size in pixels
 //   - atlas UV range in pixels (uv_min = uv_max means "no glyph")
 //   - foreground/background color
-//   - flag bits (cursor, color glyph, no glyph, underline)
+//   - flag bits (cursor, color glyph, no glyph, decoration strips:
+//     underline / strikethrough / overline)
 //
 // Two fragment entry points so the cell layer can render in two passes
 // with the RGP 3D pass sandwiched between them:
@@ -67,6 +68,10 @@ const FLAG_CURSOR: u32       = 1u;
 const FLAG_COLOR_GLYPH: u32  = 2u;
 const FLAG_NO_GLYPH: u32     = 4u;
 const FLAG_UNDERLINE: u32    = 8u;
+const FLAG_STRIKE: u32       = 16u;
+const FLAG_OVERLINE: u32     = 32u;
+// Any decoration strip (see `FLAG_DECORATION` in instance.rs).
+const FLAG_DECORATION: u32   = FLAG_UNDERLINE | FLAG_STRIKE | FLAG_OVERLINE;
 
 @vertex
 fn vs_main(
@@ -125,9 +130,9 @@ fn vs_main(
 // visible against the cursor.
 @fragment
 fn fs_bg(in: VsOut) -> @location(0) vec4<f32> {
-    // Underline is still a foreground decoration — it renders in the
-    // glyph pass at z=0.5 so 3D can occlude it.
-    if ((in.flags & FLAG_UNDERLINE) != 0u) {
+    // Decorations (underline, strikethrough, overline) are foreground
+    // — they render in the glyph pass at z=0.5 so 3D can occlude them.
+    if ((in.flags & FLAG_DECORATION) != 0u) {
         discard;
     }
     // Glyph-shaped instances would only paint a glyph-sized rect, not
@@ -179,11 +184,18 @@ fn fs_glyph(in: VsOut) -> @location(0) vec4<f32> {
         discard;
     }
 
-    // Underline strip: SGR underline / OSC 8 hyperlink. The color is
-    // stored in `bg` for backward compatibility with the old combined
-    // shader (see `underline_instance`).
-    if ((in.flags & FLAG_UNDERLINE) != 0u) {
-        return vec4<f32>(in.bg.rgb * in.bg.a, in.bg.a);
+    // Decoration strip: SGR underline / strikethrough / overline, OSC 8
+    // hyperlink underline, IME preedit. The color is stored in `bg` for
+    // backward compatibility with the old combined shader (see
+    // `underline_instance`). Like glyphs, strikethrough / overline
+    // pixels over the cursor block take the contrast color so they stay
+    // visible. FLAG_UNDERLINE alone is excluded: the banner / dialog
+    // "cover" quads reuse it and must keep their own color.
+    if ((in.flags & FLAG_DECORATION) != 0u) {
+        let line_over_cursor = (in.flags & (FLAG_STRIKE | FLAG_OVERLINE)) != 0u
+            && pixel_in_cursor(in.clip.xy);
+        let rgb = select(in.bg.rgb, cursor_contrast_color(), line_over_cursor);
+        return vec4<f32>(rgb * in.bg.a, in.bg.a);
     }
 
     // Plain bg quad — handled by the bg pass, skip here.

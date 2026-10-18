@@ -124,7 +124,15 @@ pub(crate) fn render_term_offscreen(term: &Term, width: u32, height: u32) -> Rgb
     // Build instances.
     let theme = Theme::default_dark();
     let row_glyphs_ref = &row_glyphs;
-    let instances = toastty_render::text::instance::build_instances(
+    // Font-derived decoration geometry, as the live renderer uses.
+    let opts = toastty_render::text::instance::CellRenderOpts {
+        blink_on: true,
+        decor: Some(rasterizer.decoration_metrics()),
+    };
+    let mut instances = Vec::new();
+    let (rows, _) = term.size();
+    toastty_render::text::instance::build_instances_into_opts(
+        &mut instances,
         term,
         cell_size,
         &theme,
@@ -133,6 +141,10 @@ pub(crate) fn render_term_offscreen(term: &Term, width: u32, height: u32) -> Rgb
             let lg = row_glyphs_ref.get(row as usize)?;
             lg.get(col, ch)
         },
+        |_, _| false,
+        toastty_render::text::instance::EdgeBleed::default(),
+        f32::from(rows) * cell_size.1,
+        &opts,
     );
 
     // Readback buffer.

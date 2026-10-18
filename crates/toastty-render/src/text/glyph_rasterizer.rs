@@ -18,6 +18,7 @@ use wgpu::{Device, Extent3d, Queue, Texture, TextureFormat};
 
 use crate::text::atlas::{Atlas, AtlasLayer, AtlasSlot, GlyphKey};
 use crate::text::cluster_width::{GlyphPos, snap_cluster_widths_per_cluster};
+use crate::text::decoration::{DecorationMetrics, FontLineMetrics};
 use crate::text::instance::GlyphSlot;
 use crate::text::presentation;
 
@@ -238,6 +239,9 @@ pub struct GlyphRasterizer {
     /// baseline keeps every cell on the same grid baseline. See the
     /// `glyph_offset_is_independent_of_line_content` regression test.
     baseline_y: f32,
+    /// Strikethrough / overline / double-underline geometry derived from
+    /// the primary face's line metrics (see [`measure_decorations`]).
+    decoration_metrics: DecorationMetrics,
     /// Configured font family, kept around for `Attrs`.
     family_name: String,
     /// Per-character glyph cache. Keyed on `char` alone, which is **only
@@ -360,6 +364,8 @@ impl GlyphRasterizer {
         // vertical placement (see [`Self::baseline_y`]).
         let (cell_w, cell_h, baseline_y) = measure_cell(&mut font_system, metrics, font_name);
         let cell_size = (cell_w, cell_h);
+        let decoration_metrics =
+            measure_decorations(&mut font_system, metrics, font_name, cell_h, baseline_y);
 
         // Pre-allocate the per-line buffer.
         let mut buffer = Buffer::new(&mut font_system, metrics);
@@ -410,6 +416,7 @@ impl GlyphRasterizer {
             metrics,
             cell_size,
             baseline_y,
+            decoration_metrics,
             family_name,
             char_cache: HashMap::new(),
             char_cache_misses: std::collections::HashSet::new(),
@@ -665,6 +672,13 @@ impl GlyphRasterizer {
     /// Cell size in pixels (width, height).
     pub fn cell_size(&self) -> (f32, f32) {
         self.cell_size
+    }
+
+    /// Font-derived geometry for SGR strikethrough, overline and double
+    /// underline at the current size.
+    #[must_use]
+    pub fn decoration_metrics(&self) -> DecorationMetrics {
+        self.decoration_metrics
     }
 
     /// Atlas dimensions per layer (same for both).
@@ -1131,6 +1145,40 @@ fn make_glyph_slot(slot: AtlasSlot, placement: GlyphPlacement) -> GlyphSlot {
         glyph_size: placement.size,
         has_secondary: false,
     }
+}
+
+/// Read the primary face's strikeout position and stroke thickness
+/// (`OS/2.yStrikeoutPosition`, `post.underlineThickness`, via swash)
+/// and turn them into per-cell [`DecorationMetrics`]. The face is the
+/// one cosmic-text picks for "M", i.e. the same face [`measure_cell`]
+/// measured. Falls back to fraction-of-cell geometry if no face shapes.
+fn measure_decorations(
+    font_system: &mut FontSystem,
+    metrics: Metrics,
+    family: Option<&str>,
+    cell_h: f32,
+    baseline_y: f32,
+) -> DecorationMetrics {
+    let mut probe = Buffer::new(font_system, metrics);
+    probe.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
+    let attrs = Attrs::new().family(Family::Name(family.unwrap_or("monospace")));
+    probe.set_text("M", &attrs, Shaping::Advanced, None);
+    probe.shape_until_scroll(font_system, false);
+    let face = probe
+        .layout_runs()
+        .flat_map(|run| run.glyphs.iter())
+        .map(|g| (g.font_id, g.font_weight))
+        .next();
+    let line = face
+        .and_then(|(id, weight)| font_system.get_font(id, weight))
+        .map(|font| {
+            let m = font.as_swash().metrics(&[]).scale(metrics.font_size);
+            FontLineMetrics {
+                strikeout_offset: m.strikeout_offset,
+                stroke_size: m.stroke_size,
+            }
+        });
+    DecorationMetrics::new(cell_h, baseline_y, line)
 }
 
 /// Probe the primary font's reference glyph "M" to derive the cell
