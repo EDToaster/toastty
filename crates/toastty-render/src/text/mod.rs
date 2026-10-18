@@ -4,6 +4,8 @@
 //!
 //! - [`cluster_width`] — mode 2027 cluster snap (pure).
 //! - [`atlas`] — shelf-pack glyph atlas (pure).
+//! - [`decoration`] — SGR decoration geometry, faint colour, blink /
+//!   conceal visibility (pure).
 //! - [`instance`] — `CellInstance` + `build_instances` (pure).
 //! - [`viewport`] — smooth-scroll state (pure).
 //! - [`presentation`] — UTS #51 emoji-vs-text presentation selection.
@@ -14,6 +16,7 @@
 
 pub mod atlas;
 pub mod cluster_width;
+pub mod decoration;
 pub mod instance;
 pub mod presentation;
 pub mod viewport;

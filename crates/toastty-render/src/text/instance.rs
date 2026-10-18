@@ -10,6 +10,10 @@
 use bytemuck::{Pod, Zeroable};
 use toastty_term::{Cell, Color as TColor, CursorShape, Damage, PLACEHOLDER, Row, Style, Term};
 
+use crate::text::decoration::{
+    DecorationKind, DecorationMetrics, decoration_strips, dim_color, foreground_visible,
+};
+
 /// Flag bit: instance is the text-cursor block (forces inverse rendering,
 /// no glyph sample).
 pub const FLAG_CURSOR: u32 = 1 << 0;
@@ -21,12 +25,43 @@ pub const FLAG_COLOR_GLYPH: u32 = 1 << 1;
 /// Flag bit: this instance has no glyph at all (background-only fill).
 pub const FLAG_NO_GLYPH: u32 = 1 << 2;
 
-/// Flag bit: this instance is the underline strip for a cell flagged
-/// with SGR underline or an active OSC 8 hyperlink. The shader doesn't
-/// branch on this bit (current shader treats it the same as
-/// `FLAG_NO_GLYPH`); we still flag it so future shader work can pick
-/// it out without re-scanning the instance buffer.
+/// Flag bit: this instance is an underline strip (SGR 4 / 4:N / 21, an
+/// OSC 8 hyperlink, or the IME preedit). Each stroke of a double
+/// underline is its own strip.
 pub const FLAG_UNDERLINE: u32 = 1 << 3;
+
+/// Flag bit: this instance is a strikethrough strip (SGR 9).
+pub const FLAG_STRIKETHROUGH: u32 = 1 << 4;
+
+/// Flag bit: this instance is an overline strip (SGR 53).
+pub const FLAG_OVERLINE: u32 = 1 << 5;
+
+/// Every decoration-strip bit. The shader paints any instance with one
+/// of these as a solid foreground-coloured rect in the glyph pass
+/// (colour in `bg`, see [`underline_instance`]).
+pub const FLAG_DECORATION: u32 = FLAG_UNDERLINE | FLAG_STRIKETHROUGH | FLAG_OVERLINE;
+
+/// Per-frame text-rendition inputs that aren't part of the grid.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CellRenderOpts {
+    /// SGR 5 / 6 blink phase. `false` = off-phase: blinking cells draw
+    /// only their background. The renderer keeps this `true` when blink
+    /// is disabled in config.
+    pub blink_on: bool,
+    /// Font-derived decoration geometry. `None` falls back to
+    /// [`DecorationMetrics::fallback`] for the cell height (tests and
+    /// GPU-less callers).
+    pub decor: Option<DecorationMetrics>,
+}
+
+impl Default for CellRenderOpts {
+    fn default() -> Self {
+        Self {
+            blink_on: true,
+            decor: None,
+        }
+    }
+}
 
 /// GPU-side instance layout. `repr(C)` + `Pod + Zeroable` so it round-trips
 /// through `bytemuck::cast_slice` cleanly.
@@ -202,7 +237,18 @@ fn extend_edge_quad(
 #[inline]
 #[must_use]
 pub fn cell_fills_bg(cell: &Cell) -> bool {
-    cell.style.flags.reverse || cell.style.bg != TColor::Default
+    cell.style.flags.reverse() || cell.style.bg != TColor::Default
+}
+
+/// True if `row` has a cell whose blink (SGR 5 / 6) would be visible,
+/// i.e. blinking and not concealed. The renderer arms the text-blink
+/// timer only while some on-screen row returns true.
+#[inline]
+#[must_use]
+pub fn row_has_blink(row: &Row) -> bool {
+    row.cells
+        .iter()
+        .any(|c| c.style.flags.blink() && !c.style.flags.hidden())
 }
 
 /// True if **every** column `0..cols` of `row` paints a non-default
@@ -670,8 +716,12 @@ pub fn is_blank_for_render(cell: &Cell) -> bool {
     cell.ch.is_whitespace()
         && cell.style.bg == TColor::Default
         && cell.style.fg == TColor::Default
-        && !cell.style.flags.reverse
-        && !cell.style.flags.underline
+        && !cell.style.flags.reverse()
+        && !cell.style.flags.has_underline()
+        // Strikethrough / overline draw a line even through spaces
+        // (xterm `drawUnderline` covers the whole run).
+        && !cell.style.flags.strikethrough()
+        && !cell.style.flags.overline()
         // A hyperlinked cell needs the underline strip even when its
         // text is empty / styled the same as the surroundings.
         && cell.hyperlink_id.is_none()
@@ -701,6 +751,125 @@ pub(crate) fn underline_instance(pos: [f32; 2], cell_size: [f32; 2], fg: [f32; 4
     }
 }
 
+/// Build one decoration strip (underline stroke, strikethrough or
+/// overline) `strip = (y offset, height)` within the cell at `pos`,
+/// `width` px wide. Colour goes in `bg` like [`underline_instance`].
+fn decoration_instance(
+    pos: [f32; 2],
+    width: f32,
+    strip: (f32, f32),
+    fg: [f32; 4],
+    kind: DecorationKind,
+) -> CellInstance {
+    let kind_flag = match kind {
+        DecorationKind::Underline => FLAG_UNDERLINE,
+        DecorationKind::Strikethrough => FLAG_STRIKETHROUGH,
+        DecorationKind::Overline => FLAG_OVERLINE,
+    };
+    CellInstance {
+        pos: [pos[0], pos[1] + strip.0],
+        size: [width, strip.1],
+        uv_min: [0.0, 0.0],
+        uv_max: [0.0, 0.0],
+        fg,
+        bg: fg,
+        flags: FLAG_NO_GLYPH | kind_flag,
+        pad: [0; 3],
+    }
+}
+
+/// Glyph colour for a cell: the resolved (post-reverse) foreground,
+/// faded toward the *displayed* background when SGR 2 (faint) is set.
+/// `bg` is the selection tint for selected cells, so dim text stays
+/// distinguishable on the highlight. Bold is not rendered as a
+/// different weight or colour, so bold + dim is simply dim.
+#[inline]
+#[must_use]
+pub fn glyph_fg(cell: &Cell, fg: [f32; 4], bg: [f32; 4]) -> [f32; 4] {
+    if cell.style.flags.dim() {
+        dim_color(fg, bg)
+    } else {
+        fg
+    }
+}
+
+/// Emit a cell's glyph(s) and decoration strips, shared by the full and
+/// partial-redraw builders so the two can't drift.
+///
+/// Nothing is emitted for concealed cells or blinking cells in the
+/// blink off-phase (see [`foreground_visible`]); the caller has already
+/// pushed the background quad, so the cell (and any selection tint)
+/// still paints. Decorations span both columns of a width-2 cluster
+/// (`is_wide`) and are drawn per cell, so they're unaffected by
+/// ligature shaping. Emitted *after* the glyph so an underline draws
+/// over descenders (matches xterm).
+#[allow(clippy::too_many_arguments)]
+fn push_cell_foreground<F>(
+    out: &mut Vec<CellInstance>,
+    locate_glyph: &mut F,
+    r: u16,
+    c: u16,
+    cell: &Cell,
+    is_wide: bool,
+    pos: [f32; 2],
+    cell_size: (f32, f32),
+    fg: [f32; 4],
+    bg: [f32; 4],
+    link_underline: bool,
+    opts: &CellRenderOpts,
+) where
+    F: FnMut(u16, u16, char, &Style) -> Option<GlyphSlot>,
+{
+    if !foreground_visible(cell.style.flags, opts.blink_on) {
+        return;
+    }
+    let (cell_w, cell_h) = cell_size;
+    // Whitespace / NUL have no glyph. Kitty Unicode placeholder cells
+    // (`U+10EEEE`) live in the grid as cursor-motion shims; the image
+    // pipeline draws the actual pixels, so skip the glyph (the
+    // rasterizer would draw `.notdef` tofu where the image will land).
+    let has_glyph = !(cell.ch.is_whitespace() || cell.ch == '\0' || cell.ch == PLACEHOLDER);
+    if has_glyph {
+        let primary = locate_glyph(r, c, cell.ch, &cell.style);
+        if let Some(slot) = primary {
+            let flags = if slot.is_color { FLAG_COLOR_GLYPH } else { 0 };
+            // Glyph quad: position is cell + glyph bearing; size is
+            // the glyph's own pixel extent (matches the atlas
+            // region). The fragment shader's UV interpolation then
+            // maps the quad 1:1 to the atlas region.
+            out.push(CellInstance {
+                pos: [pos[0] + slot.glyph_offset[0], pos[1] + slot.glyph_offset[1]],
+                size: slot.glyph_size,
+                uv_min: slot.uv_min,
+                uv_max: slot.uv_max,
+                fg,
+                bg,
+                flags,
+                pad: [0; 3],
+            });
+        }
+        if primary.is_some_and(|p| p.has_secondary) {
+            push_secondary_glyphs(out, locate_glyph, r, c, cell, pos, fg, bg);
+        }
+    }
+
+    // Decorations: SGR underline styles, link underline (OSC 8 or the
+    // Ctrl/Cmd-hovered link span, `link_underline`), strikethrough,
+    // overline. M10-followup I6: width-2 (CJK)
+    // primaries decorate the FULL cluster (both columns).
+    let width = if is_wide { 2.0 * cell_w } else { cell_w };
+    let metrics = opts
+        .decor
+        .unwrap_or_else(|| DecorationMetrics::fallback(cell_h));
+    decoration_strips(
+        cell.style.flags,
+        link_underline,
+        cell_h,
+        &metrics,
+        |kind, strip| out.push(decoration_instance(pos, width, strip, fg, kind)),
+    );
+}
+
 /// Effective fg/bg for a cell after applying SGR `reverse` (mode 7).
 ///
 /// `ext_palette` (when `Some`) is consulted for `Color::Indexed256` lookups
@@ -713,7 +882,7 @@ pub fn resolve_cell_colors(
 ) -> ([f32; 4], [f32; 4]) {
     let fg = theme.resolve_fg(cell.style.fg, ext_palette);
     let bg = theme.resolve_bg(cell.style.bg, ext_palette);
-    if cell.style.flags.reverse {
+    if cell.style.flags.reverse() {
         (bg, fg)
     } else {
         (fg, bg)
@@ -792,8 +961,42 @@ fn line_id_for_render_row(
 /// Same as [`build_instances`] but appends into a caller-provided
 /// `Vec` (which is `clear()`ed first). Reusing the buffer across frames
 /// avoids per-frame allocations on the hot render path.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+///
+/// Uses default [`CellRenderOpts`] (blink on-phase, fallback decoration
+/// geometry); see [`build_instances_into_opts`].
+#[allow(clippy::too_many_arguments)]
 pub fn build_instances_into<F, S>(
+    out: &mut Vec<CellInstance>,
+    term: &Term,
+    cell_size: (f32, f32),
+    theme: &Theme,
+    ext_palette: Option<&[[f32; 4]; 256]>,
+    locate_glyph: F,
+    is_selected: S,
+    bleed: EdgeBleed<'_>,
+    content_h: f32,
+) where
+    F: FnMut(u16, u16, char, &Style) -> Option<GlyphSlot>,
+    S: FnMut(u64, u16) -> bool,
+{
+    build_instances_into_opts(
+        out,
+        term,
+        cell_size,
+        theme,
+        ext_palette,
+        locate_glyph,
+        is_selected,
+        bleed,
+        content_h,
+        &CellRenderOpts::default(),
+    );
+}
+
+/// [`build_instances_into`] with explicit per-frame [`CellRenderOpts`]
+/// (blink phase, font-derived decoration metrics).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn build_instances_into_opts<F, S>(
     out: &mut Vec<CellInstance>,
     term: &Term,
     cell_size: (f32, f32),
@@ -803,6 +1006,7 @@ pub fn build_instances_into<F, S>(
     mut is_selected: S,
     bleed: EdgeBleed<'_>,
     content_h: f32,
+    opts: &CellRenderOpts,
 ) where
     F: FnMut(u16, u16, char, &Style) -> Option<GlyphSlot>,
     S: FnMut(u64, u16) -> bool,
@@ -873,6 +1077,7 @@ pub fn build_instances_into<F, S>(
             let pos = [f32::from(c) * cell_w, f32::from(r) * cell_h + y_translate];
             let (fg, bg) = resolve_cell_colors(cell, theme, ext_palette);
             let bg = if selected { theme.selection_bg } else { bg };
+            let fg = glyph_fg(cell, fg, bg);
 
             // Width-2 (CJK) primaries: widen the bg quad to span both
             // columns so the continuation half isn't left showing the
@@ -921,62 +1126,21 @@ pub fn build_instances_into<F, S>(
                 pad: [0; 3],
             });
 
-            if cell.ch.is_whitespace() {
-                continue;
-            }
-
-            // Kitty Unicode placeholder cells (`U+10EEEE`) live in the
-            // grid as cursor-motion shims; the image pipeline draws the
-            // actual pixels. Skip the glyph emission so the rasterizer
-            // doesn't draw `.notdef` tofu where the image will land.
-            // (Keep the bg quad — placeholders still need to overpaint
-            // whatever was there before the image arrived.)
-            if cell.ch == PLACEHOLDER {
-                continue;
-            }
-
-            let primary = locate_glyph(r, c, cell.ch, &cell.style);
-            if let Some(slot) = primary {
-                let flags = if slot.is_color { FLAG_COLOR_GLYPH } else { 0 };
-                // Glyph quad: position is cell + glyph bearing; size is
-                // the glyph's own pixel extent (matches the atlas
-                // region). The fragment shader's UV interpolation then
-                // maps the quad 1:1 to the atlas region.
-                out.push(CellInstance {
-                    pos: [pos[0] + slot.glyph_offset[0], pos[1] + slot.glyph_offset[1]],
-                    size: slot.glyph_size,
-                    uv_min: slot.uv_min,
-                    uv_max: slot.uv_max,
-                    fg,
-                    bg,
-                    flags,
-                    pad: [0; 3],
-                });
-            }
-            if primary.is_some_and(|p| p.has_secondary) {
-                push_secondary_glyphs(out, &mut locate_glyph, r, c, cell, pos, fg, bg);
-            }
-
-            // Underline strip for SGR underline or OSC 8 hyperlink.
-            // M10-followup I6: peek the next cell — width-2 (CJK)
-            // primaries underline the FULL cluster (both columns), not
-            // just the primary column. Without this, hyperlinked CJK
-            // text underlined only the leading half of every wide
-            // glyph. (We do the same in `build_dirty_instances_into`,
-            // and the bg quad above uses the same widening so the
-            // continuation half is covered.)
-            if cell.style.flags.underline || cell.hyperlink_id.is_some() {
-                let strip_w = if row
-                    .cells
-                    .get(c as usize + 1)
-                    .is_some_and(|next| next.is_continuation)
-                {
-                    2.0 * cell_w
-                } else {
-                    cell_w
-                };
-                out.push(underline_instance(pos, [strip_w, cell_h], fg));
-            }
+            push_cell_foreground(
+                out,
+                &mut locate_glyph,
+                r,
+                c,
+                cell,
+                is_wide,
+                pos,
+                cell_size,
+                fg,
+                bg,
+                cell.hyperlink_id.is_some()
+                    || line_id.is_some_and(|l| term.is_link_hovered(l, c)),
+                opts,
+            );
         }
     }
 
@@ -1038,8 +1202,40 @@ impl<'a> Iterator for DirtyCols<'a> {
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // mirrors build_instances_into + adds damage/visibility/ext_palette
+#[allow(clippy::too_many_arguments)] // mirrors build_instances_into + adds damage/visibility/ext_palette
 pub fn build_dirty_instances_into<F, S>(
+    out: &mut Vec<CellInstance>,
+    term: &Term,
+    damage: &Damage,
+    cell_size: (f32, f32),
+    theme: &Theme,
+    ext_palette: Option<&[[f32; 4]; 256]>,
+    cursor_visible: bool,
+    locate_glyph: F,
+    is_selected: S,
+    bleed: EdgeBleed<'_>,
+) where
+    F: FnMut(u16, u16, char, &Style) -> Option<GlyphSlot>,
+    S: FnMut(u64, u16) -> bool,
+{
+    build_dirty_instances_into_opts(
+        out,
+        term,
+        damage,
+        cell_size,
+        theme,
+        ext_palette,
+        cursor_visible,
+        locate_glyph,
+        is_selected,
+        bleed,
+        &CellRenderOpts::default(),
+    );
+}
+
+/// [`build_dirty_instances_into`] with explicit [`CellRenderOpts`].
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn build_dirty_instances_into_opts<F, S>(
     out: &mut Vec<CellInstance>,
     term: &Term,
     damage: &Damage,
@@ -1050,6 +1246,7 @@ pub fn build_dirty_instances_into<F, S>(
     mut locate_glyph: F,
     mut is_selected: S,
     bleed: EdgeBleed<'_>,
+    opts: &CellRenderOpts,
 ) where
     F: FnMut(u16, u16, char, &Style) -> Option<GlyphSlot>,
     S: FnMut(u64, u16) -> bool,
@@ -1065,7 +1262,7 @@ pub fn build_dirty_instances_into<F, S>(
         // extra (blank) row is emitted.
         let (rows, _) = term.size();
         let content_h = f32::from(rows) * cell_size.1;
-        build_instances_into(
+        build_instances_into_opts(
             out,
             term,
             cell_size,
@@ -1075,6 +1272,7 @@ pub fn build_dirty_instances_into<F, S>(
             is_selected,
             bleed,
             content_h,
+            opts,
         );
         if !cursor_visible {
             // Drop the trailing cursor instance the full builder
@@ -1146,6 +1344,7 @@ pub fn build_dirty_instances_into<F, S>(
             let pos = [f32::from(c) * cell_w, f32::from(r) * cell_h + y_translate];
             let (fg, bg) = resolve_cell_colors(cell, theme, ext_palette);
             let bg = if selected { theme.selection_bg } else { bg };
+            let fg = glyph_fg(cell, fg, bg);
 
             // Width-2 (CJK) primaries: widen the bg quad to span both
             // columns so the continuation half isn't left showing the
@@ -1193,52 +1392,21 @@ pub fn build_dirty_instances_into<F, S>(
                 pad: [0; 3],
             });
 
-            if cell.ch.is_whitespace() || cell.ch == '\0' {
-                continue;
-            }
-
-            // Suppress glyph emission for Kitty Unicode placeholder
-            // cells — see the matching note in `build_instances_into`.
-            // The bg quad above is kept so old content stays
-            // overpainted under LoadOp::Load.
-            if cell.ch == PLACEHOLDER {
-                continue;
-            }
-
-            let primary = locate_glyph(r, c, cell.ch, &cell.style);
-            if let Some(slot) = primary {
-                let flags = if slot.is_color { FLAG_COLOR_GLYPH } else { 0 };
-                out.push(CellInstance {
-                    pos: [pos[0] + slot.glyph_offset[0], pos[1] + slot.glyph_offset[1]],
-                    size: slot.glyph_size,
-                    uv_min: slot.uv_min,
-                    uv_max: slot.uv_max,
-                    fg,
-                    bg,
-                    flags,
-                    pad: [0; 3],
-                });
-            }
-            if primary.is_some_and(|p| p.has_secondary) {
-                push_secondary_glyphs(out, &mut locate_glyph, r, c, cell, pos, fg, bg);
-            }
-
-            // Underline strip for SGR underline or OSC 8 hyperlink. Emit
-            // *after* the glyph so it draws on top of any descender
-            // (matches xterm). M10-followup I6: same width-2 widening
-            // as the full builder above.
-            if cell.style.flags.underline || cell.hyperlink_id.is_some() {
-                let strip_w = if row
-                    .cells
-                    .get(c as usize + 1)
-                    .is_some_and(|next| next.is_continuation)
-                {
-                    2.0 * cell_w
-                } else {
-                    cell_w
-                };
-                out.push(underline_instance(pos, [strip_w, cell_h], fg));
-            }
+            push_cell_foreground(
+                out,
+                &mut locate_glyph,
+                r,
+                c,
+                cell,
+                is_wide,
+                pos,
+                cell_size,
+                fg,
+                bg,
+                cell.hyperlink_id.is_some()
+                    || line_id.is_some_and(|l| term.is_link_hovered(l, c)),
+                opts,
+            );
         }
     }
 
@@ -1488,10 +1656,10 @@ mod tests {
         c.style.bg = TColor::Red;
         assert!(!is_blank_for_render(&c));
         let mut c = Cell::BLANK;
-        c.style.flags.reverse = true;
+        c.style.flags.set(toastty_term::StyleFlags::REVERSE, true);
         assert!(!is_blank_for_render(&c));
         let mut c = Cell::BLANK;
-        c.style.flags.underline = true;
+        c.style.flags.underline = toastty_term::UnderlineStyle::Single;
         assert!(!is_blank_for_render(&c));
         let mut c = Cell::BLANK;
         c.ch = 'a';
@@ -1514,7 +1682,7 @@ mod tests {
         // Reverse with default fg/bg → filled (paints fg-as-bg, a solid
         // band — the status-line case).
         let mut c = Cell::BLANK;
-        c.style.flags.reverse = true;
+        c.style.flags.set(toastty_term::StyleFlags::REVERSE, true);
         assert!(cell_fills_bg(&c));
         // Non-default fg WITHOUT reverse does not fill the background.
         let mut c = Cell::BLANK;
@@ -1557,7 +1725,7 @@ mod tests {
         let mut c = Cell::BLANK;
         c.style.fg = TColor::Red;
         c.style.bg = TColor::Default;
-        c.style.flags.reverse = true;
+        c.style.flags.set(toastty_term::StyleFlags::REVERSE, true);
         let (fg, bg) = resolve_cell_colors(&c, &theme, None);
         assert_eq!(fg, theme.bg);
         assert_eq!(bg, theme.resolve_fg(TColor::Red, None));
@@ -1816,6 +1984,90 @@ mod tests {
             underline_count, 1,
             "hyperlinked cell must emit one underline strip"
         );
+    }
+
+    /// Underline strips in `v` and their x positions.
+    fn underline_xs(v: &[CellInstance]) -> Vec<f32> {
+        v.iter()
+            .filter(|i| i.flags & FLAG_UNDERLINE != 0 && i.flags & FLAG_CURSOR == 0)
+            .map(|i| i.pos[0])
+            .collect()
+    }
+
+    #[test]
+    fn hovered_link_span_emits_underline_in_full_build() {
+        // Plain text URL, not underlined until hovered.
+        let mut t = Term::new(2, 20, 0);
+        feed(&mut t, "a http://x.y/例 b".as_bytes());
+        let build = |t: &Term| {
+            build_instances(
+                t,
+                (8.0, 16.0),
+                &Theme::default_dark(),
+                None,
+                |_, _, _, _| None,
+            )
+        };
+        assert_eq!(underline_xs(&build(&t)), Vec::<f32>::new());
+        let hit = t
+            .link_at(toastty_term::Pos::new(t.bottom_id() - 1, 4))
+            .unwrap();
+        t.set_link_hover(Some(hit.span));
+        let xs = underline_xs(&build(&t));
+        // Cols 2..=13 ("http://x.y/" + wide 例 primary at 13); the
+        // continuation (col 14) is covered by the widened primary strip.
+        let want: Vec<f32> = (2u16..=13).map(|c| f32::from(c) * 8.0).collect();
+        assert_eq!(xs, want);
+        let wide = build(&t)
+            .into_iter()
+            .find(|i| i.flags & FLAG_UNDERLINE != 0 && i.pos[0] == 13.0 * 8.0)
+            .unwrap();
+        assert_eq!(wide.size[0], 16.0);
+        t.set_link_hover(None);
+        assert_eq!(underline_xs(&build(&t)), Vec::<f32>::new());
+    }
+
+    #[test]
+    fn clearing_hover_repaints_rows_without_underline_in_dirty_build() {
+        // Partial-redraw path: after the hover clears, the damaged row is
+        // re-emitted (bg quads overpaint last frame's strip) with no
+        // underline — no ghosting under LoadOp::Load.
+        let mut t = Term::new(3, 20, 0);
+        feed(&mut t, b"\r\nhttp://a.b/c");
+        let span = t
+            .link_at(toastty_term::Pos::new(t.bottom_id() - 1, 0))
+            .unwrap()
+            .span;
+        let dirty = |t: &Term| {
+            let mut out = Vec::new();
+            super::build_dirty_instances_into(
+                &mut out,
+                t,
+                t.damage(),
+                (8.0, 16.0),
+                &Theme::default_dark(),
+                None,
+                false,
+                |_, _, _, _| None,
+                |_, _| false,
+                EdgeBleed::default(),
+            );
+            out
+        };
+        t.clear_damage();
+        t.set_link_hover(Some(span));
+        let on = dirty(&t);
+        assert_eq!(underline_xs(&on).len(), 12);
+        t.clear_damage();
+        t.set_link_hover(None);
+        let off = dirty(&t);
+        assert_eq!(underline_xs(&off), Vec::<f32>::new());
+        // Every cell of row 1 was re-emitted (bg quads at y = 16).
+        let row1_bg = off
+            .iter()
+            .filter(|i| i.pos[1] == 16.0 && i.flags & FLAG_UNDERLINE == 0)
+            .count();
+        assert!(row1_bg >= 12, "row 1 repainted, got {row1_bg}");
     }
 
     #[test]
@@ -3085,5 +3337,301 @@ mod tests {
             },
         );
         assert_eq!(keys, 0);
+    }
+
+    // ----- SGR renditions: dim / strike / overline / double underline /
+    // blink / hidden ---------------------------------------------------
+
+    /// Run the full builder with every non-space char resolving to a
+    /// 1x1 glyph slot, so glyph instances are observable.
+    fn build_sgr(t: &Term, opts: &CellRenderOpts, selected: bool) -> Vec<CellInstance> {
+        let mut out = Vec::new();
+        let (rows, _) = t.size();
+        build_instances_into_opts(
+            &mut out,
+            t,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            |_, _, _, _| Some(slot_at(0.0, false)),
+            |_, _| selected,
+            EdgeBleed::default(),
+            f32::from(rows) * 16.0,
+            opts,
+        );
+        out.pop(); // cursor
+        out
+    }
+
+    /// Same input through the partial-redraw builder (non-`all` damage).
+    fn build_sgr_dirty(t: &Term, opts: &CellRenderOpts) -> Vec<CellInstance> {
+        let mut damage = t.damage().clone();
+        damage.all = false;
+        let mut out = Vec::new();
+        build_dirty_instances_into_opts(
+            &mut out,
+            t,
+            &damage,
+            (8.0, 16.0),
+            &Theme::default_dark(),
+            None,
+            false,
+            |_, _, _, _| Some(slot_at(0.0, false)),
+            |_, _| false,
+            EdgeBleed::default(),
+            opts,
+        );
+        out
+    }
+
+    fn glyphs(v: &[CellInstance]) -> Vec<&CellInstance> {
+        v.iter().filter(|i| i.flags & FLAG_NO_GLYPH == 0).collect()
+    }
+
+    fn with_flag(v: &[CellInstance], flag: u32) -> Vec<&CellInstance> {
+        v.iter().filter(|i| i.flags & flag != 0).collect()
+    }
+
+    fn term_with(bytes: &[u8]) -> Term {
+        let mut t = Term::new(1, 8, 0);
+        feed(&mut t, bytes);
+        t
+    }
+
+    #[test]
+    fn decoration_flag_bits_are_distinct() {
+        let bits = [
+            FLAG_CURSOR,
+            FLAG_COLOR_GLYPH,
+            FLAG_NO_GLYPH,
+            FLAG_UNDERLINE,
+            FLAG_STRIKETHROUGH,
+            FLAG_OVERLINE,
+        ];
+        let mut acc = 0;
+        for b in bits {
+            assert_eq!(acc & b, 0);
+            acc |= b;
+        }
+        assert_eq!(
+            FLAG_DECORATION,
+            FLAG_UNDERLINE | FLAG_STRIKETHROUGH | FLAG_OVERLINE
+        );
+    }
+
+    #[test]
+    fn dim_glyph_is_blended_toward_background() {
+        let theme = Theme::default_dark();
+        let v = build_sgr(&term_with(b"\x1b[2mA"), &CellRenderOpts::default(), false);
+        let g = glyphs(&v);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].fg, dim_color(theme.fg, theme.bg));
+        // Undimmed reference.
+        let v = build_sgr(&term_with(b"A"), &CellRenderOpts::default(), false);
+        assert_eq!(glyphs(&v)[0].fg, theme.fg);
+        // Bold + dim is dim (bold has no colour/weight effect).
+        let v = build_sgr(&term_with(b"\x1b[1;2mA"), &CellRenderOpts::default(), false);
+        assert_eq!(glyphs(&v)[0].fg, dim_color(theme.fg, theme.bg));
+    }
+
+    #[test]
+    fn dim_with_reverse_and_selection_uses_displayed_colours() {
+        let theme = Theme::default_dark();
+        // Reverse: glyph is the theme bg, blended toward the (fg) cell bg.
+        let v = build_sgr(&term_with(b"\x1b[2;7mA"), &CellRenderOpts::default(), false);
+        assert_eq!(glyphs(&v)[0].fg, dim_color(theme.bg, theme.fg));
+        // Selected: blended toward the selection tint actually painted.
+        let v = build_sgr(&term_with(b"\x1b[2mA"), &CellRenderOpts::default(), true);
+        assert_eq!(glyphs(&v)[0].fg, dim_color(theme.fg, theme.selection_bg));
+        assert_eq!(v[0].bg, theme.selection_bg);
+        // Dim also tints decorations (they share the glyph colour).
+        let v = build_sgr(&term_with(b"\x1b[2;9mA"), &CellRenderOpts::default(), false);
+        assert_eq!(
+            with_flag(&v, FLAG_STRIKETHROUGH)[0].bg,
+            dim_color(theme.fg, theme.bg)
+        );
+    }
+
+    #[test]
+    fn strikethrough_and_overline_use_decoration_metrics() {
+        let metrics = DecorationMetrics::new(16.0, 12.0, None);
+        let opts = CellRenderOpts {
+            blink_on: true,
+            decor: Some(metrics),
+        };
+        let v = build_sgr(&term_with(b"\x1b[9;53mA"), &opts, false);
+        let strike = with_flag(&v, FLAG_STRIKETHROUGH);
+        assert_eq!(strike.len(), 1);
+        assert_eq!(strike[0].pos, [0.0, metrics.strike_y]);
+        assert_eq!(strike[0].size, [8.0, metrics.thickness]);
+        assert!(strike[0].flags & FLAG_NO_GLYPH != 0);
+        let over = with_flag(&v, FLAG_OVERLINE);
+        assert_eq!(over.len(), 1);
+        assert_eq!(over[0].pos, [0.0, 0.0]);
+        assert_eq!(with_flag(&v, FLAG_UNDERLINE).len(), 0);
+        // Decorations come after the glyph so they draw over it.
+        let gi = v.iter().position(|i| i.flags & FLAG_NO_GLYPH == 0).unwrap();
+        let si = v
+            .iter()
+            .position(|i| i.flags & FLAG_STRIKETHROUGH != 0)
+            .unwrap();
+        assert!(si > gi);
+        // Without explicit metrics the fallback geometry is used.
+        let v = build_sgr(&term_with(b"\x1b[9mA"), &CellRenderOpts::default(), false);
+        let fallback = DecorationMetrics::fallback(16.0);
+        assert_eq!(
+            with_flag(&v, FLAG_STRIKETHROUGH)[0].pos[1],
+            fallback.strike_y
+        );
+    }
+
+    #[test]
+    fn double_underline_emits_two_strips_and_single_one() {
+        let v = build_sgr(&term_with(b"\x1b[21mA"), &CellRenderOpts::default(), false);
+        let u = with_flag(&v, FLAG_UNDERLINE);
+        assert_eq!(u.len(), 2);
+        let m = DecorationMetrics::fallback(16.0);
+        assert_eq!(u[0].pos[1], m.double_underline_y[0]);
+        assert_eq!(u[1].pos[1], m.double_underline_y[1]);
+        let v = build_sgr(&term_with(b"\x1b[4:2mA"), &CellRenderOpts::default(), false);
+        assert_eq!(with_flag(&v, FLAG_UNDERLINE).len(), 2);
+        // Curly still renders as a single underline for now.
+        let v = build_sgr(&term_with(b"\x1b[4:3mA"), &CellRenderOpts::default(), false);
+        let u = with_flag(&v, FLAG_UNDERLINE);
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].size, [8.0, 2.0]);
+        assert_eq!(u[0].pos[1], 14.0);
+    }
+
+    #[test]
+    fn decorations_span_wide_clusters_and_spaces() {
+        let v = build_sgr(
+            &term_with("\x1b[9;53;21m中".as_bytes()),
+            &CellRenderOpts::default(),
+            false,
+        );
+        for i in with_flag(&v, FLAG_DECORATION) {
+            assert_eq!(
+                i.size[0], 16.0,
+                "width-2 cluster decorations span both columns"
+            );
+        }
+        assert_eq!(with_flag(&v, FLAG_DECORATION).len(), 4);
+        // Spaces get strike / overline / underline too (xterm draws the
+        // line across the whole run), but no glyph.
+        let v = build_sgr(
+            &term_with(b"\x1b[4;9;53m  "),
+            &CellRenderOpts::default(),
+            false,
+        );
+        assert_eq!(glyphs(&v).len(), 0);
+        assert_eq!(with_flag(&v, FLAG_STRIKETHROUGH).len(), 2);
+        assert_eq!(with_flag(&v, FLAG_OVERLINE).len(), 2);
+        assert_eq!(with_flag(&v, FLAG_UNDERLINE).len(), 2);
+    }
+
+    #[test]
+    fn is_blank_for_render_accounts_for_line_decorations() {
+        use toastty_term::StyleFlags;
+        let mut c = Cell::BLANK;
+        c.style.flags.set(StyleFlags::STRIKETHROUGH, true);
+        assert!(!is_blank_for_render(&c));
+        let mut c = Cell::BLANK;
+        c.style.flags.set(StyleFlags::OVERLINE, true);
+        assert!(!is_blank_for_render(&c));
+        let mut c = Cell::BLANK;
+        c.style.flags.underline = toastty_term::UnderlineStyle::Double;
+        assert!(!is_blank_for_render(&c));
+        // Dim / blink / hidden / bold / italic spaces draw nothing.
+        let mut c = Cell::BLANK;
+        c.style.flags.set(
+            StyleFlags::DIM
+                | StyleFlags::BLINK
+                | StyleFlags::HIDDEN
+                | StyleFlags::BOLD
+                | StyleFlags::ITALIC,
+            true,
+        );
+        assert!(is_blank_for_render(&c));
+    }
+
+    #[test]
+    fn hidden_cells_draw_background_only() {
+        let v = build_sgr(
+            &term_with(b"\x1b[8;4;9;53;41mA"),
+            &CellRenderOpts::default(),
+            false,
+        );
+        assert_eq!(glyphs(&v).len(), 0, "no glyph for concealed text");
+        assert!(
+            with_flag(&v, FLAG_DECORATION).is_empty(),
+            "xterm draws decorations in bg"
+        );
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].bg, Theme::default_dark().resolve_bg(TColor::Red, None));
+        // Selection still highlights concealed cells.
+        let v = build_sgr(&term_with(b"\x1b[8mA"), &CellRenderOpts::default(), true);
+        assert_eq!(v.len(), 8, "every (selected) cell paints only its bg quad");
+        assert_eq!(glyphs(&v).len(), 0);
+        assert_eq!(v[0].bg, Theme::default_dark().selection_bg);
+        // Hidden hyperlink: underline hidden too.
+        let v = build_sgr(
+            &term_with(b"\x1b]8;;https://e.x\x1b\\\x1b[8mA"),
+            &CellRenderOpts::default(),
+            false,
+        );
+        assert_eq!(with_flag(&v, FLAG_UNDERLINE).len(), 0);
+    }
+
+    #[test]
+    fn blink_off_phase_hides_glyph_and_decorations() {
+        let t = term_with(b"\x1b[5;9mA\x1b[25;9mB");
+        let on = CellRenderOpts::default();
+        let off = CellRenderOpts {
+            blink_on: false,
+            decor: None,
+        };
+        let v = build_sgr(&t, &on, false);
+        assert_eq!(glyphs(&v).len(), 2);
+        assert_eq!(with_flag(&v, FLAG_STRIKETHROUGH).len(), 2);
+        let v = build_sgr(&t, &off, false);
+        // Only the non-blinking B keeps its glyph + strike.
+        let g = glyphs(&v);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].pos[0], 8.0);
+        assert_eq!(with_flag(&v, FLAG_STRIKETHROUGH).len(), 1);
+        // Both bg quads still emitted (overpaint under LoadOp::Load).
+        assert_eq!(with_flag(&v, FLAG_NO_GLYPH).len() - 1, 2);
+    }
+
+    #[test]
+    fn dirty_builder_matches_full_builder_for_renditions() {
+        let t = term_with("\x1b[2;9;53;21;5mA中\x1b[8mx\x1b[0m".as_bytes());
+        for opts in [
+            CellRenderOpts::default(),
+            CellRenderOpts {
+                blink_on: false,
+                decor: Some(DecorationMetrics::new(16.0, 13.0, None)),
+            },
+        ] {
+            let full = build_sgr(&t, &opts, false);
+            // The dirty builder also overpaints the blank cells (cols
+            // 4..8) with bg quads; compare the written cells only.
+            let dirty: Vec<_> = build_sgr_dirty(&t, &opts)
+                .into_iter()
+                .filter(|i| i.pos[0] < 32.0)
+                .collect();
+            assert_ne!(full.len(), 0);
+            assert_eq!(full, dirty);
+        }
+    }
+
+    #[test]
+    fn row_has_blink_ignores_hidden_and_plain_cells() {
+        assert!(!row_has_blink(term_with(b"abc").row(0)));
+        assert!(row_has_blink(term_with(b"a\x1b[5mb").row(0)));
+        assert!(row_has_blink(term_with(b"a\x1b[6mb").row(0)));
+        assert!(!row_has_blink(term_with(b"a\x1b[5;8mb").row(0)));
+        assert!(!row_has_blink(term_with(b"a\x1b[5;25mb").row(0)));
     }
 }

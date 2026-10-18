@@ -12,7 +12,8 @@ Tracking list of escape sequences, modes, and extensions toastty intends to supp
 | UTF-8 | Wide chars (East Asian width), combining marks |
 | PTY | `openpty()` on Unix; ConPTY on Windows (later) |
 | terminfo entry | Ship as `toastty` (plus `xterm-256color` fallback) |
-| SGR colors | 16 / 256 / 24-bit truecolor |
+| SGR colors | 16 / 256 / 24-bit truecolor. Signalled to apps via `COLORTERM=truecolor` (plus `TERM_PROGRAM=toastty`, `TERM_PROGRAM_VERSION`) in the child env, XTGETTCAP `Tc`/`RGB`/`setrgbf`/`setrgbb`, and DECRQSS `m` read-back |
+| SGR renditions | 1 bold (no weight change yet), 2 faint (fg blended 50% toward bg in sRGB, after reverse/selection), 3 italic, 4 / `4:1` underline, 21 / `4:2` double underline (`4:3`–`4:5` stored, drawn single for now; `4:0` and 24 clear every style), 5 / 6 blink (6 = 5; 530 ms half-cycle, `[text] blink = false` draws steadily; wake-ups only while blinking cells are on screen), 7 reverse, 8 conceal (no glyph or decorations, like xterm; bg and selection still paint, copy keeps the text), 9 strikethrough (font `OS/2` strikeout position + `post` stroke thickness), 53 overline. Resets: 22 (bold + faint), 23, 24, 25, 27, 28, 29, 55, and 0 / empty (all). Decorations span both columns of wide chars and are drawn per cell, independent of ligatures. Underline colour (58/59) is still unrendered |
 | Alternate screen buffer | DECSET 1049 |
 
 ## Tier 1 — Expected by modern apps
@@ -24,7 +25,8 @@ Tracking list of escape sequences, modes, and extensions toastty intends to supp
 | Focus in/out events | DECSET 1004 | |
 | Clipboard | OSC 52 | Read + write, gated by `[security]`. Selection param: `c` clipboard, `p` PRIMARY (clipboard on macOS), `s`/empty both, `q`/`0-7` ignored; multiple chars combine, queries read the first supported one. Padded or unpadded base64; empty/invalid data clears the selection (xterm). Query replies mirror the request's BEL/ST terminator. OSC strings are capped at 8 MiB (`toastty_parser::MAX_OSC_LEN`) |
 | PRIMARY selection | X11 / Wayland | Finished mouse selections go to PRIMARY as well as the clipboard. Middle-click (when the app isn't tracking the mouse, or with Shift) and Shift+Insert paste PRIMARY; on macOS they paste the clipboard |
-| Hyperlinks | OSC 8 | |
+| Hyperlinks | OSC 8 | Ctrl+click (Cmd+click on macOS) opens the link via the system opener (`$BROWSER`, else `xdg-open` / `open`); `javascript:`, `data:`, `vbscript:`, `blob:`, `about:` and similar schemes are refused. Holding the modifier over a link shows the hand cursor. OSC 8 beats a URL detected in the same cells |
+| Plain-text URLs | (none, detected in text) | `http(s)://`, `file://`, `ftp(s)://`, `sftp://`, `ssh://`, `git://`, `mailto:` are detected in the logical (soft-wrap-joined) line, on screen or in scrollback (`toastty_protocols::url_detect`). Trailing `. , ; : ! ? ' "` are stripped, `()`/`[]` must balance (Wikipedia links, IPv6 hosts), `<…>`, quotes and Markdown `[text](url)` delimit. Holding Ctrl/Cmd underlines the hovered link and shows the hand cursor; Ctrl/Cmd+click opens it. Like OSC 8, the click opens even while an app tracks the mouse; without the modifier, clicks and selection work as before. The underline clears on modifier release, pointer move-off, scroll, focus loss or when output replaces the text |
 | Current working directory | OSC 7 | `file://` URL; lets new tabs inherit cwd |
 | Window/icon title | OSC 0 / 1 / 2 | Plus title stack (CSI 22/23) |
 | Foreground/background/cursor color | OSC 10 / 11 / 12 | Query + set |
@@ -32,6 +34,7 @@ Tracking list of escape sequences, modes, and extensions toastty intends to supp
 | Cursor shape | DECSCUSR (CSI q) | Bar / block / underline + blink |
 | REP | CSI b | Repeat preceding character |
 | Mode query | DECRQM / DECRPM | Apps probe support |
+| Setting query | DECRQSS (`DCS $ q Pt ST`) | Replies `DCS 1 $ r <value><Pt> ST` for `m` (SGR, xterm form: leading `0`, extended colours as `38:5:N` / `38:2::R:G:B`), `r` (DECSTBM), ` q` (DECSCUSR), `"p` (DECSCL, `62;1`), `t` (rows), `$\|` (columns); anything else gets `DCS 0 $ r ST`. Bodies are capped at 4 KiB |
 
 ## Tier 2 — Modern extensions (the 2024–2026 wave)
 
@@ -39,11 +42,11 @@ Tracking list of escape sequences, modes, and extensions toastty intends to supp
 | --- | --- | --- |
 | Synchronized output | DECSET 2026 (BSU/ESU) | Atomic redraws; tmux/neovim/Textual rely on it. Must-have |
 | Grapheme cluster processing | DECSET 2027 | Terminal Unicode Core; opt-in correct emoji/ZWJ width |
-| In-band resize notifications | DECSET 2048 | Stream-based resize, no SIGWINCH race |
+| In-band resize notifications | DECSET 2048 | Stream-based resize, no SIGWINCH race. Sent on window resize, font zoom, and config reloads that change the grid |
 | Kitty keyboard protocol | CSI u + progressive enhancement flags | Push/pop via `CSI > flags u` / `CSI < u`. Neovim/helix/zellij use it |
 | Semantic prompts | OSC 133 (FinalTerm) | Powers prompt jumping, command status, shell integration |
 | ConEmu progress | OSC 9;4 | Surfaced in tab/taskbar UI |
-| XTGETTCAP | DCS + q ... ST | Programmatic terminfo query |
+| XTGETTCAP | DCS + q ... ST | Programmatic terminfo query. One reply per name, in order (kitty style; xterm packs them and stops at the first unknown): `DCS 1 + r <hex> ST` for booleans (`Tc`, `RGB`), `DCS 1 + r <hex>=<hex-value> ST` for strings/numbers, `DCS 0 + r <hex> ST` for unknown names, bare `DCS 0 + r ST` for bad hex. Answers `TN`/`name` (`xterm-256color`), `Co`/`colors` (256), `Tc`, `RGB`, `setrgbf`/`setrgbb`, `Ss`/`Se`, `Sync`, `BE`/`BD`/`PS`/`PE`, `fe`/`fd`/`kxIN`/`kxOUT`, and `Ms` only when `[security] osc_52_write` is on. `Smulx`/`Setulc` are not advertised (styled/coloured underlines aren't rendered). Bodies are capped at 4 KiB |
 | Extended color query | OSC 21 | Hex-format color queries |
 | Complex script placement | OSC 66 | Kitty extension for Indic/Arabic shaping width |
 

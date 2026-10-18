@@ -30,6 +30,7 @@ mod scrollback;
 mod security;
 mod selection;
 mod shell;
+mod text;
 mod theme;
 mod window;
 mod xdg;
@@ -45,6 +46,7 @@ pub use scrollback::{ScrollbackConfig, SmoothingFunction};
 pub use security::SecurityConfig;
 pub use selection::{DEFAULT_WORD_CHARS, SelectionConfig};
 pub use shell::ShellConfig;
+pub use text::TextConfig;
 pub use theme::ThemeConfig;
 pub use window::{
     ConfirmClose, ExtendBackground, ExtendBackgroundWhen, ExtendCondition, GridAlign,
@@ -70,6 +72,7 @@ pub struct Config {
     pub window: WindowConfig,
     pub scroll_button: ScrollButtonConfig,
     pub selection: SelectionConfig,
+    pub text: TextConfig,
 }
 
 impl Default for Config {
@@ -95,6 +98,7 @@ impl Config {
             window: WindowConfig::defaults(),
             scroll_button: ScrollButtonConfig::defaults(),
             selection: SelectionConfig::defaults(),
+            text: TextConfig::defaults(),
         }
     }
 
@@ -232,6 +236,14 @@ mod tests {
         assert_eq!(cfg.selection.word_chars, "_");
         assert_eq!(cfg.cursor.shape, CursorShape::Block);
         assert_eq!(Config::defaults().selection.word_chars, DEFAULT_WORD_CHARS);
+    }
+
+    #[test]
+    fn text_blink_parses_and_defaults() {
+        assert!(Config::defaults().text.blink);
+        let cfg = Config::parse_str("[text]\nblink = false\n").unwrap();
+        assert!(!cfg.text.blink);
+        assert!(Config::parse_str("[text]\nnope = 1\n").is_err());
     }
 
     #[test]

@@ -52,19 +52,191 @@ pub enum Color {
     Rgb(u8, u8, u8),
 }
 
+/// SGR underline style (`CSI 4 m`, `CSI 21 m`, and the kitty / ITU-T
+/// T.416 colon form `CSI 4:N m`).
+///
+/// Stored as a one-byte enum rather than more bools so further styles
+/// can be added without growing [`Cell`]. The discriminants match the
+/// `4:N` sub-parameter (kitty's "styled underlines" extension,
+/// <https://sw.kovidgoyal.net/kitty/underlines/>), so `4:N` maps
+/// directly through [`UnderlineStyle::from_sgr_subparam`].
+///
+/// The renderer currently draws `Single` and `Double`; `Curly`,
+/// `Dotted` and `Dashed` are stored faithfully but drawn as a single
+/// underline until they get dedicated geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+#[repr(u8)]
+pub enum UnderlineStyle {
+    /// No underline (`CSI 24 m`, `CSI 4:0 m`).
+    #[default]
+    None = 0,
+    /// `CSI 4 m` / `CSI 4:1 m`.
+    Single = 1,
+    /// `CSI 21 m` / `CSI 4:2 m` (xterm, kitty, VTE: SGR 21 is doubly
+    /// underlined per ECMA-48, not "bold off").
+    Double = 2,
+    /// `CSI 4:3 m` (undercurl).
+    Curly = 3,
+    /// `CSI 4:4 m`.
+    Dotted = 4,
+    /// `CSI 4:5 m`.
+    Dashed = 5,
+}
+
+impl UnderlineStyle {
+    /// Decode the `N` of `CSI 4:N m`. Unknown values return `None`
+    /// (the Rust `Option`, not [`UnderlineStyle::None`]) so the caller
+    /// leaves the current underline untouched, as kitty does.
+    #[must_use]
+    pub const fn from_sgr_subparam(n: u16) -> Option<Self> {
+        Some(match n {
+            0 => Self::None,
+            1 => Self::Single,
+            2 => Self::Double,
+            3 => Self::Curly,
+            4 => Self::Dotted,
+            5 => Self::Dashed,
+            _ => return None,
+        })
+    }
+}
+
 /// Per-cell rendering attribute flags.
 ///
-/// `clippy::struct_excessive_bools` is suppressed here: these are a fixed,
-/// orthogonal four-state SGR rendition, not a state machine in disguise.
-/// The TODO above (pack `Style` into a `u32` stylesheet ID) will remove
-/// this representation entirely once SGR coverage stabilises.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[allow(clippy::struct_excessive_bools)]
+/// The on/off SGR renditions are packed into one byte (`bits`, see the
+/// `StyleFlags::BOLD` … `StyleFlags::HIDDEN` constants) and the
+/// underline is a separate [`UnderlineStyle`] byte, so the whole thing
+/// is 2 bytes. Eight separate bools plus the enum would be 9 bytes and
+/// push [`Cell`] from 20 to 28 bytes; see `cell_size_documented`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct StyleFlags {
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-    pub reverse: bool,
+    bits: u8,
+    /// Underline style (SGR 4 / 4:N / 21 / 24).
+    pub underline: UnderlineStyle,
+}
+
+impl StyleFlags {
+    /// SGR 1. Cleared by SGR 22.
+    pub const BOLD: u8 = 1 << 0;
+    /// SGR 2 (faint). Cleared by SGR 22, which also clears bold.
+    pub const DIM: u8 = 1 << 1;
+    /// SGR 3. Cleared by SGR 23.
+    pub const ITALIC: u8 = 1 << 2;
+    /// SGR 5 (slow) and SGR 6 (rapid, treated as slow). Cleared by 25.
+    pub const BLINK: u8 = 1 << 3;
+    /// SGR 7. Cleared by SGR 27.
+    pub const REVERSE: u8 = 1 << 4;
+    /// SGR 8 (conceal). Cleared by SGR 28.
+    pub const HIDDEN: u8 = 1 << 5;
+    /// SGR 9 (crossed-out). Cleared by SGR 29.
+    pub const STRIKETHROUGH: u8 = 1 << 6;
+    /// SGR 53. Cleared by SGR 55.
+    pub const OVERLINE: u8 = 1 << 7;
+
+    /// No attributes, no underline. Same as `Default`.
+    pub const EMPTY: Self = Self {
+        bits: 0,
+        underline: UnderlineStyle::None,
+    };
+
+    /// True iff every bit in `mask` is set.
+    #[inline]
+    #[must_use]
+    pub const fn contains(self, mask: u8) -> bool {
+        self.bits & mask == mask
+    }
+
+    /// Set or clear every bit in `mask`.
+    #[inline]
+    pub fn set(&mut self, mask: u8, on: bool) {
+        if on {
+            self.bits |= mask;
+        } else {
+            self.bits &= !mask;
+        }
+    }
+
+    /// Builder form of [`StyleFlags::set`] (`on = true`).
+    #[inline]
+    #[must_use]
+    pub const fn with(self, mask: u8) -> Self {
+        Self {
+            bits: self.bits | mask,
+            underline: self.underline,
+        }
+    }
+
+    /// Builder: replace the underline style.
+    #[inline]
+    #[must_use]
+    pub const fn with_underline(self, underline: UnderlineStyle) -> Self {
+        Self {
+            bits: self.bits,
+            underline,
+        }
+    }
+
+    /// Raw attribute bits (the `StyleFlags::BOLD` … constants OR-ed).
+    #[inline]
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.bits
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn bold(self) -> bool {
+        self.contains(Self::BOLD)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn dim(self) -> bool {
+        self.contains(Self::DIM)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn italic(self) -> bool {
+        self.contains(Self::ITALIC)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn blink(self) -> bool {
+        self.contains(Self::BLINK)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn reverse(self) -> bool {
+        self.contains(Self::REVERSE)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn hidden(self) -> bool {
+        self.contains(Self::HIDDEN)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn strikethrough(self) -> bool {
+        self.contains(Self::STRIKETHROUGH)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn overline(self) -> bool {
+        self.contains(Self::OVERLINE)
+    }
+
+    /// True for any underline style other than [`UnderlineStyle::None`].
+    #[inline]
+    #[must_use]
+    pub const fn has_underline(self) -> bool {
+        !matches!(self.underline, UnderlineStyle::None)
+    }
 }
 
 /// SGR rendition state currently in effect.
@@ -80,12 +252,7 @@ impl Style {
     pub const RESET: Self = Self {
         fg: Color::Default,
         bg: Color::Default,
-        flags: StyleFlags {
-            bold: false,
-            italic: false,
-            underline: false,
-            reverse: false,
-        },
+        flags: StyleFlags::EMPTY,
     };
 }
 
@@ -156,10 +323,9 @@ mod tests {
         let s = Style::RESET;
         assert_eq!(s.fg, Color::Default);
         assert_eq!(s.bg, Color::Default);
-        assert!(!s.flags.bold);
-        assert!(!s.flags.italic);
-        assert!(!s.flags.underline);
-        assert!(!s.flags.reverse);
+        assert_eq!(s.flags, StyleFlags::EMPTY);
+        assert_eq!(s.flags.bits(), 0);
+        assert!(!s.flags.has_underline());
     }
 
     #[test]
@@ -194,14 +360,94 @@ mod tests {
 
     #[test]
     fn style_flags_are_copy_and_eq() {
-        let a = StyleFlags {
-            bold: true,
-            italic: false,
-            underline: true,
-            reverse: false,
-        };
+        let a = StyleFlags::EMPTY
+            .with(StyleFlags::BOLD)
+            .with_underline(UnderlineStyle::Single);
         let b = a;
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn style_flag_bits_are_distinct_and_cover_a_byte() {
+        let all = [
+            StyleFlags::BOLD,
+            StyleFlags::DIM,
+            StyleFlags::ITALIC,
+            StyleFlags::BLINK,
+            StyleFlags::REVERSE,
+            StyleFlags::HIDDEN,
+            StyleFlags::STRIKETHROUGH,
+            StyleFlags::OVERLINE,
+        ];
+        let mut acc = 0u8;
+        for b in all {
+            assert_eq!(b.count_ones(), 1);
+            assert_eq!(acc & b, 0, "bit {b:#x} reused");
+            acc |= b;
+        }
+        assert_eq!(acc, 0xFF);
+    }
+
+    #[test]
+    fn style_flag_getters_and_set() {
+        type Getter = (u8, fn(StyleFlags) -> bool);
+        let mut f = StyleFlags::default();
+        let getters: [Getter; 8] = [
+            (StyleFlags::BOLD, StyleFlags::bold),
+            (StyleFlags::DIM, StyleFlags::dim),
+            (StyleFlags::ITALIC, StyleFlags::italic),
+            (StyleFlags::BLINK, StyleFlags::blink),
+            (StyleFlags::REVERSE, StyleFlags::reverse),
+            (StyleFlags::HIDDEN, StyleFlags::hidden),
+            (StyleFlags::STRIKETHROUGH, StyleFlags::strikethrough),
+            (StyleFlags::OVERLINE, StyleFlags::overline),
+        ];
+        for (bit, get) in getters {
+            assert!(!get(f));
+            f.set(bit, true);
+            assert!(get(f));
+            assert!(f.contains(bit));
+            assert_eq!(f.bits(), bit);
+            f.set(bit, false);
+            assert!(!get(f));
+            assert_eq!(f, StyleFlags::EMPTY);
+        }
+        // Multi-bit masks set and clear together (SGR 22 uses this).
+        f.set(StyleFlags::BOLD | StyleFlags::DIM, true);
+        assert!(f.bold() && f.dim());
+        assert!(!f.contains(StyleFlags::BOLD | StyleFlags::ITALIC));
+        f.set(StyleFlags::BOLD | StyleFlags::DIM, false);
+        assert_eq!(f, StyleFlags::EMPTY);
+    }
+
+    #[test]
+    fn underline_style_subparams() {
+        use UnderlineStyle as U;
+        let want = [
+            U::None,
+            U::Single,
+            U::Double,
+            U::Curly,
+            U::Dotted,
+            U::Dashed,
+        ];
+        for (n, u) in want.into_iter().enumerate() {
+            assert_eq!(U::from_sgr_subparam(n as u16), Some(u));
+            assert_eq!(u as u8, n as u8, "discriminant matches 4:N");
+        }
+        assert_eq!(U::from_sgr_subparam(6), None);
+        assert_eq!(U::from_sgr_subparam(u16::MAX), None);
+        assert!(!StyleFlags::EMPTY.has_underline());
+        for u in [U::Single, U::Double, U::Curly, U::Dotted, U::Dashed] {
+            assert!(StyleFlags::EMPTY.with_underline(u).has_underline());
+        }
+    }
+
+    #[test]
+    fn style_flags_pack_into_two_bytes() {
+        assert_eq!(std::mem::size_of::<UnderlineStyle>(), 1);
+        assert_eq!(std::mem::size_of::<StyleFlags>(), 2);
+        assert_eq!(std::mem::size_of::<Style>(), 10);
     }
 
     /// M10.5: `Option<HyperlinkId>` must niche-pack to 2 bytes — the
@@ -219,14 +465,17 @@ mod tests {
     /// bloat.
     #[test]
     fn cell_size_documented() {
-        // ch (4) + style (12) + hyperlink_id (2) + extra (2) +
-        // is_continuation (1), padded to 4-byte alignment = 24. The
-        // grapheme `extra` id took one spare padding byte plus one new
-        // byte (20 → 24); multi-codepoint text lives in the per-Term
-        // intern table so the common single-codepoint cell stays small.
+        // ch (4) + style (10: fg 4 + bg 4 + flags 2) + hyperlink_id (2)
+        // + extra (2) + is_continuation (1), padded to 4-byte alignment
+        // = 20. Before the SGR-attrs work `StyleFlags` was four bools
+        // (style = 12) and the cell was 24; packing the renditions into
+        // a bit byte + an underline-style byte made room for dim,
+        // blink, hidden, strike, overline and underline styles while
+        // shrinking the cell. Multi-codepoint text lives in the
+        // per-Term intern table so the common cell stays small.
         let s = std::mem::size_of::<Cell>();
         assert!(
-            s <= 24,
+            s <= 20,
             "Cell grew to {s} bytes — please check the layout (decision #6)"
         );
     }

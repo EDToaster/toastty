@@ -9,12 +9,15 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod child_env;
 pub mod cli;
 pub mod clipboard;
 pub mod config_watcher;
 pub mod focus;
+pub mod font_zoom;
 pub mod geometry;
 pub mod keyboard;
+pub mod links;
 pub mod mouse;
 pub mod paste;
 pub mod pty_log;

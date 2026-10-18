@@ -18,6 +18,7 @@ use wgpu::{Device, Extent3d, Queue, Texture, TextureFormat};
 
 use crate::text::atlas::{Atlas, AtlasLayer, AtlasSlot, GlyphKey};
 use crate::text::cluster_width::{GlyphPos, snap_cluster_widths_per_cluster};
+use crate::text::decoration::{DecorationMetrics, FontLineMetrics};
 use crate::text::instance::GlyphSlot;
 use crate::text::presentation;
 
@@ -238,6 +239,9 @@ pub struct GlyphRasterizer {
     /// baseline keeps every cell on the same grid baseline. See the
     /// `glyph_offset_is_independent_of_line_content` regression test.
     baseline_y: f32,
+    /// Strikethrough / overline / double-underline geometry derived from
+    /// the primary face's line metrics (see [`measure_decorations`]).
+    decoration_metrics: DecorationMetrics,
     /// Configured font family, kept around for `Attrs`.
     family_name: String,
     /// Per-character glyph cache. Keyed on `char` alone, which is **only
@@ -360,6 +364,8 @@ impl GlyphRasterizer {
         // vertical placement (see [`Self::baseline_y`]).
         let (cell_w, cell_h, baseline_y) = measure_cell(&mut font_system, metrics, font_name);
         let cell_size = (cell_w, cell_h);
+        let decoration_metrics =
+            measure_decorations(&mut font_system, metrics, font_name, cell_h, baseline_y);
 
         // Pre-allocate the per-line buffer.
         let mut buffer = Buffer::new(&mut font_system, metrics);
@@ -410,6 +416,7 @@ impl GlyphRasterizer {
             metrics,
             cell_size,
             baseline_y,
+            decoration_metrics,
             family_name,
             char_cache: HashMap::new(),
             char_cache_misses: std::collections::HashSet::new(),
@@ -420,6 +427,43 @@ impl GlyphRasterizer {
             vs16_color_override: HashMap::new(),
             requested_family_available,
         }
+    }
+
+    /// Re-target the rasterizer at a new pixel size in place (runtime font
+    /// zoom, DPI change), keeping the loaded font database.
+    ///
+    /// [`Self::new`] calls `FontSystem::new()`, which enumerates and parses
+    /// every system font; doing that on every zoom keypress would cost tens
+    /// of milliseconds and churn the allocator. Everything that depends on
+    /// the size is rebuilt: metrics, cell size and baseline (re-measured
+    /// exactly as `new` does, so the result is identical to a fresh
+    /// rasterizer), the shaping buffers, the swash bitmap cache (keyed per
+    /// size, so it would otherwise grow with every distinct size visited),
+    /// the atlas packers, placements and the per-char slot cache. The
+    /// atlas textures are reused: a fresh packer re-uploads every glyph it
+    /// hands out, and sampling never reads outside a glyph's own rect.
+    ///
+    /// Size-independent caches survive: standalone glyph ids, the
+    /// ligature-uncacheable and no-glyph sets and the presentation/VS16
+    /// family overrides only depend on the font's cmap/GSUB, not on size.
+    pub fn set_font_size(&mut self, font_size: f32, line_height_ratio: f32) {
+        let line_height_px = (font_size * line_height_ratio).round().max(1.0);
+        let metrics = Metrics::new(font_size, line_height_px);
+        let family = self.family_name.clone();
+        let (cell_w, cell_h, baseline_y) =
+            measure_cell(&mut self.font_system, metrics, Some(family.as_str()));
+        for buf in [&mut self.buffer, &mut self.isolation_buffer] {
+            *buf = Buffer::new(&mut self.font_system, metrics);
+            buf.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
+            buf.set_monospace_width(Some(cell_w));
+        }
+        self.metrics = metrics;
+        self.cell_size = (cell_w, cell_h);
+        self.baseline_y = baseline_y;
+        self.swash_cache = SwashCache::new();
+        self.atlas = Atlas::new(ATLAS_W, ATLAS_H);
+        self.placements.clear();
+        self.char_cache.clear();
     }
 
     /// Glyph id this char would produce shaped alone, with no
@@ -665,6 +709,13 @@ impl GlyphRasterizer {
     /// Cell size in pixels (width, height).
     pub fn cell_size(&self) -> (f32, f32) {
         self.cell_size
+    }
+
+    /// Font-derived geometry for SGR strikethrough, overline and double
+    /// underline at the current size.
+    #[must_use]
+    pub fn decoration_metrics(&self) -> DecorationMetrics {
+        self.decoration_metrics
     }
 
     /// Atlas dimensions per layer (same for both).
@@ -1133,6 +1184,40 @@ fn make_glyph_slot(slot: AtlasSlot, placement: GlyphPlacement) -> GlyphSlot {
     }
 }
 
+/// Read the primary face's strikeout position and stroke thickness
+/// (`OS/2.yStrikeoutPosition`, `post.underlineThickness`, via swash)
+/// and turn them into per-cell [`DecorationMetrics`]. The face is the
+/// one cosmic-text picks for "M", i.e. the same face [`measure_cell`]
+/// measured. Falls back to fraction-of-cell geometry if no face shapes.
+fn measure_decorations(
+    font_system: &mut FontSystem,
+    metrics: Metrics,
+    family: Option<&str>,
+    cell_h: f32,
+    baseline_y: f32,
+) -> DecorationMetrics {
+    let mut probe = Buffer::new(font_system, metrics);
+    probe.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
+    let attrs = Attrs::new().family(Family::Name(family.unwrap_or("monospace")));
+    probe.set_text("M", &attrs, Shaping::Advanced, None);
+    probe.shape_until_scroll(font_system, false);
+    let face = probe
+        .layout_runs()
+        .flat_map(|run| run.glyphs.iter())
+        .map(|g| (g.font_id, g.font_weight))
+        .next();
+    let line = face
+        .and_then(|(id, weight)| font_system.get_font(id, weight))
+        .map(|font| {
+            let m = font.as_swash().metrics(&[]).scale(metrics.font_size);
+            FontLineMetrics {
+                strikeout_offset: m.strikeout_offset,
+                stroke_size: m.stroke_size,
+            }
+        });
+    DecorationMetrics::new(cell_h, baseline_y, line)
+}
+
 /// Probe the primary font's reference glyph "M" to derive the cell
 /// geometry. Returns `(cell_w, cell_h, baseline_y)`.
 ///
@@ -1436,6 +1521,65 @@ mod tests {
             (h - 19.0).abs() < 1e-6,
             "16px × 1.20 line height should snap to 19, got {h}",
         );
+    }
+
+    /// Font zoom: re-sizing in place must give exactly the metrics and
+    /// glyphs a freshly built rasterizer at that size would, drop every
+    /// size-dependent cache (so no slot from the old size is served),
+    /// and survive many round trips without the atlas filling up.
+    #[test]
+    fn set_font_size_matches_fresh_rasterizer() {
+        let (device, queue, mut rasterizer) = make_rasterizer();
+        let line16 = rasterizer.shape_line(&queue, "Hello", false);
+        let a16 = line16.get(0, 'H').expect("H shaped at 16px");
+        assert!(!rasterizer.char_cache.is_empty());
+
+        for size in [24.0_f32, 9.0, 72.0, 6.0] {
+            rasterizer.set_font_size(size, DEFAULT_LINE_HEIGHT_RATIO);
+            assert!(
+                rasterizer.char_cache.is_empty(),
+                "char cache kept at {size}"
+            );
+            assert!(
+                rasterizer.placements.is_empty(),
+                "placements kept at {size}"
+            );
+            let fresh = make_rasterizer_sized(&device, size);
+            assert_eq!(rasterizer.cell_size(), fresh.cell_size(), "cell at {size}");
+            assert!((rasterizer.baseline_y - fresh.baseline_y).abs() < 1e-6);
+            assert!((rasterizer.metrics.font_size - size).abs() < 1e-6);
+        }
+
+        rasterizer.set_font_size(24.0, DEFAULT_LINE_HEIGHT_RATIO);
+        let line24 = rasterizer.shape_line(&queue, "Hello", false);
+        let a24 = line24.get(0, 'H').expect("H shaped at 24px");
+        assert!(
+            a24.glyph_size[1] > a16.glyph_size[1],
+            "24px glyph {:?} should be taller than 16px glyph {:?}",
+            a24.glyph_size,
+            a16.glyph_size,
+        );
+        let mut fresh = make_rasterizer_sized(&device, 24.0);
+        let fresh24 = fresh.shape_line(&queue, "Hello", false);
+        let f = fresh24.get(0, 'H').expect("H shaped fresh");
+        assert_eq!(a24.glyph_size, f.glyph_size);
+        assert_eq!(a24.glyph_offset, f.glyph_offset);
+
+        // Back to 16: identical to the original glyph again.
+        rasterizer.set_font_size(16.0, DEFAULT_LINE_HEIGHT_RATIO);
+        let again = rasterizer.shape_line(&queue, "Hello", false);
+        let b16 = again.get(0, 'H').expect("H reshaped at 16px");
+        assert_eq!(a16.glyph_size, b16.glyph_size);
+        assert_eq!(a16.glyph_offset, b16.glyph_offset);
+
+        // Many zooms: the atlas restarts each time, so it never fills.
+        for i in 0..100 {
+            #[allow(clippy::cast_precision_loss)]
+            let size = 10.0 + (i % 30) as f32;
+            rasterizer.set_font_size(size, DEFAULT_LINE_HEIGHT_RATIO);
+            let lg = rasterizer.shape_line(&queue, "The quick brown fox", false);
+            assert!(lg.get(0, 'T').is_some(), "shaping failed at {size}");
+        }
     }
 
     /// Wide / zero-width characters must not enter `char_cache`: their

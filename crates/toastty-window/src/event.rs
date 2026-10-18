@@ -169,6 +169,13 @@ pub enum Event {
         position: (f64, f64),
         modifiers: Modifiers,
     },
+    /// The keyboard modifier state changed (winit `ModifiersChanged`).
+    /// Lets the app react to a bare modifier press or release with no
+    /// key or pointer event attached — e.g. the Ctrl/Cmd link-hover
+    /// underline appearing and disappearing.
+    ModifiersChanged(Modifiers),
+    /// The pointer left the window (winit `CursorLeft`).
+    PointerLeft,
     /// Scroll wheel / trackpad scroll. `kind` distinguishes a discrete
     /// notch (`Lines`) from a continuous pixel stream (`Pixels`, the
     /// usual macOS trackpad path including inertial momentum frames).

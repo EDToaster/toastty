@@ -57,3 +57,6 @@ position = "bottom-right"
 
 [selection]
 word_chars = "_-./~:?&=%+#@"
+
+[text]
+blink = true

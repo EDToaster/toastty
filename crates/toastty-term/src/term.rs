@@ -9,9 +9,10 @@ use std::time::Instant;
 use toastty_protocols::unicode_core::cluster_cell_width;
 use unicode_width::UnicodeWidthChar;
 
-use crate::cell::{Cell, Color, Style};
+use crate::cell::{Cell, Color, Style, StyleFlags, UnderlineStyle};
 use crate::cursor::Cursor;
 use crate::damage::Damage;
+use crate::dcs_query::{DcsQuery, DcsQueryKind, QueryState};
 use crate::extra::{CellExtra, ExtraTable, MAX_GRAPHEME_EXTRA_BYTES};
 use crate::grid::Grid;
 use toastty_config::CursorShape;
@@ -281,6 +282,9 @@ pub struct Term {
     /// raw body bytes accumulated between `hook` (final byte `q`) and
     /// `unhook`. `None` outside a sixel DCS.
     sixel_pending: Option<SixelDcs>,
+    /// In-progress XTGETTCAP / DECRQSS query body (bounded). `None`
+    /// outside such a DCS. See [`crate::dcs_query`].
+    dcs_query: Option<DcsQuery>,
     /// DECSDM (mode 80) state. Per current xterm semantics, SET = "sixel
     /// display mode" (image is anchored, screen does NOT scroll to make
     /// room); RESET = sixel scrolling (the default, image viewers expect
@@ -372,6 +376,11 @@ pub struct Term {
     /// released), keyed by line id. `None` while a drag is in progress
     /// or when there's no selection. See [`Term::commit_selection`].
     selection_snapshot: Option<Vec<(u64, u64)>>,
+    /// Link span under the pointer while the open-link modifier is held
+    /// (underlined by the renderer). Display state owned by the binary;
+    /// dropped with the selection on resize / RIS / screen switch. See
+    /// [`crate::link`].
+    pub(crate) link_hover: Option<crate::link::LinkSpan>,
     /// DECSTBM top/bottom margins (0-indexed, inclusive). Default spans
     /// the full visible region: `(0, rows - 1)`. `CSI Ps;Ps r` updates
     /// these; resize and RIS reset to the full region. Only LF / RI /
@@ -548,6 +557,7 @@ impl Term {
             image_handler: KittyHandler::new(),
             sixel_handler: SixelHandler::default(),
             sixel_pending: None,
+            dcs_query: None,
             sixel_display_mode: false,
             sixel_cursor_right: false,
             // m7: default 320 MiB image cache cap (kitty spec recommends
@@ -571,6 +581,7 @@ impl Term {
             rgp_scene: RgpScene::new(),
             selection: None,
             selection_snapshot: None,
+            link_hover: None,
             scroll_top: 0,
             scroll_bot: rows - 1,
             modify_other_keys: 0,
@@ -1493,6 +1504,7 @@ impl Term {
     fn drop_selection(&mut self) {
         self.selection = None;
         self.selection_snapshot = None;
+        self.link_hover = None;
     }
 
     /// True iff `(line_id, col)` is currently selected. Cheap — a
@@ -1530,6 +1542,13 @@ impl Term {
     /// across thousands of scrollback rows stays cheap.
     fn dirty_selection_rows(&mut self, sel: Option<crate::selection::Selection>) {
         let Some(sel) = sel else { return };
+        self.dirty_line_ids(sel.rows_touched());
+    }
+
+    /// Mark every on-screen row whose line id falls in `ids` fully dirty.
+    /// Walks only the visible rows, so a range spanning thousands of
+    /// scrollback lines stays cheap.
+    pub(crate) fn dirty_line_ids(&mut self, ids: std::ops::RangeInclusive<u64>) {
         let cols = self.cols;
         let rows = self.rows;
         let scroll = u64::from(self.viewport.current_lines);
@@ -1542,7 +1561,7 @@ impl Term {
             let Some(line_id) = bottom.checked_sub(above_bottom) else {
                 continue;
             };
-            if sel.rows_touched().contains(&line_id) {
+            if ids.contains(&line_id) {
                 self.mark_cells(vr, 0, cols);
             }
         }
@@ -2792,6 +2811,20 @@ impl Term {
         }
     }
 
+    /// Snapshot of the state XTGETTCAP / DECRQSS report on.
+    fn query_state(&self) -> QueryState {
+        QueryState {
+            style: self.cursor.style,
+            scroll_top: self.scroll_top,
+            scroll_bot: self.scroll_bot,
+            cursor_shape: self.cursor_shape,
+            cursor_blink: self.cursor_blink,
+            rows: self.rows,
+            cols: self.cols,
+            osc52_write: self.security.osc_52_write,
+        }
+    }
+
     /// Apply DECSCUSR (`CSI Ps SP q`). Mapping per xterm:
     ///
     /// | Ps     | Shape     | Blink |
@@ -3254,6 +3287,16 @@ impl Term {
                     self.cursor_underline_color = None;
                     self.apply_sgr_param(0);
                 }
+                // Colon-form underline style `CSI 4:N m` (kitty / VTE
+                // styled underlines, ITU-T T.416 sub-parameter syntax).
+                // 4:0 = none, 4:1 single, 4:2 double, 4:3 curly,
+                // 4:4 dotted, 4:5 dashed. Unknown N leaves the current
+                // underline unchanged rather than falling back to SGR 4.
+                4 if slice.len() >= 2 => {
+                    if let Some(u) = UnderlineStyle::from_sgr_subparam(slice[1]) {
+                        self.cursor.style.flags.underline = u;
+                    }
+                }
                 v => self.apply_sgr_param(v),
             }
         }
@@ -3261,16 +3304,34 @@ impl Term {
 
     fn apply_sgr_param(&mut self, v: u16) {
         let style = &mut self.cursor.style;
+        let flags = &mut style.flags;
         match v {
             0 => *style = Style::RESET,
-            1 => style.flags.bold = true,
-            3 => style.flags.italic = true,
-            4 => style.flags.underline = true,
-            7 => style.flags.reverse = true,
-            22 => style.flags.bold = false,
-            23 => style.flags.italic = false,
-            24 => style.flags.underline = false,
-            27 => style.flags.reverse = false,
+            1 => flags.set(StyleFlags::BOLD, true),
+            2 => flags.set(StyleFlags::DIM, true),
+            3 => flags.set(StyleFlags::ITALIC, true),
+            4 => flags.underline = UnderlineStyle::Single,
+            // SGR 6 (rapid blink) is treated as SGR 5, like xterm,
+            // kitty and VTE: one blink cadence only.
+            5 | 6 => flags.set(StyleFlags::BLINK, true),
+            7 => flags.set(StyleFlags::REVERSE, true),
+            8 => flags.set(StyleFlags::HIDDEN, true),
+            9 => flags.set(StyleFlags::STRIKETHROUGH, true),
+            // ECMA-48 SGR 21 = doubly underlined (xterm, kitty, VTE,
+            // foot). The old Linux-console "bold off" meaning is not
+            // honoured; 22 is the portable way to clear bold.
+            21 => flags.underline = UnderlineStyle::Double,
+            // SGR 22 = "normal intensity": clears both bold and faint.
+            22 => flags.set(StyleFlags::BOLD | StyleFlags::DIM, false),
+            23 => flags.set(StyleFlags::ITALIC, false),
+            // 24 clears every underline style (single/double/curly/...).
+            24 => flags.underline = UnderlineStyle::None,
+            25 => flags.set(StyleFlags::BLINK, false),
+            27 => flags.set(StyleFlags::REVERSE, false),
+            28 => flags.set(StyleFlags::HIDDEN, false),
+            29 => flags.set(StyleFlags::STRIKETHROUGH, false),
+            53 => flags.set(StyleFlags::OVERLINE, true),
+            55 => flags.set(StyleFlags::OVERLINE, false),
             30..=37 => style.fg = ansi_color(v - 30, false),
             39 => style.fg = Color::Default,
             40..=47 => style.bg = ansi_color(v - 40, false),
@@ -4078,6 +4139,10 @@ impl Perform for Term {
         // Sixel = final byte `q` with NO intermediates. DECRQSS is `$q`
         // and other DCS queries carry intermediates — exclude them so we
         // don't capture a non-sixel DCS as a sixel body.
+        // A fresh DCS always replaces any query left over from an
+        // aborted one (vte calls `unhook` on CAN/SUB/ESC, so this is
+        // belt and braces).
+        self.dcs_query = DcsQueryKind::from_hook(intermediates, action).map(DcsQuery::new);
         if action == 'q' && intermediates.is_empty() {
             let mut it = params.iter();
             let mut next = || it.next().and_then(|sub| sub.first().copied());
@@ -4096,6 +4161,10 @@ impl Perform for Term {
         // more than any sane image; overflow leaves a truncated buffer
         // that fails decode cleanly in `unhook`.
         const SIXEL_BODY_CAP: usize = 64 * 1024 * 1024;
+        if let Some(q) = &mut self.dcs_query {
+            q.push(byte);
+            return;
+        }
         if let Some(s) = &mut self.sixel_pending
             && s.buf.len() < SIXEL_BODY_CAP
         {
@@ -4104,6 +4173,11 @@ impl Perform for Term {
     }
 
     fn unhook(&mut self) {
+        if let Some(q) = self.dcs_query.take() {
+            let reply = q.reply(&self.query_state());
+            self.pty_replies.extend_from_slice(&reply);
+            return;
+        }
         let Some(dcs) = self.sixel_pending.take() else {
             return;
         };
@@ -5199,15 +5273,15 @@ mod tests {
         let s = t.row(0).cells[0].style;
         assert_eq!(s.fg, Color::Red);
         assert_eq!(s.bg, Color::Blue);
-        assert!(s.flags.bold);
-        assert!(s.flags.italic);
+        assert!(s.flags.bold());
+        assert!(s.flags.italic());
     }
 
     #[test]
     fn sgr_reset_clears_everything() {
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[1;31mA\x1b[0mB");
-        assert!(t.row(0).cells[0].style.flags.bold);
+        assert!(t.row(0).cells[0].style.flags.bold());
         assert_eq!(t.row(0).cells[1].style, Style::RESET);
     }
 
@@ -5225,15 +5299,184 @@ mod tests {
         let a = t.row(0).cells[0].style.flags;
         assert_eq!(
             a,
-            StyleFlags {
-                bold: true,
-                italic: true,
-                underline: true,
-                reverse: true
-            }
+            StyleFlags::EMPTY
+                .with(StyleFlags::BOLD | StyleFlags::ITALIC | StyleFlags::REVERSE)
+                .with_underline(UnderlineStyle::Single)
         );
         let b = t.row(0).cells[1].style.flags;
         assert_eq!(b, StyleFlags::default());
+    }
+
+    /// Flags of the cell at column `col` after feeding `bytes` into a
+    /// fresh 1x16 term.
+    fn sgr_flags_after(bytes: &[u8], col: usize) -> StyleFlags {
+        let mut t = Term::new(1, 16, 0);
+        feed(&mut t, bytes);
+        t.row(0).cells[col].style.flags
+    }
+
+    #[test]
+    fn sgr_each_new_attribute_sets_its_bit() {
+        let cases: [(&[u8], u8); 7] = [
+            (b"\x1b[2mx", StyleFlags::DIM),
+            (b"\x1b[5mx", StyleFlags::BLINK),
+            (b"\x1b[6mx", StyleFlags::BLINK),
+            (b"\x1b[8mx", StyleFlags::HIDDEN),
+            (b"\x1b[9mx", StyleFlags::STRIKETHROUGH),
+            (b"\x1b[53mx", StyleFlags::OVERLINE),
+            (b"\x1b[1mx", StyleFlags::BOLD),
+        ];
+        for (seq, bit) in cases {
+            let f = sgr_flags_after(seq, 0);
+            assert_eq!(f.bits(), bit, "{:?}", String::from_utf8_lossy(seq));
+            assert_eq!(f.underline, UnderlineStyle::None);
+        }
+    }
+
+    #[test]
+    fn sgr_rapid_blink_is_same_as_slow_blink() {
+        assert_eq!(
+            sgr_flags_after(b"\x1b[6mx", 0),
+            sgr_flags_after(b"\x1b[5mx", 0)
+        );
+    }
+
+    #[test]
+    fn sgr_combined_params_bold_dim_strike_overline() {
+        let f = sgr_flags_after(b"\x1b[1;2;9;53mx", 0);
+        assert!(f.bold() && f.dim() && f.strikethrough() && f.overline());
+        assert!(!f.italic() && !f.blink() && !f.hidden() && !f.reverse());
+        assert!(!f.has_underline());
+    }
+
+    #[test]
+    fn sgr_22_clears_both_bold_and_dim_only() {
+        let f = sgr_flags_after(b"\x1b[1;2;3;9mA\x1b[22mB", 1);
+        assert!(!f.bold() && !f.dim());
+        assert!(f.italic() && f.strikethrough(), "22 must not touch others");
+        // Dim alone is also cleared by 22.
+        assert!(!sgr_flags_after(b"\x1b[2mA\x1b[22mB", 1).dim());
+    }
+
+    #[test]
+    fn sgr_individual_resets_clear_only_their_attribute() {
+        let all = b"\x1b[1;2;3;4;5;7;8;9;53m";
+        let cases: [(&[u8], u8); 6] = [
+            (b"\x1b[23mx", StyleFlags::ITALIC),
+            (b"\x1b[25mx", StyleFlags::BLINK),
+            (b"\x1b[27mx", StyleFlags::REVERSE),
+            (b"\x1b[28mx", StyleFlags::HIDDEN),
+            (b"\x1b[29mx", StyleFlags::STRIKETHROUGH),
+            (b"\x1b[55mx", StyleFlags::OVERLINE),
+        ];
+        for (reset, bit) in cases {
+            let mut seq = all.to_vec();
+            seq.extend_from_slice(reset);
+            let f = sgr_flags_after(&seq, 0);
+            assert_eq!(f.bits(), !bit, "{:?}", String::from_utf8_lossy(reset));
+            assert_eq!(f.underline, UnderlineStyle::Single, "underline survives");
+        }
+    }
+
+    #[test]
+    fn sgr_21_and_colon_4_2_are_double_underline() {
+        assert_eq!(
+            sgr_flags_after(b"\x1b[21mx", 0).underline,
+            UnderlineStyle::Double
+        );
+        assert_eq!(
+            sgr_flags_after(b"\x1b[4:2mx", 0).underline,
+            UnderlineStyle::Double
+        );
+        // The semicolon form `4;2` is SGR 4 + SGR 2 (single + dim), not
+        // a double underline.
+        let f = sgr_flags_after(b"\x1b[4;2mx", 0);
+        assert_eq!(f.underline, UnderlineStyle::Single);
+        assert!(f.dim());
+    }
+
+    #[test]
+    fn sgr_colon_underline_styles() {
+        let cases = [
+            (&b"\x1b[4:0mx"[..], UnderlineStyle::None),
+            (b"\x1b[4:1mx", UnderlineStyle::Single),
+            (b"\x1b[4:2mx", UnderlineStyle::Double),
+            (b"\x1b[4:3mx", UnderlineStyle::Curly),
+            (b"\x1b[4:4mx", UnderlineStyle::Dotted),
+            (b"\x1b[4:5mx", UnderlineStyle::Dashed),
+        ];
+        for (seq, want) in cases {
+            assert_eq!(sgr_flags_after(seq, 0).underline, want);
+        }
+        // 4:0 turns an existing underline off.
+        assert_eq!(
+            sgr_flags_after(b"\x1b[21mA\x1b[4:0mB", 1).underline,
+            UnderlineStyle::None
+        );
+        // Unknown style leaves the current underline untouched.
+        assert_eq!(
+            sgr_flags_after(b"\x1b[21mA\x1b[4:9mB", 1).underline,
+            UnderlineStyle::Double
+        );
+        assert_eq!(
+            sgr_flags_after(b"\x1b[4:9mx", 0).underline,
+            UnderlineStyle::None
+        );
+        // Colon sub-params mixed with ordinary params in one sequence.
+        let f = sgr_flags_after(b"\x1b[1;4:3;9mx", 0);
+        assert!(f.bold() && f.strikethrough());
+        assert_eq!(f.underline, UnderlineStyle::Curly);
+        // Plain 4 after a styled underline goes back to single.
+        assert_eq!(
+            sgr_flags_after(b"\x1b[4:3mA\x1b[4mB", 1).underline,
+            UnderlineStyle::Single
+        );
+    }
+
+    #[test]
+    fn sgr_24_clears_every_underline_style() {
+        for seq in [
+            &b"\x1b[4m"[..],
+            b"\x1b[21m",
+            b"\x1b[4:2m",
+            b"\x1b[4:3m",
+            b"\x1b[4:5m",
+        ] {
+            let mut v = seq.to_vec();
+            v.extend_from_slice(b"\x1b[24mx");
+            assert_eq!(sgr_flags_after(&v, 0).underline, UnderlineStyle::None);
+        }
+    }
+
+    #[test]
+    fn sgr_0_and_empty_reset_all_new_attributes() {
+        let set = b"\x1b[1;2;3;5;7;8;9;21;53;31;44m";
+        for reset in [&b"\x1b[0m"[..], b"\x1b[m"] {
+            let mut t = Term::new(1, 4, 0);
+            let mut v = set.to_vec();
+            v.push(b'A');
+            v.extend_from_slice(reset);
+            v.push(b'B');
+            feed(&mut t, &v);
+            let a = t.row(0).cells[0].style.flags;
+            assert_eq!(a.bits(), 0xFF, "every rendition bit set");
+            assert_eq!(a.underline, UnderlineStyle::Double);
+            assert_eq!(t.row(0).cells[1].style, Style::RESET);
+        }
+        // Reset mid-sequence, then set again.
+        let f = sgr_flags_after(b"\x1b[2;9;0;53mx", 0);
+        assert_eq!(f.bits(), StyleFlags::OVERLINE);
+    }
+
+    #[test]
+    fn hidden_cells_keep_their_text() {
+        // Conceal is a rendering attribute only: the grid keeps the
+        // characters, so selection/copy still yields them (xterm).
+        let mut t = Term::new(1, 8, 0);
+        feed(&mut t, b"\x1b[8msecret\x1b[28m!");
+        assert_eq!(row_text(&t, 0), "secret!");
+        assert!(t.row(0).cells[0].style.flags.hidden());
+        assert!(!t.row(0).cells[6].style.flags.hidden());
     }
 
     #[test]
@@ -5531,10 +5774,7 @@ mod tests {
         t.cursor.style = Style {
             fg: Color::Red,
             bg: Color::Default,
-            flags: StyleFlags {
-                bold: true,
-                ..StyleFlags::default()
-            },
+            flags: StyleFlags::EMPTY.with(StyleFlags::BOLD),
         };
         t.apply_sgr(&Params::default());
         assert_eq!(t.cursor.style, Style::RESET);
@@ -5884,7 +6124,7 @@ mod tests {
         // consumed: fg should be Red (untouched), NOT something else.
         assert_eq!(s.fg, Color::Red);
         // And no flag side effects from consuming `5`.
-        assert!(!s.flags.bold);
+        assert!(!s.flags.bold());
     }
 
     #[test]
@@ -5903,7 +6143,7 @@ mod tests {
         // `32` leaking through).
         assert_ne!(s.fg, Color::Green);
         // And bold must still be on (we didn't accidentally consume the 1).
-        assert!(s.flags.bold);
+        assert!(s.flags.bold());
     }
 
     #[test]
@@ -5916,7 +6156,7 @@ mod tests {
         let s = t.row(0).cells[0].style;
         assert_eq!(s.fg, Color::Indexed256(42));
         assert_eq!(s.bg, Color::Default);
-        assert!(s.flags.bold);
+        assert!(s.flags.bold());
     }
 
     #[test]
@@ -5962,7 +6202,7 @@ mod tests {
         feed(&mut t, b"\x1b[1;38;9;31mX");
         let s = t.row(0).cells[0].style;
         // Bold from before the introducer should stick.
-        assert!(s.flags.bold);
+        assert!(s.flags.bold());
         // The trailing `31` (red fg) must apply — the parser must have
         // bailed cleanly out of the malformed 38;9 sequence.
         assert_eq!(s.fg, Color::Red);
@@ -5976,7 +6216,7 @@ mod tests {
         let s = t.row(0).cells[1].style;
         assert_eq!(s.fg, Color::Default);
         assert_eq!(s.bg, Color::Blue);
-        assert!(s.flags.bold);
+        assert!(s.flags.bold());
     }
 
     #[test]
@@ -7048,6 +7288,142 @@ mod tests {
         let mut t = Term::new(2, 4, 0);
         feed(&mut t, b"\x1b[0c");
         assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?62;4;22c");
+    }
+
+    // ----- XTGETTCAP / DECRQSS (DCS queries) -------------------------------
+
+    #[test]
+    fn xtgettcap_neovim_truecolor_probe() {
+        // Neovim's `vim.tty.query({'Tc','RGB','setrgbf','setrgbb'})`.
+        let mut t = Term::new(4, 10, 0);
+        feed(
+            &mut t,
+            b"\x1bP+q5463;524742;73657472676266;73657472676262\x1b\\",
+        );
+        let reply = String::from_utf8(t.drain_pty_replies()).unwrap();
+        let parts: Vec<&str> = reply.split("\x1b\\").filter(|p| !p.is_empty()).collect();
+        assert_eq!(parts.len(), 4, "{reply:?}");
+        assert_eq!(parts[0], "\x1bP1+r5463");
+        assert_eq!(parts[1], "\x1bP1+r524742");
+        assert!(parts[2].starts_with("\x1bP1+r73657472676266="));
+        assert!(parts[3].starts_with("\x1bP1+r73657472676262="));
+        // Nothing printed to the grid.
+        assert_eq!(t.row(0).cells[0].ch, ' ');
+    }
+
+    #[test]
+    fn xtgettcap_unknown_and_invalid() {
+        let mut t = Term::new(4, 10, 0);
+        feed(&mut t, b"\x1bP+q536D756C78\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP0+r536D756C78\x1b\\");
+        feed(&mut t, b"\x1bP+qnothex\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP0+r\x1b\\");
+    }
+
+    #[test]
+    fn xtgettcap_ms_follows_security_flags() {
+        let mut t = Term::new(4, 10, 0);
+        feed(&mut t, b"\x1bP+q4D73\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP0+r4D73\x1b\\");
+        t.set_security(SecurityFlags {
+            osc_52_read: false,
+            osc_52_write: true,
+        });
+        feed(&mut t, b"\x1bP+q4D73\x1b\\");
+        assert!(t.drain_pty_replies().starts_with(b"\x1bP1+r4D73="));
+    }
+
+    #[test]
+    fn dcs_query_split_across_reads() {
+        let mut t = Term::new(4, 10, 0);
+        let mut p = Parser::new();
+        let input = b"\x1bP+q5463;524742\x1b\\";
+        for b in input {
+            p.advance(&mut t, std::slice::from_ref(b));
+        }
+        assert_eq!(
+            t.drain_pty_replies(),
+            b"\x1bP1+r5463\x1b\\\x1bP1+r524742\x1b\\"
+        );
+        // DECRQSS split mid-body and mid-terminator.
+        p.advance(&mut t, b"\x1bP$");
+        p.advance(&mut t, b"q m");
+        assert_eq!(t.drain_pty_replies(), b"");
+        p.advance(&mut t, b"\x1b");
+        p.advance(&mut t, b"\\");
+        // ` m` isn't a setting we know.
+        assert_eq!(t.drain_pty_replies(), b"\x1bP0$r\x1b\\");
+    }
+
+    #[test]
+    fn dcs_query_oversize_payload_is_bounded() {
+        let mut t = Term::new(4, 10, 0);
+        let mut input = b"\x1bP+q".to_vec();
+        let name = b"5463;";
+        while input.len() < 100_000 {
+            input.extend_from_slice(name);
+        }
+        input.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &input);
+        assert_eq!(t.drain_pty_replies(), b"\x1bP0+r\x1b\\");
+        // The terminal is back to normal afterwards.
+        feed(&mut t, b"ok");
+        assert_eq!(t.row(0).cells[0].ch, 'o');
+        feed(&mut t, b"\x1bP+q5463\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1+r5463\x1b\\");
+    }
+
+    #[test]
+    fn decrqss_sgr_reports_current_rendition() {
+        let mut t = Term::new(4, 10, 0);
+        // Neovim's probe: reset, set a truecolor bg, read it back.
+        feed(&mut t, b"\x1b[0m\x1b[48;2;1;2;3m\x1bP$qm\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1$r0;48:2::1:2:3m\x1b\\");
+        feed(&mut t, b"\x1b[0;1;7;38:5:200;41m\x1bP$qm\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1$r0;1;7;38:5:200;41m\x1b\\");
+        feed(&mut t, b"\x1b[m\x1bP$qm\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1$r0m\x1b\\");
+    }
+
+    #[test]
+    fn decrqss_decstbm_and_decscusr() {
+        let mut t = Term::new(10, 10, 0);
+        feed(&mut t, b"\x1bP$qr\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1$r1;10r\x1b\\");
+        feed(&mut t, b"\x1b[3;7r\x1bP$qr\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1$r3;7r\x1b\\");
+        feed(&mut t, b"\x1b[6 q\x1bP$q q\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1$r6 q\x1b\\");
+        feed(&mut t, b"\x1b[0 q\x1bP$q q\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1$r1 q\x1b\\");
+        feed(&mut t, b"\x1bP$qt\x1b\\\x1bP$q$|\x1b\\");
+        assert_eq!(
+            t.drain_pty_replies(),
+            b"\x1bP1$r10t\x1b\\\x1bP1$r10$|\x1b\\"
+        );
+        feed(&mut t, b"\x1bP$qs\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP0$r\x1b\\");
+    }
+
+    #[test]
+    fn dcs_queries_do_not_disturb_sixel() {
+        let mut t = Term::new(8, 8, 0);
+        // Query, then sixel, then query: sixel still decodes and the
+        // queries don't swallow its body (or vice versa).
+        feed(&mut t, b"\x1bP+q5463\x1b\\");
+        feed(&mut t, SIXEL_3X6);
+        feed(&mut t, b"\x1bP$qm\x1b\\");
+        assert_eq!(t.image_grid().iter().count(), 1);
+        assert_eq!(t.drain_pty_replies(), b"\x1bP1+r5463\x1b\\\x1bP1$r0m\x1b\\");
+    }
+
+    #[test]
+    fn other_dcs_is_ignored() {
+        let mut t = Term::new(4, 10, 0);
+        // DECUDK-ish / tmux passthrough-ish DCS: no reply, no output.
+        feed(&mut t, b"\x1bP1;1|17/ab\x1b\\\x1bPtmux;x\x1b\\");
+        assert_eq!(t.drain_pty_replies(), b"");
+        assert_eq!(t.row(0).cells[0].ch, ' ');
     }
 
     // ----- Sixel (DCS) ------------------------------------------------------
