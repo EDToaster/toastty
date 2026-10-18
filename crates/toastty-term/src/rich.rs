@@ -436,7 +436,7 @@ impl RichBlockStore {
 
 /// Parsed `OSC 7700` sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Osc7700 {
+pub struct Osc7700 {
     pub kind: String,
     pub cwd: Option<PathBuf>,
     pub source: String,
@@ -456,7 +456,7 @@ fn b64_decode(s: &[u8]) -> Option<Vec<u8>> {
 /// (`params[0]` is `7700`). `None` for anything malformed: unknown
 /// kind, invalid base64 or UTF-8 in the payload, wrong field count.
 /// Unknown keys and an undecodable `cwd=` are ignored.
-pub(crate) fn parse_osc_7700(params: &[&[u8]]) -> Option<Osc7700> {
+pub fn parse_osc_7700(params: &[&[u8]]) -> Option<Osc7700> {
     let (kind, keys, payload) = match params {
         [_, kind, keys, payload] => (*kind, *keys, *payload),
         _ => return None,

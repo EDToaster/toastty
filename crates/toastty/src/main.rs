@@ -165,6 +165,16 @@ fn initial_cwd() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("/"))
 }
 
+/// Runtime security gates from the `[security]` config table.
+fn security_flags(sec: toastty_config::SecurityConfig) -> SecurityFlags {
+    SecurityFlags {
+        osc_52_read: sec.osc_52_read,
+        osc_52_write: sec.osc_52_write,
+        markdown: sec.markdown,
+        markdown_local_files: sec.markdown_local_files,
+    }
+}
+
 fn main() -> Result<()> {
     // Parse args BEFORE tracing init — otherwise --print-default-config
     // would have log lines interleaved with the TOML we want to write
@@ -184,6 +194,9 @@ fn main() -> Result<()> {
         cli::Action::PrintVersion => {
             println!("{}", cli::version_text());
             return Ok(());
+        }
+        cli::Action::Markdown { file } => {
+            return toastty::md_cmd::run(file.as_deref());
         }
         cli::Action::PrintDefaultConfig => {
             cli::write_default_config(&mut std::io::stdout()).context("write default config")?;
@@ -285,6 +298,14 @@ struct Toastty {
     /// arrive *without* a position field (e.g. wheel scrolls under SGR
     /// reporting) can be reported at the last known cell.
     mouse_pos: (f64, f64),
+    /// The pointer is inside the window (motion seen since the last
+    /// `PointerLeft`). Gates the "Copy Markdown" chip.
+    pointer_inside: bool,
+    /// Rich block whose "Copy Markdown" chip is shown.
+    rich_chip_block: Option<toastty_term::RichBlockId>,
+    /// A press consumed by the "Copy Markdown" chip; its release is
+    /// eaten too.
+    rich_chip_click: Option<MouseButton>,
     /// Currently held mouse button (the most recent press without a
     /// matching release). Used to fill the "button held" slot of motion
     /// reports under DECSET 1002.
@@ -426,10 +447,10 @@ impl Toastty {
         term.set_cursor_default(config.cursor.shape, config.cursor.blink);
         // Thread the `[security]` flags through so OSC 52 dispatch can
         // gate before queueing a clipboard request.
-        term.set_security(SecurityFlags {
-            osc_52_read: config.security.osc_52_read,
-            osc_52_write: config.security.osc_52_write,
-        });
+        term.set_security(security_flags(config.security));
+        // Markdown rich blocks (OSC 7700): the engine is built lazily on
+        // the first block.
+        term.set_rich_layout(Box::new(toastty::markdown::MarkdownLayout::new()));
         let font_zoom = FontZoom::new(config.font.size_px);
         Self {
             config,
@@ -449,6 +470,9 @@ impl Toastty {
             font_zoom,
             last_title: None,
             mouse_pos: (0.0, 0.0),
+            pointer_inside: false,
+            rich_chip_block: None,
+            rich_chip_click: None,
             mouse_held: None,
             link_click_button: None,
             link_modifiers: Modifiers::empty(),
@@ -776,6 +800,7 @@ impl Toastty {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let (cpw, cph) = (cell_w as u16, cell_h as u16);
         self.term.set_cell_pixel_size(cpw, cph);
+        self.push_rich_env();
         if let Some(pty) = self.pty.as_mut() {
             let pixel_width = u16::try_from(content_w).unwrap_or(u16::MAX);
             let pixel_height = u16::try_from(content_h).unwrap_or(u16::MAX);
@@ -798,6 +823,32 @@ impl Toastty {
     /// the `scale_factor` / `font_zoom` fields.
     fn scaled_font_px(&self) -> f32 {
         effective_font_size_px(self.font_zoom.current_px(), self.scale_factor)
+    }
+
+    /// Push the font size and theme palette Markdown blocks are laid
+    /// out with (sRGB). A change re-lays out / re-colours the blocks on
+    /// the next frame.
+    fn push_rich_env(&mut self) {
+        let font_px = self.scaled_font_px();
+        let Some(r) = self.renderer.as_ref() else {
+            return;
+        };
+        let theme = r.theme();
+        let srgb = |c: [f32; 4]| {
+            [
+                linear_to_srgb_u8(c[0]),
+                linear_to_srgb_u8(c[1]),
+                linear_to_srgb_u8(c[2]),
+            ]
+        };
+        self.term.set_rich_env(toastty_term::RichEnv {
+            font_px,
+            palette: toastty_term::RichPalette {
+                fg: srgb(theme.fg),
+                bg: srgb(theme.bg),
+                ansi: theme.palette.map(srgb),
+            },
+        });
     }
 
     /// Send the DECSET 2048 in-band resize report for the current grid,
@@ -1169,10 +1220,8 @@ impl Toastty {
         }
         self.term
             .set_cursor_default(self.config.cursor.shape, self.config.cursor.blink);
-        self.term.set_security(SecurityFlags {
-            osc_52_read: self.config.security.osc_52_read,
-            osc_52_write: self.config.security.osc_52_write,
-        });
+        self.term.set_security(security_flags(self.config.security));
+        self.push_rich_env();
         // Padding / extend_background / grid_align are safe to live-apply
         // (render + grid only, no surface reconfigure). Push them before the
         // grid sync so the recomputed grid reflects any padding change.
@@ -1498,8 +1547,11 @@ impl Toastty {
     /// column/row boundary.
     fn handle_mouse_motion(&mut self, position: (f64, f64), modifiers: Modifiers) -> ControlSignal {
         self.mouse_pos = position;
+        self.pointer_inside = true;
         self.link_modifiers = modifiers;
-        let hover_changed = self.refresh_scroll_chip_hover() | self.refresh_link_hover();
+        let hover_changed = self.refresh_scroll_chip_hover()
+            | self.refresh_link_hover()
+            | self.refresh_rich_chip();
         let signal = self.handle_mouse_motion_inner(position, modifiers);
         if hover_changed && signal == ControlSignal::Continue {
             ControlSignal::RedrawIn(Duration::ZERO)
@@ -1521,6 +1573,67 @@ impl Toastty {
             .scroll_button_rect(&self.term)
             .is_some_and(|rect| x >= rect[0] && x < rect[2] && y >= rect[1] && y < rect[3]);
         r.set_scroll_button_hover(hovered)
+    }
+
+    /// Show the "Copy Markdown" chip for the rich block under the
+    /// pointer (staying on the current block while the pointer is on the
+    /// chip itself, which can overhang a short block) and track whether
+    /// the chip is hovered. Returns `true` when anything changed.
+    fn refresh_rich_chip(&mut self) -> bool {
+        #[allow(clippy::cast_possible_truncation)]
+        let (x, y) = (self.mouse_pos.0 as f32, self.mouse_pos.1 as f32);
+        let inside = |rect: [f32; 4]| x >= rect[0] && x < rect[2] && y >= rect[1] && y < rect[3];
+        let Some(r) = self.renderer.as_ref() else {
+            return false;
+        };
+        let on_chip = r.rich_chip_rect(&self.term).is_some_and(inside);
+        let block = if !self.pointer_inside || self.close_pending {
+            None
+        } else if on_chip && self.rich_chip_block.is_some() {
+            self.rich_chip_block
+        } else {
+            self.pointer_grid_pos()
+                .and_then(|pos| self.term.row_by_line_id(pos.line_id))
+                .and_then(|row| row.rich)
+                .map(|tag| tag.block)
+        };
+        let top = block.and_then(|b| self.term.rich_block_view_span(b)).map(|s| s.0);
+        let block = block.filter(|_| top.is_some());
+        self.rich_chip_block = block;
+        let Some(r) = self.renderer.as_mut() else {
+            return false;
+        };
+        // Place the chip first (its rect depends on `top`), then hover-test
+        // against the new rect.
+        let mut changed = r.set_rich_chip(top, on_chip);
+        let hovered = top.is_some() && r.rich_chip_rect(&self.term).is_some_and(inside);
+        changed |= r.set_rich_chip(top, hovered);
+        changed
+    }
+
+    /// Left-press on the "Copy Markdown" chip: copy the block's source
+    /// to the clipboard and consume the click.
+    fn try_click_rich_chip(&mut self, position: (f64, f64)) -> bool {
+        let Some(block) = self.rich_chip_block else {
+            return false;
+        };
+        let Some(rect) = self
+            .renderer
+            .as_ref()
+            .and_then(|r| r.rich_chip_rect(&self.term))
+        else {
+            return false;
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let (x, y) = (position.0 as f32, position.1 as f32);
+        if x < rect[0] || x >= rect[2] || y < rect[1] || y >= rect[3] {
+            return false;
+        }
+        if let Some(src) = self.term.rich_block_source(block) {
+            let src = src.to_string();
+            self.write_clipboard(src);
+        }
+        true
     }
 
     fn handle_mouse_motion_inner(
@@ -1582,6 +1695,21 @@ impl Toastty {
             && button == MouseButton::Left
             && self.try_click_scroll_button(position)
         {
+            return ControlSignal::RedrawIn(Duration::ZERO);
+        }
+        // "Copy Markdown" chip on a rich block: copies the source and is
+        // consumed like the scroll button. The release is eaten too so a
+        // tracking app never sees half a click.
+        if state == KeyState::Released && self.rich_chip_click == Some(button) {
+            self.rich_chip_click = None;
+            return ControlSignal::Continue;
+        }
+        if state == KeyState::Pressed
+            && button == MouseButton::Left
+            && self.try_click_rich_chip(position)
+        {
+            self.rich_chip_click = Some(button);
+            self.mouse_held = None;
             return ControlSignal::RedrawIn(Duration::ZERO);
         }
         // OSC 8 click-to-open: Cmd-Left on macOS / Ctrl-Left elsewhere.
@@ -2444,6 +2572,11 @@ impl App for Toastty {
                 // The chip may have appeared/vanished under a still
                 // pointer (wheel scroll, click, new output).
                 self.refresh_scroll_chip_hover();
+                // Re-lay out / re-colour / GC rich blocks, then place the
+                // "Copy Markdown" chip for the block under the pointer
+                // (it moves with scrolling and new output).
+                self.term.sync_rich_blocks();
+                self.refresh_rich_chip();
                 let mut next_blink: Option<Duration> = None;
                 if let Some(r) = self.renderer.as_mut() {
                     match r.render_term(&mut self.term) {
@@ -2555,7 +2688,9 @@ impl App for Toastty {
                 }
             }
             Event::PointerLeft => {
-                if self.clear_link_hover() {
+                self.pointer_inside = false;
+                let chip = self.refresh_rich_chip();
+                if self.clear_link_hover() | chip {
                     ControlSignal::RedrawIn(Duration::ZERO)
                 } else {
                     ControlSignal::Continue
