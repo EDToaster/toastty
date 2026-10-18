@@ -13,7 +13,7 @@
 //! - [`layout`]: Markdown → boxes → pixels (headings, emphasis, lists,
 //!   task lists, quotes, code with highlighting, tables, links, rules,
 //!   images, inline and display maths, Mermaid).
-//! - [`math`]: LaTeX maths → [`Raster`] (RaTeX).
+//! - [`math`]: LaTeX maths → [`Raster`] (`RaTeX`).
 //! - [`mermaid`]: Mermaid source → [`Raster`] (mermaid-rs-renderer + resvg).
 
 pub mod layout;
