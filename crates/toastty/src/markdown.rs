@@ -8,21 +8,48 @@
 //! created lazily on the first block, so a session that never shows
 //! Markdown pays nothing.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use toastty_markdown::{LayoutParams, RenderedBlock, ResourcePolicy, Rgba, Theme};
+use toastty_markdown::{
+    BlockLayout, LayoutParams, LinkSpan, RenderedBlock, Renderer, ResourcePolicy, Rgba, TextRun,
+    Theme,
+};
 use toastty_term::{
-    RichBlockLayout, RichImage, RichLayout, RichLayoutRequest, RichLinkSpan, RichPalette,
-    RichTextRun,
+    RichBlockLayout, RichImage, RichLayout, RichLayoutRequest, RichLinkSpan, RichPaint,
+    RichPalette, RichTextRun,
 };
 
 /// The only block kind this adapter renders.
 pub const KIND_MARKDOWN: &str = "md";
 
 /// [`RichBlockLayout`] backed by the Markdown engine.
+///
+/// Layout runs on every reflow (each step of a window resize), so it
+/// only lays out: the block's image is a [`MarkdownPaint`] that paints
+/// the rows the renderer actually shows, when it shows them. Painters
+/// share the engine (it owns the glyph cache) behind a mutex.
 #[derive(Debug, Default)]
 pub struct MarkdownLayout {
-    renderer: Option<toastty_markdown::Renderer>,
+    renderer: Option<Arc<Mutex<Renderer>>>,
+}
+
+/// Paints bands of one laid-out block on demand.
+#[derive(Debug)]
+pub struct MarkdownPaint {
+    renderer: Arc<Mutex<Renderer>>,
+    layout: BlockLayout,
+}
+
+impl RichPaint for MarkdownPaint {
+    fn paint(&self, y0: u32, h: u32) -> Option<Vec<u8>> {
+        let mut r = self.renderer.lock().ok()?;
+        let raster = r.paint(&self.layout, y0, h);
+        (raster.width == self.layout.width && raster.height == h).then_some(raster.pixels)
+    }
+
+    fn byte_len(&self) -> u64 {
+        self.layout.approx_bytes()
+    }
 }
 
 impl MarkdownLayout {
@@ -34,9 +61,9 @@ impl MarkdownLayout {
     /// Adapter over a caller-built engine (tests use one with only
     /// bundled fonts).
     #[must_use]
-    pub fn with_renderer(renderer: toastty_markdown::Renderer) -> Self {
+    pub fn with_renderer(renderer: Renderer) -> Self {
         Self {
-            renderer: Some(renderer),
+            renderer: Some(Arc::new(Mutex::new(renderer))),
         }
     }
 }
@@ -46,12 +73,14 @@ impl RichBlockLayout for MarkdownLayout {
         if req.kind != KIND_MARKDOWN {
             return None;
         }
-        let renderer = self
-            .renderer
-            .get_or_insert_with(toastty_markdown::Renderer::new);
+        let renderer = Arc::clone(
+            self.renderer
+                .get_or_insert_with(|| Arc::new(Mutex::new(Renderer::new()))),
+        );
         let params = layout_params(req);
-        match renderer.render(req.source, &params) {
-            Ok(block) => Some(convert_block(block, &params)),
+        let laid = renderer.lock().ok()?.layout(req.source, &params);
+        match laid {
+            Ok(layout) => Some(convert_layout(layout, renderer, &params)),
             Err(e) => {
                 tracing::warn!("markdown block layout failed: {e}");
                 None
@@ -91,6 +120,35 @@ pub fn layout_params(req: &RichLayoutRequest<'_>) -> LayoutParams {
     }
 }
 
+/// Convert a lazily painted layout into the terminal's block layout.
+/// Same contract checks as [`convert_block`]; a layout that draws
+/// nothing gets no image.
+#[must_use]
+pub fn convert_layout(
+    layout: BlockLayout,
+    renderer: Arc<Mutex<Renderer>>,
+    params: &LayoutParams,
+) -> RichLayout {
+    let rows = layout.rows.clamp(1, params.max_rows.max(1));
+    let want_w = params.width_px();
+    let want_h = u32::from(rows) * params.cell_h;
+    let ok = layout.width == want_w
+        && layout.height == want_h
+        && want_w > 0
+        && want_h > 0
+        && !layout.is_blank();
+    let text = convert_text(layout.text().iter().cloned(), rows);
+    let links = convert_links(layout.links().iter().cloned(), rows);
+    let image =
+        ok.then(|| RichImage::new(want_w, want_h, Arc::new(MarkdownPaint { renderer, layout })));
+    RichLayout {
+        rows,
+        image,
+        text,
+        links,
+    }
+}
+
 /// Convert the engine's output into the terminal's block layout.
 ///
 /// Defensive against an engine that breaks its own contract: the row
@@ -106,19 +164,21 @@ pub fn convert_block(block: RenderedBlock, params: &LayoutParams) -> RichLayout 
     let img = block.image;
     let image = (img.width == want_w
         && img.height == want_h
-        && img.pixels.len() as u64 == u64::from(want_w) * u64::from(want_h) * 4
         && want_w > 0
         && want_h > 0
         && img.pixels.as_chunks::<4>().0.iter().any(|px| px[3] != 0))
-    .then(|| RichImage {
-        width: img.width,
-        height: img.height,
-        pixels: Arc::from(img.pixels),
-    });
-    let text = block
-        .text
-        .into_iter()
-        .take(usize::from(rows))
+    .then(|| RichImage::from_pixels(img.width, img.height, img.pixels))
+    .flatten();
+    RichLayout {
+        rows,
+        image,
+        text: convert_text(block.text.into_iter(), rows),
+        links: convert_links(block.links.into_iter(), rows),
+    }
+}
+
+fn convert_text(text: impl Iterator<Item = Vec<TextRun>>, rows: u16) -> Vec<Vec<RichTextRun>> {
+    text.take(usize::from(rows))
         .map(|runs| {
             runs.into_iter()
                 .map(|r| RichTextRun {
@@ -127,30 +187,25 @@ pub fn convert_block(block: RenderedBlock, params: &LayoutParams) -> RichLayout 
                 })
                 .collect()
         })
-        .collect();
-    let links = block
-        .links
-        .into_iter()
+        .collect()
+}
+
+fn convert_links(links: impl Iterator<Item = LinkSpan>, rows: u16) -> Vec<RichLinkSpan> {
+    links
         .filter(|l| l.row < rows && l.cols.start < l.cols.end)
         .map(|l| RichLinkSpan {
             row: l.row,
             cols: l.cols,
             url: l.url,
         })
-        .collect();
-    RichLayout {
-        rows,
-        image,
-        text,
-        links,
-    }
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
-    use toastty_markdown::{LinkSpan, Raster, TextRun};
+    use toastty_markdown::Raster;
 
     fn palette() -> RichPalette {
         let mut ansi = [[0u8; 3]; 16];
@@ -240,10 +295,8 @@ mod tests {
         let out = convert_block(block(2, 80, 32, 255), &p);
         assert_eq!(out.rows, 2);
         let img = out.image.unwrap();
-        assert_eq!(
-            (img.width, img.height, img.pixels.len()),
-            (80, 32, 80 * 32 * 4)
-        );
+        assert_eq!((img.width, img.height), (80, 32));
+        assert_eq!(img.paint(0, 32).unwrap().len(), 80 * 32 * 4);
         assert_eq!(out.text.len(), 2);
         assert_eq!(out.text[1][0].text, "row1");
         assert_eq!(out.text[1][0].col, 1);
@@ -286,5 +339,33 @@ mod tests {
         let mut l = MarkdownLayout::new();
         assert!(l.layout(&request("svg", None)).is_none());
         assert!(l.renderer.is_none());
+    }
+
+    #[test]
+    fn layout_paints_lazily_and_matches_a_full_render() {
+        let mut l = MarkdownLayout::with_renderer(Renderer::hermetic());
+        let mut req = request("md", None);
+        req.source = "# Title\n\nSome *text* and `code`.\n\n- a\n- b\n";
+        req.max_rows = 50;
+        let out = l.layout(&req).unwrap();
+        let img = out.image.unwrap();
+        assert_eq!(img.height, u32::from(out.rows) * 16);
+        let full = Renderer::hermetic()
+            .render(req.source, &layout_params(&req))
+            .unwrap();
+        assert_eq!(img.paint(0, img.height).unwrap(), full.image.pixels);
+        // A band equals the same rows of the full image.
+        let stride = 80 * 4;
+        let band = img.paint(16, 32).unwrap();
+        assert_eq!(band, full.image.pixels[16 * stride..48 * stride]);
+    }
+
+    #[test]
+    fn blank_layout_has_no_image() {
+        let mut l = MarkdownLayout::with_renderer(Renderer::hermetic());
+        let mut req = request("md", None);
+        req.source = "   ";
+        let out = l.layout(&req).unwrap();
+        assert!(out.image.is_none());
     }
 }

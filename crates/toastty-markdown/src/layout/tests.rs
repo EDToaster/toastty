@@ -102,7 +102,7 @@ fn with_backends<T>(
 ) -> T {
     let mut r = Renderer::hermetic();
     r.cache.math = math;
-    r.cache.mermaid = mermaid;
+    r.cache.mermaid = super::MermaidBackend::Fake(mermaid);
     f(&mut r)
 }
 

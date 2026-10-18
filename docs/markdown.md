@@ -82,17 +82,19 @@ PTY bytes ─▶ toastty-parser ─▶ Term::osc_dispatch(7700)
                                    │  decode, security gate
                                    ▼
                      RichBlockLayout (trait, injected by the binary)
-                                   │  toastty-markdown::Renderer::render
+                                   │  toastty-markdown::Renderer::layout
                                    ▼
-                RenderedBlock { rows, image, text per row, links }
+          BlockLayout { rows, text per row, links, display list }
+            (the image is a painter: nothing is rasterized yet)
                                    │
      Term writes `rows` grid rows: plain text into the cells, links as
      hyperlink ids, and a per-row tag `RichRow { block, index }`.
      The image goes into a RichBlockStore (not the kitty ImageRegistry).
                                    │
-Renderer: for each visible row with a RichRow tag, draw the matching
-cell_h-tall slice of the block's image instead of the row's text glyphs.
-If the image is gone, the plain text in the cells is drawn as normal.
+Renderer: for each visible row with a RichRow tag, paint (once) the
+16-row tile holding it, upload it, and draw the row's cell_h-tall slice
+instead of the row's text glyphs. If the image is gone, the plain text
+in the cells is drawn as normal.
 ```
 
 - **`toastty-markdown`** (new crate) is pure CPU and knows nothing about the
@@ -123,14 +125,41 @@ If the image is gone, the plain text in the cells is drawn as normal.
 - **Storage:** `RichBlockStore` keeps, per block id:
   - the source;
   - the parameters it was rendered with;
-  - the latest `RenderedBlock` image.
+  - the latest layout's painter (`RichImage`).
 
   Blocks with no tagged rows left in the grid or scrollback are freed. The
-  store has a byte budget like the image registry; evicted images fall back to
-  drawing their text.
+  store has a byte budget like the image registry (now counting layouts, not
+  pixels); evicted images fall back to drawing their text.
 - **Theme and zoom:** a palette change (config reload, OSC 4/10/11) or a
   change of font size or DPI renders the visible blocks again. The row count
   is kept when only colours change.
+
+### Resize performance
+
+A window resize re-lays out every block, on screen or not, at every step of
+the drag, so layout has to cost about as much as text reflow. Two changes
+make it so:
+
+- **Layout and painting are separate.** `Renderer::layout` produces the
+  rows, text, links and a display list; `Renderer::paint(layout, y0, h)`
+  rasterizes any band of it. The terminal's `RichImage` is a lazy painter,
+  and the GPU cache paints only the 16-row tiles holding visible rows. An
+  offscreen block costs no pixels at all; an on-screen one costs a screenful.
+  Bands are bit-exact with a full paint (vector ops are drawn in block
+  coordinates and translated exactly, with an 8 px margin cropped off, and
+  images are pre-scaled and blitted at whole pixels), except for 1 px
+  hairlines, which may move by a few levels; `tests/lazy_paint.rs` checks this.
+- **Width-independent work is cached** in the renderer across layouts:
+  shaped paragraphs (keyed by a 128-bit hash of their content), highlighted
+  code, maths rasters, decoded images, and Mermaid diagrams. Mermaid is split
+  into `prepare_mermaid` (parse, lay out, SVG tree: once) and a rasterization
+  at the fitted width that happens only when a tile showing it is painted,
+  and is reused by the other tiles.
+
+Release build, demo document (376 rows), sweeping 120 → 40 columns
+(`cargo run --release -p toastty-markdown --example resize_bench -- doc.md`):
+layout 0.8 ms per width (was 54 ms for layout plus full paint), plus about
+2.4 ms to paint one screen of 50 rows.
 
 ### Implementation notes (v1)
 
@@ -150,11 +179,12 @@ If the image is gone, the plain text in the cells is drawn as normal.
   `Grid::resize_reflow_with`.
 - A block that an app partly overwrote is frozen: its remaining tagged rows
   keep their slices but are no longer re-laid out.
-- The image budget is 256 MiB (`RICH_DEFAULT_BUDGET`), least recently drawn
-  first; evicted blocks draw their text. On the GPU, textures are kept for the
-  visible blocks plus up to 8 recently shown ones; images taller than the
-  device's max texture size are split into tiles on row boundaries, and a
-  block wider than it falls back to text.
+- The store budget is 256 MiB (`RICH_DEFAULT_BUDGET`), least recently drawn
+  first; evicted blocks draw their text. On the GPU, blocks live as tiles of
+  16 cell rows (fewer if the device's max texture size demands), painted and
+  uploaded only when one of their rows is visible; up to 64 tiles that are no
+  longer visible are kept. A block wider than the max texture size falls back
+  to text.
 - Selected cells over a block get a translucent selection-colour tint drawn
   over the image. OSC 8 underlines are not drawn on block rows (the image
   styles its links); the Ctrl/Cmd hover underline still is.

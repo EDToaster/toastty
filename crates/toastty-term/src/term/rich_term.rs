@@ -130,8 +130,7 @@ fn run_layout(
     // The image must cover exactly the block's rows.
     let want_h = u32::from(out.rows) * params.cell_h;
     if let Some(img) = out.image.as_mut() {
-        let stride_ok = img.pixels.len() == img.width as usize * img.height as usize * 4;
-        if !stride_ok || img.width == 0 {
+        if img.width == 0 {
             out.image = None;
         } else if img.height != want_h {
             *img = img.with_height(want_h);

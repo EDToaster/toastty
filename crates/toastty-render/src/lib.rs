@@ -28,9 +28,9 @@ pub mod color;
 pub mod image;
 pub mod rgp;
 pub mod surface_format;
-pub mod text;
 #[cfg(test)]
 mod test_gpu;
+pub mod text;
 
 use std::time::{Duration, Instant};
 
@@ -1819,15 +1819,12 @@ impl Renderer {
             0.0
         };
         let mut tagged: Vec<(u16, toastty_term::RichRow)> = Vec::new();
-        let mut visible: Vec<toastty_term::RichBlockId> = Vec::new();
         for r in 0..rows_rendered {
             if let Some(tag) = term.view_row(r).rich {
                 tagged.push((r, tag));
-                if !visible.contains(&tag.block) {
-                    visible.push(tag.block);
-                }
             }
         }
+        let visible: Vec<toastty_term::RichRow> = tagged.iter().map(|(_, t)| *t).collect();
         let Some(pipe) = self.image_pipeline.as_mut() else {
             return Vec::new();
         };

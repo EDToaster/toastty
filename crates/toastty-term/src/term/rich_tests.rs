@@ -73,11 +73,7 @@ impl RichBlockLayout for Fake {
             for _ in 0..w * h {
                 px.extend_from_slice(&[fg[0], fg[1], fg[2], 255]);
             }
-            RichImage {
-                width: w,
-                height: h,
-                pixels: px.into(),
-            }
+            RichImage::from_pixels(w, h, px).unwrap()
         });
         Some(RichLayout {
             rows,
@@ -584,7 +580,7 @@ fn palette_change_recolors_and_keeps_rows() {
     assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
     assert_ne!(t.rich_blocks().block_revision(id).unwrap(), rev);
     let img = t.rich_blocks().image(id).unwrap();
-    assert_eq!(&img.pixels[..4], &[1, 2, 3, 255]);
+    assert_eq!(&img.paint(0, 1).unwrap()[..4], &[1, 2, 3, 255]);
     assert_eq!(img.height, 32);
     assert_eq!(t.rich_blocks().get(id).unwrap().rows, 2);
 }

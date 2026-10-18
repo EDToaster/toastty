@@ -27,6 +27,7 @@ fn new_term() -> Term {
     t.set_security(SecurityFlags {
         osc_52_read: true,
         osc_52_write: true,
+        ..SecurityFlags::default()
     });
     t
 }
@@ -283,6 +284,7 @@ fn real_tmux_outer_output_parses() {
     t.set_security(SecurityFlags {
         osc_52_read: false,
         osc_52_write: true,
+        ..SecurityFlags::default()
     });
     let mut p = Parser::new();
     for chunk in TMUX_OUTER_OUTPUT[..marker].chunks(5) {

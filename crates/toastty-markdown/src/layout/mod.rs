@@ -35,15 +35,20 @@ mod style;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use cosmic_text::{FontSystem, SwashCache};
 use pulldown_cmark::{Alignment, BlockQuoteKind};
 
+use crate::mermaid::PreparedDiagram;
 use crate::{Error, LayoutParams, Raster, RenderedBlock, Rgba, TextRun, Theme};
 use fonts::Fonts;
 use grid::{Frag, LinkPx};
-use highlight::Highlighter;
+use highlight::{Highlighter, Tok};
 use inline::{Align, Atom, Boxed, Line, LineCtx, Para, Piece, Shaped, SpanInfo};
-use paint::Op;
+use paint::{Img, Op, Src};
 use parse::{Block, Inline, Item};
 use style::Palette;
 
@@ -68,13 +73,69 @@ const MAX_CACHED_GLYPHS: usize = 16_384;
 pub(crate) type MathFn = fn(&str, bool, f32, Rgba) -> Result<Raster, String>;
 pub(crate) type MermaidFn = fn(&str, u32, f32, &Theme) -> Result<Raster, String>;
 
+/// How diagrams are produced: the real renderer (prepared once and
+/// cached, rasterized lazily at paint) or a test stand-in called on
+/// every layout.
+#[derive(Clone, Copy)]
+pub(crate) enum MermaidBackend {
+    Real,
+    #[cfg_attr(not(test), allow(dead_code))]
+    Fake(MermaidFn),
+}
+
+/// Entry caps: past one, that cache is cleared (documents rarely come
+/// close; this only bounds memory for pathological input).
+const MAX_MEMO_ENTRIES: usize = 8_192;
+const MAX_MEMO_DIAGRAMS: usize = 64;
+const MAX_MEMO_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+
+type MathKey = (String, bool, u32, Rgba);
+type ImageKey = (String, bool, Option<PathBuf>);
+type DiagramKey = (String, u32, Theme);
+type CodeKey = (String, String, Theme);
+
+/// Width-independent results, kept across layouts so re-laying out a
+/// document at a new width (window resize) only re-wraps and re-places.
+#[derive(Default)]
+pub(crate) struct Memo {
+    math: HashMap<MathKey, Option<Arc<Img>>>,
+    images: HashMap<ImageKey, Result<Arc<Img>, images::Denied>>,
+    image_bytes: u64,
+    diagrams: HashMap<DiagramKey, Result<Arc<PreparedDiagram>, String>>,
+    code: HashMap<CodeKey, Arc<Vec<Vec<Tok>>>>,
+    shaped: HashMap<u128, Arc<Shaped>>,
+}
+
+impl Memo {
+    fn trim(&mut self) {
+        if self.math.len() > MAX_MEMO_ENTRIES {
+            self.math.clear();
+        }
+        if self.images.len() > MAX_MEMO_ENTRIES || self.image_bytes > MAX_MEMO_IMAGE_BYTES {
+            self.images.clear();
+            self.image_bytes = 0;
+        }
+        if self.diagrams.len() > MAX_MEMO_DIAGRAMS {
+            self.diagrams.clear();
+        }
+        if self.code.len() > MAX_MEMO_ENTRIES {
+            self.code.clear();
+        }
+        if self.shaped.len() > MAX_MEMO_ENTRIES * 4 {
+            self.shaped.clear();
+        }
+    }
+}
+
 /// Per-renderer state reused across renders.
 pub(crate) struct Caches {
     fonts: Fonts,
     swash: SwashCache,
     hl: Highlighter,
+    memo: Memo,
+    scaled: paint::Scaled,
     pub(crate) math: MathFn,
-    pub(crate) mermaid: MermaidFn,
+    pub(crate) mermaid: MermaidBackend,
 }
 
 impl std::fmt::Debug for Caches {
@@ -91,8 +152,10 @@ impl Caches {
             fonts: fonts::resolve(fs),
             swash: SwashCache::new(),
             hl: Highlighter::default(),
+            memo: Memo::default(),
+            scaled: paint::Scaled::default(),
             math: crate::math::render_math,
-            mermaid: crate::mermaid::render_mermaid,
+            mermaid: MermaidBackend::Real,
         }
     }
 }
@@ -125,15 +188,15 @@ struct Lay<'a> {
     fs: &'a mut FontSystem,
     fonts: &'a Fonts,
     hl: &'a mut Highlighter,
+    memo: &'a mut Memo,
     math: MathFn,
-    mermaid: MermaidFn,
+    mermaid: MermaidBackend,
     p: &'a LayoutParams,
     pal: Palette,
     links: &'a [String],
     ops: Vec<Op>,
     frags: Vec<Frag>,
     link_px: Vec<LinkPx>,
-    rasters: Vec<Raster>,
     image_budget: u64,
     /// Body font size and line pitch.
     f: f32,
@@ -144,12 +207,46 @@ struct Lay<'a> {
     y_limit: f32,
 }
 
-pub(crate) fn render(
+/// A laid-out block: everything but pixels. Paint any band of it with
+/// [`paint`]. Shareable across threads.
+#[derive(Debug)]
+pub(crate) struct Laid {
+    pub rows: u16,
+    pub width: u32,
+    pub height: u32,
+    pub cell_h: u32,
+    pub text: Vec<Vec<TextRun>>,
+    pub links: Vec<crate::LinkSpan>,
+    ops: Vec<Op>,
+    /// When truncated: rows from here down are cleared and `note` drawn.
+    text_rows: u32,
+    note: Vec<Op>,
+}
+
+impl Laid {
+    pub(crate) fn is_blank(&self) -> bool {
+        self.ops.is_empty() && self.note.is_empty()
+    }
+
+    pub(crate) fn approx_bytes(&self) -> u64 {
+        let ops = (self.ops.len() + self.note.len()) * std::mem::size_of::<Op>();
+        let text: usize = self
+            .text
+            .iter()
+            .flatten()
+            .map(|r| r.text.len() + std::mem::size_of::<TextRun>())
+            .sum();
+        let links: usize = self.links.iter().map(|l| l.url.len() + 32).sum();
+        (ops + text + links + 256) as u64
+    }
+}
+
+pub(crate) fn layout(
     fs: &mut FontSystem,
     caches: &mut Caches,
     markdown: &str,
     params: &LayoutParams,
-) -> Result<RenderedBlock, Error> {
+) -> Laid {
     let width = params.width_px();
     let cell_h = params.cell_h;
     let row_bytes = u64::from(width) * u64::from(cell_h) * 4;
@@ -159,10 +256,12 @@ pub(crate) fn render(
     let doc = parse::parse(markdown);
     let f = params.font_px.clamp(4.0, 512.0);
     let line_h = (cell_h as f32).max((f * 1.2).ceil());
+    caches.memo.trim();
     let mut lay = Lay {
         fs,
         fonts: &caches.fonts,
         hl: &mut caches.hl,
+        memo: &mut caches.memo,
         math: caches.math,
         mermaid: caches.mermaid,
         p: params,
@@ -171,7 +270,6 @@ pub(crate) fn render(
         ops: vec![],
         frags: vec![],
         link_px: vec![],
-        rasters: vec![],
         image_budget: MAX_IMAGE_BUDGET,
         f,
         line_h,
@@ -192,20 +290,17 @@ pub(crate) fn render(
     let truncated = needed > u64::from(row_cap);
     let rows = if truncated { row_cap } else { needed as u16 };
     let height = u32::from(rows) * cell_h;
-    let mut pm = tiny_skia::Pixmap::new(width, height).ok_or(Error::Render("pixmap".into()))?;
     let text_rows = if truncated {
         usize::from(rows) - 1
     } else {
         usize::from(rows)
     };
-    paint::execute(&mut pm, &lay.ops, &lay.rasters, lay.fs, &mut caches.swash);
     let mut text = grid::text_rows(&lay.frags, params.cell_w, cell_h, text_rows);
     let links = grid::link_spans(&lay.link_px, params.cols, params.cell_w, cell_h, text_rows);
+    let ops = std::mem::take(&mut lay.ops);
+    let mut note = vec![];
     if truncated {
-        // Clear the last row and write the note there.
-        let row_start = text_rows * (cell_h as usize) * (width as usize) * 4;
-        pm.data_mut()[row_start..].fill(0);
-        lay.ops.clear();
+        // The last row is cleared at paint time and the note drawn there.
         let base = Base {
             size: f * 0.875,
             bold: false,
@@ -222,21 +317,124 @@ pub(crate) fn render(
         let lines = shaped.break_lines(inner, &lctx);
         let top = text_rows as f32 * cell_h as f32
             + ((cell_h as f32 - inline::height(&lines)) / 2.0).floor();
-        let (texts, _) = shaped.emit(&lines, x0, top, inner, &lctx, &mut lay.ops, lay.fonts);
-        paint::execute(&mut pm, &lay.ops, &[], lay.fs, &mut caches.swash);
-        let note: String = texts.into_iter().map(|t| t.text).collect();
+        let (texts, _) = shaped.emit(&lines, x0, top, inner, &lctx, &mut note, lay.fonts);
+        let note_text: String = texts.into_iter().map(|t| t.text).collect();
         let col = (x0 / params.cell_w as f32).round() as u16;
-        text.push(vec![TextRun { col, text: note }]);
+        text.push(vec![TextRun {
+            col,
+            text: note_text,
+        }]);
+    }
+    debug_assert_eq!(text.len(), usize::from(rows));
+    Laid {
+        rows,
+        width,
+        height,
+        cell_h,
+        text,
+        links,
+        ops,
+        text_rows: if truncated {
+            text_rows as u32
+        } else {
+            u32::from(rows)
+        },
+        note,
+    }
+}
+
+/// Extra rows painted (and cropped) around a band; see [`paint_band`].
+const BAND_MARGIN: u32 = 8;
+
+/// Paint block pixel rows `y0 .. y0 + h` (clamped to the block) as a
+/// premultiplied pixmap. `None` when the band is empty.
+pub(crate) fn paint_band(
+    fs: &mut FontSystem,
+    caches: &mut Caches,
+    laid: &Laid,
+    y0: u32,
+    h: u32,
+) -> Option<tiny_skia::Pixmap> {
+    let y0 = y0.min(laid.height);
+    let h = h.min(laid.height - y0);
+    if h == 0 || laid.width == 0 {
+        return None;
+    }
+    // Paint a margin above and below and crop it: the rasterizer treats
+    // paths that cross the pixmap edge slightly differently, so without
+    // it anti-aliasing at band edges (tile seams) could differ from the
+    // same rows painted as part of a taller band.
+    let top = y0.saturating_sub(BAND_MARGIN);
+    let bottom = (y0 + h + BAND_MARGIN).min(laid.height);
+    let mut pm = tiny_skia::Pixmap::new(laid.width, bottom - top)?;
+    paint::execute(
+        &mut pm,
+        &laid.ops,
+        top,
+        fs,
+        &mut caches.swash,
+        &mut caches.scaled,
+    );
+    let clear_from = laid.text_rows * laid.cell_h;
+    if clear_from < laid.height && bottom > clear_from {
+        let from = clear_from.saturating_sub(top) as usize * laid.width as usize * 4;
+        pm.data_mut()[from..].fill(0);
+        paint::execute(
+            &mut pm,
+            &laid.note,
+            top,
+            fs,
+            &mut caches.swash,
+            &mut caches.scaled,
+        );
     }
     if caches.swash.image_cache.len() > MAX_CACHED_GLYPHS {
         caches.swash.image_cache.clear();
     }
-    debug_assert_eq!(text.len(), usize::from(rows));
+    if top == y0 && bottom == y0 + h {
+        return Some(pm);
+    }
+    let stride = laid.width as usize * 4;
+    let start = (y0 - top) as usize * stride;
+    let mut out = tiny_skia::Pixmap::new(laid.width, h)?;
+    out.data_mut()
+        .copy_from_slice(&pm.data()[start..start + h as usize * stride]);
+    pm = out;
+    Some(pm)
+}
+
+/// Paint a band as a straight-alpha raster (always `width` × clamped `h`).
+pub(crate) fn paint_raster(
+    fs: &mut FontSystem,
+    caches: &mut Caches,
+    laid: &Laid,
+    y0: u32,
+    h: u32,
+) -> Raster {
+    match paint_band(fs, caches, laid, y0, h) {
+        Some(pm) => paint::into_raster(pm),
+        None => Raster {
+            width: laid.width,
+            height: 0,
+            pixels: vec![],
+            baseline: None,
+        },
+    }
+}
+
+pub(crate) fn render(
+    fs: &mut FontSystem,
+    caches: &mut Caches,
+    markdown: &str,
+    params: &LayoutParams,
+) -> Result<RenderedBlock, Error> {
+    let laid = layout(fs, caches, markdown, params);
+    let pm = paint_band(fs, caches, &laid, 0, laid.height).ok_or(Error::Render("pixmap".into()))?;
     Ok(RenderedBlock {
-        rows,
+        rows: laid.rows,
         image: paint::into_raster(pm),
-        text,
-        links,
+        text: laid.text,
+        links: laid.links,
     })
 }
 
@@ -391,9 +589,9 @@ impl Lay<'_> {
     }
 
     /// Fit a raster into at most `max_w` px wide at the display scale.
-    fn fit(r: &Raster, max_w: f32, natural_scale: f32) -> (f32, f32) {
-        let mut w = r.width as f32 * natural_scale;
-        let mut h = r.height as f32 * natural_scale;
+    fn fit((rw, rh): (u32, u32), max_w: f32, natural_scale: f32) -> (f32, f32) {
+        let mut w = rw as f32 * natural_scale;
+        let mut h = rh as f32 * natural_scale;
         if w > max_w && w > 0.0 {
             h *= max_w / w;
             w = max_w;
@@ -401,29 +599,41 @@ impl Lay<'_> {
         (w.max(1.0).round(), h.max(1.0).round())
     }
 
-    fn push_raster(&mut self, r: Raster) -> usize {
-        self.rasters.push(r);
-        self.rasters.len() - 1
+    /// Shape a paragraph, reusing the result of an identical one.
+    fn shape(&mut self, para: &Para) -> Arc<Shaped> {
+        let key = inline::para_key(para);
+        if let Some(s) = self.memo.shaped.get(&key) {
+            return Arc::clone(s);
+        }
+        let s = Arc::new(Shaped::new(self.fs, self.fonts, para));
+        self.memo.shaped.insert(key, Arc::clone(&s));
+        s
     }
 
-    fn try_math(&mut self, tex: &str, display: bool, size: f32, color: Rgba) -> Option<Raster> {
+    fn try_math(&mut self, tex: &str, display: bool, size: f32, color: Rgba) -> Option<Arc<Img>> {
         if tex.len() > MAX_MATH_SRC || tex.trim().is_empty() {
             return None;
         }
-        match (self.math)(tex, display, size, color) {
+        let key = (tex.to_owned(), display, size.to_bits(), color);
+        if let Some(hit) = self.memo.math.get(&key) {
+            return hit.clone();
+        }
+        let img = match (self.math)(tex, display, size, color) {
             Ok(r)
                 if r.width > 0
                     && r.height > 0
                     && r.pixels.len() >= (r.width as usize) * (r.height as usize) * 4 =>
             {
-                Some(r)
+                Img::new(&r)
             }
             Ok(_) => None,
             Err(e) => {
                 tracing::debug!("maths fallback: {e}");
                 None
             }
-        }
+        };
+        self.memo.math.insert(key, img.clone());
+        img
     }
 
     fn build_para(&mut self, inl: &[Inline], base: Base, max_w: f32) -> Para {
@@ -466,13 +676,13 @@ impl Lay<'_> {
                     let delim = if *display { "$$" } else { "$" };
                     let src = format!("{delim}{}{delim}", tex.replace('\n', " "));
                     if let Some(r) = raster {
-                        let (w, h) = Self::fit(&r, max_w, 1.0);
+                        let (w, h) = Self::fit((r.width, r.height), max_w, 1.0);
                         let k = h / r.height as f32;
                         let asc = match r.baseline {
                             Some(b) if !*display => (b as f32 * k).round(),
                             _ => h,
                         };
-                        let raster = self.push_raster(r);
+                        let raster = Src::Img(r);
                         let atom = Atom {
                             w,
                             h,
@@ -524,22 +734,37 @@ impl Lay<'_> {
         base: Base,
         max_w: f32,
     ) {
-        let loaded = images::load(url, &self.p.resources);
+        let key = (
+            url.to_owned(),
+            self.p.resources.allow_local_files,
+            self.p.resources.base_dir.clone(),
+        );
+        let loaded = if let Some(hit) = self.memo.images.get(&key) {
+            hit.clone()
+        } else {
+            let r = images::load(url, &self.p.resources).and_then(|r| {
+                Img::new(&r).ok_or_else(|| images::Denied::Failed("empty image".into()))
+            });
+            if let Ok(img) = &r {
+                self.memo.image_bytes += img.bytes();
+            }
+            self.memo.images.insert(key, r.clone());
+            r
+        };
         let label = if alt.trim().is_empty() {
             "image".to_owned()
         } else {
             alt.trim().to_owned()
         };
         match loaded {
-            Ok(r) if (r.pixels.len() as u64) <= self.image_budget => {
-                self.image_budget -= r.pixels.len() as u64;
-                let (w, h) = Self::fit(&r, max_w, self.scale);
-                let idx = self.push_raster(r);
+            Ok(r) if r.bytes() <= self.image_budget => {
+                self.image_budget -= r.bytes();
+                let (w, h) = Self::fit((r.width, r.height), max_w, self.scale);
                 para.pieces.push(Piece::Atom(Atom {
                     w,
                     h,
                     asc: h,
-                    raster: idx,
+                    raster: Src::Img(r),
                     link: st.link,
                     text: label,
                 }));
@@ -587,7 +812,7 @@ impl Lay<'_> {
     }
 
     fn flow(&mut self, para: &Para, x: f32, w: f32, y: f32, lctx: &LineCtx) -> f32 {
-        let shaped = Shaped::new(self.fs, self.fonts, para);
+        let shaped = self.shape(para);
         let lines = shaped.break_lines(w, lctx);
         self.emit(&shaped, &lines, x, y, w, lctx);
         y + inline::height(&lines)
@@ -813,7 +1038,7 @@ impl Lay<'_> {
                 };
                 let mut para = Para::default();
                 para.text(&txt, self.span(base, parse::Style::default()));
-                let shaped = Shaped::new(self.fs, self.fonts, &para);
+                let shaped = self.shape(&para);
                 let lctx = self.line_ctx(size, false, Align::Right, self.line_h);
                 let lines = shaped.break_lines(f32::INFINITY, &lctx);
                 let right = cx - (f * 0.4).round();
@@ -931,15 +1156,22 @@ impl Lay<'_> {
         let pad_y = (self.line_h * 0.5).round();
         let inner = (w - 2.0 * pad_x).max(1.0);
         let first_op = self.ops.len();
-        let lines = self.hl.highlight(text, lang, &self.pal);
-        let lctx = self.line_ctx(self.f, true, Align::Left, self.line_h);
-        let mut cy = y + pad_y;
-        let lines = if lines.is_empty() {
-            vec![vec![]]
+        let key = (lang.to_owned(), text.to_owned(), self.p.theme.clone());
+        let lines = if let Some(hit) = self.memo.code.get(&key) {
+            Arc::clone(hit)
         } else {
+            let lines = self.hl.highlight(text, lang, &self.pal);
+            let lines = Arc::new(if lines.is_empty() {
+                vec![vec![]]
+            } else {
+                lines
+            });
+            self.memo.code.insert(key, Arc::clone(&lines));
             lines
         };
-        for toks in &lines {
+        let lctx = self.line_ctx(self.f, true, Align::Left, self.line_h);
+        let mut cy = y + pad_y;
+        for toks in lines.iter() {
             if cy > self.y_limit {
                 break;
             }
@@ -961,7 +1193,7 @@ impl Lay<'_> {
                 };
                 para.text(clip(&t.text, &mut budget), span);
             }
-            let shaped = Shaped::new(self.fs, self.fonts, &para);
+            let shaped = self.shape(&para);
             let ls = shaped.break_lines(inner, &lctx);
             if ls.is_empty() {
                 cy += self.line_h;
@@ -1000,12 +1232,11 @@ impl Lay<'_> {
             };
             return self.paragraph(&inl, base, x, w, y, Align::Left);
         };
-        let (dw, dh) = Self::fit(&r, w, 1.0);
+        let (dw, dh) = Self::fit((r.width, r.height), w, 1.0);
         let pad = (self.f * 0.25).round();
         let ix = x + ((w - dw) / 2.0).floor();
-        let idx = self.push_raster(r);
         self.ops.push(Op::Image {
-            idx,
+            src: Src::Img(r),
             x: ix,
             y: y + pad,
             w: dw,
@@ -1023,28 +1254,41 @@ impl Lay<'_> {
     }
 
     fn diagram(&mut self, src: &str, x: f32, w: f32, y: f32) -> f32 {
-        let theme = self.p.theme.clone();
-        let result = (self.mermaid)(src, w.max(1.0) as u32, self.f, &theme);
-        let r = match result {
-            Ok(r)
-                if r.width > 0
-                    && r.height > 0
-                    && r.pixels.len() >= (r.width as usize) * (r.height as usize) * 4 =>
-            {
-                r
+        let max_w = w.max(1.0) as u32;
+        let placed: Result<(Src, (u32, u32)), String> = match self.mermaid {
+            MermaidBackend::Real => {
+                let key = (src.to_owned(), self.f.to_bits(), self.p.theme.clone());
+                let prepared = if let Some(hit) = self.memo.diagrams.get(&key) {
+                    hit.clone()
+                } else {
+                    let r = crate::mermaid::prepare_mermaid(src, self.f, &self.p.theme);
+                    self.memo.diagrams.insert(key, r.clone());
+                    r
+                };
+                prepared.and_then(|d| {
+                    let size = d.size_for(max_w)?;
+                    Ok((Src::Diagram(d, max_w), size))
+                })
             }
-            other => {
-                if let Err(e) = other {
-                    tracing::debug!("mermaid fallback: {e}");
+            MermaidBackend::Fake(f) => f(src, max_w, self.f, &self.p.theme).and_then(|r| {
+                if r.pixels.len() < (r.width as usize) * (r.height as usize) * 4 {
+                    return Err("short raster".into());
                 }
+                let img = Img::new(&r).ok_or("empty raster")?;
+                Ok((Src::Img(img), (r.width, r.height)))
+            }),
+        };
+        let (src_img, size) = match placed {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!("mermaid fallback: {e}");
                 return self.code("mermaid", src, x, w, y);
             }
         };
-        let (dw, dh) = Self::fit(&r, w, 1.0);
+        let (dw, dh) = Self::fit(size, w, 1.0);
         let ix = x + ((w - dw) / 2.0).floor();
-        let idx = self.push_raster(r);
         self.ops.push(Op::Image {
-            idx,
+            src: src_img,
             x: ix,
             y,
             w: dw,
@@ -1101,7 +1345,7 @@ impl Lay<'_> {
             .chain(rows.iter().map(|r| (false, r.as_slice())))
             .collect();
         // Shape every cell once.
-        let mut shaped: Vec<Vec<Shaped>> = vec![];
+        let mut shaped: Vec<Vec<Arc<Shaped>>> = vec![];
         for (is_head, r) in &all {
             let mut out = vec![];
             for c in 0..ncols {
@@ -1113,7 +1357,7 @@ impl Lay<'_> {
                     color: ctx.color,
                 };
                 let para = self.build_para(inl, base, w);
-                out.push(Shaped::new(self.fs, self.fonts, &para));
+                out.push(self.shape(&para));
             }
             shaped.push(out);
         }

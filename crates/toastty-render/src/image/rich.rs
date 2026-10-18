@@ -2,23 +2,27 @@
 //! term's [`toastty_term::RichBlockStore`] images and the per-row slice
 //! instances.
 //!
-//! Each block image is uploaded once into the shared [`ImagePipeline`]
-//! texture pool and re-uploaded when its revision changes. Images taller
-//! than the GPU's max texture dimension are split into tiles whose height
-//! is a whole number of cell rows, so a row's slice never straddles two
-//! textures. Each visible tagged row draws the `cell_h`-tall slice
-//! `index * cell_h .. (index + 1) * cell_h` of its block across the row.
+//! Block images are painted lazily ([`RichImage::paint`]) and uploaded
+//! in fixed tiles of [`TILE_ROWS`] cell rows, and only the tiles holding
+//! a visible row are painted. A re-layout (every step of a window resize
+//! re-lays out each block) therefore costs one screenful of pixels, not
+//! the whole document. Each visible tagged row draws the `cell_h`-tall
+//! slice `index * cell_h .. (index + 1) * cell_h` of its block across the
+//! row; a row never straddles two tiles.
 
 use std::collections::HashMap;
 
-use toastty_term::{RichBlockId, RichImage, Term};
+use toastty_term::{RichBlockId, RichImage, RichRow, Term};
 
 use super::instance::ImageInstance;
 use super::pipeline::ImagePipeline;
 
-/// Never keep more than this many block textures resident while not
-/// visible (visible ones are always kept).
-pub const MAX_IDLE_BLOCKS: usize = 8;
+/// Cell rows per tile (fewer when the GPU's max texture size demands).
+pub const TILE_ROWS: u32 = 16;
+
+/// Never keep more than this many tiles resident while not visible
+/// (visible ones are always kept).
+pub const MAX_IDLE_TILES: usize = 64;
 
 /// One texture holding rows `y0 .. y0 + height` of a block image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,49 +30,53 @@ pub struct RichTile {
     pub texture_index: usize,
     pub y0: u32,
     pub height: u32,
+    last_frame: u64,
 }
 
-/// GPU state of one block.
+/// GPU state of one block: the tiles painted so far, by tile number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RichTexEntry {
     pub revision: u32,
     pub width: u32,
     pub height: u32,
     pub cell_h: u32,
-    pub tiles: Vec<RichTile>,
-    last_frame: u64,
+    /// Cell rows per tile.
+    pub tile_rows: u32,
+    pub tiles: HashMap<u32, RichTile>,
 }
 
-/// Split an image of `height` px into tiles of at most `max_dim` px,
-/// each a whole number of `cell_h` rows (so no row straddles tiles).
-/// Returns `(y0, height)` pairs; empty when a single row doesn't fit.
+/// Cell rows per tile for this cell height and texture limit (0 when a
+/// single row doesn't fit).
 #[must_use]
-pub fn plan_tiles(height: u32, cell_h: u32, max_dim: u32) -> Vec<(u32, u32)> {
-    if cell_h == 0 || cell_h > max_dim || height == 0 {
-        return Vec::new();
+pub fn tile_rows(cell_h: u32, max_dim: u32) -> u32 {
+    if cell_h == 0 || cell_h > max_dim {
+        return 0;
     }
-    let tile_h = (max_dim / cell_h) * cell_h;
-    let mut out = Vec::new();
-    let mut y = 0;
-    while y < height {
-        let h = tile_h.min(height - y);
-        out.push((y, h));
-        y += h;
-    }
-    out
+    (max_dim / cell_h).min(TILE_ROWS)
 }
 
-/// Texture index and UV rect of row `index` of a block.
+impl RichTexEntry {
+    /// Pixel band `(y0, height)` of tile `t`, or `None` past the image.
+    #[must_use]
+    pub fn tile_span(&self, t: u32) -> Option<(u32, u32)> {
+        let tile_h = self.tile_rows * self.cell_h;
+        let y0 = t.checked_mul(tile_h)?;
+        (tile_h > 0 && y0 < self.height).then(|| (y0, tile_h.min(self.height - y0)))
+    }
+}
+
+/// Texture index and UV rect of row `index` of a block, when its tile
+/// is resident.
 #[must_use]
 pub fn row_slice(entry: &RichTexEntry, index: u16) -> Option<(usize, [f32; 2], [f32; 2])> {
+    if entry.tile_rows == 0 {
+        return None;
+    }
     let y = u32::from(index) * entry.cell_h;
     if y + entry.cell_h > entry.height {
         return None;
     }
-    let tile = entry
-        .tiles
-        .iter()
-        .find(|t| y >= t.y0 && y + entry.cell_h <= t.y0 + t.height)?;
+    let tile = entry.tiles.get(&(u32::from(index) / entry.tile_rows))?;
     #[allow(clippy::cast_precision_loss)]
     let (y0, y1, th) = (
         (y - tile.y0) as f32,
@@ -78,7 +86,7 @@ pub fn row_slice(entry: &RichTexEntry, index: u16) -> Option<(usize, [f32; 2], [
     Some((tile.texture_index, [0.0, y0 / th], [1.0, y1 / th]))
 }
 
-/// Block id → GPU textures.
+/// Block id → GPU tiles.
 #[derive(Debug, Default)]
 pub struct RichTextureCache {
     entries: HashMap<RichBlockId, RichTexEntry>,
@@ -103,16 +111,23 @@ impl RichTextureCache {
         self.entries.is_empty()
     }
 
+    /// Resident tiles across all blocks.
+    #[must_use]
+    pub fn tile_count(&self) -> usize {
+        self.entries.values().map(|e| e.tiles.len()).sum()
+    }
+
     fn free(pipe: &mut ImagePipeline, e: &RichTexEntry) {
-        for t in &e.tiles {
+        for t in e.tiles.values() {
             pipe.free_texture(t.texture_index);
         }
     }
 
-    /// Bring the textures for the blocks visible this frame up to date
-    /// (`visible` lists their ids) and drop textures for blocks that are
-    /// gone, evicted, or idle past [`MAX_IDLE_BLOCKS`]. `max_dim` is the
-    /// GPU's max 2D texture dimension. Returns `true` when anything was
+    /// Bring the tiles behind the rows visible this frame (`visible`
+    /// lists their block tags) up to date, painting and uploading any
+    /// that are missing, and drop tiles for blocks that are gone,
+    /// re-imaged, or idle past [`MAX_IDLE_TILES`]. `max_dim` is the GPU's
+    /// max 2D texture dimension. Returns `true` when anything was
     /// uploaded or freed.
     #[allow(clippy::too_many_arguments)]
     pub fn sync(
@@ -121,7 +136,7 @@ impl RichTextureCache {
         queue: &wgpu::Queue,
         pipe: &mut ImagePipeline,
         term: &Term,
-        visible: &[RichBlockId],
+        visible: &[RichRow],
         cell_h: u32,
         max_dim: u32,
     ) -> bool {
@@ -146,37 +161,87 @@ impl RichTextureCache {
                 changed = true;
             }
         }
-        for &id in visible {
-            if let Some(e) = self.entries.get_mut(&id) {
-                e.last_frame = frame;
+        let rows_per_tile = tile_rows(cell_h, max_dim);
+        let mut warmed: Vec<RichBlockId> = Vec::new();
+        for tag in visible {
+            let id = tag.block;
+            if !warmed.contains(&id) {
                 // Keep the block warm in the store's LRU while on screen.
                 let _ = store.image(id);
-                continue;
+                warmed.push(id);
             }
-            let (Some(img), Some(rev)) = (store.image(id), store.block_revision(id)) else {
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.entries.entry(id) {
+                let (Some(img), Some(rev)) = (store.image(id), store.block_revision(id)) else {
+                    continue;
+                };
+                if img.width == 0 || img.width > max_dim || rows_per_tile == 0 {
+                    continue;
+                }
+                slot.insert(RichTexEntry {
+                    revision: rev,
+                    width: img.width,
+                    height: img.height,
+                    cell_h,
+                    tile_rows: rows_per_tile,
+                    tiles: HashMap::new(),
+                });
+            }
+            let Some(e) = self.entries.get_mut(&id) else {
                 continue;
             };
-            if let Some(e) = upload(device, queue, pipe, img, rev, cell_h, max_dim, frame) {
-                self.entries.insert(id, e);
-                changed = true;
+            let t = u32::from(tag.index) / e.tile_rows;
+            if let Some(tile) = e.tiles.get_mut(&t) {
+                tile.last_frame = frame;
+                continue;
             }
-        }
-        // Bound idle residency.
-        while self.entries.len() > visible.len() + MAX_IDLE_BLOCKS {
-            let Some(victim) = self
-                .entries
-                .iter()
-                .filter(|(_, e)| e.last_frame != frame)
-                .min_by_key(|(_, e)| e.last_frame)
-                .map(|(id, _)| *id)
-            else {
-                break;
+            let Some((y0, h)) = e.tile_span(t) else {
+                continue;
             };
-            if let Some(e) = self.entries.remove(&victim) {
-                Self::free(pipe, &e);
-                changed = true;
+            let Some(img) = store.image(id) else { continue };
+            let Some(bytes) = paint_tile(img, y0, h) else {
+                continue;
+            };
+            let idx = pipe.upload_rgba(device, queue, e.width, h, &bytes);
+            e.tiles.insert(
+                t,
+                RichTile {
+                    texture_index: idx,
+                    y0,
+                    height: h,
+                    last_frame: frame,
+                },
+            );
+            changed = true;
+        }
+        changed |= self.evict_idle(pipe, frame);
+        changed
+    }
+
+    /// Free least-recently-shown tiles past [`MAX_IDLE_TILES`].
+    fn evict_idle(&mut self, pipe: &mut ImagePipeline, frame: u64) -> bool {
+        let mut idle: Vec<(u64, RichBlockId, u32)> = self
+            .entries
+            .iter()
+            .flat_map(|(id, e)| {
+                e.tiles
+                    .iter()
+                    .filter(|(_, t)| t.last_frame != frame)
+                    .map(|(n, t)| (t.last_frame, *id, *n))
+            })
+            .collect();
+        let mut changed = false;
+        if idle.len() > MAX_IDLE_TILES {
+            idle.sort_unstable();
+            for &(_, id, n) in &idle[..idle.len() - MAX_IDLE_TILES] {
+                if let Some(e) = self.entries.get_mut(&id)
+                    && let Some(t) = e.tiles.remove(&n)
+                {
+                    pipe.free_texture(t.texture_index);
+                    changed = true;
+                }
             }
         }
+        self.entries.retain(|_, e| !e.tiles.is_empty());
         changed
     }
 
@@ -203,45 +268,10 @@ impl RichTextureCache {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn upload(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    pipe: &mut ImagePipeline,
-    img: &RichImage,
-    revision: u32,
-    cell_h: u32,
-    max_dim: u32,
-    frame: u64,
-) -> Option<RichTexEntry> {
-    if img.width == 0 || img.width > max_dim {
-        return None;
-    }
-    let plan = plan_tiles(img.height, cell_h, max_dim);
-    if plan.is_empty() {
-        return None;
-    }
-    let stride = img.width as usize * 4;
-    let mut tiles = Vec::with_capacity(plan.len());
-    for (y0, h) in plan {
-        let start = y0 as usize * stride;
-        let end = start + h as usize * stride;
-        let bytes = img.pixels.get(start..end)?;
-        let idx = pipe.upload_rgba(device, queue, img.width, h, bytes);
-        tiles.push(RichTile {
-            texture_index: idx,
-            y0,
-            height: h,
-        });
-    }
-    Some(RichTexEntry {
-        revision,
-        width: img.width,
-        height: img.height,
-        cell_h,
-        tiles,
-        last_frame: frame,
-    })
+/// Paint one tile's pixels (exactly `width * h * 4` bytes) or `None`.
+fn paint_tile(img: &RichImage, y0: u32, h: u32) -> Option<Vec<u8>> {
+    let bytes = img.paint(y0, h)?;
+    (bytes.len() == img.width as usize * h as usize * 4).then_some(bytes)
 }
 
 /// One rendered row that shows a block slice.
@@ -288,60 +318,65 @@ pub fn build_rich_instances(
 mod tests {
     use super::*;
 
-    fn entry(height: u32, cell_h: u32, tiles: &[(u32, u32)]) -> RichTexEntry {
-        RichTexEntry {
+    fn entry(height: u32, cell_h: u32, tile_rows: u32, tiles: &[u32]) -> RichTexEntry {
+        let mut e = RichTexEntry {
             revision: 0,
             width: 80,
             height,
             cell_h,
-            tiles: tiles
-                .iter()
-                .enumerate()
-                .map(|(i, (y0, h))| RichTile {
-                    texture_index: i + 10,
-                    y0: *y0,
-                    height: *h,
-                })
-                .collect(),
-            last_frame: 0,
+            tile_rows,
+            tiles: HashMap::new(),
+        };
+        for &t in tiles {
+            let (y0, h) = e.tile_span(t).unwrap();
+            e.tiles.insert(
+                t,
+                RichTile {
+                    texture_index: t as usize + 10,
+                    y0,
+                    height: h,
+                    last_frame: 0,
+                },
+            );
         }
+        e
     }
 
     #[test]
-    fn plan_single_tile_when_it_fits() {
-        assert_eq!(plan_tiles(160, 16, 8192), vec![(0, 160)]);
+    fn tile_rows_respect_the_texture_limit() {
+        assert_eq!(tile_rows(16, 8192), TILE_ROWS);
+        assert_eq!(tile_rows(16, 64), 4);
+        assert_eq!(tile_rows(0, 64), 0);
+        assert_eq!(tile_rows(32, 16), 0);
     }
 
     #[test]
-    fn plan_splits_on_row_boundaries() {
-        // 8192 / 20 = 409 rows → 8180 px tiles.
-        let p = plan_tiles(20 * 1000, 20, 8192);
-        assert_eq!(p, vec![(0, 8180), (8180, 8180), (16360, 3640)]);
-        assert!(p.iter().all(|(y, h)| y % 20 == 0 && h % 20 == 0));
-        assert_eq!(p.iter().map(|(_, h)| h).sum::<u32>(), 20_000);
-    }
-
-    #[test]
-    fn plan_rejects_degenerate() {
-        assert_eq!(plan_tiles(0, 16, 8192), vec![]);
-        assert_eq!(plan_tiles(32, 0, 8192), vec![]);
-        assert_eq!(plan_tiles(32, 16, 8), vec![]);
+    fn tile_spans_cover_the_image_on_row_boundaries() {
+        let e = entry(20 * 37, 20, 16, &[]);
+        assert_eq!(e.tile_span(0), Some((0, 320)));
+        assert_eq!(e.tile_span(1), Some((320, 320)));
+        assert_eq!(e.tile_span(2), Some((640, 100)));
+        assert_eq!(e.tile_span(3), None);
     }
 
     #[test]
     fn row_slice_maps_rows_to_tiles_and_uvs() {
-        let e = entry(64, 16, &[(0, 32), (32, 32)]);
+        let e = entry(64, 16, 2, &[0, 1]);
         assert_eq!(row_slice(&e, 0), Some((10, [0.0, 0.0], [1.0, 0.5])));
         assert_eq!(row_slice(&e, 1), Some((10, [0.0, 0.5], [1.0, 1.0])));
         assert_eq!(row_slice(&e, 2), Some((11, [0.0, 0.0], [1.0, 0.5])));
         assert_eq!(row_slice(&e, 3), Some((11, [0.0, 0.5], [1.0, 1.0])));
         assert_eq!(row_slice(&e, 4), None);
+        // Tile not painted yet → no slice (the row's text draws).
+        let e = entry(64, 16, 2, &[1]);
+        assert_eq!(row_slice(&e, 0), None);
+        assert!(row_slice(&e, 2).is_some());
     }
 
     #[test]
     fn instances_only_for_resident_blocks() {
         let mut cache = RichTextureCache::default();
-        cache.entries.insert(7, entry(32, 16, &[(0, 32)]));
+        cache.entries.insert(7, entry(32, 16, 2, &[0]));
         let rows = [
             RichRowDraw {
                 y: 0.0,
@@ -376,11 +411,7 @@ mod tests {
             let h = u32::from(rows) * req.cell_h;
             Some(toastty_term::RichLayout {
                 rows,
-                image: Some(RichImage {
-                    width: w,
-                    height: h,
-                    pixels: vec![self.0; (w * h * 4) as usize].into(),
-                }),
+                image: RichImage::from_pixels(w, h, vec![self.0; (w * h * 4) as usize]),
                 text: Vec::new(),
                 links: Vec::new(),
             })
@@ -388,7 +419,10 @@ mod tests {
     }
 
     fn term_with_block(lines: usize) -> Term {
-        let mut t = Term::new(40, 4, 0);
+        term_with_block_in(Term::new(40, 4, 0), lines)
+    }
+
+    fn term_with_block_in(mut t: Term, lines: usize) -> Term {
         t.set_rich_layout(Box::new(Solid(200)));
         let src = vec!["x"; lines].join("\n");
         let b64 = {
@@ -419,8 +453,12 @@ mod tests {
         t
     }
 
+    fn tags(id: RichBlockId, rows: std::ops::Range<u16>) -> Vec<RichRow> {
+        rows.map(|index| RichRow { block: id, index }).collect()
+    }
+
     #[test]
-    fn gpu_sync_uploads_tiles_and_reuploads_on_revision() {
+    fn gpu_sync_paints_only_visible_tiles_and_reuploads_on_revision() {
         let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
             return; // no GPU in this sandbox
         };
@@ -428,33 +466,61 @@ mod tests {
         let mut t = term_with_block(10);
         let id = t.row(0).rich.unwrap().block;
         let mut cache = RichTextureCache::default();
-        // Default cell 8x16; max_dim 64 → 4 rows per tile → 3 tiles.
-        assert!(cache.sync(&device, &queue, &mut pipe, &t, &[id], 16, 64));
+        // Cell 16 px, max_dim 64 → 4 rows per tile. Rows 0..3 visible →
+        // only tile 0 is painted.
+        assert!(cache.sync(&device, &queue, &mut pipe, &t, &tags(id, 0..3), 16, 64));
         let e = cache.get(id).unwrap().clone();
-        assert_eq!(e.tiles.len(), 3);
-        assert_eq!(
-            e.tiles.iter().map(|t| t.height).collect::<Vec<_>>(),
-            [64, 64, 32]
-        );
-        assert_eq!(
-            row_slice(&e, 9).map(|s| s.0),
-            Some(e.tiles[2].texture_index)
-        );
+        assert_eq!(e.tile_rows, 4);
+        assert_eq!(e.tiles.len(), 1);
+        assert!(row_slice(&e, 2).is_some());
+        assert!(row_slice(&e, 9).is_none());
         // Nothing changed → no upload.
-        assert!(!cache.sync(&device, &queue, &mut pipe, &t, &[id], 16, 64));
+        assert!(!cache.sync(&device, &queue, &mut pipe, &t, &tags(id, 0..3), 16, 64));
+        // Scrolled to the end: the last (short) tile gets painted.
+        assert!(cache.sync(&device, &queue, &mut pipe, &t, &tags(id, 8..10), 16, 64));
+        let e = cache.get(id).unwrap();
+        assert_eq!(e.tiles[&2].height, 32);
+        assert_eq!(
+            row_slice(e, 9).map(|s| s.0),
+            Some(e.tiles[&2].texture_index)
+        );
         // Palette change → new image revision → re-upload.
+        let rev = e.revision;
         let mut env = t.rich_env();
         env.palette.fg = [9, 9, 9];
         t.set_rich_env(env);
         t.sync_rich_blocks();
-        assert!(cache.sync(&device, &queue, &mut pipe, &t, &[id], 16, 64));
-        assert_ne!(cache.get(id).unwrap().revision, e.revision);
+        assert!(cache.sync(&device, &queue, &mut pipe, &t, &tags(id, 0..3), 16, 64));
+        assert_ne!(cache.get(id).unwrap().revision, rev);
+        assert_eq!(cache.tile_count(), 1, "old tiles freed");
         // Block gone → textures freed.
         let mut p = toastty_parser::Parser::new();
         p.advance(&mut t, b"\x1b[2J");
         t.sync_rich_blocks();
         assert!(cache.sync(&device, &queue, &mut pipe, &t, &[], 16, 64));
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn gpu_idle_tiles_are_bounded() {
+        let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
+            return;
+        };
+        let mut pipe = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        // 300 rows at 2 rows per tile (max_dim 32) → 150 possible tiles.
+        let t = term_with_block_in(Term::new(40, 4, 1000), 300);
+        let id = t.rich_blocks().ids().next().expect("block stored");
+        assert_eq!(t.rich_blocks().get(id).unwrap().rows, 300);
+        let mut cache = RichTextureCache::default();
+        for r in 0..200u16 {
+            cache.sync(&device, &queue, &mut pipe, &t, &tags(id, r..r + 1), 16, 32);
+        }
+        assert!(cache.tile_count() <= MAX_IDLE_TILES + 1);
+        // The most recently shown rows are the ones kept.
+        let e = cache.get(id).unwrap();
+        assert_eq!(e.tile_rows, 2);
+        assert!(e.tiles.contains_key(&99) && e.tiles.contains_key(&75));
+        assert!(!e.tiles.contains_key(&0));
     }
 
     #[test]
@@ -467,7 +533,7 @@ mod tests {
         let id = t.row(0).rich.unwrap().block;
         let mut cache = RichTextureCache::default();
         // 4 cols * 8 px = 32 px wide > 16 → text fallback.
-        cache.sync(&device, &queue, &mut pipe, &t, &[id], 16, 16);
+        cache.sync(&device, &queue, &mut pipe, &t, &tags(id, 0..1), 16, 16);
         assert!(cache.get(id).is_none());
     }
 }

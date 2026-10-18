@@ -12,7 +12,7 @@ use cosmic_text::{
 };
 
 use super::fonts::Fonts;
-use super::paint::Op;
+use super::paint::{Op, Src};
 use crate::Rgba;
 
 /// Background/border decoration around a span.
@@ -50,8 +50,8 @@ pub(crate) struct Atom {
     pub h: f32,
     /// Height above the baseline.
     pub asc: f32,
-    /// Index into the render's raster list.
-    pub raster: usize,
+    /// What to draw.
+    pub raster: Src,
     pub link: Option<usize>,
     /// Plain text the atom stands for (selection/copy).
     pub text: String,
@@ -659,7 +659,7 @@ impl Shaped {
                     PlacedKind::Atom(a) => {
                         let at = &self.atoms[a];
                         ops.push(Op::Image {
-                            idx: at.raster,
+                            src: at.raster.clone(),
                             x: (ox + p.x).round(),
                             y: (base - at.asc).round(),
                             w: at.w,
@@ -790,4 +790,59 @@ impl Shaped {
 /// Total height of `lines`.
 pub(crate) fn height(lines: &[Line]) -> f32 {
     lines.iter().map(|l| l.h).sum()
+}
+
+/// Content key of a paragraph: everything `Shaped::new` reads. 128 bits
+/// (two independently seeded hashes) so a collision is not a concern.
+pub(crate) fn para_key(para: &Para) -> u128 {
+    use std::hash::{Hash, Hasher};
+    fn span<H: Hasher>(h: &mut H, s: &SpanInfo) {
+        (
+            s.mono,
+            s.bold,
+            s.italic,
+            s.underline,
+            s.strike,
+            s.boxed as u8,
+        )
+            .hash(h);
+        (s.size.to_bits(), s.rise.to_bits(), s.color, s.bg, s.link).hash(h);
+    }
+    fn atom<H: Hasher>(h: &mut H, a: &Atom) {
+        (
+            a.w.to_bits(),
+            a.h.to_bits(),
+            a.asc.to_bits(),
+            a.raster.id(),
+            a.link,
+        )
+            .hash(h);
+        a.text.hash(h);
+    }
+    let mut out = 0u128;
+    for seed in [0x9e37_79b9_u64, 0x85eb_ca6b] {
+        let mut h = std::hash::DefaultHasher::new();
+        seed.hash(&mut h);
+        para.pieces.len().hash(&mut h);
+        for p in &para.pieces {
+            match p {
+                Piece::Text(t, s) => {
+                    0u8.hash(&mut h);
+                    t.hash(&mut h);
+                    span(&mut h, s);
+                }
+                Piece::Atom(a) => {
+                    1u8.hash(&mut h);
+                    atom(&mut h, a);
+                }
+                Piece::Break => 2u8.hash(&mut h),
+                Piece::Display(a) => {
+                    3u8.hash(&mut h);
+                    atom(&mut h, a);
+                }
+            }
+        }
+        out = (out << 64) | u128::from(h.finish());
+    }
+    out
 }
