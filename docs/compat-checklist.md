@@ -104,7 +104,7 @@ parsed and dropped (screenshot check: `printf '\e[2mdim \e[9mstrike \e[4:3mcurly
 ## 4. User-facing features
 
 - [ ] **P1 — Font zoom.** Ctrl+= / Ctrl+- / Ctrl+0 (Cmd on macOS) to grow, shrink and reset the font size at runtime, re-rasterising and resizing the grid (PTY winsize plus in-band resize).
-- [ ] **P1 — Clickable plain-text URLs.** Only OSC 8 links can be opened today (Ctrl/Cmd+click). Detect `http(s)://`, `file://` and similar URLs in the visible text, underline them on hover with the modifier held, and open them on modifier+click. Must handle soft-wrapped lines and trailing punctuation.
+- [x] **P1 — Clickable plain-text URLs.** Only OSC 8 links can be opened today (Ctrl/Cmd+click). Detect `http(s)://`, `file://` and similar URLs in the visible text, underline them on hover with the modifier held, and open them on modifier+click. Must handle soft-wrapped lines and trailing punctuation. Done: `toastty_protocols::url_detect` + `Term::link_at` (soft wraps, wide/grapheme cells, scrollback), Ctrl/Cmd-hover underline + hand cursor, shared safe opener for OSC 8 and detected URLs.
 - [ ] **P1 — Scrollback search** (Ctrl+Shift+F / Cmd+F): incremental, highlight all matches, next/previous, regex optional.
 - [ ] **P1 — Configurable keybindings** (`[keybindings]` table). Copy, paste and Shift+Insert are hardcoded today.
 - [ ] **P2 — Prompt navigation.** Jump to previous/next prompt using the OSC 133 marks the terminal already records (`Term::prompt_marks`). Optionally select or copy the last command's output.
