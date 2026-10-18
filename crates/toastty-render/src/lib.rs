@@ -23,6 +23,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod chip;
 pub mod color;
 pub mod image;
 pub mod rgp;
@@ -41,6 +42,8 @@ use wgpu::{
     RequestAdapterOptions, Surface, SurfaceConfiguration, TextureFormat, TextureUsages,
 };
 
+use crate::chip::ChipFade;
+use crate::chip::pipeline::{ChipPipeline, ChipUniform};
 use crate::image::atlas::ImageTextureCache;
 use crate::image::instance::{ImageInstance, build_image_instances, split_layers};
 use crate::image::pipeline::ImagePipeline;
@@ -327,9 +330,22 @@ pub struct Renderer {
     scratch_stale: bool,
     /// Scroll-to-bottom button: `Some(corner)` enables it (the binary maps
     /// the `[scroll_button]` config here), `None` disables it. When
-    /// enabled, the button is painted in `corner` each frame the view is
-    /// scrolled back (see [`Self::draw_scroll_button`]).
+    /// enabled, a small round chip ([`crate::chip`]) is painted in
+    /// `corner` while the view is scrolled back.
     scroll_button: Option<ScrollButtonCorner>,
+    /// SDF pipeline that draws the scroll-to-bottom chip. Lazily built
+    /// alongside the text pipeline.
+    chip_pipeline: Option<ChipPipeline>,
+    /// Window scale factor (physical px per logical px) used to size
+    /// pixel-based UI such as the chip. Pushed by the binary.
+    ui_scale: f32,
+    /// Pointer is over the chip's hit rect (brightens it).
+    chip_hover: bool,
+    /// Fade-in / fade-out state of the chip.
+    chip_fade: ChipFade,
+    /// The chip was composited into the previous frame, so its pixels
+    /// must be cleared even if it is now fully faded out.
+    chip_drawn_last: bool,
     /// Window-padding insets in **physical px** (the binary pre-scales
     /// logical px by `scale_factor`). The content grid is inset by these
     /// from the full surface (`config.width`/`config.height`, which always
@@ -858,6 +874,11 @@ impl Renderer {
             // frames pick up the cascade rule.
             scratch_stale: true,
             scroll_button: None,
+            chip_pipeline: None,
+            ui_scale: 1.0,
+            chip_hover: false,
+            chip_fade: ChipFade::default(),
+            chip_drawn_last: false,
             pad_top: 0,
             pad_right: 0,
             pad_bottom: 0,
@@ -947,6 +968,9 @@ impl Renderer {
         if self.image_pipeline.is_none() {
             self.image_pipeline = Some(ImagePipeline::new(&self.device, self.config.format));
         }
+        if self.chip_pipeline.is_none() {
+            self.chip_pipeline = Some(ChipPipeline::new(&self.device, self.config.format));
+        }
         // Same for the RGP pipeline.
         if self.rgp_pipeline.is_none() {
             self.rgp_pipeline = Some(Rgp3dPipeline::new(&self.device, self.config.format));
@@ -1035,13 +1059,13 @@ impl Renderer {
             .blink
             .next_deadline(term.cursor_blink(), Instant::now());
         let rgp = term.rgp_scene().animation_deadline();
-        // Whichever fires first wins. Both are `Option<Duration>`.
-        match (blink, rgp) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        }
+        // Scroll-chip fade: tick at ~60 Hz while it is in progress.
+        let chip = self
+            .chip_fade
+            .animating(Instant::now())
+            .then_some(Duration::from_millis(16));
+        // Whichever fires first wins. All are `Option<Duration>`.
+        [blink, rgp, chip].into_iter().flatten().min()
     }
 
     /// Set (or clear) a debug overlay string painted at the top-right
@@ -1137,7 +1161,36 @@ impl Renderer {
     /// frame where the view is scrolled back into the scrollback. Cheap to
     /// call every config reload; it just stores the corner.
     pub fn set_scroll_button(&mut self, corner: Option<ScrollButtonCorner>) {
+        if corner != self.scroll_button {
+            self.needs_full_clear = true;
+        }
         self.scroll_button = corner;
+        if corner.is_none() {
+            self.chip_fade.snap(false);
+            self.chip_hover = false;
+        }
+    }
+
+    /// Set the window scale factor (physical px per logical px) used to
+    /// size pixel-based UI such as the scroll-to-bottom chip.
+    pub fn set_ui_scale(&mut self, scale: f64) {
+        #[allow(clippy::cast_possible_truncation)]
+        let scale = scale as f32;
+        if scale.is_finite() && scale > 0.0 && (scale - self.ui_scale).abs() > f32::EPSILON {
+            self.ui_scale = scale;
+            self.needs_full_clear = true;
+        }
+    }
+
+    /// Update whether the pointer hovers the scroll-to-bottom chip.
+    /// Returns `true` when that changed (so the caller should redraw).
+    pub fn set_scroll_button_hover(&mut self, hovered: bool) -> bool {
+        if hovered == self.chip_hover {
+            return false;
+        }
+        self.chip_hover = hovered;
+        self.needs_full_clear = true;
+        true
     }
 
     /// Floor-divide leftover and per-axis leading-edge offset for the
@@ -1473,7 +1526,7 @@ impl Renderer {
     /// each row's glyphs are drawn in `fg` on top. `grid_cols` clips any
     /// cell that would run past the right edge. The box width is taken from
     /// the first row (every row is the same width). Shared by
-    /// [`Self::draw_close_dialog`] and [`Self::draw_scroll_button`]; the
+    /// [`Self::draw_close_dialog`] and the banners; the
     /// per-cell two-cover-quad rationale lives in [`Self::draw_banner`].
     #[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
     fn draw_box_rows(
@@ -1559,116 +1612,26 @@ impl Renderer {
         }
     }
 
-    /// Scroll-to-bottom button box dimensions, in cells — a 5×3 rounded
-    /// box (`╭───╮` / `│ ↓ │` / `╰───╯`) — and its margin from the
-    /// viewport edge.
-    const SCROLL_BTN_COLS: u32 = 5;
-    const SCROLL_BTN_ROWS: u32 = 3;
-    const SCROLL_BTN_MARGIN: u32 = 1;
-
-    /// Cell-space top-left `(left_col, top_row)` of the scroll-to-bottom
-    /// button for the given viewport pixels + corner. `None` when the
-    /// viewport is too small to fit the box plus its margins.
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    fn scroll_button_cell_origin(
-        width: u32,
-        height: u32,
-        cell_size: (f32, f32),
-        corner: ScrollButtonCorner,
-    ) -> Option<(u32, u32)> {
-        let (cell_w, cell_h) = cell_size;
-        if cell_w <= 0.0 || cell_h <= 0.0 {
-            return None;
-        }
-        let cols = (width as f32 / cell_w).floor() as u32;
-        let rows = (height as f32 / cell_h).floor() as u32;
-        if cols < Self::SCROLL_BTN_COLS + 2 * Self::SCROLL_BTN_MARGIN
-            || rows < Self::SCROLL_BTN_ROWS + Self::SCROLL_BTN_MARGIN
-        {
-            return None;
-        }
-        let top_row = rows - Self::SCROLL_BTN_ROWS - Self::SCROLL_BTN_MARGIN;
-        let left_col = match corner {
-            ScrollButtonCorner::BottomRight => {
-                cols - Self::SCROLL_BTN_COLS - Self::SCROLL_BTN_MARGIN
-            }
-            ScrollButtonCorner::BottomLeft => Self::SCROLL_BTN_MARGIN,
-        };
-        Some((left_col, top_row))
+    /// Where the scroll-to-bottom chip sits this frame, if enabled (the
+    /// caller decides visibility). Physical px, content origin applied.
+    fn scroll_chip_geometry(&self) -> Option<chip::ChipGeometry> {
+        let corner = self.scroll_button?;
+        let dims = self.content_dims(self.cell_size());
+        chip::chip_geometry(self.content_origin(), dims, self.ui_scale, corner)
     }
 
-    /// Pixel-space rect `[x0, y0, x1, y1]` of the scroll-to-bottom button
-    /// when it is currently visible — i.e. enabled via
+    /// Pixel-space hit rect `[x0, y0, x1, y1]` of the scroll-to-bottom
+    /// chip when it is currently visible — i.e. enabled via
     /// [`Self::set_scroll_button`] AND `term` is scrolled back into the
-    /// scrollback. `None` otherwise. The binary uses this to hit-test
-    /// mouse clicks against the button.
+    /// scrollback. `None` otherwise. Physical px (content origin baked
+    /// in), slightly larger than the drawn disc. The binary hit-tests
+    /// clicks and hover against it.
     #[must_use]
-    #[allow(clippy::cast_precision_loss)]
     pub fn scroll_button_rect(&self, term: &Term) -> Option<[f32; 4]> {
-        let corner = self.scroll_button?;
         if !term.is_view_scrolled_back() {
             return None;
         }
-        let cell_size = self.cell_size();
-        // The button anchors to the content corner (the painted positions
-        // flow through the content_origin uniform). This rect is
-        // physical-space (hit-tested against raw mouse px), so bake the
-        // origin in here on the CPU.
-        let (cdw, cdh) = self.content_dims(cell_size);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let (left_col, top_row) =
-            Self::scroll_button_cell_origin(cdw as u32, cdh as u32, cell_size, corner)?;
-        let (cw, ch) = cell_size;
-        let origin = self.content_origin();
-        let x0 = left_col as f32 * cw + origin[0];
-        let y0 = top_row as f32 * ch + origin[1];
-        Some([
-            x0,
-            y0,
-            x0 + Self::SCROLL_BTN_COLS as f32 * cw,
-            y0 + Self::SCROLL_BTN_ROWS as f32 * ch,
-        ])
-    }
-
-    /// Append instances for the scroll-to-bottom button anchored at
-    /// `corner`. The caller is responsible for deciding visibility (config
-    /// enabled + view scrolled back); this just paints the box. Reuses
-    /// [`compose_dialog_rows`] to build the `↓`-in-a-rounded-box rows and
-    /// [`Self::draw_box_rows`] to paint them.
-    #[allow(
-        clippy::too_many_arguments,
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    fn draw_scroll_button(
-        queue: &Queue,
-        width: u32,
-        height: u32,
-        instances: &mut Vec<CellInstance>,
-        text: &mut TextState,
-        corner: ScrollButtonCorner,
-        panel_bg: [f32; 4],
-        fg: [f32; 4],
-        cell_size: (f32, f32),
-        term: &Term,
-    ) {
-        let Some((left_col, top_row)) =
-            Self::scroll_button_cell_origin(width, height, cell_size, corner)
-        else {
-            return;
-        };
-        let grid_cols = (width as f32 / cell_size.0).floor().max(1.0) as u32;
-        // "↓" in a 3-wide rounded box → ["╭───╮", "│ ↓ │", "╰───╯"].
-        let rows = compose_dialog_rows("↓", 1, 0);
-        Self::draw_box_rows(
-            queue, instances, text, &rows, left_col, top_row, grid_cols, cell_size, panel_bg, fg,
-            term,
-        );
+        self.scroll_chip_geometry().map(|g| g.hit_rect)
     }
 
     /// Set (or clear) the IME preedit string drawn inline at the cursor.
@@ -1872,9 +1835,20 @@ impl Renderer {
             self.needs_full_clear = true;
             term.mark_all_dirty();
         }
+        // Scroll-to-bottom chip: fade toward visible while scrolled back
+        // (hidden behind the close dialog). A fade step or a visibility
+        // edge forces the frame through the skip gate.
+        let chip_target = self.scroll_button.is_some()
+            && self.close_prompt.is_none()
+            && term.is_view_scrolled_back();
+        self.chip_fade.set_visible(chip_target, now);
+        let chip_alpha = self.chip_fade.value(now);
+        let chip_changed =
+            self.chip_fade.animating(now) || (chip_alpha > 0.0) != self.chip_drawn_last;
         if term.damage().is_empty()
             && !cursor_animation_due
             && !rgp_animation_active
+            && !chip_changed
             && !self.needs_full_clear
             && self.debug_overlay.is_none()
             && self.error_banner.is_none()
@@ -1883,6 +1857,15 @@ impl Renderer {
         {
             return Ok(RenderOutcome::Skipped);
         }
+
+        // The chip is translucent: compositing it over a LoadOp::Load
+        // partial frame would stack on last frame's chip. While it is
+        // (or just was) on screen, repaint everything underneath.
+        if chip_alpha > 0.0 || self.chip_drawn_last {
+            self.needs_full_clear = true;
+            term.mark_all_dirty();
+        }
+        self.chip_drawn_last = chip_alpha > 0.0;
 
         // If the blink tick fired, flip the visibility flag now —
         // before instance building reads `cursor_visible`.
@@ -2253,40 +2236,6 @@ impl Renderer {
                     });
                 }
             }
-        }
-
-        // Scroll-to-bottom button: a small rounded box in a corner, shown
-        // only while the view is scrolled up into the scrollback. Drawn
-        // before the error banner / close dialog so a modal scrim dims it.
-        // The chip background is the theme bg nudged toward fg so it reads
-        // as a raised affordance against the grid; the arrow + border use
-        // the theme fg.
-        if let Some(corner) = self.scroll_button
-            && term.is_view_scrolled_back()
-        {
-            let mix = |a: f32, b: f32, k: f32| a + (b - a) * k;
-            let chip = [
-                mix(theme.bg[0], theme.fg[0], 0.16),
-                mix(theme.bg[1], theme.fg[1], 0.16),
-                mix(theme.bg[2], theme.fg[2], 0.16),
-                0.95,
-            ];
-            // Anchor the button to the content corner: pass content dims
-            // (the positions flow through the content_origin uniform).
-            let (cdw, cdh) = content_dims;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            Self::draw_scroll_button(
-                &self.queue,
-                cdw as u32,
-                cdh as u32,
-                &mut instances,
-                text,
-                corner,
-                chip,
-                theme.fg,
-                cell_size,
-                term,
-            );
         }
 
         // Config error banner: full-width, multi-line, dark-red bg /
@@ -2753,6 +2702,16 @@ impl Renderer {
                     viewport,
                     origin,
                 );
+            }
+
+            // 6. scroll-to-bottom chip, on top of everything.
+            if chip_alpha > 0.0
+                && let Some(chip_pipe) = self.chip_pipeline.as_ref()
+                && let Some(geom) = self.scroll_chip_geometry()
+            {
+                let colors = chip::chip_colors(self.theme.bg, self.theme.fg, self.chip_hover);
+                let uniform = ChipUniform::new(viewport, &geom, self.ui_scale, chip_alpha, &colors);
+                chip_pipe.render(&self.queue, &mut rp, &uniform);
             }
         }
 
@@ -3237,39 +3196,6 @@ mod tests {
         let first_content = &rows[1 + pad_y];
         assert!(first_content.starts_with(&format!("│{}hello", " ".repeat(pad_x))));
         assert!(first_content.ends_with('│'));
-    }
-
-    /// The scroll-button corner math anchors the 5×3 box one cell in from
-    /// the chosen corner, and bails out when the viewport is too small.
-    #[test]
-    fn scroll_button_origin_anchors_to_corner() {
-        // 800×400 with 10×20 cells → 80 cols, 20 rows.
-        let cell = (10.0, 20.0);
-        // top_row = rows - BTN_ROWS(3) - MARGIN(1) = 16 for both corners.
-        let br =
-            Renderer::scroll_button_cell_origin(800, 400, cell, ScrollButtonCorner::BottomRight);
-        // left = cols - BTN_COLS(5) - MARGIN(1) = 74.
-        assert_eq!(br, Some((74, 16)));
-        let bl =
-            Renderer::scroll_button_cell_origin(800, 400, cell, ScrollButtonCorner::BottomLeft);
-        // left = MARGIN(1).
-        assert_eq!(bl, Some((1, 16)));
-
-        // Too few columns to fit box + margins → None.
-        assert!(
-            Renderer::scroll_button_cell_origin(30, 400, cell, ScrollButtonCorner::BottomRight)
-                .is_none()
-        );
-        // Degenerate cell size → None (no divide-by-zero blowup).
-        assert!(
-            Renderer::scroll_button_cell_origin(
-                800,
-                400,
-                (0.0, 0.0),
-                ScrollButtonCorner::BottomRight
-            )
-            .is_none()
-        );
     }
 
     // ----- Grid alignment geometry -----------------------------------------
