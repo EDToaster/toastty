@@ -20,7 +20,7 @@ Tracking list of escape sequences, modes, and extensions toastty intends to supp
 | Protocol | Sequence / Mode | Notes |
 | --- | --- | --- |
 | SGR mouse reporting | DECSET 1006 (+ 1000/1002/1003) | Required by tmux, neovim, helix |
-| Bracketed paste | DECSET 2004 | |
+| Bracketed paste | DECSET 2004 | Pastes are sanitised in both modes (xterm `allowPasteControls: false`): C0 controls except HT/CR/LF, DEL and C1 are stripped, so embedded `ESC[200~`/`ESC[201~` can't be forged; CRLF/LF become CR |
 | Focus in/out events | DECSET 1004 | |
 | Clipboard | OSC 52 | Read + write; gate write behind config |
 | Hyperlinks | OSC 8 | |
