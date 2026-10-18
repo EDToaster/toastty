@@ -32,17 +32,25 @@ use toastty_parser::{Params, Perform};
 /// tab-stop manipulation (HTS/TBC) this becomes per-column state.
 const TAB_WIDTH: u16 = 8;
 
-/// Mouse reporting protocol selected via DECSET 1000/1002/1003.
+/// Mouse reporting protocol selected via DECSET 9/1000/1002/1003.
 ///
 /// Apps opt in via the matching DECSET; the binary uses
 /// [`Term::mouse_mode`] to decide which events to forward as CSI sequences.
+/// The four tracking modes are mutually exclusive (xterm keeps a single
+/// `send_mouse_pos` value): setting one replaces whichever was active, and
+/// resetting *any* of them turns reporting off.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MouseProtocol {
     /// Mouse reporting off (default).
     #[default]
     Off,
-    /// DECSET 1000 — report button presses + releases only.
-    X10,
+    /// DECSET 9 — X10 compatibility: report button *presses* only, with
+    /// no modifier bits and no release / motion / wheel events (xterm
+    /// ctlseqs "X10 compatibility mode").
+    X10Compat,
+    /// DECSET 1000 — "normal" (VT200) tracking: presses + releases,
+    /// including modifier bits and wheel buttons.
+    Normal,
     /// DECSET 1002 — report button presses + releases + motion while a
     /// button is held (drag).
     ButtonMotion,
@@ -50,13 +58,38 @@ pub enum MouseProtocol {
     AnyMotion,
 }
 
-/// Combined mouse mode state — protocol + whether SGR (1006) encoding is
-/// active. `sgr_encoding` doesn't change which events fire, just how they
-/// are serialised.
+/// Coordinate encoding for mouse reports, selected via DECSET
+/// 1005 / 1006 / 1015.
+///
+/// The encodings are mutually exclusive, exactly as in xterm
+/// (`charproc.c`, `srm_*_EXT_MODE_MOUSE`): "rather than choose an
+/// arbitrary precedence among the coordinate modes, they are mutually
+/// exclusive. For consistency, a reset is only effective against the
+/// matching mode." So the most recently *set* encoding wins, and
+/// `CSI ? 1015 l` while 1006 is active leaves SGR in place.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MouseEncoding {
+    /// No extension: legacy X11 `CSI M Cb Cx Cy`, one byte per value
+    /// (value + 32). Coordinates are limited to 223.
+    #[default]
+    Default,
+    /// DECSET 1005 — like [`Self::Default`] but values ≥ 96 are sent as
+    /// two-byte UTF-8, extending the coordinate limit to 2015.
+    Utf8,
+    /// DECSET 1006 — SGR: `CSI < Cb ; Cx ; Cy M|m`, decimal, unlimited,
+    /// with distinct press (`M`) / release (`m`) finals.
+    Sgr,
+    /// DECSET 1015 — urxvt: `CSI Cb ; Cx ; Cy M`, decimal, unlimited, but
+    /// `Cb` keeps the +32 offset and releases are button 3 like legacy.
+    Urxvt,
+}
+
+/// Combined mouse mode state — protocol + coordinate encoding. `encoding`
+/// doesn't change which events fire, just how they are serialised.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MouseMode {
     pub protocol: MouseProtocol,
-    pub sgr_encoding: bool,
+    pub encoding: MouseEncoding,
 }
 
 impl MouseMode {
@@ -2763,6 +2796,38 @@ impl Term {
         }
     }
 
+    /// DECSET / DECRST for the mouse modes.
+    ///
+    /// Tracking modes (9 / 1000 / 1002 / 1003) share one slot like
+    /// xterm's `send_mouse_pos`: set replaces whichever was active, reset
+    /// of any of them turns reporting off. The coordinate encodings
+    /// (1005 UTF-8 / 1006 SGR / 1015 urxvt) are likewise mutually
+    /// exclusive: set selects, reset only clears the matching mode
+    /// (xterm `charproc.c`, `srm_*_EXT_MODE_MOUSE`).
+    fn set_mouse_private_mode(&mut self, code: u16, enable: bool) {
+        let protocol = match code {
+            9 => MouseProtocol::X10Compat,
+            1000 => MouseProtocol::Normal,
+            1002 => MouseProtocol::ButtonMotion,
+            1003 => MouseProtocol::AnyMotion,
+            _ => {
+                let enc = match code {
+                    1005 => MouseEncoding::Utf8,
+                    1006 => MouseEncoding::Sgr,
+                    // 1015; the caller only routes mouse modes here.
+                    _ => MouseEncoding::Urxvt,
+                };
+                if enable {
+                    self.mouse_mode.encoding = enc;
+                } else if self.mouse_mode.encoding == enc {
+                    self.mouse_mode.encoding = MouseEncoding::Default;
+                }
+                return;
+            }
+        };
+        self.mouse_mode.protocol = if enable { protocol } else { MouseProtocol::Off };
+    }
+
     /// Resolve the DECRPM status for a private mode `ps`. Returns one
     /// of the VT-spec codes documented at the `CSI ? Ps $ p` handler:
     /// 0 (unknown), 1 (set), 2 (reset). Modes we model but don't have
@@ -2772,11 +2837,14 @@ impl Term {
     fn decrqm_status(&self, ps: u16) -> u16 {
         let is_set = match ps {
             25 => self.cursor_visible,
-            1000 => matches!(self.mouse_mode.protocol, MouseProtocol::X10),
+            9 => matches!(self.mouse_mode.protocol, MouseProtocol::X10Compat),
+            1000 => matches!(self.mouse_mode.protocol, MouseProtocol::Normal),
             1002 => matches!(self.mouse_mode.protocol, MouseProtocol::ButtonMotion),
             1003 => matches!(self.mouse_mode.protocol, MouseProtocol::AnyMotion),
             1004 => self.report_focus,
-            1006 => self.mouse_mode.sgr_encoding,
+            1005 => matches!(self.mouse_mode.encoding, MouseEncoding::Utf8),
+            1006 => matches!(self.mouse_mode.encoding, MouseEncoding::Sgr),
+            1015 => matches!(self.mouse_mode.encoding, MouseEncoding::Urxvt),
             47 | 1047 | 1049 => self.alt_active,
             2004 => self.bracketed_paste,
             2026 => self.sync_output.active,
@@ -2846,37 +2914,14 @@ impl Term {
                         self.mark_cell(row, col);
                     }
                 }
-                // 1000 — X10 / VT200 button reporting (press + release).
-                1000 => {
-                    self.mouse_mode.protocol = if enable {
-                        MouseProtocol::X10
-                    } else {
-                        MouseProtocol::Off
-                    };
-                }
-                // 1002 — button-event tracking (press/release + drag).
-                1002 => {
-                    self.mouse_mode.protocol = if enable {
-                        MouseProtocol::ButtonMotion
-                    } else {
-                        MouseProtocol::Off
-                    };
-                }
-                // 1003 — any-event tracking (all motion regardless of buttons).
-                1003 => {
-                    self.mouse_mode.protocol = if enable {
-                        MouseProtocol::AnyMotion
-                    } else {
-                        MouseProtocol::Off
-                    };
+                // 9 / 1000 / 1002 / 1003 — mouse tracking; 1005 / 1006 /
+                // 1015 — mouse coordinate encodings.
+                9 | 1000 | 1002 | 1003 | 1005 | 1006 | 1015 => {
+                    self.set_mouse_private_mode(code, enable);
                 }
                 // 1004 — focus events.
                 1004 => {
                     self.report_focus = enable;
-                }
-                // 1006 — SGR extended mouse encoding.
-                1006 => {
-                    self.mouse_mode.sgr_encoding = enable;
                 }
                 // 2004 — bracketed paste.
                 2004 => {
@@ -4973,14 +5018,38 @@ mod tests {
     }
 
     #[test]
-    fn mouse_mode_1000_x10() {
+    fn mouse_mode_1000_normal() {
         let mut t = Term::new(2, 4, 0);
         feed(&mut t, b"\x1b[?1000h");
-        assert_eq!(t.mouse_mode().protocol, MouseProtocol::X10);
+        assert_eq!(t.mouse_mode().protocol, MouseProtocol::Normal);
         assert!(t.mouse_mode().is_on());
         assert!(!t.mouse_mode().report_drag());
         feed(&mut t, b"\x1b[?1000l");
         assert_eq!(t.mouse_mode().protocol, MouseProtocol::Off);
+    }
+
+    #[test]
+    fn mouse_mode_9_x10_compat() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?9h");
+        assert_eq!(t.mouse_mode().protocol, MouseProtocol::X10Compat);
+        assert!(t.mouse_mode().is_on());
+        assert!(!t.mouse_mode().report_drag());
+        feed(&mut t, b"\x1b[?9$p");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?9;1$y");
+        feed(&mut t, b"\x1b[?9l\x1b[?9$p");
+        assert_eq!(t.mouse_mode().protocol, MouseProtocol::Off);
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?9;2$y");
+    }
+
+    #[test]
+    fn mouse_tracking_modes_replace_each_other() {
+        // xterm keeps one `send_mouse_pos`: the last set mode wins.
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?1003h\x1b[?1000h");
+        assert_eq!(t.mouse_mode().protocol, MouseProtocol::Normal);
+        feed(&mut t, b"\x1b[?1000$p\x1b[?1003$p");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?1000;1$y\x1b[?1003;2$y");
     }
 
     #[test]
@@ -5003,17 +5072,61 @@ mod tests {
     #[test]
     fn mouse_mode_1006_sgr_encoding() {
         let mut t = Term::new(2, 4, 0);
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Default);
         feed(&mut t, b"\x1b[?1006h");
-        assert!(t.mouse_mode().sgr_encoding);
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Sgr);
         feed(&mut t, b"\x1b[?1006l");
-        assert!(!t.mouse_mode().sgr_encoding);
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Default);
+    }
+
+    #[test]
+    fn mouse_mode_1005_and_1015_encodings() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?1005h");
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Utf8);
+        feed(&mut t, b"\x1b[?1015h");
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Urxvt);
+        feed(&mut t, b"\x1b[?1015l");
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Default);
+    }
+
+    #[test]
+    fn mouse_encodings_are_mutually_exclusive_like_xterm() {
+        // Last set wins; a reset only clears the matching mode.
+        let mut t = Term::new(2, 4, 0);
+        // crossterm's EnableMouseCapture order: ...1015h 1006h → SGR.
+        feed(&mut t, b"\x1b[?1015h\x1b[?1006h");
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Sgr);
+        // Resetting a non-active encoding is a no-op.
+        feed(&mut t, b"\x1b[?1015l\x1b[?1005l");
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Sgr);
+        // Reverse order → urxvt is the active one.
+        feed(&mut t, b"\x1b[?1015h");
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Urxvt);
+        feed(&mut t, b"\x1b[?1006l");
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Urxvt);
+        // DECRQM reports only the active encoding as set.
+        feed(&mut t, b"\x1b[?1005$p\x1b[?1006$p\x1b[?1015$p");
+        assert_eq!(
+            &t.drain_pty_replies()[..],
+            b"\x1b[?1005;2$y\x1b[?1006;2$y\x1b[?1015;1$y"
+        );
+        feed(&mut t, b"\x1b[?1005h\x1b[?1005$p");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?1005;1$y");
+    }
+
+    #[test]
+    fn ris_resets_mouse_mode_and_encoding() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?1002h\x1b[?1015h\x1bc");
+        assert_eq!(t.mouse_mode(), MouseMode::default());
     }
 
     #[test]
     fn mouse_mode_combined_1006_1002() {
         let mut t = Term::new(2, 4, 0);
         feed(&mut t, b"\x1b[?1002h\x1b[?1006h");
-        assert!(t.mouse_mode().sgr_encoding);
+        assert_eq!(t.mouse_mode().encoding, MouseEncoding::Sgr);
         assert_eq!(t.mouse_mode().protocol, MouseProtocol::ButtonMotion);
     }
 

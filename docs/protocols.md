@@ -19,7 +19,7 @@ Tracking list of escape sequences, modes, and extensions toastty intends to supp
 
 | Protocol | Sequence / Mode | Notes |
 | --- | --- | --- |
-| SGR mouse reporting | DECSET 1006 (+ 1000/1002/1003) | Required by tmux, neovim, helix |
+| Mouse reporting | DECSET 9 / 1000 / 1002 / 1003, encodings 1005 / 1006 / 1015 | SGR (1006) required by tmux, neovim, helix. Without an encoding mode, reports use legacy X11 `CSI M Cb Cx Cy` (coords > 223 sent as xterm's `0x00` past-end marker); 1005 = UTF-8, 1015 = urxvt. Encodings are mutually exclusive like xterm: last set wins, reset only clears the matching mode. DECSET 9 = X10 presses only, no modifiers |
 | Bracketed paste | DECSET 2004 | Pastes are sanitised in both modes (xterm `allowPasteControls: false`): C0 controls except HT/CR/LF, DEL and C1 are stripped, so embedded `ESC[200~`/`ESC[201~` can't be forged; CRLF/LF become CR |
 | Focus in/out events | DECSET 1004 | |
 | Clipboard | OSC 52 | Read + write; gate write behind config |
