@@ -36,7 +36,7 @@ including maths and Mermaid diagrams, inline in the terminal.
 | Images: remote URLs | never fetched (alt text is shown) |
 | Inline maths `$…$` and display maths `$$…$$` (RaTeX, KaTeX-compatible) | yes |
 | Fenced ```` ```math ```` blocks | yes |
-| Fenced ```` ```mermaid ```` diagrams (mermaid-rs-renderer) | yes |
+| Fenced ```` ```mermaid ```` diagrams (mermaid-svg) | yes |
 | Raw HTML | ignored (shown as text) |
 | Footnotes | rendered as text |
 
@@ -105,7 +105,7 @@ If the image is gone, the plain text in the cells is drawn as normal.
   - Code highlighting: syntect, coloured from the terminal's ANSI palette.
   - Maths: RaTeX (`ratex-parser` / `ratex-layout`, rasterized with the KaTeX
     fonts).
-  - Mermaid: `mermaid-rs-renderer` produces SVG, which resvg rasterizes.
+  - Mermaid: `mermaid-svg` produces SVG, which resvg rasterizes.
   - Text: the layout reports, for every row, the plain text runs that sit on
     it, mapped to columns by x position. The terminal writes them into the
     cells.

@@ -468,10 +468,24 @@ fn maths_falls_back_to_inline_code() {
 
 #[test]
 fn mermaid_falls_back_to_source_code_block() {
-    let b = render("```mermaid\ngraph TD\n  A-->B\n```\n");
-    assert_eq!(lines(&b), vec!["graph TD", "  A-->B"]);
+    // Not a diagram type mermaid knows: shown as a code block of the source.
+    let b = render("```mermaid\nnotadiagram\n  A-->B\n```\n");
+    assert_eq!(lines(&b), vec!["notadiagram", "  A-->B"]);
     let pal = Palette::new(&Theme::default());
     assert_eq!(px(&b, 30, 4), pal.code_bg);
+}
+
+#[test]
+fn mermaid_diagram_renders_as_image() {
+    let b = render("```mermaid\ngraph TD\n  A-->B\n```\n");
+    // The source still sits under the block for copy/search.
+    assert_eq!(&lines(&b)[..2], &["graph TD", "  A-->B"]);
+    // Drawn as a diagram, not a code panel, and taller than the 2 lines.
+    let pal = Palette::new(&Theme::default());
+    assert_ne!(px(&b, 30, 4), pal.code_bg);
+    assert!(b.rows > 4, "rows = {}", b.rows);
+    let ink = b.image.pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
+    assert!(ink > 500, "diagram has ink: {ink}");
 }
 
 const RED: Rgba = [255, 0, 0, 255];
