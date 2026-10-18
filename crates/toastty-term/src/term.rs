@@ -7471,8 +7471,13 @@ mod tests {
     #[test]
     fn other_dcs_is_ignored() {
         let mut t = Term::new(4, 10, 0);
-        // DECUDK-ish / tmux passthrough-ish DCS: no reply, no output.
-        feed(&mut t, b"\x1bP1;1|17/ab\x1b\\\x1bPtmux;x\x1b\\");
+        // DECUDK-ish and near-miss tmux introducers: no reply, no
+        // output. (Real `ESC P tmux ;` passthrough is unwrapped by the
+        // parser; see tests/tmux_passthrough.rs.)
+        feed(
+            &mut t,
+            b"\x1bP1;1|17/ab\x1b\\\x1bPtmux:x\x1b\\\x1bPtmuxx\x1b\\",
+        );
         assert_eq!(t.drain_pty_replies(), b"");
         assert_eq!(t.row(0).cells[0].ch, ' ');
     }

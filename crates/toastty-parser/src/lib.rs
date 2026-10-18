@@ -9,6 +9,10 @@
 //! [`Perform::apc_end`] so large payloads (e.g. a 50 MB RGP `.glb`)
 //! don't have to be buffered before dispatch.
 //!
+//! tmux passthrough (`ESC P tmux ; … ESC \`, ESCs doubled) is
+//! unwrapped before any of that, so wrapped OSC / APC / DCS / CSI
+//! sequences reach the handler exactly as if they had been sent bare.
+//!
 //! See [`docs/decisions/streaming-apc.md`](../../docs/decisions/streaming-apc.md).
 
 #![forbid(unsafe_code)]
@@ -16,6 +20,6 @@
 mod parser;
 mod perform;
 
-pub use parser::{MAX_OSC_LEN, Parser};
+pub use parser::{MAX_OSC_LEN, MAX_PASSTHROUGH_LEN, Parser};
 pub use perform::{BufferingApcHandler, Perform};
 pub use vte::Params;
