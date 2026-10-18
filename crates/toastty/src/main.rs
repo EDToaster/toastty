@@ -1549,9 +1549,8 @@ impl Toastty {
         self.mouse_pos = position;
         self.pointer_inside = true;
         self.link_modifiers = modifiers;
-        let hover_changed = self.refresh_scroll_chip_hover()
-            | self.refresh_link_hover()
-            | self.refresh_rich_chip();
+        let hover_changed =
+            self.refresh_scroll_chip_hover() | self.refresh_link_hover() | self.refresh_rich_chip();
         let signal = self.handle_mouse_motion_inner(position, modifiers);
         if hover_changed && signal == ControlSignal::Continue {
             ControlSignal::RedrawIn(Duration::ZERO)
@@ -1597,7 +1596,9 @@ impl Toastty {
                 .and_then(|row| row.rich)
                 .map(|tag| tag.block)
         };
-        let top = block.and_then(|b| self.term.rich_block_view_span(b)).map(|s| s.0);
+        let top = block
+            .and_then(|b| self.term.rich_block_view_span(b))
+            .map(|s| s.0);
         let block = block.filter(|_| top.is_some());
         self.rich_chip_block = block;
         let Some(r) = self.renderer.as_mut() else {
