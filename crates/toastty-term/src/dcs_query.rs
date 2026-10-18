@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 
 use toastty_config::CursorShape;
 
-use crate::cell::{Color, Style};
+use crate::cell::{Color, Style, UnderlineStyle};
 
 /// Upper bound on a buffered query body. Real queries are tiny (neovim's
 /// four-cap XTGETTCAP is 27 bytes); the cap only exists so a hostile or
@@ -292,11 +292,25 @@ fn decscusr_value(shape: CursorShape, blink: bool) -> u8 {
 pub(crate) fn sgr_report(style: &Style) -> String {
     let mut s = String::from("0");
     let f = style.flags;
+    let underline = match f.underline {
+        UnderlineStyle::None => None,
+        UnderlineStyle::Single => Some("4"),
+        // xterm reports a double underline as SGR 21.
+        UnderlineStyle::Double => Some("21"),
+        UnderlineStyle::Curly => Some("4:3"),
+        UnderlineStyle::Dotted => Some("4:4"),
+        UnderlineStyle::Dashed => Some("4:5"),
+    };
     for (on, code) in [
-        (f.bold, "1"),
-        (f.italic, "3"),
-        (f.underline, "4"),
-        (f.reverse, "7"),
+        (f.bold(), "1"),
+        (f.dim(), "2"),
+        (f.italic(), "3"),
+        (underline.is_some(), underline.unwrap_or("")),
+        (f.blink(), "5"),
+        (f.reverse(), "7"),
+        (f.hidden(), "8"),
+        (f.strikethrough(), "9"),
+        (f.overline(), "53"),
     ] {
         if on {
             s.push(';');
@@ -546,18 +560,54 @@ mod tests {
             style: Style {
                 fg: Color::Rgb(255, 0, 7),
                 bg: Color::Indexed256(42),
-                flags: StyleFlags {
-                    bold: true,
-                    italic: true,
-                    underline: true,
-                    reverse: true,
-                },
+                flags: StyleFlags::EMPTY
+                    .with(StyleFlags::BOLD)
+                    .with(StyleFlags::ITALIC)
+                    .with(StyleFlags::REVERSE)
+                    .with_underline(UnderlineStyle::Single),
             },
             ..state()
         };
         assert_eq!(
             rqss("m", &st),
             "\x1bP1$r0;1;3;4;7;38:2::255:0:7;48:5:42m\x1b\\"
+        );
+    }
+
+    #[test]
+    fn decrqss_sgr_reports_extended_renditions() {
+        let mut flags = StyleFlags::EMPTY;
+        for m in [
+            StyleFlags::DIM,
+            StyleFlags::BLINK,
+            StyleFlags::HIDDEN,
+            StyleFlags::STRIKETHROUGH,
+            StyleFlags::OVERLINE,
+        ] {
+            flags.set(m, true);
+        }
+        let with = |u| QueryState {
+            style: Style {
+                flags: flags.with_underline(u),
+                ..Style::RESET
+            },
+            ..state()
+        };
+        assert_eq!(
+            rqss("m", &with(UnderlineStyle::Double)),
+            "\x1bP1$r0;2;21;5;8;9;53m\x1b\\"
+        );
+        assert_eq!(
+            rqss("m", &with(UnderlineStyle::Curly)),
+            "\x1bP1$r0;2;4:3;5;8;9;53m\x1b\\"
+        );
+        assert_eq!(
+            rqss("m", &with(UnderlineStyle::Dotted)),
+            "\x1bP1$r0;2;4:4;5;8;9;53m\x1b\\"
+        );
+        assert_eq!(
+            rqss("m", &with(UnderlineStyle::Dashed)),
+            "\x1bP1$r0;2;4:5;5;8;9;53m\x1b\\"
         );
     }
 
