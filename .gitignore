@@ -2,3 +2,4 @@
 .claude/
 __pycache__/
 *.pyc
+crates/toastty-render/target-snapshot-failures/

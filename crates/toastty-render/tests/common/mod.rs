@@ -317,6 +317,15 @@ pub(crate) fn assert_matches_golden(name: &str, img: &RgbaImage) {
 
     let score = similarity.score;
     eprintln!("snapshot {name}: SSIM = {score:.6}");
+    if score < 0.99 {
+        // Keep the mismatching render for inspection (CI uploads this
+        // directory as an artifact on failure).
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target-snapshot-failures");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = img.save(dir.join(format!("{name}.actual.png")));
+            eprintln!("wrote {}", dir.join(format!("{name}.actual.png")).display());
+        }
+    }
     assert!(
         score >= 0.99,
         "SSIM {score:.6} < 0.99 for snapshot `{name}` (golden at {})",
