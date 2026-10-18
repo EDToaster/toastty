@@ -1,0 +1,35 @@
+[package]
+name = "toastty-markdown"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Lays out and rasterizes Markdown (with maths and Mermaid) into terminal rich blocks"
+
+[dependencies]
+cosmic-text.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+pulldown-cmark = { version = "0.13", default-features = false }
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+base64 = "0.22"
+unicode-width.workspace = true
+# Maths: RaTeX (KaTeX-compatible), fonts embedded. >= 0.1.11 for the
+# CVE-2026-53531 nesting-depth fix.
+ratex-parser = "0.1.15"
+ratex-layout = "0.1.15"
+ratex-types = "0.1.15"
+ratex-render = { version = "0.1.15", features = ["embed-fonts"] }
+png = "0.17"
+# Mermaid: pure Rust, no font or filesystem access; resvg 0.46 shares
+# tiny-skia 0.11 with the layout engine.
+mermaid-svg = "0.7"
+resvg = { version = "0.46", default-features = false, features = ["text"] }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[lints]
+workspace = true

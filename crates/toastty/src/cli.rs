@@ -34,6 +34,10 @@ pub enum Action {
     PrintHelp,
     /// Print the version string to stdout and exit.
     PrintVersion,
+    /// `toastty md [FILE|-]`: print a Markdown document as a rich block
+    /// (or as plain text outside toastty) and exit. `None` / `-` reads
+    /// stdin.
+    Markdown { file: Option<PathBuf> },
 }
 
 /// An argument we didn't recognise.
@@ -69,7 +73,23 @@ where
     let mut action_kind: Option<ActionKind> = None;
     let mut command: Option<CommandOverride> = None;
     let mut working_directory: Option<PathBuf> = None;
-    let mut iter = args.into_iter().map(Into::into);
+    let mut iter = args.into_iter().map(Into::into).peekable();
+    // `toastty md …` is a subcommand only as the very first argument
+    // (`toastty -- md` still runs a program called `md`).
+    if iter.peek().is_some_and(|a| a == "md") {
+        iter.next();
+        let rest: Vec<String> = iter.collect();
+        return match rest.as_slice() {
+            [] => Ok(Action::Markdown { file: None }),
+            [f] if f == "-" || !f.starts_with('-') => Ok(Action::Markdown {
+                file: Some(PathBuf::from(f)),
+            }),
+            [f] => Err(ParseError { arg: f.clone() }),
+            [_, extra, ..] => Err(ParseError {
+                arg: format!("md takes one file, got extra argument {extra}"),
+            }),
+        };
+    }
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--print-default-config" => action_kind = Some(ActionKind::PrintDefaultConfig),
@@ -161,6 +181,7 @@ toastty — lightweight GPU-accelerated terminal emulator
 USAGE:
     toastty [FLAGS] [-- | -e | --command] <command> [args...]
     toastty [FLAGS] <command> [args...]
+    toastty md [FILE|-]
 
 FLAGS:
     -d, --working-directory <PATH>
@@ -170,6 +191,12 @@ FLAGS:
                               Useful for bootstrapping: `toastty --print-default-config > ~/.config/toastty/config.toml`
     -h, --help                Print this help and exit
     -V, --version             Print the version and exit
+
+MARKDOWN:
+    `toastty md README.md` (or `cat notes.md | toastty md`) prints the
+    document as a rendered block when run inside toastty, and as plain
+    text elsewhere (other terminals, tmux, screen, zellij, herdr). To
+    launch a program called `md`, use `toastty -- md`.
 
 COMMAND:
     Anything after the first bare positional, after `--`, or after
@@ -241,6 +268,38 @@ mod tests {
             parse(["--help", "--print-default-config"]).unwrap(),
             Action::PrintDefaultConfig
         );
+    }
+
+    #[test]
+    fn md_subcommand() {
+        assert_eq!(parse(["md"]).unwrap(), Action::Markdown { file: None });
+        assert_eq!(
+            parse(["md", "README.md"]).unwrap(),
+            Action::Markdown {
+                file: Some(PathBuf::from("README.md"))
+            }
+        );
+        assert_eq!(
+            parse(["md", "-"]).unwrap(),
+            Action::Markdown {
+                file: Some(PathBuf::from("-"))
+            }
+        );
+        assert!(parse(["md", "a.md", "b.md"]).is_err());
+        assert_eq!(parse(["md", "--x"]).unwrap_err().arg, "--x");
+    }
+
+    #[test]
+    fn md_only_as_first_argument() {
+        // After the separator it's a program name.
+        let Action::Run { command, .. } = parse(["--", "md", "x"]).unwrap() else {
+            panic!("expected Run");
+        };
+        assert_eq!(command.unwrap().program, PathBuf::from("md"));
+        let Action::Run { command, .. } = parse(["-d", "/tmp", "md"]).unwrap() else {
+            panic!("expected Run");
+        };
+        assert_eq!(command.unwrap().program, PathBuf::from("md"));
     }
 
     #[test]

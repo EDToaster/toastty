@@ -34,9 +34,21 @@ Cargo workspace under `crates/`:
 | Paste clipboard | Ctrl+Shift+V | Cmd+V |
 | Paste PRIMARY selection | Shift+Insert | Shift+Insert (clipboard) |
 | Open hyperlink | Ctrl+click | Cmd+click |
+| Copy a Markdown block's source | click the copy chip shown at the block's top right on hover | same |
 | Zoom in | Ctrl+= (also Ctrl++, Ctrl+Shift+=, Ctrl+keypad +) | Cmd+= (same variants) |
 | Zoom out | Ctrl+- (also Ctrl+Shift+-, Ctrl+keypad -) | Cmd+- |
 | Reset zoom | Ctrl+0 | Cmd+0 |
+
+### Markdown
+
+`toastty md README.md` (or `cat notes.md | toastty md`) prints a Markdown
+document as a rendered block: headings, tables, code, maths and Mermaid
+diagrams, laid out for the window width and re-laid out when it changes.
+Selecting text copies the rendered text; the copy chip copies the source;
+links open with Ctrl+click (Cmd+click on macOS). Outside toastty, and inside
+tmux / screen / zellij / herdr for now, it prints the plain Markdown. See
+[docs/markdown.md](docs/markdown.md) and the `[security] markdown` /
+`markdown_local_files` config keys.
 
 ### Font zoom
 

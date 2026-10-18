@@ -33,6 +33,8 @@ fn fully_populated_fixture_parses_via_load_from_path() {
         }
     );
     assert_eq!(cfg.window.grid_align, GridAlign::Centered);
+    assert!(cfg.security.markdown);
+    assert!(cfg.security.markdown_local_files);
     assert_eq!(
         cfg.window.padding,
         PaddingConfig {

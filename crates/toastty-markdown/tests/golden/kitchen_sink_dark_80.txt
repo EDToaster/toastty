@@ -1,0 +1,46 @@
+rows 43
+  0
+  1 @1:"Toastty Markdown"
+  2
+  3 @1:"A fast, GPU-accelerated terminal that renders plain rich Markdown inline. Use toastty md README.md to"
+  4 @1:"try it, or read the docs."
+  5
+  6
+  7 @1:"Features"
+  8
+  9 @2:"- Headings, bold, italic, inline code and links"
+ 10 @2:"- Nested lists:"
+ 11 @5:"- second level with a long item that needs to wrap onto the next line nicely"
+ 12 @7:"- third level"
+ 13 @2:"- Ordered lists:"
+ 14 @4:"1. first"
+ 15 @4:"2. second"
+ 16
+ 17 @1:"Tasks"
+ 18
+ 19 @1:"[x] parse with pulldown-cmark"
+ 20 @1:"[ ] draw maths"
+ 21 @1:"[ ] draw diagrams"
+ 22 @1:"> Block quotes are drawn with a bar on the left and muted text."
+ 23
+ 24 @1:"> > Nested quotes work too."
+ 25
+ 26 @2:"// Highlighted with syntect."
+ 27 @2:"fn main() {"
+ 28 @2:"    let greeting = \"hello\";"
+ 29 @2:"    println!(\"{greeting}, world: {}\", 42);"
+ 30 @2:"}"
+ 31
+ 32 @2:"Element | Status | Notes"
+ 33
+ 34 @2:"Tables | done | aligned columns"
+ 35
+ 36 @2:"Images | partial | data: URIs only"
+ 37
+ 38
+ 39 @1:"Smaller heading"
+ 40
+ 41 @1:"Text after a rule, with an image placeholder: logo and an embedded image: gradient"
+ 42
+link row 4 cols 14..18 https://example.com/docs
+link row 9 cols 34..38 https://example.com

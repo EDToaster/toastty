@@ -130,6 +130,7 @@ fn wrap_line(
         rows.push(Row {
             cells: SmallVec::from_vec(std::mem::take(cur)),
             soft_wrap,
+            rich: None,
         });
     };
 
@@ -253,6 +254,7 @@ mod tests {
         Row {
             cells: SmallVec::from_vec(cells),
             soft_wrap,
+            rich: None,
         }
     }
 
