@@ -104,7 +104,8 @@ parsed and dropped (screenshot check: `printf '\e[2mdim \e[9mstrike \e[4:3mcurly
 
 ## 4. User-facing features
 
-- [ ] **P1 — Font zoom.** Ctrl+= / Ctrl+- / Ctrl+0 (Cmd on macOS) to grow, shrink and reset the font size at runtime, re-rasterising and resizing the grid (PTY winsize plus in-band resize).
+- [x] **P1 — Font zoom.** Ctrl+= / Ctrl+- / Ctrl+0 (Cmd on macOS) to grow, shrink and reset the font size at runtime, re-rasterising and resizing the grid (PTY winsize plus in-band resize).
+  - Done: `toastty::font_zoom` (bindings incl. Ctrl++ / Ctrl+Shift+= / keypad, 1 px steps clamped to 6..=72 px, reload rebasing); `Renderer::set_font_size` re-rasterises in place without reloading the font database; regrid reuses the window-resize path (`resync_grid` + 2048 report). Documented in the README.
 - [x] **P1 — Clickable plain-text URLs.** Only OSC 8 links can be opened today (Ctrl/Cmd+click). Detect `http(s)://`, `file://` and similar URLs in the visible text, underline them on hover with the modifier held, and open them on modifier+click. Must handle soft-wrapped lines and trailing punctuation. Done: `toastty_protocols::url_detect` + `Term::link_at` (soft wraps, wide/grapheme cells, scrollback), Ctrl/Cmd-hover underline + hand cursor, shared safe opener for OSC 8 and detected URLs.
 - [ ] **P1 — Scrollback search** (Ctrl+Shift+F / Cmd+F): incremental, highlight all matches, next/previous, regex optional.
 - [ ] **P1 — Configurable keybindings** (`[keybindings]` table). Copy, paste and Shift+Insert are hardcoded today.

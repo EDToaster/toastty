@@ -42,7 +42,7 @@ Tracking list of escape sequences, modes, and extensions toastty intends to supp
 | --- | --- | --- |
 | Synchronized output | DECSET 2026 (BSU/ESU) | Atomic redraws; tmux/neovim/Textual rely on it. Must-have |
 | Grapheme cluster processing | DECSET 2027 | Terminal Unicode Core; opt-in correct emoji/ZWJ width |
-| In-band resize notifications | DECSET 2048 | Stream-based resize, no SIGWINCH race |
+| In-band resize notifications | DECSET 2048 | Stream-based resize, no SIGWINCH race. Sent on window resize, font zoom, and config reloads that change the grid |
 | Kitty keyboard protocol | CSI u + progressive enhancement flags | Push/pop via `CSI > flags u` / `CSI < u`. Neovim/helix/zellij use it |
 | Semantic prompts | OSC 133 (FinalTerm) | Powers prompt jumping, command status, shell integration |
 | ConEmu progress | OSC 9;4 | Surfaced in tab/taskbar UI |
