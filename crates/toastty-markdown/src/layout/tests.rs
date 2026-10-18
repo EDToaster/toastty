@@ -459,6 +459,9 @@ fn maths_falls_back_to_inline_code() {
     assert_eq!(lines(&b), vec!["$$\\int_0^1 x\\,dx$$"]);
     let b = render("```math\na^2+b^2\n```\n");
     assert_eq!(lines(&b), vec!["$$a^2+b^2$$"]);
+    // Invalid TeX (unbalanced group) falls back to the code-styled source.
+    let b = render("```math\n\\frac{a\n```\n");
+    assert_eq!(lines(&b), vec!["$$\\frac{a$$"]);
     let pal = Palette::new(&Theme::default());
     assert!(count_color(&b, pal.inline_code_bg, 0) > 100);
 }
