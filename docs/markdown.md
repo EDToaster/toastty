@@ -1,6 +1,6 @@
 # Markdown rich blocks
 
-Status: in progress (v1). This is the design for rendering Markdown documents,
+Status: v1 implemented. This is the design for rendering Markdown documents,
 including maths and Mermaid diagrams, inline in the terminal.
 
 ## User-facing behaviour
