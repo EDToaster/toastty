@@ -723,6 +723,7 @@ impl Toastty {
         let align = grid_align(self.config.window.grid_align);
         if let Some(r) = self.renderer.as_mut() {
             r.set_padding(pt, pr, pb, pl); // top, right, bottom, left (physical px)
+            r.set_ui_scale(self.scale_factor);
             r.set_extend_background_when(when);
             r.set_extend_background(ext);
             r.set_grid_align(align);
@@ -1388,6 +1389,35 @@ impl Toastty {
     /// column/row boundary.
     fn handle_mouse_motion(&mut self, position: (f64, f64), modifiers: Modifiers) -> ControlSignal {
         self.mouse_pos = position;
+        let hover_changed = self.refresh_scroll_chip_hover();
+        let signal = self.handle_mouse_motion_inner(position, modifiers);
+        if hover_changed && signal == ControlSignal::Continue {
+            ControlSignal::RedrawIn(Duration::ZERO)
+        } else {
+            signal
+        }
+    }
+
+    /// Re-evaluate whether the pointer (`self.mouse_pos`) is over the
+    /// visible scroll-to-bottom chip and push that to the renderer.
+    /// Returns `true` when the hover state changed.
+    fn refresh_scroll_chip_hover(&mut self) -> bool {
+        let Some(r) = self.renderer.as_mut() else {
+            return false;
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let (x, y) = (self.mouse_pos.0 as f32, self.mouse_pos.1 as f32);
+        let hovered = r
+            .scroll_button_rect(&self.term)
+            .is_some_and(|rect| x >= rect[0] && x < rect[2] && y >= rect[1] && y < rect[3]);
+        r.set_scroll_button_hover(hovered)
+    }
+
+    fn handle_mouse_motion_inner(
+        &mut self,
+        position: (f64, f64),
+        modifiers: Modifiers,
+    ) -> ControlSignal {
         // Local drag-select first: when we've started a selection,
         // every motion event extends it, even if the foreground app
         // would otherwise want the motion. (The selection only starts
@@ -2281,6 +2311,9 @@ impl App for Toastty {
                     r.set_debug_overlay(Some(&self.fps_buf));
                 }
 
+                // The chip may have appeared/vanished under a still
+                // pointer (wheel scroll, click, new output).
+                self.refresh_scroll_chip_hover();
                 let mut next_blink: Option<Duration> = None;
                 if let Some(r) = self.renderer.as_mut() {
                     match r.render_term(&mut self.term) {
