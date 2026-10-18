@@ -305,6 +305,13 @@ pub struct Renderer {
     image_instances_below_bg: Vec<ImageInstance>,
     image_instances_below: Vec<ImageInstance>,
     image_instances_above: Vec<ImageInstance>,
+    /// Rich blocks (OSC 7700): GPU textures per block image.
+    rich_tex_cache: crate::image::rich::RichTextureCache,
+    /// Rich-block slices + selection tint drawn this frame.
+    rich_instances: Vec<ImageInstance>,
+    /// Rich slices were drawn last frame (a frame that stops drawing
+    /// them must repaint everything).
+    rich_drawn_last: bool,
     /// Last viewport offset rendered. When it changes we force a full
     /// clear — partial redraw can't reliably overpaint the previous
     /// frame at the new y-translation (blank cells skip emission, so
@@ -977,6 +984,9 @@ impl Renderer {
             image_instances_below_bg: Vec::new(),
             image_instances_below: Vec::new(),
             image_instances_above: Vec::new(),
+            rich_tex_cache: crate::image::rich::RichTextureCache::default(),
+            rich_instances: Vec::new(),
+            rich_drawn_last: false,
             last_view_offset: (0, 0.0),
             scratch_depth_texture,
             scratch_depth_view,
@@ -1773,6 +1783,139 @@ impl Renderer {
         }
     }
 
+    /// Rich blocks: sync GPU textures for the blocks on screen and
+    /// return `(render_row, draw)` for every rendered row that will show
+    /// an image slice (block image resident and the row's slice present).
+    fn sync_rich_blocks(&mut self, term: &Term) -> Vec<(u16, crate::image::rich::RichRowDraw)> {
+        if term.rich_blocks().is_empty() && self.rich_tex_cache.is_empty() {
+            return Vec::new();
+        }
+        let cell = self.cell_size();
+        if cell.1 < 1.0 {
+            return Vec::new();
+        }
+        let (rows, _) = term.size();
+        let content_h = self.content_dims(cell).1;
+        let view_pixel = term.view_offset_pixel();
+        let rows_rendered =
+            crate::text::instance::rows_to_render(rows, view_pixel, cell.1, content_h);
+        let y_translate = if view_pixel > 0.0 {
+            view_pixel - cell.1
+        } else {
+            0.0
+        };
+        let mut tagged: Vec<(u16, toastty_term::RichRow)> = Vec::new();
+        let mut visible: Vec<toastty_term::RichBlockId> = Vec::new();
+        for r in 0..rows_rendered {
+            if let Some(tag) = term.view_row(r).rich {
+                tagged.push((r, tag));
+                if !visible.contains(&tag.block) {
+                    visible.push(tag.block);
+                }
+            }
+        }
+        let Some(pipe) = self.image_pipeline.as_mut() else {
+            return Vec::new();
+        };
+        let max_dim = self.device.limits().max_texture_dimension_2d;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let cell_h_px = cell.1.round() as u32;
+        let changed = self.rich_tex_cache.sync(
+            &self.device,
+            &self.queue,
+            pipe,
+            term,
+            &visible,
+            cell_h_px,
+            max_dim,
+        );
+        if changed {
+            self.needs_full_clear = true;
+        }
+        tagged
+            .into_iter()
+            .filter(|(_, tag)| {
+                self.rich_tex_cache
+                    .get(tag.block)
+                    .is_some_and(|e| crate::image::rich::row_slice(e, tag.index).is_some())
+            })
+            .map(|(r, tag)| {
+                (
+                    r,
+                    crate::image::rich::RichRowDraw {
+                        y: f32::from(r) * cell.1 + y_translate,
+                        block: tag.block,
+                        index: tag.index,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Selection highlight over rich-block slices: a translucent quad
+    /// per selected run of cells, drawn right after the slices so a
+    /// selection stays visible over opaque parts of the image.
+    fn push_rich_selection_tint(
+        &mut self,
+        term: &Term,
+        draws: &[(u16, crate::image::rich::RichRowDraw)],
+        cell: (f32, f32),
+    ) {
+        if term.selection().is_none() {
+            return;
+        }
+        let Some(pipe) = self.image_pipeline.as_mut() else {
+            return;
+        };
+        let (rows, cols) = term.size();
+        let pixel_extra = u16::from(term.view_offset_pixel() > 0.0);
+        let sel = self.theme.selection_bg;
+        let rgba = [
+            crate::color::linear_to_srgb_u8(sel[0]),
+            crate::color::linear_to_srgb_u8(sel[1]),
+            crate::color::linear_to_srgb_u8(sel[2]),
+            110,
+        ];
+        let mut tint: Option<usize> = None;
+        for (r, d) in draws {
+            let Some(line_id) = crate::text::instance::line_id_for_render_row(
+                term.bottom_id(),
+                rows,
+                term.view_offset_lines(),
+                pixel_extra,
+                *r,
+            ) else {
+                continue;
+            };
+            let mut c = 0u16;
+            while c < cols {
+                if !term.is_cell_selected(line_id, c) {
+                    c += 1;
+                    continue;
+                }
+                let start = c;
+                while c < cols && term.is_cell_selected(line_id, c) {
+                    c += 1;
+                }
+                let idx = *tint.get_or_insert_with(|| {
+                    self.rich_tex_cache
+                        .tint_texture(&self.device, &self.queue, pipe, rgba)
+                });
+                #[allow(clippy::cast_possible_truncation)]
+                self.rich_instances.push(ImageInstance {
+                    pos: [f32::from(start) * cell.0, d.y],
+                    size: [f32::from(c - start) * cell.0, cell.1],
+                    uv_min: [0.0, 0.0],
+                    uv_max: [1.0, 1.0],
+                    texture_index: idx as u32,
+                    z: -1,
+                    image_id: 0,
+                    _pad: [0; 1],
+                });
+            }
+        }
+    }
+
     /// Where the scroll-to-bottom chip sits this frame, if enabled (the
     /// caller decides visibility). Physical px, content origin applied.
     fn scroll_chip_geometry(&self) -> Option<chip::ChipGeometry> {
@@ -1966,6 +2109,20 @@ impl Renderer {
             term.mark_all_dirty();
         }
 
+        // Rich blocks: upload / refresh the textures of the blocks on
+        // screen and collect the rows that draw an image slice.
+        let rich_draws = self.sync_rich_blocks(term);
+        let rich_active = !rich_draws.is_empty();
+        if rich_active != self.rich_drawn_last {
+            self.needs_full_clear = true;
+        }
+        let mut rich_suppress = vec![false; usize::from(term.size().0) + 2];
+        for d in &rich_draws {
+            if let Some(slot) = rich_suppress.get_mut(usize::from(d.0)) {
+                *slot = true;
+            }
+        }
+
         // M9 skip-submit: if no cells changed AND no animation tick is
         // due, there's nothing to draw. Skip the surface acquire +
         // encode + submit entirely. The binary preserves the damage
@@ -2022,6 +2179,15 @@ impl Renderer {
         {
             return Ok(RenderOutcome::Skipped);
         }
+
+        // Rich slices are alpha-blended over the cell backgrounds, so a
+        // partial (LoadOp::Load) frame would stack them on last frame's
+        // pixels. Repaint everything while blocks are (or just were) shown.
+        if rich_active || self.rich_drawn_last {
+            self.needs_full_clear = true;
+            term.mark_all_dirty();
+        }
+        self.rich_drawn_last = rich_active;
 
         // The chip is translucent: compositing it over a LoadOp::Load
         // partial frame would stack on last frame's chip. While it is
@@ -2144,8 +2310,16 @@ impl Renderer {
                 // an extra glyph cosmic-text would shape, shifting every
                 // downstream cluster's snapped column by one.
                 text.line_text_scratch.clear();
+                // A row showing a rich-block slice draws the image
+                // instead of its text glyphs (the cells keep the text
+                // for selection / copy / the evicted fallback).
+                let suppress = rich_suppress.get(r as usize).copied().unwrap_or(false);
                 for c in &row.cells {
                     if c.is_continuation {
+                        continue;
+                    }
+                    if suppress {
+                        text.line_text_scratch.push(' ');
                         continue;
                     }
                     // Replace Kitty Unicode placeholder cells
@@ -2631,6 +2805,20 @@ impl Renderer {
             self.image_instances_above.extend_from_slice(above);
         }
 
+        // Rich-block slices, then the selection tint over them.
+        self.rich_instances.clear();
+        if rich_active {
+            let rows_draw: Vec<crate::image::rich::RichRowDraw> =
+                rich_draws.iter().map(|d| d.1).collect();
+            crate::image::rich::build_rich_instances(
+                &mut self.rich_instances,
+                &self.rich_tex_cache,
+                &rows_draw,
+                cell_size.1,
+            );
+            self.push_rich_selection_tint(term, &rich_draws, cell_size);
+        }
+
         // Acquire surface frame. This is where `Fifo` present mode
         // blocks waiting for vsync; if any prior frame is still queued,
         // we sit here for ~16.7ms.
@@ -2820,6 +3008,9 @@ impl Renderer {
             #[allow(clippy::cast_precision_loss)] // viewport in 16k-px range.
             let viewport = (self.config.width as f32, self.config.height as f32);
 
+            if let Some(img_pipe) = self.image_pipeline.as_mut() {
+                img_pipe.begin_frame();
+            }
             // m2: below-cell-bg images draw before the text bg pass so
             // the cell background colors paint over them.
             if let Some(img_pipe) = self.image_pipeline.as_mut()
@@ -2849,6 +3040,21 @@ impl Renderer {
             text_ref
                 .pipeline
                 .render_bg(&mut rp, &text_ref.bind_group, inst_count);
+
+            // Rich-block slices (+ selection tint) over the cell
+            // backgrounds, under everything else.
+            if let Some(img_pipe) = self.image_pipeline.as_mut()
+                && !self.rich_instances.is_empty()
+            {
+                img_pipe.render(
+                    &self.device,
+                    &self.queue,
+                    &mut rp,
+                    &self.rich_instances,
+                    viewport,
+                    origin,
+                );
+            }
 
             if let Some(rgp_pipe) = self.rgp_pipeline.as_mut() {
                 rgp_pipe.render(

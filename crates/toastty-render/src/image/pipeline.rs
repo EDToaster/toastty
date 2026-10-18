@@ -31,6 +31,12 @@ pub struct ImagePipeline {
     globals_buf: wgpu::Buffer,
     instance_buf: wgpu::Buffer,
     instance_buf_cap: u64,
+    /// Extra instance buffers for the 2nd, 3rd … `render` call of a
+    /// frame. `queue.write_buffer` lands at submit time, so every draw
+    /// list in one pass needs its own buffer; reusing one would make all
+    /// passes see the last list. Reset by [`ImagePipeline::begin_frame`].
+    extra_bufs: Vec<(wgpu::Buffer, u64)>,
+    calls_this_frame: usize,
     sampler: wgpu::Sampler,
     /// Texture storage: each entry's index matches
     /// `ImageTexEntry::texture_index`.
@@ -167,6 +173,8 @@ impl ImagePipeline {
             globals_buf,
             instance_buf,
             instance_buf_cap,
+            extra_bufs: Vec::new(),
+            calls_this_frame: 0,
             sampler,
             textures: Vec::new(),
             free_indices: Vec::new(),
@@ -286,22 +294,42 @@ impl ImagePipeline {
         };
         queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
-        // Grow instance buffer if needed.
+        // Pick this call's instance buffer (the first call uses the
+        // primary one), growing it if needed.
         let needed = std::mem::size_of_val(instances) as u64;
-        if needed > self.instance_buf_cap {
+        let call = self.calls_this_frame;
+        self.calls_this_frame += 1;
+        let (buf, cap) = if call == 0 {
+            (&mut self.instance_buf, &mut self.instance_buf_cap)
+        } else {
+            while self.extra_bufs.len() < call {
+                let b = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("toastty-image instances (extra)"),
+                    size: 256 * std::mem::size_of::<ImageInstance>() as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.extra_bufs
+                    .push((b, 256 * std::mem::size_of::<ImageInstance>() as u64));
+            }
+            let (b, c) = &mut self.extra_bufs[call - 1];
+            (b, c)
+        };
+        if needed > *cap {
             let new_cap = needed.next_power_of_two();
-            self.instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            *buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("toastty-image instances (grown)"),
                 size: new_cap,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.instance_buf_cap = new_cap;
+            *cap = new_cap;
         }
-        queue.write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(instances));
+        queue.write_buffer(buf, 0, bytemuck::cast_slice(instances));
+        let buf = buf.clone();
 
         pass.set_pipeline(&self.pipeline);
-        pass.set_vertex_buffer(0, self.instance_buf.slice(..));
+        pass.set_vertex_buffer(0, buf.slice(..));
 
         // One draw per instance, rebinding the texture between draws.
         for (i, inst) in instances.iter().enumerate() {
@@ -332,17 +360,39 @@ impl ImagePipeline {
         }
     }
 
+    /// Mark the start of a frame: the next [`ImagePipeline::render`]
+    /// call uses the primary instance buffer again.
+    pub fn begin_frame(&mut self) {
+        self.calls_this_frame = 0;
+    }
+
     fn allocate_texture(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         data: &ImageData,
     ) -> usize {
+        self.upload_rgba(device, queue, data.width, data.height, &data.pixels)
+    }
+
+    /// Upload a straight-alpha sRGB RGBA8 image (`width * height * 4`
+    /// bytes) into a free texture slot and return its index (usable as
+    /// [`ImageInstance::texture_index`]). Free with
+    /// [`ImagePipeline::free_texture`]. Used by rich blocks, which keep
+    /// their own cache outside the kitty registry.
+    pub fn upload_rgba(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> usize {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("toastty-image texture"),
             size: wgpu::Extent3d {
-                width: data.width.max(1),
-                height: data.height.max(1),
+                width: width.max(1),
+                height: height.max(1),
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -352,25 +402,27 @@ impl ImagePipeline {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &data.pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(data.width * 4),
-                rows_per_image: Some(data.height),
-            },
-            wgpu::Extent3d {
-                width: data.width.max(1),
-                height: data.height.max(1),
-                depth_or_array_layers: 1,
-            },
-        );
+        if width > 0 && height > 0 && pixels.len() >= (width as usize * height as usize * 4) {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         if let Some(idx) = self.free_indices.pop() {
@@ -382,6 +434,11 @@ impl ImagePipeline {
             self.views.push(view);
             self.textures.len() - 1
         }
+    }
+
+    /// Return a slot from [`ImagePipeline::upload_rgba`] to the pool.
+    pub fn free_texture(&mut self, index: usize) {
+        self.release_texture(index);
     }
 
     fn release_texture(&mut self, index: usize) {
