@@ -765,3 +765,96 @@ Footnote reference[^n] and an ![remote image](https://x/y.png) and a local ![fil
         }
     }
 }
+
+#[test]
+fn colour_changes_keep_the_row_count() {
+    let src = include_str!("../../tests/golden/kitchen_sink.md");
+    let dark = render(src);
+    let mut p = params(80);
+    p.theme = light();
+    let lt = render_with(src, &p);
+    assert_eq!(dark.rows, lt.rows);
+    assert_eq!(dark.text, lt.text);
+    assert_eq!(dark.links, lt.links);
+    assert_ne!(dark.image, lt.image);
+}
+
+#[test]
+fn links_in_tables_and_linked_images() {
+    let b = render("| site |\n|---|\n| [home](https://h) |\n");
+    assert_eq!(b.links.len(), 1);
+    assert_eq!(b.links[0].url, "https://h");
+    let row = usize::from(b.links[0].row);
+    assert_eq!(b.text[row][0].text, "home");
+    let img = data_png(20, 10, [1, 200, 1, 255]);
+    let b = render(&format!("[![pic]({img})](https://target)"));
+    assert_eq!(b.links.len(), 1);
+    assert_eq!(b.links[0].url, "https://target");
+    assert!(b.links[0].cols.end - b.links[0].cols.start >= 2);
+}
+
+#[test]
+fn hidpi_and_tall_cells_scale_the_layout() {
+    let src = "# Title\n\nBody text that wraps a little bit.\n\n- item\n";
+    let lo = render_with(src, &params(40));
+    let mut p = params(40);
+    p.cell_w = 20;
+    p.cell_h = 44;
+    p.font_px = 32.0;
+    let hi = render_with(src, &p);
+    assert_eq!(lo.rows, hi.rows);
+    assert_eq!(lines(&lo), lines(&hi));
+    // Taller cells than the font needs: one body line per row still.
+    let mut p = params(40);
+    p.cell_h = 30;
+    let b = render_with("a  \nb  \nc", &p);
+    assert_eq!(b.rows, 3);
+}
+
+#[test]
+fn oversized_inline_rasters_are_scaled_to_fit() {
+    fn huge(_: &str, _: bool, _: f32, _: Rgba) -> Result<Raster, String> {
+        Ok(solid(3000, 50, Some(40)))
+    }
+    with_backends(huge, fake_mermaid, |r| {
+        let p = params(40);
+        let b = r.render("$x$", &p).unwrap();
+        check_invariants(&b, &p);
+        let (x0, _, x1, _) = red_bbox(&b);
+        assert!(x1 - x0 < 380 && x1 < 400);
+    });
+}
+
+#[test]
+fn bogus_backend_rasters_fall_back() {
+    fn short(_: &str, _: bool, _: f32, _: Rgba) -> Result<Raster, String> {
+        Ok(Raster {
+            width: 10,
+            height: 10,
+            pixels: vec![0; 4],
+            baseline: None,
+        })
+    }
+    fn empty(_: &str, _: u32, _: f32, _: &Theme) -> Result<Raster, String> {
+        Ok(Raster {
+            width: 0,
+            height: 0,
+            pixels: vec![],
+            baseline: None,
+        })
+    }
+    with_backends(short, empty, |r| {
+        let p = params(40);
+        let b = r.render("$x$\n\n```mermaid\ngraph\n```", &p).unwrap();
+        assert_eq!(lines(&b), vec!["$x$", "graph"]);
+    });
+}
+
+#[test]
+fn system_renderer_smoke() {
+    // Works with or without system fonts (bundled fallbacks).
+    let mut r = Renderer::new();
+    let b = r.render("Hello **world** `code`", &params(40)).unwrap();
+    assert_eq!(b.rows, 1);
+    assert_eq!(lines(&b), vec!["Hello world code"]);
+}
