@@ -957,7 +957,8 @@ pub fn build_instances_into<F, S>(
                 push_secondary_glyphs(out, &mut locate_glyph, r, c, cell, pos, fg, bg);
             }
 
-            // Underline strip for SGR underline or OSC 8 hyperlink.
+            // Underline strip for SGR underline, OSC 8 hyperlink, or the
+            // Ctrl/Cmd-hovered link span (`Term::is_link_hovered`).
             // M10-followup I6: peek the next cell — width-2 (CJK)
             // primaries underline the FULL cluster (both columns), not
             // just the primary column. Without this, hyperlinked CJK
@@ -965,7 +966,10 @@ pub fn build_instances_into<F, S>(
             // glyph. (We do the same in `build_dirty_instances_into`,
             // and the bg quad above uses the same widening so the
             // continuation half is covered.)
-            if cell.style.flags.underline || cell.hyperlink_id.is_some() {
+            if cell.style.flags.underline
+                || cell.hyperlink_id.is_some()
+                || line_id.is_some_and(|l| term.is_link_hovered(l, c))
+            {
                 let strip_w = if row
                     .cells
                     .get(c as usize + 1)
@@ -1223,11 +1227,14 @@ pub fn build_dirty_instances_into<F, S>(
                 push_secondary_glyphs(out, &mut locate_glyph, r, c, cell, pos, fg, bg);
             }
 
-            // Underline strip for SGR underline or OSC 8 hyperlink. Emit
-            // *after* the glyph so it draws on top of any descender
-            // (matches xterm). M10-followup I6: same width-2 widening
+            // Underline strip for SGR underline, OSC 8 hyperlink, or the
+            // hovered link span. Emit *after* the glyph so it draws on
+            // top of any descender (matches xterm). M10-followup I6: same width-2 widening
             // as the full builder above.
-            if cell.style.flags.underline || cell.hyperlink_id.is_some() {
+            if cell.style.flags.underline
+                || cell.hyperlink_id.is_some()
+                || line_id.is_some_and(|l| term.is_link_hovered(l, c))
+            {
                 let strip_w = if row
                     .cells
                     .get(c as usize + 1)
@@ -1816,6 +1823,90 @@ mod tests {
             underline_count, 1,
             "hyperlinked cell must emit one underline strip"
         );
+    }
+
+    /// Underline strips in `v` and their x positions.
+    fn underline_xs(v: &[CellInstance]) -> Vec<f32> {
+        v.iter()
+            .filter(|i| i.flags & FLAG_UNDERLINE != 0 && i.flags & FLAG_CURSOR == 0)
+            .map(|i| i.pos[0])
+            .collect()
+    }
+
+    #[test]
+    fn hovered_link_span_emits_underline_in_full_build() {
+        // Plain text URL, not underlined until hovered.
+        let mut t = Term::new(2, 20, 0);
+        feed(&mut t, "a http://x.y/例 b".as_bytes());
+        let build = |t: &Term| {
+            build_instances(
+                t,
+                (8.0, 16.0),
+                &Theme::default_dark(),
+                None,
+                |_, _, _, _| None,
+            )
+        };
+        assert_eq!(underline_xs(&build(&t)), Vec::<f32>::new());
+        let hit = t
+            .link_at(toastty_term::Pos::new(t.bottom_id() - 1, 4))
+            .unwrap();
+        t.set_link_hover(Some(hit.span));
+        let xs = underline_xs(&build(&t));
+        // Cols 2..=13 ("http://x.y/" + wide 例 primary at 13); the
+        // continuation (col 14) is covered by the widened primary strip.
+        let want: Vec<f32> = (2u16..=13).map(|c| f32::from(c) * 8.0).collect();
+        assert_eq!(xs, want);
+        let wide = build(&t)
+            .into_iter()
+            .find(|i| i.flags & FLAG_UNDERLINE != 0 && i.pos[0] == 13.0 * 8.0)
+            .unwrap();
+        assert_eq!(wide.size[0], 16.0);
+        t.set_link_hover(None);
+        assert_eq!(underline_xs(&build(&t)), Vec::<f32>::new());
+    }
+
+    #[test]
+    fn clearing_hover_repaints_rows_without_underline_in_dirty_build() {
+        // Partial-redraw path: after the hover clears, the damaged row is
+        // re-emitted (bg quads overpaint last frame's strip) with no
+        // underline — no ghosting under LoadOp::Load.
+        let mut t = Term::new(3, 20, 0);
+        feed(&mut t, b"\r\nhttp://a.b/c");
+        let span = t
+            .link_at(toastty_term::Pos::new(t.bottom_id() - 1, 0))
+            .unwrap()
+            .span;
+        let dirty = |t: &Term| {
+            let mut out = Vec::new();
+            super::build_dirty_instances_into(
+                &mut out,
+                t,
+                t.damage(),
+                (8.0, 16.0),
+                &Theme::default_dark(),
+                None,
+                false,
+                |_, _, _, _| None,
+                |_, _| false,
+                EdgeBleed::default(),
+            );
+            out
+        };
+        t.clear_damage();
+        t.set_link_hover(Some(span));
+        let on = dirty(&t);
+        assert_eq!(underline_xs(&on).len(), 12);
+        t.clear_damage();
+        t.set_link_hover(None);
+        let off = dirty(&t);
+        assert_eq!(underline_xs(&off), Vec::<f32>::new());
+        // Every cell of row 1 was re-emitted (bg quads at y = 16).
+        let row1_bg = off
+            .iter()
+            .filter(|i| i.pos[1] == 16.0 && i.flags & FLAG_UNDERLINE == 0)
+            .count();
+        assert!(row1_bg >= 12, "row 1 repainted, got {row1_bg}");
     }
 
     #[test]
