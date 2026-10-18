@@ -168,50 +168,62 @@ impl Parser {
                         }
                     }
                 }
-                ApcState::Osc { len } => {
-                    let term = osc_terminator(bytes);
-                    let body = term.unwrap_or(bytes.len());
-                    if len + body > self.max_osc_len {
-                        // Too long: make vte drop what it has buffered
-                        // (CAN aborts the string; the null performer
-                        // swallows the truncated dispatch) and skip
-                        // the rest of this OSC.
-                        self.vte.advance(&mut NullPerform, &[0x18]);
-                        self.apc = ApcState::OscDiscard;
-                        bytes = &bytes[body..];
-                        continue;
-                    }
-                    if body > 0 {
-                        self.vte
-                            .advance(&mut VteAdapter { inner: perform }, &bytes[..body]);
-                    }
-                    let Some(pos) = term else {
-                        self.apc = ApcState::Osc { len: len + body };
-                        return;
-                    };
-                    if bytes[pos] == 0x1B {
-                        // Possibly ST; let the ESC peek logic replay it.
-                        self.apc = ApcState::AfterEsc;
-                    } else {
-                        self.vte
-                            .advance(&mut VteAdapter { inner: perform }, &bytes[pos..=pos]);
-                        self.apc = ApcState::Ground;
-                    }
-                    bytes = &bytes[pos + 1..];
-                }
-                ApcState::OscDiscard => {
-                    let Some(pos) = osc_terminator(bytes) else {
-                        return;
-                    };
-                    self.apc = if bytes[pos] == 0x1B {
-                        ApcState::AfterEsc
-                    } else {
-                        ApcState::Ground
-                    };
-                    bytes = &bytes[pos + 1..];
-                }
+                ApcState::Osc { len } => bytes = self.advance_osc(perform, bytes, len),
+                ApcState::OscDiscard => bytes = self.discard_osc(bytes),
             }
         }
+    }
+
+    /// `ApcState::Osc` step: forward OSC bytes to vte while counting
+    /// them, aborting the string if it outgrows `max_osc_len`. Returns
+    /// the unconsumed input.
+    fn advance_osc<'b, P: Perform + ?Sized>(
+        &mut self,
+        perform: &mut P,
+        bytes: &'b [u8],
+        len: usize,
+    ) -> &'b [u8] {
+        let term = osc_terminator(bytes);
+        let body = term.unwrap_or(bytes.len());
+        if len + body > self.max_osc_len {
+            // Too long: make vte drop what it has buffered (CAN aborts
+            // the string; the null performer swallows the truncated
+            // dispatch) and skip the rest of this OSC.
+            self.vte.advance(&mut NullPerform, &[0x18]);
+            self.apc = ApcState::OscDiscard;
+            return &bytes[body..];
+        }
+        if body > 0 {
+            self.vte
+                .advance(&mut VteAdapter { inner: perform }, &bytes[..body]);
+        }
+        let Some(pos) = term else {
+            self.apc = ApcState::Osc { len: len + body };
+            return &[];
+        };
+        if bytes[pos] == 0x1B {
+            // Possibly ST; let the ESC peek logic replay it.
+            self.apc = ApcState::AfterEsc;
+        } else {
+            self.vte
+                .advance(&mut VteAdapter { inner: perform }, &bytes[pos..=pos]);
+            self.apc = ApcState::Ground;
+        }
+        &bytes[pos + 1..]
+    }
+
+    /// `ApcState::OscDiscard` step: drop bytes up to and including the
+    /// aborted OSC's terminator. Returns the unconsumed input.
+    fn discard_osc<'b>(&mut self, bytes: &'b [u8]) -> &'b [u8] {
+        let Some(pos) = osc_terminator(bytes) else {
+            return &[];
+        };
+        self.apc = if bytes[pos] == 0x1B {
+            ApcState::AfterEsc
+        } else {
+            ApcState::Ground
+        };
+        &bytes[pos + 1..]
     }
 }
 
