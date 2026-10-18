@@ -496,8 +496,11 @@ impl GridAlign {
 ///
 /// Returns `(rem, lead)`: `rem = [rem_w, rem_h]` is the sub-cell leftover
 /// the floor-divided grid (`floor(content / cell)` cells) leaves over each
-/// axis, and `lead = rem * leading_fraction` is the share assigned to the
-/// leading (left/top) edge. A non-positive cell dimension yields zero
+/// axis, and `lead = floor(rem * leading_fraction)` is the share assigned
+/// to the leading (left/top) edge. The floor keeps the grid origin on a
+/// whole pixel so glyphs stay crisp (centered alignment would otherwise
+/// put every glyph on a half pixel for odd leftovers); the trailing edge
+/// absorbs the extra pixel. A non-positive cell dimension yields zero
 /// leftover for that axis (degenerate guard — no division).
 #[must_use]
 fn grid_overflow_px(
@@ -3471,9 +3474,31 @@ mod tests {
         let (rem, lead) = grid_overflow_px((805.0, 605.0), (10.0, 20.0), 0.5);
         assert!((rem[0] - 5.0).abs() < 1e-3);
         assert!((rem[1] - 5.0).abs() < 1e-3);
-        // Centered: half the leftover leads, half trails.
-        assert!((lead[0] - 2.5).abs() < 1e-3, "lead_x");
-        assert!((lead[1] - 2.5).abs() < 1e-3, "lead_y");
+        // Centered: half the leftover leads, floored to a whole pixel
+        // (2.5 -> 2) so glyphs land on the pixel grid; the trailing
+        // edge gets the remaining 3 px.
+        assert_eq!(lead, [2.0, 2.0]);
+    }
+
+    #[test]
+    fn grid_overflow_centered_even_leftover_splits_exactly() {
+        let (rem, lead) = grid_overflow_px((806.0, 608.0), (10.0, 20.0), 0.5);
+        assert_eq!(rem, [6.0, 8.0]);
+        assert_eq!(lead, [3.0, 4.0]);
+    }
+
+    #[test]
+    fn grid_overflow_lead_is_always_whole_pixels() {
+        // Fractional cell sizes (DPI scaling) still give integer leads,
+        // never more than the leftover.
+        for w in [801.0_f32, 803.5, 809.9] {
+            let (rem, lead) = grid_overflow_px((w, 600.0), (9.6, 20.0), 0.5);
+            assert_eq!(lead[0], lead[0].floor(), "w={w}");
+            assert!(lead[0] <= rem[0] * 0.5 + 1e-4, "w={w}");
+        }
+        // TopLeft (fraction 0) never leads.
+        let (_, lead) = grid_overflow_px((805.0, 605.0), (10.0, 20.0), 0.0);
+        assert_eq!(lead, [0.0, 0.0]);
     }
 
     #[test]
