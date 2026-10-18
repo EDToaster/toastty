@@ -22,7 +22,8 @@ Tracking list of escape sequences, modes, and extensions toastty intends to supp
 | Mouse reporting | DECSET 9 / 1000 / 1002 / 1003, encodings 1005 / 1006 / 1015 | SGR (1006) required by tmux, neovim, helix. Without an encoding mode, reports use legacy X11 `CSI M Cb Cx Cy` (coords > 223 sent as xterm's `0x00` past-end marker); 1005 = UTF-8, 1015 = urxvt. Encodings are mutually exclusive like xterm: last set wins, reset only clears the matching mode. DECSET 9 = X10 presses only, no modifiers |
 | Bracketed paste | DECSET 2004 | Pastes are sanitised in both modes (xterm `allowPasteControls: false`): C0 controls except HT/CR/LF, DEL and C1 are stripped, so embedded `ESC[200~`/`ESC[201~` can't be forged; CRLF/LF become CR |
 | Focus in/out events | DECSET 1004 | |
-| Clipboard | OSC 52 | Read + write; gate write behind config |
+| Clipboard | OSC 52 | Read + write, gated by `[security]`. Selection param: `c` clipboard, `p` PRIMARY (clipboard on macOS), `s`/empty both, `q`/`0-7` ignored; multiple chars combine, queries read the first supported one. Padded or unpadded base64; empty/invalid data clears the selection (xterm). Query replies mirror the request's BEL/ST terminator. OSC strings are capped at 8 MiB (`toastty_parser::MAX_OSC_LEN`) |
+| PRIMARY selection | X11 / Wayland | Finished mouse selections go to PRIMARY as well as the clipboard. Middle-click (when the app isn't tracking the mouse, or with Shift) and Shift+Insert paste PRIMARY; on macOS they paste the clipboard |
 | Hyperlinks | OSC 8 | |
 | Current working directory | OSC 7 | `file://` URL; lets new tabs inherit cwd |
 | Window/icon title | OSC 0 / 1 / 2 | Plus title stack (CSI 22/23) |

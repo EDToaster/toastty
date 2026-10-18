@@ -27,7 +27,7 @@ use toastty_term::{
     ClipboardRequest, Pos, SecurityFlags, Selection, SelectionMode, Smoothing, Term,
 };
 use toastty_window::{
-    App, ControlSignal, Event, KeyState, LogicalKey, Modifiers, MouseButton, NamedKey,
+    App, ControlSignal, Event, KeyState, LogicalKey, Modifiers, MouseButton, NamedKey, PhysicalKey,
     ToasttyWindow, WindowHandle, WindowOptions, run,
 };
 use tracing::{debug, info, warn};
@@ -35,6 +35,7 @@ use tracing_subscriber::EnvFilter;
 
 use toastty::cli;
 use toastty::cli::CommandOverride;
+use toastty::clipboard::{self as sysclip, ClipboardTarget};
 use toastty::config_watcher::ConfigWatcher;
 use toastty::focus::encode_focus;
 use toastty::geometry::{
@@ -294,6 +295,16 @@ struct Toastty {
     /// keeps a connection to the OS clipboard server; constructing it
     /// failed on the user's box is recoverable — we just log + skip.
     clipboard: Option<arboard::Clipboard>,
+    /// Keys whose *press* toastty consumed as a copy/paste shortcut.
+    /// Under the kitty keyboard protocol (flag 2, report events) the
+    /// matching release would otherwise reach the app as an orphan
+    /// (`ESC[118;1:3u` after Ctrl+Shift+V), so we swallow it too. Keyed
+    /// by [`key_identity`]; a handful of entries at most.
+    swallowed_releases: Vec<String>,
+    /// True when a middle-button press was consumed as a PRIMARY
+    /// paste, so its release isn't forwarded to a mouse-tracking app
+    /// (Shift+middle-click under tracking).
+    middle_paste_consumed: bool,
     /// Optional bidirectional PTY-byte logger, enabled by
     /// `TOASTTY_PTY_LOG=<path>`. No-op when the env var is unset.
     pty_log: PtyLogger,
@@ -427,6 +438,8 @@ impl Toastty {
             link_click_button: None,
             last_reported_cell: None,
             clipboard: None,
+            swallowed_releases: Vec::new(),
+            middle_paste_consumed: false,
             pty_log: PtyLogger::from_env(),
             alt_scroll_pixel_accum: 0.0,
             mouse_scroll_accum_y: 0.0,
@@ -477,32 +490,38 @@ impl Toastty {
         }
     }
 
-    /// Read the system clipboard and write it to the PTY, bracketed if the
-    /// foreground app has opted into DECSET 2004.
-    fn paste(&mut self) {
-        if self.pty.is_none() {
-            return;
-        }
-        // Lazy-init the clipboard handle. If init failed last time, retry —
-        // a transient failure (e.g. Wayland server hadn't bound the data
-        // device yet) shouldn't doom every paste for the rest of the
-        // session.
+    /// Lazy-init `self.clipboard`. If init failed last time, retry — a
+    /// transient failure (e.g. Wayland server hadn't bound the data
+    /// device yet) shouldn't doom every paste for the rest of the
+    /// session.
+    fn clipboard_handle(&mut self) -> Option<&mut arboard::Clipboard> {
         if self.clipboard.is_none() {
             match arboard::Clipboard::new() {
                 Ok(c) => self.clipboard = Some(c),
                 Err(e) => {
                     warn!("clipboard init failed: {e}");
-                    return;
+                    return None;
                 }
             }
         }
-        let Some(clipboard) = self.clipboard.as_mut() else {
+        self.clipboard.as_mut()
+    }
+
+    /// Read `target` (CLIPBOARD, or PRIMARY for middle-click /
+    /// Shift+Insert; PRIMARY falls back to the clipboard where the
+    /// platform has none) and write it to the PTY, bracketed if the
+    /// foreground app has opted into DECSET 2004.
+    fn paste_from(&mut self, target: ClipboardTarget) {
+        if self.pty.is_none() {
+            return;
+        }
+        let Some(clipboard) = self.clipboard_handle() else {
             return;
         };
-        let text = match clipboard.get_text() {
+        let text = match sysclip::get_text(clipboard, target) {
             Ok(s) => s,
             Err(e) => {
-                debug!("clipboard read failed: {e}");
+                debug!("clipboard read ({target:?}) failed: {e}");
                 return;
             }
         };
@@ -534,38 +553,45 @@ impl Toastty {
     /// render thread is invisible. (TODO if real workloads disagree:
     /// move clipboard I/O onto a dedicated worker thread.)
     fn service_clipboard_request(&mut self, req: &ClipboardRequest) {
-        if self.clipboard.is_none() {
-            match arboard::Clipboard::new() {
-                Ok(c) => self.clipboard = Some(c),
-                Err(e) => {
-                    warn!("clipboard init failed: {e}");
-                    return;
-                }
-            }
-        }
-        let Some(clipboard) = self.clipboard.as_mut() else {
+        let Some(clipboard) = self.clipboard_handle() else {
             return;
         };
         match req {
-            ClipboardRequest::Set { data } => {
+            ClipboardRequest::Set { data, targets } => {
                 // OSC 52 set must be UTF-8 text to round-trip through
                 // arboard's typed API; lossy-decode if the app sent
                 // garbage bytes.
-                let text = String::from_utf8_lossy(data);
-                if let Err(e) = clipboard.set_text(text.into_owned()) {
-                    warn!("clipboard write failed: {e}");
+                let text = String::from_utf8_lossy(data).into_owned();
+                for target in sysclip::effective_targets(*targets) {
+                    if let Err(e) = sysclip::set_text(clipboard, target, text.clone()) {
+                        warn!("clipboard write ({target:?}) failed: {e}");
+                    }
                 }
             }
-            ClipboardRequest::Query { selection } => {
-                let bytes = match clipboard.get_text() {
+            ClipboardRequest::Clear { targets } => {
+                for target in sysclip::effective_targets(*targets) {
+                    if let Err(e) = sysclip::clear(clipboard, target) {
+                        debug!("clipboard clear ({target:?}) failed: {e}");
+                    }
+                }
+            }
+            ClipboardRequest::Query {
+                selection,
+                target,
+                bell_terminated,
+            } => {
+                // An empty / non-text buffer replies with empty data
+                // rather than leaving the app waiting for an answer.
+                let bytes = match sysclip::get_text(clipboard, *target) {
                     Ok(s) => s.into_bytes(),
                     Err(e) => {
-                        debug!("clipboard read failed: {e}");
-                        return;
+                        debug!("clipboard read ({target:?}) failed: {e}");
+                        Vec::new()
                     }
                 };
                 let sel = toastty_protocols::clipboard::SelectionChars(selection.clone());
-                let reply = toastty_protocols::clipboard::encode_reply(&sel, &bytes);
+                let reply =
+                    toastty_protocols::clipboard::encode_reply(&sel, &bytes, *bell_terminated);
                 self.term.push_pty_reply(&reply);
             }
         }
@@ -1213,9 +1239,11 @@ impl Toastty {
         ControlSignal::Continue
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_key(
         &mut self,
         logical: &LogicalKey,
+        physical: &PhysicalKey,
         text: Option<&str>,
         modifiers: Modifiers,
         state: KeyState,
@@ -1231,20 +1259,49 @@ impl Toastty {
             }
             return self.handle_close_prompt_key(logical, text);
         }
-        // Intercept paste binding *before* the regular encoder.
-        if state == KeyState::Pressed && is_paste_binding(logical, modifiers) {
-            self.paste();
-            return ControlSignal::RedrawIn(Duration::ZERO);
+        // Release of a key whose press we consumed as a shortcut: swallow
+        // it so kitty-protocol apps don't see an orphan release.
+        let key_id = key_identity(logical, physical);
+        if state == KeyState::Released
+            && let Some(i) = self.swallowed_releases.iter().position(|k| *k == key_id)
+        {
+            self.swallowed_releases.swap_remove(i);
+            return ControlSignal::Continue;
         }
-        // Copy current selection (if any) to the clipboard. Eats the
-        // keypress so the foreground app doesn't also see it.
+        // Intercept paste bindings *before* the regular encoder.
+        // Shift+Insert pastes PRIMARY on X11/Wayland (xterm, Alacritty),
+        // the clipboard elsewhere.
+        if state == KeyState::Pressed {
+            let source = if is_paste_binding(logical, modifiers) {
+                Some(ClipboardTarget::Clipboard)
+            } else if is_selection_paste_binding(logical, modifiers) {
+                Some(sysclip::selection_paste_source())
+            } else {
+                None
+            };
+            if let Some(source) = source {
+                self.paste_from(source);
+                self.swallow_release(key_id);
+                return ControlSignal::RedrawIn(Duration::ZERO);
+            }
+        }
+        // Copy current selection (if any) to the clipboard and eat the
+        // keypress. With nothing selected the shortcut is the app's to
+        // use (herdr's `copy_on_select = false` + Ctrl+Shift+C flow), but
+        // only when the kitty keyboard protocol makes it distinguishable:
+        // in legacy encoding Ctrl+Shift+C is byte-identical to Ctrl+C
+        // (SIGINT) and Cmd+C would type a bare `c`, so a reflexive copy
+        // press must not reach the app there.
         if state == KeyState::Pressed && is_copy_binding(logical, modifiers) {
-            if let Some(text) = self.term.extract_selection_text()
-                && !text.is_empty()
-            {
+            let text = self.term.extract_selection_text().filter(|t| !t.is_empty());
+            let have_selection = text.is_some();
+            if let Some(text) = text {
                 self.write_clipboard(text);
             }
-            return ControlSignal::RedrawIn(Duration::ZERO);
+            if copy_binding_consumes(have_selection, self.term.kitty_flags()) {
+                self.swallow_release(key_id);
+                return ControlSignal::RedrawIn(Duration::ZERO);
+            }
         }
         // Don't forward synthetic events — winit fires those on focus loss
         // to clear modifier state; reporting them to the PTY would desync
@@ -1408,6 +1465,13 @@ impl Toastty {
             self.mouse_held = None;
             return ControlSignal::Continue;
         }
+        let mode = self.term.mouse_mode();
+        // Middle-click pastes PRIMARY (clipboard on macOS) unless the app
+        // is tracking the mouse; Shift forces the paste, xterm-style.
+        if button == MouseButton::Middle && self.handle_middle_paste(state, mode.is_on(), modifiers)
+        {
+            return ControlSignal::RedrawIn(Duration::ZERO);
+        }
         // Local text selection takes priority over PTY forwarding when
         // the foreground app hasn't opted into mouse tracking — or when
         // Shift is held, which bypasses tracking (xterm convention,
@@ -1417,7 +1481,6 @@ impl Toastty {
         // goes to whoever got the press, even if Shift was let go
         // mid-drag. Only the left button drives selection; other
         // buttons fall through to the existing encoder.
-        let mode = self.term.mouse_mode();
         if button == MouseButton::Left {
             let local = match state {
                 KeyState::Pressed => !mode.is_on() || modifiers.contains(Modifiers::SHIFT),
@@ -1649,25 +1712,60 @@ impl Toastty {
 
     /// The user finished a mouse selection whose text is `text`
     /// (non-empty). Single hook for everything that should happen with
-    /// a completed selection: today copy-on-select to the CLIPBOARD; an
-    /// X11/Wayland PRIMARY owner belongs here too.
+    /// a completed selection: copy-on-select to PRIMARY (X11/Wayland)
+    /// and the CLIPBOARD.
     fn selection_finished(&mut self, text: String) {
+        self.write_primary(&text);
         self.write_clipboard(text);
     }
 
-    /// Lazy-init `self.clipboard` and write `text`. Mirrors the
-    /// paste-path init in `Self::paste`.
-    fn write_clipboard(&mut self, text: String) {
-        if self.clipboard.is_none() {
-            match arboard::Clipboard::new() {
-                Ok(c) => self.clipboard = Some(c),
-                Err(e) => {
-                    warn!("clipboard init failed: {e}");
-                    return;
-                }
-            }
+    /// Mirror a finished mouse selection into PRIMARY (X11/Wayland
+    /// select-to-copy, pasted by middle-click / Shift+Insert). No-op
+    /// where the platform has no PRIMARY.
+    fn write_primary(&mut self, text: &str) {
+        if !sysclip::HAS_PRIMARY {
+            return;
         }
-        if let Some(cb) = self.clipboard.as_mut()
+        if let Some(cb) = self.clipboard_handle()
+            && let Err(e) = sysclip::set_text(cb, ClipboardTarget::Primary, text.to_owned())
+        {
+            warn!("primary selection write failed: {e}");
+        }
+    }
+
+    /// Middle-button press/release: paste the selection buffer when
+    /// [`middle_click_pastes`] says so. Returns `true` when the event
+    /// was consumed (the press, and the release of a consumed press).
+    fn handle_middle_paste(
+        &mut self,
+        state: KeyState,
+        tracking: bool,
+        modifiers: Modifiers,
+    ) -> bool {
+        match state {
+            KeyState::Pressed => {
+                if !middle_click_pastes(tracking, modifiers) {
+                    return false;
+                }
+                self.middle_paste_consumed = true;
+                self.paste_from(sysclip::selection_paste_source());
+                true
+            }
+            KeyState::Released => std::mem::take(&mut self.middle_paste_consumed),
+        }
+    }
+
+    /// Remember that the press of `key_id` was consumed so its release
+    /// is swallowed too.
+    fn swallow_release(&mut self, key_id: String) {
+        if !self.swallowed_releases.contains(&key_id) {
+            self.swallowed_releases.push(key_id);
+        }
+    }
+
+    /// Write `text` to the CLIPBOARD (lazy-initialising the handle).
+    fn write_clipboard(&mut self, text: String) {
+        if let Some(cb) = self.clipboard_handle()
             && let Err(e) = cb.set_text(text)
         {
             warn!("clipboard write failed: {e}");
@@ -2240,14 +2338,15 @@ impl App for Toastty {
             }
             Event::Key {
                 logical,
+                physical,
                 text,
                 modifiers,
                 state,
                 repeat,
                 is_synthetic,
-                ..
             } => self.handle_key(
                 &logical,
+                &physical,
                 text.as_deref(),
                 modifiers,
                 state,
@@ -2402,6 +2501,42 @@ fn is_copy_binding(logical: &LogicalKey, modifiers: Modifiers) -> bool {
     false
 }
 
+/// True when a copy-shortcut press should be consumed rather than
+/// forwarded: always when there was a selection to copy; with nothing
+/// selected, only in legacy key encoding (`kitty_flags == 0`), where the
+/// app couldn't tell Ctrl+Shift+C from Ctrl+C anyway.
+fn copy_binding_consumes(have_selection: bool, kitty_flags: u8) -> bool {
+    have_selection || kitty_flags == 0
+}
+
+/// True when `(logical, modifiers)` is Shift+Insert — paste the
+/// selection buffer (PRIMARY on X11/Wayland, like xterm and Alacritty;
+/// the clipboard on macOS).
+fn is_selection_paste_binding(logical: &LogicalKey, modifiers: Modifiers) -> bool {
+    matches!(logical, LogicalKey::Named(NamedKey::Insert)) && modifiers == Modifiers::SHIFT
+}
+
+/// True when a middle-button press should paste the selection buffer:
+/// when the app isn't tracking the mouse, or with Shift held to
+/// override tracking (xterm convention). Otherwise the press is the
+/// app's.
+fn middle_click_pastes(tracking: bool, modifiers: Modifiers) -> bool {
+    !tracking || modifiers.contains(Modifiers::SHIFT)
+}
+
+/// Stable identity for matching a key release to its press. Prefers
+/// the physical key code, which survives modifiers being released first
+/// (`V` vs `v`); falls back to the lowercased logical key.
+fn key_identity(logical: &LogicalKey, physical: &PhysicalKey) -> String {
+    match physical {
+        PhysicalKey::Code(code) => code.clone(),
+        PhysicalKey::Unidentified => match logical {
+            LogicalKey::Character(c) => format!("char:{}", c.to_lowercase()),
+            other => format!("logical:{other:?}"),
+        },
+    }
+}
+
 /// True when `(logical, modifiers)` is a "paste from clipboard" binding.
 ///
 /// We accept both the macOS-canonical `Cmd+V` and the Linux-canonical
@@ -2433,6 +2568,52 @@ mod tests {
 
     fn ch(s: &str) -> LogicalKey {
         LogicalKey::Character(s.to_string())
+    }
+
+    #[test]
+    fn shift_insert_is_selection_paste() {
+        let ins = LogicalKey::Named(NamedKey::Insert);
+        assert!(is_selection_paste_binding(&ins, Modifiers::SHIFT));
+        assert!(!is_selection_paste_binding(&ins, Modifiers::empty()));
+        assert!(!is_selection_paste_binding(
+            &ins,
+            Modifiers::SHIFT | Modifiers::CONTROL
+        ));
+        assert!(!is_selection_paste_binding(&ch("v"), Modifiers::SHIFT));
+        // Shift+Insert isn't the clipboard paste binding.
+        assert!(!is_paste_binding(&ins, Modifiers::SHIFT));
+    }
+
+    #[test]
+    fn middle_click_paste_rules() {
+        assert!(middle_click_pastes(false, Modifiers::empty()));
+        assert!(!middle_click_pastes(true, Modifiers::empty()));
+        assert!(middle_click_pastes(true, Modifiers::SHIFT));
+        assert!(middle_click_pastes(false, Modifiers::CONTROL));
+    }
+
+    #[test]
+    fn copy_binding_forwarded_only_without_selection_under_kitty() {
+        assert!(copy_binding_consumes(true, 0));
+        assert!(copy_binding_consumes(true, 7));
+        // Legacy encoding: Ctrl+Shift+C == Ctrl+C, so keep eating it.
+        assert!(copy_binding_consumes(false, 0));
+        // Kitty protocol: the app can tell it apart — forward it.
+        assert!(!copy_binding_consumes(false, 1));
+        assert!(!copy_binding_consumes(false, 7));
+    }
+
+    #[test]
+    fn key_identity_prefers_physical_code() {
+        let code = PhysicalKey::Code("KeyV".into());
+        assert_eq!(key_identity(&ch("V"), &code), key_identity(&ch("v"), &code));
+        assert_eq!(key_identity(&ch("V"), &code), "KeyV");
+        let un = PhysicalKey::Unidentified;
+        assert_eq!(key_identity(&ch("V"), &un), key_identity(&ch("v"), &un));
+        assert_ne!(
+            key_identity(&ch("v"), &un),
+            key_identity(&LogicalKey::Named(NamedKey::Insert), &un)
+        );
     }
 
     #[test]
