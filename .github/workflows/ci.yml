@@ -1,0 +1,63 @@
+# Build and test on every push to main and every pull request.
+# No publishing: this workflow only compiles and runs the test suite.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  # Smaller target dirs (and caches); backtraces still have symbols.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+jobs:
+  test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Headless GPU + fonts for the render tests:
+      # - mesa-vulkan-drivers: lavapipe, a software Vulkan adapter for wgpu
+      # - fonts: CJK / colour-emoji fallback cases in the glyph tests
+      # - xkbcommon / wayland headers: winit's Linux backends
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mesa-vulkan-drivers libvulkan1 \
+            libxkbcommon-dev libwayland-dev \
+            fonts-dejavu-core fonts-noto-cjk fonts-noto-color-emoji
+
+      # rust-toolchain.toml pins the channel and components.
+      - name: Install Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Test
+        run: cargo test --workspace --locked --no-fail-fast
