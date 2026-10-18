@@ -61,11 +61,19 @@ OSC 7700 ; md ; <keys> ; <base64 payload> ST
   of the row below the block.
 - In the alternate screen the sequence is ignored, because full-screen apps own
   that screen.
-- **Through tmux:** the helper wraps the sequence in tmux passthrough
-  (`DCS tmux; <ESC doubled> ST`) when `$TMUX` is set. toastty unwraps it.
-  tmux needs `set -g allow-passthrough on`.
+- **Multiplexers:** inside tmux, herdr, screen or zellij (`$TMUX`,
+  `$HERDR_PANE_ID` / `$HERDR_ENV`, `$STY`, `$ZELLIJ`) the helper doesn't try
+  passthrough. It prints the raw Markdown, like the non-toastty fallback, and,
+  only when stderr is a terminal, a one-line note on stderr ("toastty md: rich
+  rendering isn't available inside tmux yet; showing plain text"). Multiplexer
+  support is a follow-up, probably via kitty-style Unicode placeholders so the
+  multiplexer owns the cells. toastty does not unwrap `DCS tmux;` passthrough.
 - **Detection:** the helper only emits the sequence when `TERM_PROGRAM=toastty`.
-  Otherwise it prints the raw Markdown.
+  Otherwise it prints the raw Markdown. Documents too large for the OSC cap
+  are printed as plain text as well.
+- **`cwd=`:** the helper sends the file's directory (the current directory for
+  stdin), so `![](img.png)` next to the file works when local files are
+  allowed.
 
 ## Architecture
 
@@ -124,6 +132,39 @@ If the image is gone, the plain text in the cells is drawn as normal.
   change of font size or DPI renders the visible blocks again. The row count
   is kept when only colours change.
 
+### Implementation notes (v1)
+
+- The trait is `toastty_term::RichBlockLayout`; the binary installs
+  `toastty::markdown::MarkdownLayout`, which builds the
+  `toastty_markdown::Renderer` (and its font database) on the first block.
+  `toastty-term` has no dependency on `toastty-markdown`.
+- Layout parameters: `cols` = grid width, the renderer's integral cell size,
+  `font_px` = font size × display scale (including zoom), the theme palette
+  in sRGB with OSC 4 overrides for colours 0–15, `max_rows` = 2000
+  (`RICH_MAX_ROWS`).
+- Re-layout is deferred: geometry and palette changes mark blocks dirty and
+  the binary calls `Term::sync_rich_blocks()` once per frame, which re-lays
+  out (geometry change) or re-colours (palette only, keeping the row count:
+  the new image is cropped or padded to the old height) and frees unreferenced
+  blocks. Reflow on a column change re-lays blocks out synchronously inside
+  `Grid::resize_reflow_with`.
+- A block that an app partly overwrote is frozen: its remaining tagged rows
+  keep their slices but are no longer re-laid out.
+- The image budget is 256 MiB (`RICH_DEFAULT_BUDGET`), least recently drawn
+  first; evicted blocks draw their text. On the GPU, textures are kept for the
+  visible blocks plus up to 8 recently shown ones; images taller than the
+  device's max texture size are split into tiles on row boundaries, and a
+  block wider than it falls back to text.
+- Selected cells over a block get a translucent selection-colour tint drawn
+  over the image. OSC 8 underlines are not drawn on block rows (the image
+  styles its links); the Ctrl/Cmd hover underline still is.
+- Frames that show block rows are always full redraws (the slices are
+  alpha-blended over the cell backgrounds).
+- "Copy Markdown" is a round chip with a copy icon (the scroll-to-bottom
+  chip's SDF pipeline), at the top right of the hovered block, pinned to the
+  top of the window when the block starts above it. Clicking copies the
+  source to the clipboard; the click never reaches the app.
+
 ## Security
 
 - The block arrives over the PTY and may come from any program, including one
@@ -152,5 +193,5 @@ If the image is gone, the plain text in the cells is drawn as normal.
 - **Term:** unit tests cover the protocol, row tagging, scrolling into
   scrollback, reflow re-layout, overwrite clearing, the alternate screen, the
   security gates and copy.
-- **End to end:** GIFs recorded with real `toastty md` runs, including inside
-  tmux.
+- **End to end:** GIFs recorded with real `toastty md` runs. Inside tmux the
+  helper's plain-text fallback is checked instead.
