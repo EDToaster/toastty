@@ -1097,6 +1097,27 @@ impl Renderer {
         self.needs_full_clear = true;
     }
 
+    /// Change only the font size, keeping the family, font database and
+    /// GPU pipelines (runtime font zoom). Re-rasterises lazily: the glyph
+    /// atlas, per-char cache and every row's shaped glyphs are dropped,
+    /// and [`Self::cell_size`] reports the new metrics immediately so the
+    /// caller can regrid before the next frame. See
+    /// `GlyphRasterizer::set_font_size` for what is kept and why this is
+    /// much cheaper than [`Self::with_font_ex`].
+    ///
+    /// Before any font is loaded there is nothing to resize, so this falls
+    /// back to [`Self::with_font_ex`] with the default family.
+    pub fn set_font_size(&mut self, font_size_px: f32, line_height: f32) {
+        let Some(text) = self.text.as_mut() else {
+            self.with_font_ex(None, font_size_px, line_height);
+            return;
+        };
+        text.rasterizer.set_font_size(font_size_px, line_height);
+        // Cached rows hold atlas slots from the old packer: re-shape all.
+        text.line_cache.clear();
+        self.needs_full_clear = true;
+    }
+
     /// True iff the family name passed to the most recent
     /// [`Self::with_font_ex`] call resolved to a real face in the
     /// loaded font database. `false` means cosmic-text fell back to
