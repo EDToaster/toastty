@@ -59,6 +59,21 @@ Image support strategy: **Kitty graphics protocol primary, Sixel fallback.** iTe
 
 > **APC framing caveat.** Both Kitty graphics and RGP use APC (`ESC _ ... ST`), and `vte 0.15.0` silently drops APC payloads — there is no `apc_dispatch` hook. toastty ships its own streaming APC scanner (~90 LoC). Handlers receive `start(header)` / `chunk(&[u8])` / `end()` rather than buffering whole payloads, which matters when an RGP `.glb` upload is 50 MB. See [decisions/streaming-apc.md](./decisions/streaming-apc.md).
 
+## Grapheme clusters and copied text
+
+How `Term::print` folds codepoints into cells (and therefore what copy and the renderer see):
+
+| Input | DECSET 2027 off (legacy wcwidth) | DECSET 2027 on |
+| --- | --- | --- |
+| Zero-width codepoints (combining marks, ZWJ, ZWNJ, VS15/VS16, Hangul V/T jamo) | Appended to the cell left of the cursor; no column used (same cursor arithmetic as wcwidth). Dropped only at column 0 | Same |
+| Emoji after a ZWJ (`👨‍👩‍👧`), skin-tone modifier after its base (`👍🏽`) | Joins the first emoji's cell: one 2-cell glyph | Same |
+| Other UAX #29 continuations (regional-indicator pairs, spacing marks, Indic conjuncts) | Own cell(s), per-codepoint wcwidth | Joins the cluster |
+| Cluster width | `cluster_cell_width` (the renderer's snap function), so a 1-cell base grows to 2 cells when e.g. `❤ + ZWJ + 🔥` (either mode) or `❤ + VS16` (2027 only) makes it wide — unless it sits in the last column. Clusters never shrink | |
+
+The trailing codepoints live in a per-terminal intern table referenced by a 2-byte id in `Cell`, so shifts, scrolling, reflow and erase keep them attached. Copy (`extract_selection_text`) emits each cell's full grapheme.
+
+**Tabs:** HT records the run of blank cells it advanced over. Copy emits a literal `\t` for the run while every cell in it is still blank and the selection covers the whole run (kitty and Ghostty behave the same; xterm copies spaces). Anything written into the run, or a selection that cuts it, copies the displayed spaces instead.
+
 ## Tier 4 — Niceties / later
 
 | Protocol | Notes |
