@@ -41,7 +41,7 @@ pub struct Raster {
 
 /// Colours used to draw a block. Derived by the terminal from its
 /// current palette so blocks match the user's theme.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Theme {
     /// Default text colour.
     pub fg: Rgba,
@@ -206,7 +206,21 @@ impl Renderer {
         Self { fonts, cache }
     }
 
-    /// Lay out and rasterize `markdown`.
+    fn check(params: &LayoutParams) -> Result<(), Error> {
+        if params.cols == 0 || params.cell_w == 0 || params.cell_h == 0 {
+            return Err(Error::Params("zero-sized grid"));
+        }
+        if params.width_px() > layout::MAX_WIDTH_PX || params.cell_h > layout::MAX_CELL_H {
+            return Err(Error::Params("block too large"));
+        }
+        if !(params.font_px.is_finite() && params.font_px > 0.0) {
+            return Err(Error::Params("invalid font size"));
+        }
+        Ok(())
+    }
+
+    /// Lay out and rasterize `markdown`: [`Renderer::layout`] plus a
+    /// full [`Renderer::paint`].
     ///
     /// # Errors
     /// [`Error::Params`] for a zero-sized cell, zero columns, or a block
@@ -217,16 +231,75 @@ impl Renderer {
         markdown: &str,
         params: &LayoutParams,
     ) -> Result<RenderedBlock, Error> {
-        if params.cols == 0 || params.cell_w == 0 || params.cell_h == 0 {
-            return Err(Error::Params("zero-sized grid"));
-        }
-        if params.width_px() > layout::MAX_WIDTH_PX || params.cell_h > layout::MAX_CELL_H {
-            return Err(Error::Params("block too large"));
-        }
-        if !(params.font_px.is_finite() && params.font_px > 0.0) {
-            return Err(Error::Params("invalid font size"));
-        }
+        Self::check(params)?;
         layout::render(&mut self.fonts, &mut self.cache, markdown, params)
+    }
+
+    /// Lay out `markdown` without painting it: rows, text and links,
+    /// plus a display list that [`Renderer::paint`] rasterizes on demand.
+    ///
+    /// Width-independent work (parsing aside: shaping, highlighting,
+    /// maths, diagrams, image decoding) is cached across calls, so laying
+    /// the same document out again at another width only re-wraps it.
+    ///
+    /// # Errors
+    /// As [`Renderer::render`].
+    pub fn layout(&mut self, markdown: &str, params: &LayoutParams) -> Result<BlockLayout, Error> {
+        Self::check(params)?;
+        let laid = layout::layout(&mut self.fonts, &mut self.cache, markdown, params);
+        Ok(BlockLayout {
+            rows: laid.rows,
+            width: laid.width,
+            height: laid.height,
+            laid: std::sync::Arc::new(laid),
+        })
+    }
+
+    /// Paint block pixel rows `y0 .. y0 + h` of `layout` (clamped to the
+    /// block) as a straight-alpha raster `layout.width` wide. Painting
+    /// the whole block gives the same pixels as [`Renderer::render`].
+    pub fn paint(&mut self, layout: &BlockLayout, y0: u32, h: u32) -> Raster {
+        layout::paint_raster(&mut self.fonts, &mut self.cache, &layout.laid, y0, h)
+    }
+}
+
+/// A laid-out block from [`Renderer::layout`]. Cheap to clone and
+/// shareable across threads; paint it with [`Renderer::paint`] (using
+/// the renderer that produced it, which owns the glyph cache).
+#[derive(Debug, Clone)]
+pub struct BlockLayout {
+    /// Rows the block occupies.
+    pub rows: u16,
+    /// Pixel size (`cols * cell_w` × `rows * cell_h`).
+    pub width: u32,
+    pub height: u32,
+    laid: std::sync::Arc<layout::Laid>,
+}
+
+impl BlockLayout {
+    /// Plain text per row (`text()[r]` are the runs on block row `r`).
+    #[must_use]
+    pub fn text(&self) -> &[Vec<TextRun>] {
+        &self.laid.text
+    }
+
+    #[must_use]
+    pub fn links(&self) -> &[LinkSpan] {
+        &self.laid.links
+    }
+
+    /// Nothing would be drawn (every pixel transparent).
+    #[must_use]
+    pub fn is_blank(&self) -> bool {
+        self.laid.is_blank()
+    }
+
+    /// Approximate heap bytes held by the layout itself (shared rasters
+    /// such as decoded images and maths are owned by the renderer's
+    /// caches and not counted).
+    #[must_use]
+    pub fn approx_bytes(&self) -> u64 {
+        self.laid.approx_bytes()
     }
 }
 

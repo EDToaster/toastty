@@ -89,10 +89,167 @@ pub fn render_mermaid(
     if !font_px.is_finite() || font_px <= 0.0 {
         return Err(format!("invalid font size {font_px}"));
     }
+    let prepared = prepare_mermaid(src, font_px, theme)?;
+    prepared.rasterize(max_width_px)
+}
+
+/// A parsed, themed Mermaid diagram, ready to rasterize at any width.
+///
+/// Parsing, layout and SVG generation don't depend on the block width, so
+/// the layout engine prepares a diagram once per (source, font size,
+/// theme) and only re-rasterizes it, lazily and only when painted, when
+/// the width it must fit changes.
+pub struct PreparedDiagram {
+    tree: usvg::Tree,
+    /// Canvas origin and size in SVG units (covers spill past the view box).
+    x0: f32,
+    y0: f32,
+    w: f32,
+    h: f32,
+    font_px: f32,
+    /// Last rasterization: (max width it was fitted to, pixels).
+    last: std::sync::Mutex<Option<(u32, Arc<Pixmap>)>>,
+}
+
+impl std::fmt::Debug for PreparedDiagram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedDiagram")
+            .field("w", &self.w)
+            .field("h", &self.h)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Parse and theme `src` (see [`render_mermaid`] for the limits). Cheap
+/// to keep: it holds the SVG tree, not pixels.
+///
+/// # Errors
+/// Same as [`render_mermaid`], except that size problems only surface
+/// from [`PreparedDiagram::size_for`] / [`PreparedDiagram::rasterize`].
+pub fn prepare_mermaid(
+    src: &str,
+    font_px: f32,
+    theme: &Theme,
+) -> Result<Arc<PreparedDiagram>, String> {
+    if src.len() > MAX_SOURCE_BYTES {
+        return Err(format!(
+            "mermaid source is {} bytes (limit {MAX_SOURCE_BYTES})",
+            src.len()
+        ));
+    }
+    if src.trim().is_empty() {
+        return Err("empty mermaid source".into());
+    }
+    if !font_px.is_finite() || font_px <= 0.0 {
+        return Err(format!("invalid font size {font_px}"));
+    }
     guarded(|| {
         let svg = render_svg(src, theme)?;
-        rasterize(&svg, max_width_px, font_px)
+        let opts = usvg::Options {
+            font_family: FONT_FAMILY.to_owned(),
+            fontdb: fontdb(),
+            ..usvg::Options::default()
+        };
+        let tree = usvg::Tree::from_str(&svg, &opts).map_err(|e| format!("invalid svg: {e}"))?;
+        let size = tree.size();
+        // Content can spill past the renderer's view box (e.g. a sequence
+        // note right of the last participant): grow the canvas to cover it.
+        let (mut x0, mut y0, mut x1, mut y1) = (0.0_f32, 0.0_f32, size.width(), size.height());
+        let bbox = tree.root().abs_stroke_bounding_box();
+        if bbox.width() > 0.0 && bbox.height() > 0.0 {
+            x0 = x0.min(bbox.left().floor());
+            y0 = y0.min(bbox.top().floor());
+            x1 = x1.max(bbox.right().ceil());
+            y1 = y1.max(bbox.bottom().ceil());
+        } else {
+            return Err("diagram rendered empty".into());
+        }
+        let (w, h) = (x1 - x0, y1 - y0);
+        if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
+            return Err("diagram has no size".into());
+        }
+        Ok(Arc::new(PreparedDiagram {
+            tree,
+            x0,
+            y0,
+            w,
+            h,
+            font_px,
+            last: std::sync::Mutex::new(None),
+        }))
     })
+}
+
+impl PreparedDiagram {
+    /// Pixel size the diagram rasterizes to when it must fit
+    /// `max_width_px`, and the scale used.
+    ///
+    /// # Errors
+    /// When the diagram would be too small to read at that width.
+    pub fn size_for(&self, max_width_px: u32) -> Result<(u32, u32), String> {
+        self.fit(max_width_px).map(|(_, w, h)| (w, h))
+    }
+
+    fn fit(&self, max_width_px: u32) -> Result<(f32, u32, u32), String> {
+        if max_width_px == 0 {
+            return Err("zero width".into());
+        }
+        let (scale, pw, ph) = fit(self.w, self.h, max_width_px, self.font_px);
+        if scale * BASE_FONT_PX < MIN_LABEL_PX.min(self.font_px) {
+            return Err(format!(
+                "diagram too large to show legibly ({:.0}x{:.0} at {max_width_px} px wide)",
+                self.w, self.h
+            ));
+        }
+        Ok((scale, pw, ph))
+    }
+
+    /// Premultiplied pixels fitted to `max_width_px`. The last result is
+    /// kept, so painting several tiles of one diagram rasterizes once.
+    pub(crate) fn pixmap(&self, max_width_px: u32) -> Result<Arc<Pixmap>, String> {
+        if let Ok(last) = self.last.lock()
+            && let Some((w, pm)) = last.as_ref()
+            && *w == max_width_px
+        {
+            return Ok(Arc::clone(pm));
+        }
+        let (scale, pw, ph) = self.fit(max_width_px)?;
+        let pm = guarded(|| {
+            let mut pixmap = Pixmap::new(pw, ph).ok_or("cannot allocate raster")?;
+            resvg::render(
+                &self.tree,
+                Transform::from_translate(-self.x0, -self.y0).post_scale(scale, scale),
+                &mut pixmap.as_mut(),
+            );
+            Ok(Arc::new(pixmap))
+        })?;
+        if let Ok(mut last) = self.last.lock() {
+            *last = Some((max_width_px, Arc::clone(&pm)));
+        }
+        Ok(pm)
+    }
+
+    /// Straight-alpha raster fitted to `max_width_px`.
+    ///
+    /// # Errors
+    /// Too small to read, allocation failure, or an empty render.
+    pub fn rasterize(&self, max_width_px: u32) -> Result<Raster, String> {
+        let pixmap = self.pixmap(max_width_px)?;
+        let mut pixels = Vec::with_capacity(pixmap.width() as usize * pixmap.height() as usize * 4);
+        for px in pixmap.pixels() {
+            let c = px.demultiply();
+            pixels.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+        }
+        if pixels.as_chunks::<4>().0.iter().all(|p| p[3] == 0) {
+            return Err("diagram rendered empty".into());
+        }
+        Ok(Raster {
+            width: pixmap.width(),
+            height: pixmap.height(),
+            pixels,
+            baseline: None,
+        })
+    }
 }
 
 /// Run `f`, turning a panic into an error.
@@ -325,56 +482,6 @@ fn fit(w: f32, h: f32, max_width_px: u32, font_px: f32) -> (f32, u32, u32) {
     let pw = ((w * scale).ceil() as u32).clamp(1, max_w as u32);
     let ph = ((h * scale).ceil() as u32).clamp(1, MAX_HEIGHT_PX);
     (scale, pw, ph)
-}
-
-fn rasterize(svg: &str, max_width_px: u32, font_px: f32) -> Result<Raster, String> {
-    let opts = usvg::Options {
-        font_family: FONT_FAMILY.to_owned(),
-        fontdb: fontdb(),
-        ..usvg::Options::default()
-    };
-    let tree = usvg::Tree::from_str(svg, &opts).map_err(|e| format!("invalid svg: {e}"))?;
-    let size = tree.size();
-    // Content can spill past the renderer's view box (e.g. a sequence note
-    // right of the last participant): grow the canvas to cover it.
-    let (mut x0, mut y0, mut x1, mut y1) = (0.0_f32, 0.0_f32, size.width(), size.height());
-    let bbox = tree.root().abs_stroke_bounding_box();
-    if bbox.width() > 0.0 && bbox.height() > 0.0 {
-        x0 = x0.min(bbox.left().floor());
-        y0 = y0.min(bbox.top().floor());
-        x1 = x1.max(bbox.right().ceil());
-        y1 = y1.max(bbox.bottom().ceil());
-    }
-    let (w, h) = (x1 - x0, y1 - y0);
-    if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
-        return Err("diagram has no size".into());
-    }
-    let (scale, pw, ph) = fit(w, h, max_width_px, font_px);
-    if scale * BASE_FONT_PX < MIN_LABEL_PX.min(font_px) {
-        return Err(format!(
-            "diagram too large to show legibly ({w:.0}x{h:.0} at {max_width_px} px wide)"
-        ));
-    }
-    let mut pixmap = Pixmap::new(pw, ph).ok_or("cannot allocate raster")?;
-    resvg::render(
-        &tree,
-        Transform::from_translate(-x0, -y0).post_scale(scale, scale),
-        &mut pixmap.as_mut(),
-    );
-    let mut pixels = Vec::with_capacity(pw as usize * ph as usize * 4);
-    for px in pixmap.pixels() {
-        let c = px.demultiply();
-        pixels.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
-    }
-    if pixels.as_chunks::<4>().0.iter().all(|p| p[3] == 0) {
-        return Err("diagram rendered empty".into());
-    }
-    Ok(Raster {
-        width: pw,
-        height: ph,
-        pixels,
-        baseline: None,
-    })
 }
 
 // --- theme -------------------------------------------------------------
