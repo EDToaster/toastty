@@ -11,7 +11,7 @@ enum ApcState {
     AfterEsc,
     /// Inside an APC payload; bytes flow to [`Perform::apc_chunk`].
     Apc,
-    /// Inside APC and the last byte was 0x1B; if next is `\` we end
+    /// Inside APC and the last byte was 0x1B; if next is `\\` we end
     /// the APC, otherwise the ESC was data.
     ApcAfterEsc,
     /// Inside an OSC string (`ESC ]`) that vte is buffering; `len`
@@ -21,6 +21,10 @@ enum ApcState {
     /// An OSC overran [`MAX_OSC_LEN`] and was aborted; discard bytes
     /// until the string's terminator so its tail isn't printed.
     OscDiscard,
+    /// Saw `ESC P` (vte has the ESC, not the `P`) and the first
+    /// `matched` bytes of [`TMUX_PREFIX`]; deciding between a tmux
+    /// passthrough and an ordinary DCS.
+    DcsIntro { matched: usize },
 }
 
 /// Upper bound on one OSC string's payload, in bytes.
@@ -34,6 +38,23 @@ enum ApcState {
 /// clipboard writes of ~6 MiB of text (base64 overhead is 4/3).
 pub const MAX_OSC_LEN: usize = 8 * 1024 * 1024;
 
+/// Upper bound on one tmux passthrough's unwrapped payload, in bytes.
+///
+/// The payload is buffered until its terminator (so an oversized one
+/// can be dropped whole), which makes this the parser's worst-case
+/// extra memory per stream. It matches [`MAX_OSC_LEN`] so an OSC 52
+/// that fits directly also fits wrapped; tmux's own
+/// `input-buffer-size` (1 MiB by default) is smaller still.
+pub const MAX_PASSTHROUGH_LEN: usize = MAX_OSC_LEN;
+
+/// Bytes after `ESC P` that mark a tmux passthrough
+/// (`ESC P tmux ; <payload, ESCs doubled> ESC \`).
+const TMUX_PREFIX: &[u8] = b"tmux;";
+
+/// Passthrough buffers larger than this are freed after dispatch
+/// rather than kept around for the next sequence.
+const PASSTHROUGH_KEEP_CAPACITY: usize = 64 * 1024;
+
 /// Performer that drops every event; used to reset vte's state after
 /// aborting an oversized OSC without dispatching the truncated string.
 struct NullPerform;
@@ -41,59 +62,42 @@ struct NullPerform;
 impl vte::Perform for NullPerform {}
 
 /// First byte that ends an OSC string in vte 0.15: BEL, CAN, SUB or
-/// ESC (vte terminates on any ESC; `ESC \` is the ST form).
+/// ESC (vte terminates on any ESC; `ESC \\` is the ST form).
 fn osc_terminator(bytes: &[u8]) -> Option<usize> {
     let a = memchr::memchr3(0x07, 0x18, 0x1B, bytes);
     let b = memchr::memchr(0x1A, &bytes[..a.unwrap_or(bytes.len())]);
     b.or(a)
 }
 
-/// Top-level parser. Pre-scans the byte stream for APC sequences
-/// (which vte 0.15 drops) and forwards everything else to vte. Also
-/// tracks OSC strings so their length can be capped (see
-/// [`MAX_OSC_LEN`]).
-pub struct Parser {
+/// The APC / OSC-cap pre-scanner plus vte: everything the parser does
+/// except tmux passthrough unwrapping, which [`Parser`] layers on top
+/// so unwrapped payloads can be fed back through this same path.
+struct Scanner {
     vte: vte::Parser,
     apc: ApcState,
     /// OSC payload cap; [`MAX_OSC_LEN`] outside tests.
     max_osc_len: usize,
 }
 
-impl Default for Parser {
-    fn default() -> Self {
+impl Scanner {
+    fn new(max_osc_len: usize) -> Self {
         Self {
             vte: vte::Parser::default(),
             apc: ApcState::default(),
-            max_osc_len: MAX_OSC_LEN,
-        }
-    }
-}
-
-impl std::fmt::Debug for Parser {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Parser")
-            .field("apc", &self.apc)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Parser {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Parser with a custom OSC length cap (tests use a tiny one).
-    #[cfg(test)]
-    fn with_max_osc_len(max_osc_len: usize) -> Self {
-        Self {
             max_osc_len,
-            ..Self::default()
         }
     }
 
-    /// Feed bytes through the parser. Calls handler methods on
-    /// `perform` as events are recognized.
-    pub fn advance<P: Perform + ?Sized>(&mut self, perform: &mut P, mut bytes: &[u8]) {
+    /// Feed bytes through the scanner. With `detect_tmux`, stops right
+    /// after an `ESC P tmux ;` introducer and returns the unconsumed
+    /// rest (vte is left in ground state, as after a cancelled
+    /// escape); otherwise consumes everything and returns `None`.
+    fn advance<'b, P: Perform + ?Sized>(
+        &mut self,
+        perform: &mut P,
+        mut bytes: &'b [u8],
+        detect_tmux: bool,
+    ) -> Option<&'b [u8]> {
         while !bytes.is_empty() {
             match self.apc {
                 ApcState::Ground => {
@@ -108,7 +112,7 @@ impl Parser {
                         bytes = &bytes[pos + 1..];
                     } else {
                         self.vte.advance(&mut VteAdapter { inner: perform }, bytes);
-                        return;
+                        return None;
                     }
                 }
                 ApcState::AfterEsc => {
@@ -121,12 +125,46 @@ impl Parser {
                         self.vte
                             .advance(&mut VteAdapter { inner: perform }, &[0x1B, byte]);
                         self.apc = ApcState::Osc { len: 0 };
+                    } else if byte == b'P' && detect_tmux {
+                        // Give vte the ESC now (it ends any string or
+                        // sequence in progress, exactly as the direct
+                        // byte stream would) and hold the `P` until we
+                        // know whether this is `ESC P tmux ;`.
+                        self.vte
+                            .advance(&mut VteAdapter { inner: perform }, &[0x1B]);
+                        self.apc = ApcState::DcsIntro { matched: 0 };
                     } else {
                         // Replay ESC + this byte to vte.
                         self.vte
                             .advance(&mut VteAdapter { inner: perform }, &[0x1B, byte]);
                         self.apc = ApcState::Ground;
                     }
+                }
+                ApcState::DcsIntro { matched } => {
+                    if bytes[0] == TMUX_PREFIX[matched] {
+                        bytes = &bytes[1..];
+                        if matched + 1 < TMUX_PREFIX.len() {
+                            self.apc = ApcState::DcsIntro {
+                                matched: matched + 1,
+                            };
+                            continue;
+                        }
+                        // Full introducer. vte is in its escape state
+                        // from the ESC; CAN returns it to ground (the
+                        // null performer swallows CAN's execute).
+                        self.vte.advance(&mut NullPerform, &[0x18]);
+                        self.apc = ApcState::Ground;
+                        return Some(bytes);
+                    }
+                    // Ordinary DCS (or `ESC P` + text): replay what we
+                    // held back and reprocess this byte normally — it
+                    // may itself be an ESC.
+                    self.vte.advance(&mut VteAdapter { inner: perform }, b"P");
+                    if matched > 0 {
+                        self.vte
+                            .advance(&mut VteAdapter { inner: perform }, &TMUX_PREFIX[..matched]);
+                    }
+                    self.apc = ApcState::Ground;
                 }
                 ApcState::Apc => {
                     // Scan for terminators: ESC, BEL (0x07), or 8-bit ST (0x9C).
@@ -146,7 +184,7 @@ impl Parser {
                         }
                     } else {
                         perform.apc_chunk(bytes);
-                        return;
+                        return None;
                     }
                 }
                 ApcState::ApcAfterEsc => {
@@ -172,6 +210,7 @@ impl Parser {
                 ApcState::OscDiscard => bytes = self.discard_osc(bytes),
             }
         }
+        None
     }
 
     /// `ApcState::Osc` step: forward OSC bytes to vte while counting
@@ -227,6 +266,194 @@ impl Parser {
     }
 }
 
+/// tmux passthrough unwrapping state (`ESC P tmux ; … ESC \`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TmuxState {
+    /// Not inside a passthrough; bytes go to the [`Scanner`].
+    #[default]
+    Off,
+    /// Inside a passthrough payload, buffering unwrapped bytes.
+    Body,
+    /// Inside a payload and the last byte was ESC: `\` ends the
+    /// passthrough, anything else is the escaped byte (`ESC ESC` is a
+    /// literal ESC).
+    BodyAfterEsc,
+    /// The payload outgrew the cap and was dropped; skip to its end.
+    Discard,
+    /// Discarding and the last byte was ESC.
+    DiscardAfterEsc,
+}
+
+/// Top-level parser. Pre-scans the byte stream for APC sequences
+/// (which vte 0.15 drops) and forwards everything else to vte. Also
+/// tracks OSC strings so their length can be capped (see
+/// [`MAX_OSC_LEN`]).
+///
+/// tmux passthrough (`ESC P tmux ; <payload> ESC \`, every ESC in the
+/// payload doubled) is unwrapped here as well: the payload is
+/// buffered (up to [`MAX_PASSTHROUGH_LEN`]), un-doubled, and fed back
+/// through the normal path once the terminator arrives, so wrapped
+/// OSC / APC / DCS / CSI sequences behave exactly as if they had been
+/// sent bare.
+pub struct Parser {
+    scanner: Scanner,
+    tmux: TmuxState,
+    /// Unwrapped payload of the passthrough in progress.
+    passthrough: Vec<u8>,
+    /// Passthrough payload cap; [`MAX_PASSTHROUGH_LEN`] outside tests.
+    max_passthrough_len: usize,
+}
+
+impl Default for Parser {
+    fn default() -> Self {
+        Self {
+            scanner: Scanner::new(MAX_OSC_LEN),
+            tmux: TmuxState::default(),
+            passthrough: Vec::new(),
+            max_passthrough_len: MAX_PASSTHROUGH_LEN,
+        }
+    }
+}
+
+impl std::fmt::Debug for Parser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Parser")
+            .field("apc", &self.scanner.apc)
+            .field("tmux", &self.tmux)
+            .field("passthrough_len", &self.passthrough.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Parser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parser with a custom OSC length cap (tests use a tiny one).
+    #[cfg(test)]
+    fn with_max_osc_len(max_osc_len: usize) -> Self {
+        Self {
+            scanner: Scanner::new(max_osc_len),
+            ..Self::default()
+        }
+    }
+
+    /// Parser with a custom passthrough payload cap (tests use a tiny one).
+    #[cfg(test)]
+    fn with_max_passthrough_len(max_passthrough_len: usize) -> Self {
+        Self {
+            max_passthrough_len,
+            ..Self::default()
+        }
+    }
+
+    /// Feed bytes through the parser. Calls handler methods on
+    /// `perform` as events are recognized.
+    pub fn advance<P: Perform + ?Sized>(&mut self, perform: &mut P, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            match self.tmux {
+                TmuxState::Off => match self.scanner.advance(perform, bytes, true) {
+                    None => return,
+                    Some(rest) => {
+                        self.passthrough.clear();
+                        self.tmux = TmuxState::Body;
+                        bytes = rest;
+                    }
+                },
+                TmuxState::Body => {
+                    let pos = memchr::memchr3(0x1B, 0x18, 0x1A, bytes);
+                    let body = pos.unwrap_or(bytes.len());
+                    if !self.push_passthrough(&bytes[..body]) {
+                        bytes = &bytes[body..];
+                        continue;
+                    }
+                    let Some(pos) = pos else { return };
+                    let byte = bytes[pos];
+                    bytes = &bytes[pos + 1..];
+                    if byte == 0x1B {
+                        self.tmux = TmuxState::BodyAfterEsc;
+                    } else {
+                        // CAN / SUB cancel a DCS (ECMA-48, vte, xterm):
+                        // drop the payload and let the control itself
+                        // reach the scanner as it would outside one.
+                        self.end_passthrough();
+                        self.scanner.advance(perform, &[byte], true);
+                    }
+                }
+                TmuxState::BodyAfterEsc => {
+                    let byte = bytes[0];
+                    bytes = &bytes[1..];
+                    if byte == b'\\' {
+                        self.dispatch_passthrough(perform);
+                    } else {
+                        // tmux keeps the byte after an ESC and drops the
+                        // ESC, so `ESC ESC` is one literal ESC (and a
+                        // stray `ESC x` is just `x`).
+                        self.tmux = TmuxState::Body;
+                        self.push_passthrough(&[byte]);
+                    }
+                }
+                TmuxState::Discard => {
+                    let Some(pos) = memchr::memchr3(0x1B, 0x18, 0x1A, bytes) else {
+                        return;
+                    };
+                    let byte = bytes[pos];
+                    bytes = &bytes[pos + 1..];
+                    if byte == 0x1B {
+                        self.tmux = TmuxState::DiscardAfterEsc;
+                    } else {
+                        self.tmux = TmuxState::Off;
+                        self.scanner.advance(perform, &[byte], true);
+                    }
+                }
+                TmuxState::DiscardAfterEsc => {
+                    let byte = bytes[0];
+                    bytes = &bytes[1..];
+                    self.tmux = if byte == b'\\' {
+                        TmuxState::Off
+                    } else {
+                        TmuxState::Discard
+                    };
+                }
+            }
+        }
+    }
+
+    /// Append unwrapped payload bytes, switching to
+    /// [`TmuxState::Discard`] (and dropping the buffer) if they would
+    /// exceed the cap. Returns `false` on overflow.
+    fn push_passthrough(&mut self, bytes: &[u8]) -> bool {
+        if self.passthrough.len() + bytes.len() > self.max_passthrough_len {
+            self.end_passthrough();
+            self.tmux = TmuxState::Discard;
+            return false;
+        }
+        self.passthrough.extend_from_slice(bytes);
+        true
+    }
+
+    /// Feed the finished payload through the scanner. tmux passthrough
+    /// does not nest, so an inner `ESC P tmux ;` is an ordinary DCS.
+    /// Whatever state the payload leaves the scanner in (an
+    /// unterminated OSC, say) carries on, as if it had been sent bare.
+    fn dispatch_passthrough<P: Perform + ?Sized>(&mut self, perform: &mut P) {
+        let payload = std::mem::take(&mut self.passthrough);
+        self.scanner.advance(perform, &payload, false);
+        self.passthrough = payload;
+        self.end_passthrough();
+    }
+
+    /// Leave passthrough mode and release the payload buffer.
+    fn end_passthrough(&mut self) {
+        self.tmux = TmuxState::Off;
+        self.passthrough.clear();
+        if self.passthrough.capacity() > PASSTHROUGH_KEEP_CAPACITY {
+            self.passthrough = Vec::new();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,7 +462,7 @@ mod tests {
     type ParamVec = Vec<Vec<u16>>;
     type DcsRecord = (ParamVec, Vec<u8>, char, Vec<u8>);
 
-    #[derive(Default, Debug)]
+    #[derive(Default, Debug, PartialEq)]
     struct Recorder {
         text: String,
         execs: Vec<u8>,
@@ -370,7 +597,8 @@ mod tests {
 
     #[test]
     fn default_osc_cap_is_max_osc_len() {
-        assert_eq!(Parser::new().max_osc_len, MAX_OSC_LEN);
+        assert_eq!(Parser::new().scanner.max_osc_len, MAX_OSC_LEN);
+        assert_eq!(Parser::new().max_passthrough_len, MAX_PASSTHROUGH_LEN);
     }
 
     #[test]
@@ -565,4 +793,6 @@ mod tests {
         assert_eq!(r.csi.len(), 1);
         assert_eq!(r.apc.len(), 1);
     }
+
+    mod tmux;
 }
