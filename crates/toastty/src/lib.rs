@@ -14,6 +14,7 @@ pub mod cli;
 pub mod clipboard;
 pub mod config_watcher;
 pub mod focus;
+pub mod font_zoom;
 pub mod geometry;
 pub mod keyboard;
 pub mod links;
