@@ -209,6 +209,18 @@ impl ToasttyWindow {
         self.inner.set_ime_cursor_area(pos, size);
     }
 
+    /// Show the pointing-hand cursor (`true`, over a clickable link) or
+    /// the default cursor (`false`). Callers should only call this on a
+    /// change; some backends round-trip to the compositor.
+    pub fn set_pointer_cursor(&self, pointer: bool) {
+        let icon = if pointer {
+            winit::window::CursorIcon::Pointer
+        } else {
+            winit::window::CursorIcon::Default
+        };
+        self.inner.set_cursor(icon);
+    }
+
     /// Request a redraw. Honors winit's coalescing.
     pub fn request_redraw(&self) {
         self.inner.request_redraw();
@@ -394,6 +406,12 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<'_, A> {
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
                 trace!(?self.modifiers, "modifiers changed");
+                let leds = led::read_led_state();
+                let modifiers = translate_modifiers_with_leds(self.modifiers, leds);
+                self.dispatch(Event::ModifiersChanged(modifiers), event_loop);
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.dispatch(Event::PointerLeft, event_loop);
             }
             WindowEvent::KeyboardInput {
                 event,
