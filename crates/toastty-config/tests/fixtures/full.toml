@@ -32,6 +32,8 @@ pixel_scroll_sensitivity = 1.0
 [security]
 osc_52_read  = false
 osc_52_write = false
+markdown     = true
+markdown_local_files = true
 
 [window]
 width             = 1280
