@@ -460,28 +460,10 @@ mod tests {
     /// slots into `free_indices`.
     #[test]
     fn sync_registry_does_not_leak_textures_past_cap() {
-        use crate::{instance_descriptor, instance_flags_for_tests};
-        use pollster::block_on;
         use toastty_term::ImageRegistry;
-        use wgpu::{DeviceDescriptor, PowerPreference, RequestAdapterOptions};
 
-        let instance = wgpu::Instance::new(instance_descriptor(instance_flags_for_tests()));
-        let Ok(adapter) = block_on(instance.request_adapter(&RequestAdapterOptions {
-            power_preference: PowerPreference::LowPower,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        })) else {
+        let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
             // No GPU available in CI sandbox — skip.
-            return;
-        };
-        let Ok((device, queue)) = block_on(adapter.request_device(&DeviceDescriptor {
-            label: Some("image_pipeline test device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
-            memory_hints: wgpu::MemoryHints::Performance,
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            trace: wgpu::Trace::Off,
-        })) else {
             return;
         };
 
