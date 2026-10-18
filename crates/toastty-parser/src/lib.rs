@@ -16,6 +16,6 @@
 mod parser;
 mod perform;
 
-pub use parser::Parser;
+pub use parser::{MAX_OSC_LEN, Parser};
 pub use perform::{BufferingApcHandler, Perform};
 pub use vte::Params;
