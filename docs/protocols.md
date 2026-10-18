@@ -13,6 +13,7 @@ Tracking list of escape sequences, modes, and extensions toastty intends to supp
 | PTY | `openpty()` on Unix; ConPTY on Windows (later) |
 | terminfo entry | Ship as `toastty` (plus `xterm-256color` fallback) |
 | SGR colors | 16 / 256 / 24-bit truecolor. Signalled to apps via `COLORTERM=truecolor` (plus `TERM_PROGRAM=toastty`, `TERM_PROGRAM_VERSION`) in the child env, XTGETTCAP `Tc`/`RGB`/`setrgbf`/`setrgbb`, and DECRQSS `m` read-back |
+| SGR renditions | 1 bold (no weight change yet), 2 faint (fg blended 50% toward bg in sRGB, after reverse/selection), 3 italic, 4 / `4:1` underline, 21 / `4:2` double underline (`4:3`–`4:5` stored, drawn single for now; `4:0` and 24 clear every style), 5 / 6 blink (6 = 5; 530 ms half-cycle, `[text] blink = false` draws steadily; wake-ups only while blinking cells are on screen), 7 reverse, 8 conceal (no glyph or decorations, like xterm; bg and selection still paint, copy keeps the text), 9 strikethrough (font `OS/2` strikeout position + `post` stroke thickness), 53 overline. Resets: 22 (bold + faint), 23, 24, 25, 27, 28, 29, 55, and 0 / empty (all). Decorations span both columns of wide chars and are drawn per cell, independent of ligatures. Underline colour (58/59) is still unrendered |
 | Alternate screen buffer | DECSET 1049 |
 
 ## Tier 1 — Expected by modern apps

@@ -92,14 +92,15 @@ Test input → expected result (xterm):
 `Style` only stores bold, italic, single underline and reverse. Everything else is
 parsed and dropped (screenshot check: `printf '\e[2mdim \e[9mstrike \e[4:3mcurly\e[0m'`).
 
-- [ ] **P1 — Dim / faint (SGR 2, cleared by 22).**
-- [ ] **P1 — Strikethrough (SGR 9 / 29).**
-- [ ] **P1 — Underline styles `4:0`–`4:5`** (none, single, double, curly, dotted, dashed) and **SGR 21** (double underline). Neovim and helix use curly underlines for diagnostics. Today `4:3` renders as a plain underline.
+- [x] **P1 — Dim / faint (SGR 2, cleared by 22).** Glyph and decoration colour blended 50% toward the displayed bg (sRGB); 22 clears bold and dim.
+- [x] **P1 — Strikethrough (SGR 9 / 29).** Font-derived position/thickness (swash strikeout metrics, xterm 3/8-ascent fallback).
+- [x] **P1 — Double underline: SGR 21 and `4:2`**, with `4:0` / 24 clearing every style. Styles live in an `UnderlineStyle` enum on the cell.
+- [ ] **P1 — Curly / dotted / dashed underlines (`4:3`–`4:5`).** Parsed and stored per cell, but still drawn as a single underline. Neovim and helix use curly underlines for diagnostics.
 - [ ] **P1 — Underline colour SGR 58 / 59.** It's parsed into `cursor_underline_color` only for the kitty Unicode-placeholder image-id trick, and never stored per cell or rendered.
-- [ ] **P2 — Overline (SGR 53 / 55).**
-- [ ] **P2 — Blink (SGR 5 / 6 / 25).** Can share the cursor-blink timer; respect a config switch.
-- [ ] **P2 — Hidden / conceal (SGR 8 / 28).** Text currently stays visible.
-- [ ] Follow-up: these likely need `StyleFlags` to grow. Revisit the `TODO(cell-layout)` packed-style plan in `cell.rs` when doing this.
+- [x] **P2 — Overline (SGR 53 / 55).**
+- [x] **P2 — Blink (SGR 5 / 6 / 25).** Own phase on the cursor-blink state machine, armed only while blinking cells are visible; `[text] blink` switch.
+- [x] **P2 — Hidden / conceal (SGR 8 / 28).** No glyph or decorations (xterm draws them in bg); bg + selection paint; copy keeps the text.
+- [x] Follow-up: `StyleFlags` is now a bit byte + `UnderlineStyle` byte (2 bytes); `Cell` shrank from 24 to 20 bytes.
 
 ## 4. User-facing features
 
