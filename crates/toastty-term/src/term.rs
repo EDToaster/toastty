@@ -376,6 +376,11 @@ pub struct Term {
     /// released), keyed by line id. `None` while a drag is in progress
     /// or when there's no selection. See [`Term::commit_selection`].
     selection_snapshot: Option<Vec<(u64, u64)>>,
+    /// Link span under the pointer while the open-link modifier is held
+    /// (underlined by the renderer). Display state owned by the binary;
+    /// dropped with the selection on resize / RIS / screen switch. See
+    /// [`crate::link`].
+    pub(crate) link_hover: Option<crate::link::LinkSpan>,
     /// DECSTBM top/bottom margins (0-indexed, inclusive). Default spans
     /// the full visible region: `(0, rows - 1)`. `CSI Ps;Ps r` updates
     /// these; resize and RIS reset to the full region. Only LF / RI /
@@ -576,6 +581,7 @@ impl Term {
             rgp_scene: RgpScene::new(),
             selection: None,
             selection_snapshot: None,
+            link_hover: None,
             scroll_top: 0,
             scroll_bot: rows - 1,
             modify_other_keys: 0,
@@ -1498,6 +1504,7 @@ impl Term {
     fn drop_selection(&mut self) {
         self.selection = None;
         self.selection_snapshot = None;
+        self.link_hover = None;
     }
 
     /// True iff `(line_id, col)` is currently selected. Cheap — a
@@ -1535,6 +1542,13 @@ impl Term {
     /// across thousands of scrollback rows stays cheap.
     fn dirty_selection_rows(&mut self, sel: Option<crate::selection::Selection>) {
         let Some(sel) = sel else { return };
+        self.dirty_line_ids(sel.rows_touched());
+    }
+
+    /// Mark every on-screen row whose line id falls in `ids` fully dirty.
+    /// Walks only the visible rows, so a range spanning thousands of
+    /// scrollback lines stays cheap.
+    pub(crate) fn dirty_line_ids(&mut self, ids: std::ops::RangeInclusive<u64>) {
         let cols = self.cols;
         let rows = self.rows;
         let scroll = u64::from(self.viewport.current_lines);
@@ -1547,7 +1561,7 @@ impl Term {
             let Some(line_id) = bottom.checked_sub(above_bottom) else {
                 continue;
             };
-            if sel.rows_touched().contains(&line_id) {
+            if ids.contains(&line_id) {
                 self.mark_cells(vr, 0, cols);
             }
         }

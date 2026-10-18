@@ -25,6 +25,7 @@ mod damage;
 mod dcs_query;
 mod extra;
 mod grid;
+mod link;
 mod reflow;
 mod selection;
 mod term;
@@ -35,6 +36,7 @@ pub use cursor::Cursor;
 pub use damage::{Damage, RowDamage};
 pub use extra::{CellExtra, CellExtraId, ExtraTable};
 pub use grid::{Grid, Row, RowLocation};
+pub use link::{LinkHit, LinkSource, LinkSpan, MAX_SCAN_ROWS};
 pub use selection::{Pos, Selection, SelectionMode};
 pub use term::{
     ClipboardRequest, ClipboardTarget, ClipboardTargets, KITTY_FLAG_DISAMBIGUATE,
