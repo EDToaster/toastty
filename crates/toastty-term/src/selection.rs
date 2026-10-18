@@ -13,6 +13,12 @@
 //!    pre-extended.
 //!  - `Block`: rectangular `min_line..=max_line × min_col..=max_col`.
 //!
+//! Line ids address whichever grid is active (primary or alt — see
+//! `Term::bottom_id`); the selection is dropped on every screen switch.
+//! Wide-character widening (either half selects both) and the
+//! "committed selection" lifecycle live on `Term`, which can see cells.
+//! User-facing behaviour is documented in `docs/selection.md`.
+//!
 //! The selection has *visual* ordering (top of the screen first), which
 //! is the opposite of `line_id` ordering (older line_ids are visually
 //! higher because new rows push old ones up). [`Selection::ordered`]
@@ -46,7 +52,7 @@ pub enum SelectionMode {
     Word,
     /// Line selection (triple-click). Endpoints span full row width.
     Line,
-    /// Rectangular block selection (Alt+drag).
+    /// Rectangular block selection (Alt+drag or Ctrl+Alt+drag).
     Block,
 }
 
