@@ -324,6 +324,10 @@ pub(crate) fn assert_matches_golden(name: &str, img: &RgbaImage) {
         if std::fs::create_dir_all(&dir).is_ok() {
             let _ = img.save(dir.join(format!("{name}.actual.png")));
             eprintln!("wrote {}", dir.join(format!("{name}.actual.png")).display());
+            if let Ok(bytes) = std::fs::read(dir.join(format!("{name}.actual.png"))) {
+                let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                eprintln!("PNGHEX {name} {hex}");
+            }
         }
     }
     assert!(
