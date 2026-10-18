@@ -897,6 +897,7 @@ impl Toastty {
         }
         renderer.set_theme(theme_from_config(&self.config.theme));
         renderer.set_scroll_button(scroll_button_corner(&self.config.scroll_button));
+        renderer.set_text_blink(self.config.text.blink);
         info!(
             "renderer ready: size={size:?} cell={:?} font={:?} {}px logical @ {}× = {}px physical",
             renderer.cell_size(),
@@ -1086,6 +1087,7 @@ impl Toastty {
             }
             r.set_theme(theme_from_config(&self.config.theme));
             r.set_scroll_button(scroll_button_corner(&self.config.scroll_button));
+            r.set_text_blink(self.config.text.blink);
             // Re-plumb the theme bg into Term so OSC 11 queries reply
             // with the new value.
             let theme_bg = r.theme().bg;
