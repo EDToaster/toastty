@@ -390,8 +390,8 @@ mod tests {
 
     #[test]
     fn style_flag_getters_and_set() {
-        let mut f = StyleFlags::default();
         type Getter = (u8, fn(StyleFlags) -> bool);
+        let mut f = StyleFlags::default();
         let getters: [Getter; 8] = [
             (StyleFlags::BOLD, StyleFlags::bold),
             (StyleFlags::DIM, StyleFlags::dim),
