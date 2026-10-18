@@ -6,6 +6,10 @@
 
 use std::num::NonZeroU16;
 
+#[cfg(doc)]
+use crate::extra::CellExtra;
+use crate::extra::CellExtraId;
+
 /// Intern-table identifier for an OSC 8 hyperlink URL.
 ///
 /// `NonZeroU16` exists so `Option<HyperlinkId>` niche-packs into 2 bytes
@@ -111,6 +115,14 @@ pub struct Cell {
     /// `Term::hyperlink_url`. Stored as `NonZeroU16` so
     /// `Option<HyperlinkId>` niche-packs to 2 bytes.
     pub hyperlink_id: Option<HyperlinkId>,
+    /// Intern-table id of this cell's [`CellExtra`]: the rest of a
+    /// multi-codepoint grapheme cluster (combining marks, ZWJ emoji
+    /// tails, variation selectors) or a tab-start marker. `None` for
+    /// the common single-codepoint cell. Resolve via
+    /// `Term::cell_extra` / `Term::grapheme_tail`. Lives in the cell
+    /// (rather than a per-row side table) so every cell move — shifts,
+    /// scrolls, reflow — carries it along; see `extra.rs`.
+    pub extra: Option<CellExtraId>,
 }
 
 impl Cell {
@@ -120,6 +132,7 @@ impl Cell {
         style: Style::RESET,
         is_continuation: false,
         hyperlink_id: None,
+        extra: None,
     };
 }
 
@@ -206,14 +219,14 @@ mod tests {
     /// bloat.
     #[test]
     fn cell_size_documented() {
-        // ch (4) + style (~24) + is_continuation (1) + hyperlink_id (2)
-        // + padding. The exact number depends on `Style`'s layout;
-        // we lock in the value so changes are deliberate.
+        // ch (4) + style (12) + hyperlink_id (2) + extra (2) +
+        // is_continuation (1), padded to 4-byte alignment = 24. The
+        // grapheme `extra` id took one spare padding byte plus one new
+        // byte (20 → 24); multi-codepoint text lives in the per-Term
+        // intern table so the common single-codepoint cell stays small.
         let s = std::mem::size_of::<Cell>();
-        // 40 bytes today (Style has lots of u8 enums + 4 bools).
-        // Refactor freely but update this number to track.
         assert!(
-            s <= 64,
+            s <= 24,
             "Cell grew to {s} bytes — please check the layout (decision #6)"
         );
     }
@@ -221,5 +234,11 @@ mod tests {
     #[test]
     fn blank_cell_has_no_hyperlink_id() {
         assert_eq!(Cell::BLANK.hyperlink_id, None);
+    }
+
+    #[test]
+    fn blank_and_default_cells_have_no_extra() {
+        assert_eq!(Cell::BLANK.extra, None);
+        assert_eq!(Cell::default().extra, None);
     }
 }

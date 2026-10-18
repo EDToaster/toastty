@@ -76,6 +76,7 @@ impl Row {
             style,
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         };
         for c in &mut self.cells[start..end] {
             *c = blank;
@@ -313,6 +314,7 @@ impl Grid {
                 style,
                 is_continuation: false,
                 hyperlink_id: None,
+                extra: None,
             });
             row.soft_wrap = false;
         }
@@ -523,6 +525,7 @@ mod tests {
             style: red_style(),
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         };
         r.soft_wrap = true;
         r.clear();
@@ -553,6 +556,7 @@ mod tests {
                 style: Style::RESET,
                 is_continuation: false,
                 hyperlink_id: None,
+                extra: None,
             },
             8,
         );
@@ -574,6 +578,7 @@ mod tests {
                 style: Style::RESET,
                 is_continuation: false,
                 hyperlink_id: None,
+                extra: None,
             },
             3,
         );
@@ -590,6 +595,7 @@ mod tests {
                 style: Style::RESET,
                 is_continuation: false,
                 hyperlink_id: None,
+                extra: None,
             };
         }
         r.erase(1, 3, red_style());
@@ -601,6 +607,7 @@ mod tests {
                 style: red_style(),
                 is_continuation: false,
                 hyperlink_id: None,
+                extra: None,
             }
         );
         assert_eq!(
@@ -610,6 +617,7 @@ mod tests {
                 style: red_style(),
                 is_continuation: false,
                 hyperlink_id: None,
+                extra: None,
             }
         );
         assert_eq!(r.cells[3].ch, 'd');
@@ -648,6 +656,7 @@ mod tests {
                 style: Style::RESET,
                 is_continuation: false,
                 hyperlink_id: None,
+                extra: None,
             },
             3,
         );
@@ -658,6 +667,7 @@ mod tests {
                 style: Style::RESET,
                 is_continuation: false,
                 hyperlink_id: None,
+                extra: None,
             },
             3,
         );
@@ -678,6 +688,7 @@ mod tests {
                 style: Style::RESET,
                 is_continuation: false,
                 hyperlink_id: None,
+                extra: None,
             },
             3,
         );
@@ -688,6 +699,7 @@ mod tests {
                 style: Style::RESET,
                 is_continuation: false,
                 hyperlink_id: None,
+                extra: None,
             },
             3,
         );
@@ -711,6 +723,7 @@ mod tests {
                 style: Style::RESET,
                 is_continuation: false,
                 hyperlink_id: None,
+                extra: None,
             },
             3,
         );
@@ -734,6 +747,7 @@ mod tests {
                 style: Style::RESET,
                 is_continuation: false,
                 hyperlink_id: None,
+                extra: None,
             },
             3,
         );
@@ -760,6 +774,7 @@ mod tests {
                 style: Style::RESET,
                 is_continuation: false,
                 hyperlink_id: None,
+                extra: None,
             },
             4,
         );
@@ -779,6 +794,7 @@ mod tests {
                 style: Style::RESET,
                 is_continuation: false,
                 hyperlink_id: None,
+                extra: None,
             },
             3,
         );
@@ -789,6 +805,7 @@ mod tests {
                 style: Style::RESET,
                 is_continuation: false,
                 hyperlink_id: None,
+                extra: None,
             },
             3,
         );
@@ -821,6 +838,7 @@ mod tests {
                 style: Style::RESET,
                 is_continuation: false,
                 hyperlink_id: None,
+                extra: None,
             },
             cols,
         );
@@ -1109,6 +1127,7 @@ mod tests {
                         style: Style::RESET,
                         is_continuation: false,
                         hyperlink_id: None,
+                        extra: None,
                     },
                     4,
                 );

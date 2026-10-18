@@ -6,11 +6,13 @@
 
 use std::time::Instant;
 
+use toastty_protocols::unicode_core::cluster_cell_width;
 use unicode_width::UnicodeWidthChar;
 
 use crate::cell::{Cell, Color, Style};
 use crate::cursor::Cursor;
 use crate::damage::Damage;
+use crate::extra::{CellExtra, ExtraTable, MAX_GRAPHEME_EXTRA_BYTES};
 use crate::grid::Grid;
 use toastty_config::CursorShape;
 use toastty_graphics::kitty::handler::{KittyHandler, KittySink};
@@ -255,6 +257,11 @@ pub struct Term {
     /// [`Term::print_char`] until the next `OSC 8 ; ; ST` (closer) or
     /// a new `OSC 8 ; ... ; url` (which switches to a fresh id).
     current_hyperlink: Option<crate::cell::HyperlinkId>,
+    /// Intern table for per-cell extras: grapheme-cluster tails
+    /// (combining marks, ZWJ / VS sequences) and tab-start markers.
+    /// Cells hold a `NonZeroU16` id into it; see `extra.rs`. Shared by
+    /// the primary and alt grids, reset by RIS (which wipes both).
+    extras: ExtraTable,
     /// FIFO of OSC 52 clipboard requests waiting on the binary to
     /// service through `arboard`. Drained by [`Term::drain_clipboard_requests`].
     clipboard_requests: Vec<ClipboardRequest>,
@@ -534,6 +541,7 @@ impl Term {
             palette_revision: 0,
             hyperlinks: Vec::new(),
             current_hyperlink: None,
+            extras: ExtraTable::default(),
             clipboard_requests: Vec::new(),
             security: SecurityFlags::default(),
             apc_buffer: Vec::new(),
@@ -725,6 +733,73 @@ impl Term {
         // Ids are 1-based: `NonZeroU16::new(1)` indexes `hyperlinks[0]`.
         let idx = id.get() as usize - 1;
         self.hyperlinks.get(idx).map(String::as_str)
+    }
+
+    /// Resolve a cell's [`CellExtra`] (grapheme tail or tab marker), if
+    /// it has one.
+    #[must_use]
+    pub fn cell_extra(&self, cell: &Cell) -> Option<&CellExtra> {
+        self.extras.get(cell.extra?)
+    }
+
+    /// The codepoints that follow `cell.ch` in the cell's grapheme
+    /// cluster (`""` for the common single-codepoint cell). The renderer
+    /// appends this after `cell.ch` when building a row's shaping text so
+    /// combining marks / ZWJ sequences / VS16 are drawn, not just copied.
+    #[must_use]
+    pub fn grapheme_tail(&self, cell: &Cell) -> &str {
+        self.extras.grapheme_tail(cell.extra)
+    }
+
+    /// Append the text cell `cells[col]` contributes to copied text and
+    /// return the column to continue from (`col + 1` normally).
+    ///
+    /// - Continuation cells (trailing half of a wide cluster) contribute
+    ///   nothing — the primary already carries the cluster.
+    /// - NUL (the `Cell::default()` filler) copies as a space.
+    /// - A grapheme cell copies as `ch` followed by its stored tail, so
+    ///   decomposed accents, ZWJ emoji and variation selectors survive.
+    /// - A tab-start cell whose whole tab run (`[col, col + span)`) is
+    ///   still blank and lies inside `[col, end)` copies as one literal
+    ///   `\t` and skips the run (kitty / Ghostty behaviour). If anything
+    ///   has since been written into the run, or the selection cuts it,
+    ///   the cells copy as the spaces they now display.
+    fn append_cell_text(&self, cells: &[Cell], col: usize, end: usize, out: &mut String) -> usize {
+        let Some(cell) = cells.get(col) else {
+            return end;
+        };
+        if cell.is_continuation {
+            return col + 1;
+        }
+        match self.cell_extra(cell) {
+            Some(CellExtra::Tab(span)) => {
+                let run_end = col + usize::from(*span);
+                let intact = run_end <= end
+                    && cells
+                        .get(col..run_end)
+                        .is_some_and(|run| run.iter().all(|c| self.is_tab_run_blank(c)));
+                if intact {
+                    out.push('\t');
+                    return run_end;
+                }
+                out.push(' ');
+            }
+            extra => {
+                out.push(if cell.ch == '\0' { ' ' } else { cell.ch });
+                if let Some(CellExtra::Grapheme(tail)) = extra {
+                    out.push_str(tail);
+                }
+            }
+        }
+        col + 1
+    }
+
+    /// A cell a tab run may still cover: displays as blank and carries no
+    /// grapheme. (The run's own start cell carries the tab marker.)
+    fn is_tab_run_blank(&self, cell: &Cell) -> bool {
+        matches!(cell.ch, ' ' | '\0')
+            && !cell.is_continuation
+            && !matches!(self.cell_extra(cell), Some(CellExtra::Grapheme(_)))
     }
 
     /// Intern `url` into the hyperlink table and return its id. Dedups
@@ -1522,16 +1597,25 @@ impl Term {
             } else {
                 None
             };
+            // Selected cells in a row are one contiguous run (every mode,
+            // incl. the wide-char partner rule). Collect its text: full
+            // graphemes, intact tab runs as `\t` (see `append_cell_text`).
             let mut line_buf = String::new();
-            for (i, cell) in row.cells.iter().enumerate() {
+            let selected = |i: usize| {
                 let col = u16::try_from(i).unwrap_or(u16::MAX);
-                // Continuation cells are the trailing half of a width-2
-                // cluster — the lead cell already carries the char.
-                if cell.is_continuation || Some(i) == pad_col {
-                    continue;
-                }
-                if sel.contains(line_id, col) || wide_partner_selected(sel, row, line_id, col) {
-                    push_cell_text(&mut line_buf, cell);
+                sel.contains(line_id, col) || wide_partner_selected(sel, row, line_id, col)
+            };
+            let len = row.cells.len();
+            if let (Some(lo), Some(hi)) =
+                ((0..len).find(|&i| selected(i)), (0..len).rev().find(|&i| selected(i)))
+            {
+                let mut col = lo;
+                while col <= hi {
+                    if Some(col) == pad_col {
+                        col += 1;
+                        continue;
+                    }
+                    col = self.append_cell_text(&row.cells, col, hi + 1, &mut line_buf);
                 }
             }
             if !join_soft {
@@ -1841,6 +1925,7 @@ impl Term {
             style,
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         };
         let row = grid.row_mut(bot);
         row.resize_cols(cols);
@@ -1898,6 +1983,7 @@ impl Term {
             style,
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         };
         let row = grid.row_mut(top);
         row.resize_cols(cols);
@@ -2020,10 +2106,16 @@ impl Term {
         }
 
         let cell_w = Self::char_cell_width(c);
-        // Zero-width chars (combining marks, controls) currently fall
-        // through as a no-op. A future pass can attach them to the
-        // previous cell's grapheme; for M8 we just drop them so the
-        // cursor doesn't advance into a dead cell.
+        // Grapheme clustering: a codepoint that continues the grapheme in
+        // the cell left of the cursor is appended to that cell instead of
+        // taking a new one (ASCII never extends a cluster, so the hot path
+        // skips this). See `try_extend_grapheme` for the rules.
+        if !c.is_ascii() && self.try_extend_grapheme(c, cell_w) {
+            return;
+        }
+        // A zero-width codepoint with nothing to attach to (column 0, a
+        // continuation-only left neighbour, the extras table full) is
+        // dropped so the cursor doesn't advance into a dead cell.
         if cell_w == 0 {
             return;
         }
@@ -2056,6 +2148,7 @@ impl Term {
             style: self.cursor.style,
             is_continuation: false,
             hyperlink_id: self.current_hyperlink,
+            extra: None,
         };
         let col = self.cursor.col;
         let row = self.cursor.row;
@@ -2075,6 +2168,7 @@ impl Term {
                 style: self.cursor.style,
                 is_continuation: true,
                 hyperlink_id: self.current_hyperlink,
+                extra: None,
             };
             self.active_grid_mut()
                 .row_mut(row)
@@ -2088,6 +2182,172 @@ impl Term {
             self.mark_cell(row, col + 1);
         }
         self.cursor.col += cell_w;
+    }
+
+    /// Record that an HT advanced the cursor over `[from, to)` on `row`, so
+    /// copy can reproduce the literal tab (bug #20; kitty and Ghostty do
+    /// the same, xterm copies spaces). Only done when every cell in the
+    /// run is blank — HT doesn't erase, so a tab over existing text must
+    /// keep copying that text. The marker lives on the run's first cell
+    /// as a [`CellExtra::Tab`]; anything later written into the run
+    /// replaces a cell (dropping the marker) or makes the run non-blank,
+    /// which `append_cell_text` checks at copy time.
+    fn mark_tab_run(&mut self, row: u16, from: u16, to: u16) {
+        if to <= from {
+            return;
+        }
+        let cells = &self.active_grid().row(row).cells;
+        let (a, b) = (usize::from(from), usize::from(to));
+        let Some(run) = cells.get(a..b) else {
+            return;
+        };
+        if !run
+            .iter()
+            .all(|c| c.extra.is_none() && matches!(c.ch, ' ' | '\0') && !c.is_continuation)
+        {
+            return;
+        }
+        let first = run[0];
+        let Some(id) = self.extras.intern(CellExtra::Tab(to - from)) else {
+            return;
+        };
+        let max_cols = self.cols;
+        let marked = Cell {
+            ch: ' ',
+            extra: Some(id),
+            ..first
+        };
+        self.active_grid_mut()
+            .row_mut(row)
+            .put(from, marked, max_cols);
+    }
+
+    /// Try to append `c` to the grapheme cluster of the cell just left of
+    /// the cursor (the cell the previous `print` wrote, or — after cursor
+    /// motion — whatever sits there, matching xterm's "combining char
+    /// attaches to the preceding cell"). Returns `true` if `c` was
+    /// consumed.
+    ///
+    /// Rules, in both DECSET 2027 states:
+    /// - **Zero-width codepoints** (`wcwidth == 0`: combining marks, ZWJ,
+    ///   ZWNJ, variation selectors, Hangul V/T jamo, …) always attach.
+    ///   They occupy no column of their own in the legacy model either,
+    ///   so this changes no cursor arithmetic — it just stops dropping
+    ///   them (bug: decomposed `é` copied as `e`).
+    /// - **After a ZWJ**, a codepoint that UAX #29 keeps in the same
+    ///   cluster (GB11: `ExtPict ZWJ × ExtPict`) attaches too, so a ZWJ
+    ///   emoji sequence like 👨‍👩‍👧 occupies the width of its first
+    ///   emoji (one 2-cell glyph) instead of three side-by-side emoji.
+    /// - **Emoji skin-tone modifiers** (U+1F3FB..=U+1F3FF, wcwidth 2) that
+    ///   UAX #29 keeps with their base (👍🏽) attach as well. The renderer
+    ///   always shapes base + modifier into one 2-cell glyph, so giving the
+    ///   modifier its own two cells left a hole that shifted every later
+    ///   glyph on the row out of its cell (they then failed the per-column
+    ///   lookup and the rest of the row rendered blank).
+    ///
+    /// Additionally, with **DECSET 2027** on, any codepoint that UAX #29
+    /// says continues the cluster attaches (regional-indicator pairs,
+    /// spacing marks, Indic conjuncts, …) — the app has declared it
+    /// segments by grapheme, per the Terminal Unicode Core spec.
+    ///
+    /// After attaching, the cluster's width is recomputed with the same
+    /// [`cluster_cell_width`] the renderer snaps glyphs with, so grid and
+    /// renderer agree. A cluster that grows from 1 to 2 cells (❤ + VS16
+    /// under 2027, ❤ + ZWJ + 🔥) gains a continuation cell and the cursor
+    /// advances one column; if the cell is in the last column there is no
+    /// room and it stays 1 cell wide. Clusters never shrink (VS15 after a
+    /// wide emoji keeps 2 cells) — that would mean moving the cursor back.
+    fn try_extend_grapheme(&mut self, c: char, cell_w: u16) -> bool {
+        use unicode_segmentation::UnicodeSegmentation;
+        let row = self.cursor.row;
+        let cur = self.cursor.col.min(self.cols);
+        if cur == 0 {
+            return false;
+        }
+        let mut col = cur - 1;
+        let cells = &self.active_grid().row(row).cells;
+        if cells
+            .get(usize::from(col))
+            .is_some_and(|c| c.is_continuation)
+            && col > 0
+        {
+            col -= 1;
+        }
+        let Some(&prev) = cells.get(usize::from(col)) else {
+            return false;
+        };
+        if prev.is_continuation || prev.ch == '\0' || prev.ch == crate::PLACEHOLDER {
+            return false;
+        }
+        let tail = self.extras.grapheme_tail(prev.extra);
+        let mut cluster = String::with_capacity(prev.ch.len_utf8() + tail.len() + c.len_utf8());
+        cluster.push(prev.ch);
+        cluster.push_str(tail);
+        let joins = cell_w == 0 || {
+            let after_zwj = tail.ends_with('\u{200D}');
+            let emoji_modifier = ('\u{1F3FB}'..='\u{1F3FF}').contains(&c);
+            (self.grapheme_cluster_mode || after_zwj || emoji_modifier) && {
+                let mut probe = cluster.clone();
+                probe.push(c);
+                probe.graphemes(true).nth(1).is_none()
+            }
+        };
+        if !joins {
+            return false;
+        }
+        if tail.len() + c.len_utf8() > MAX_GRAPHEME_EXTRA_BYTES {
+            // Cluster at its length cap: swallow the codepoint (it belongs
+            // to this cluster, so it must not start a new cell) but don't
+            // store it.
+            return true;
+        }
+        let mut new_tail = String::with_capacity(tail.len() + c.len_utf8());
+        new_tail.push_str(tail);
+        new_tail.push(c);
+        cluster.push(c);
+        let Some(id) = self.extras.intern(CellExtra::Grapheme(new_tail.into())) else {
+            // Table full: fall back to the old behaviour for zero-width
+            // codepoints (dropped); a joining wide codepoint prints as
+            // its own cell.
+            return cell_w == 0;
+        };
+        let max_cols = self.cols;
+        let updated = Cell {
+            extra: Some(id),
+            ..prev
+        };
+        self.active_grid_mut()
+            .row_mut(row)
+            .put(col, updated, max_cols);
+        self.mark_cell(row, col);
+        // Width growth (1 → 2): only when the cursor sits right after the
+        // cell and there's a column to grow into.
+        let was_wide = self
+            .active_grid()
+            .row(row)
+            .cells
+            .get(usize::from(col) + 1)
+            .is_some_and(|c| c.is_continuation);
+        let grows = !was_wide
+            && cluster_cell_width(&cluster, self.grapheme_cluster_mode) >= 2
+            && cur == col + 1
+            && col + 1 < max_cols;
+        if grows {
+            self.clear_wide_orphans(row, col + 1, 1);
+            let cont = Cell {
+                ch: '\0',
+                style: prev.style,
+                is_continuation: true,
+                hyperlink_id: prev.hyperlink_id,
+                extra: None,
+            };
+            self.active_grid_mut()
+                .row_mut(row)
+                .put(col + 1, cont, max_cols);
+            self.mark_cell(row, col + 1);
+            self.cursor.col = col + 2;
+        }
+        true
     }
 
     /// Before writing `width` cells starting at `col`, blank the surviving
@@ -2111,6 +2371,7 @@ impl Term {
             style: self.cursor.style,
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         };
         let cells = &self.active_grid().row(row).cells;
         let left_orphan = col > 0 && cells.get(col as usize).is_some_and(|c| c.is_continuation);
@@ -2725,6 +2986,7 @@ impl Term {
             style,
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         };
         for c in &mut row.cells[(cols_u - n_u)..cols_u] {
             *c = blank;
@@ -2759,6 +3021,7 @@ impl Term {
             style,
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         };
         for c in &mut row.cells[col_u..(col_u + n_u)] {
             *c = blank;
@@ -2817,6 +3080,7 @@ impl Term {
             style,
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         };
         for r in cur_row..(cur_row + n) {
             let row = grid.row_mut(r);
@@ -2874,6 +3138,7 @@ impl Term {
             style,
             is_continuation: false,
             hyperlink_id: None,
+            extra: None,
         };
         for r in (region_end - n)..region_end {
             let row = grid.row_mut(r);
@@ -3251,6 +3516,9 @@ impl Term {
         self.decsc_saved = None;
         self.cursor_underline_color = None;
         self.current_hyperlink = None;
+        // Both grids were just rebuilt, so no cell references an extra
+        // any more — drop the table (the only point it can shrink).
+        self.extras = ExtraTable::default();
         // Scroll region back to the full screen.
         self.scroll_top = 0;
         self.scroll_bot = self.rows.saturating_sub(1);
@@ -3438,7 +3706,9 @@ impl Perform for Term {
                 let max_col = self.cols.saturating_sub(1);
                 let old_col = self.cursor.col.min(max_col);
                 let next = (self.cursor.col / TAB_WIDTH + 1) * TAB_WIDTH;
+                let from = self.cursor.col;
                 self.cursor.col = next.min(max_col);
+                self.mark_tab_run(row, from, self.cursor.col);
                 self.mark_cell(row, old_col);
                 self.mark_cell(row, self.cursor.col);
             }
@@ -4583,16 +4853,6 @@ fn mark_placement_dirty(t: &mut Term, p: &Placement) {
     for r in p.row_range.start..r_end {
         t.mark_cells(r, p.col_range.start, c_end);
     }
-}
-
-/// Append the text one (non-continuation) cell contributes to copied
-/// text. The single place that turns cell storage into characters for
-/// [`Term::extract_selection_text`], so a richer cell representation
-/// (e.g. attached combining marks) only has to change this function.
-/// NUL — the `Cell::default()` char padding short rows — reads as a
-/// space.
-fn push_cell_text(buf: &mut String, cell: &Cell) {
-    buf.push(if cell.ch == '\0' { ' ' } else { cell.ch });
 }
 
 /// True when the *other* half of the width-2 cluster at `col` is in

@@ -22,6 +22,7 @@
 mod cell;
 mod cursor;
 mod damage;
+mod extra;
 mod grid;
 mod reflow;
 mod selection;
@@ -31,6 +32,7 @@ mod viewport;
 pub use cell::{Cell, Color, HyperlinkId, Style, StyleFlags};
 pub use cursor::Cursor;
 pub use damage::{Damage, RowDamage};
+pub use extra::{CellExtra, CellExtraId, ExtraTable};
 pub use grid::{Grid, Row, RowLocation};
 pub use selection::{Pos, Selection, SelectionMode};
 pub use term::{
