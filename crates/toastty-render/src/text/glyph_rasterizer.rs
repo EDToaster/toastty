@@ -9,7 +9,7 @@
 
 use cosmic_text::{
     Attrs, Buffer, CacheKey, Family, FontSystem, LayoutGlyph, Metrics, Shaping, SwashCache,
-    SwashContent, fontdb,
+    SwashContent, Weight, fontdb,
 };
 use std::collections::HashMap;
 use toastty_protocols::unicode_core::cluster_cell_width;
@@ -244,6 +244,11 @@ pub struct GlyphRasterizer {
     decoration_metrics: DecorationMetrics,
     /// Configured font family, kept around for `Attrs`.
     family_name: String,
+    /// Weight of the face [`Self::family_name`] resolves to (see
+    /// [`resolve_family_weight`]). Every `Attrs` naming the primary family
+    /// carries it, so a single-weight face such as the bundled Fira Mono
+    /// Medium is actually selected instead of a regular-weight fallback.
+    primary_weight: Weight,
     /// Per-character glyph cache. Keyed on `char` alone, which is **only
     /// correct under three invariants**:
     ///   1. Single-weight font (no bold/italic switching). Bold/italic
@@ -362,10 +367,18 @@ impl GlyphRasterizer {
         // same pixel-grid-alignment reason as the height above. The same
         // probe yields the constant baseline used for every glyph's
         // vertical placement (see [`Self::baseline_y`]).
-        let (cell_w, cell_h, baseline_y) = measure_cell(&mut font_system, metrics, font_name);
+        let primary_weight = resolve_family_weight(&font_system, font_name);
+        let (cell_w, cell_h, baseline_y) =
+            measure_cell(&mut font_system, metrics, font_name, primary_weight);
         let cell_size = (cell_w, cell_h);
-        let decoration_metrics =
-            measure_decorations(&mut font_system, metrics, font_name, cell_h, baseline_y);
+        let decoration_metrics = measure_decorations(
+            &mut font_system,
+            metrics,
+            font_name,
+            primary_weight,
+            cell_h,
+            baseline_y,
+        );
 
         // Pre-allocate the per-line buffer.
         let mut buffer = Buffer::new(&mut font_system, metrics);
@@ -418,6 +431,7 @@ impl GlyphRasterizer {
             baseline_y,
             decoration_metrics,
             family_name,
+            primary_weight,
             char_cache: HashMap::new(),
             char_cache_misses: std::collections::HashSet::new(),
             uncacheable_chars: std::collections::HashSet::new(),
@@ -450,8 +464,12 @@ impl GlyphRasterizer {
         let line_height_px = (font_size * line_height_ratio).round().max(1.0);
         let metrics = Metrics::new(font_size, line_height_px);
         let family = self.family_name.clone();
-        let (cell_w, cell_h, baseline_y) =
-            measure_cell(&mut self.font_system, metrics, Some(family.as_str()));
+        let (cell_w, cell_h, baseline_y) = measure_cell(
+            &mut self.font_system,
+            metrics,
+            Some(family.as_str()),
+            self.primary_weight,
+        );
         for buf in [&mut self.buffer, &mut self.isolation_buffer] {
             *buf = Buffer::new(&mut self.font_system, metrics);
             buf.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
@@ -492,7 +510,7 @@ impl GlyphRasterizer {
         let family_name = self
             .presentation_family(ch, false, false)
             .unwrap_or_else(|| self.family_name.clone());
-        let attrs = Attrs::new().family(Family::Name(&family_name));
+        let attrs = self.attrs_for(&family_name);
 
         let mut s = String::with_capacity(4);
         s.push(ch);
@@ -592,7 +610,7 @@ impl GlyphRasterizer {
     /// path lands on a color-emoji face. `None` if nothing renders.
     fn default_resolved_font(&mut self, ch: char) -> Option<fontdb::ID> {
         let family_name = self.family_name.clone();
-        let attrs = Attrs::new().family(Family::Name(&family_name));
+        let attrs = self.attrs_for(&family_name);
 
         let mut s = String::with_capacity(4);
         s.push(ch);
@@ -673,12 +691,16 @@ impl GlyphRasterizer {
     fn shape_buffer_for_line(&mut self, text: &str, mode_2027_active: bool) {
         let runs = self.compute_presentation_runs(text, mode_2027_active);
         let default_family = self.family_name.clone();
-        let default_attrs = Attrs::new().family(Family::Name(&default_family));
+        let primary_weight = self.primary_weight;
+        let default_attrs = family_attrs(&default_family, &default_family, primary_weight);
         match &runs {
             Some(runs) => {
                 let spans = runs.iter().map(|(start, end, fam)| {
                     let name = fam.as_deref().unwrap_or(default_family.as_str());
-                    (&text[*start..*end], Attrs::new().family(Family::Name(name)))
+                    (
+                        &text[*start..*end],
+                        family_attrs(name, &default_family, primary_weight),
+                    )
                 });
                 self.buffer
                     .set_rich_text(spans, &default_attrs, Shaping::Advanced, None);
@@ -695,6 +717,13 @@ impl GlyphRasterizer {
     /// real face. `false` means cosmic-text will fall back to the
     /// host's default monospace; callers can log a warning so the user
     /// notices their config didn't take effect.
+    /// `Attrs` for shaping with `family`: the primary family carries
+    /// [`Self::primary_weight`]; any other (presentation / emoji fallback)
+    /// family keeps the default weight.
+    fn attrs_for<'a>(&self, family: &'a str) -> Attrs<'a> {
+        family_attrs(family, &self.family_name, self.primary_weight)
+    }
+
     pub fn requested_family_available(&self) -> bool {
         self.requested_family_available
     }
@@ -1193,12 +1222,15 @@ fn measure_decorations(
     font_system: &mut FontSystem,
     metrics: Metrics,
     family: Option<&str>,
+    weight: Weight,
     cell_h: f32,
     baseline_y: f32,
 ) -> DecorationMetrics {
     let mut probe = Buffer::new(font_system, metrics);
     probe.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
-    let attrs = Attrs::new().family(Family::Name(family.unwrap_or("monospace")));
+    let attrs = Attrs::new()
+        .family(Family::Name(family.unwrap_or("monospace")))
+        .weight(weight);
     probe.set_text("M", &attrs, Shaping::Advanced, None);
     probe.shape_until_scroll(font_system, false);
     let face = probe
@@ -1218,6 +1250,41 @@ fn measure_decorations(
     DecorationMetrics::new(cell_h, baseline_y, line)
 }
 
+/// Weight of the face `family` resolves to when asked for the regular
+/// weight: the nearest weight the family actually ships (CSS font
+/// matching, via fontdb). `Weight::NORMAL` when the family is unset or
+/// not installed.
+///
+/// cosmic-text only treats a face as a match for `Attrs` naming a family
+/// when the weight matches too; otherwise it prefers any other installed
+/// face of the right weight. The bundled fallback is Fira Mono **Medium**
+/// (500), so plain `Attrs` (400) silently shaped the default config with
+/// whatever system font fallback offered (e.g. proportional Noto Sans on
+/// Linux) unless Fira Mono Regular happened to be installed.
+fn resolve_family_weight(font_system: &FontSystem, family: Option<&str>) -> Weight {
+    let Some(family) = family else {
+        return Weight::NORMAL;
+    };
+    let db = font_system.db();
+    db.query(&fontdb::Query {
+        families: &[fontdb::Family::Name(family)],
+        ..fontdb::Query::default()
+    })
+    .and_then(|id| db.face(id))
+    .map_or(Weight::NORMAL, |face| face.weight)
+}
+
+/// `Attrs` naming `family`, with `primary_weight` when it is the primary
+/// family (see [`resolve_family_weight`]).
+fn family_attrs<'a>(family: &'a str, primary: &str, primary_weight: Weight) -> Attrs<'a> {
+    let attrs = Attrs::new().family(Family::Name(family));
+    if family == primary {
+        attrs.weight(primary_weight)
+    } else {
+        attrs
+    }
+}
+
 /// Probe the primary font's reference glyph "M" to derive the cell
 /// geometry. Returns `(cell_w, cell_h, baseline_y)`.
 ///
@@ -1230,11 +1297,12 @@ fn measure_cell(
     font_system: &mut FontSystem,
     metrics: Metrics,
     family: Option<&str>,
+    weight: Weight,
 ) -> (f32, f32, f32) {
     let mut probe = Buffer::new(font_system, metrics);
     probe.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
     let fam = family.unwrap_or("monospace");
-    let attrs = Attrs::new().family(Family::Name(fam));
+    let attrs = Attrs::new().family(Family::Name(fam)).weight(weight);
     probe.set_text("M", &attrs, Shaping::Advanced, None);
     probe.shape_until_scroll(font_system, false);
 
@@ -1372,6 +1440,37 @@ mod tests {
             Some(TEST_FONT),
         );
         (device, queue, rasterizer)
+    }
+
+    /// Regression: the bundled face is Fira Mono *Medium*; requesting the
+    /// family at the default (regular) weight used to make cosmic-text
+    /// pick a regular-weight system font instead (proportional Noto Sans
+    /// on Linux), so the default config never rendered in Fira Mono and
+    /// the cell width depended on the host's installed fonts.
+    #[test]
+    fn bundled_medium_face_is_selected_over_system_fallback() {
+        let (_device, _queue, mut r) = make_rasterizer();
+        assert_eq!(r.primary_weight, Weight::MEDIUM);
+        let id = r.default_resolved_font('a').expect("'a' renders");
+        let face = r.font_system.db().face(id).expect("face");
+        assert_eq!(face.post_script_name, "FiraMono-Medium");
+        // Fira Mono's advance is 0.6 em: 9.6 px at 16 px, snapped to 10.
+        assert_eq!(r.cell_size().0, 10.0);
+    }
+
+    #[test]
+    fn family_weight_falls_back_to_normal() {
+        let (_device, _queue, r) = make_rasterizer();
+        assert_eq!(resolve_family_weight(&r.font_system, None), Weight::NORMAL);
+        assert_eq!(
+            resolve_family_weight(&r.font_system, Some("No Such Font Family")),
+            Weight::NORMAL
+        );
+        // Only the primary family gets the resolved weight.
+        let other = family_attrs("Noto Color Emoji", "Fira Mono", Weight::MEDIUM);
+        assert_eq!(other.weight, Weight::NORMAL);
+        let primary = family_attrs("Fira Mono", "Fira Mono", Weight::MEDIUM);
+        assert_eq!(primary.weight, Weight::MEDIUM);
     }
 
     fn make_rasterizer_sized(device: &Device, size: f32) -> GlyphRasterizer {
