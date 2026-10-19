@@ -205,7 +205,9 @@ layout 0.8 ms per width (was 54 ms for layout plus full paint), plus about
 - **Resource limits:**
   - Source: the OSC cap, 8 MiB.
   - Rows: `max_rows`, 2,000 by default. Past that the block is cut and
-    marked as truncated.
+    marked as truncated. This is the only size cap on a block: it is
+    painted lazily, one visible 16-row tile at a time, so its full
+    pixel size is never held in memory.
   - Decoded images: 64 MiB.
   - Mermaid diagrams: 4,096 × 8,192 px, scaled down to fit.
   - Maths expressions: 4 KiB of source and 256 levels of nesting. Earlier

@@ -56,9 +56,6 @@ use style::Palette;
 pub(crate) const MAX_WIDTH_PX: u32 = 32_768;
 /// Tallest cell we accept.
 pub(crate) const MAX_CELL_H: u32 = 4_096;
-/// Cap on the block's RGBA size; past it the block is truncated like
-/// `max_rows`.
-const MAX_BLOCK_BYTES: u64 = 96 * 1024 * 1024;
 /// Total decoded image bytes per render; later images show alt text.
 const MAX_IMAGE_BUDGET: u64 = 128 * 1024 * 1024;
 /// Maths source longer than this falls back to inline code.
@@ -249,9 +246,10 @@ pub(crate) fn layout(
 ) -> Laid {
     let width = params.width_px();
     let cell_h = params.cell_h;
-    let row_bytes = u64::from(width) * u64::from(cell_h) * 4;
-    let byte_rows = (MAX_BLOCK_BYTES / row_bytes.max(1)).clamp(1, u64::from(u16::MAX));
-    let row_cap = params.max_rows.max(1).min(byte_rows as u16);
+    // Only `max_rows` bounds the block. Blocks are painted lazily in
+    // bands (only the visible GPU tiles), so the full RGBA image is never
+    // held at once and a pixel-size cap would just cut wide windows short.
+    let row_cap = params.max_rows.max(1);
 
     let doc = parse::parse(markdown);
     let f = params.font_px.clamp(4.0, 512.0);
