@@ -384,6 +384,41 @@ fn truncation_respects_max_rows() {
 }
 
 #[test]
+fn wide_hidpi_blocks_are_not_cut_short() {
+    // 400 cols x 20 px x 44 px is ~1.4 MB per row: the old 96 MiB
+    // pixel cap truncated this at ~68 rows. Only `max_rows` applies now.
+    // Layout only; painting the whole block would allocate ~420 MB.
+    let src = (0..150)
+        .map(|i| format!("para {i}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut p = params(400);
+    p.cell_w = 20;
+    p.cell_h = 44;
+    p.font_px = 32.0;
+    let l = RENDERER.with(|r| r.borrow_mut().layout(&src, &p).expect("layout"));
+    assert!(l.rows > 200, "{}", l.rows);
+    assert!(
+        l.text()
+            .iter()
+            .flatten()
+            .all(|t| !t.text.contains("truncated")),
+        "block was truncated at {} rows",
+        l.rows
+    );
+    assert!(
+        l.text()
+            .iter()
+            .flatten()
+            .any(|t| t.text.contains("para 149"))
+    );
+    // `max_rows` still bounds it.
+    p.max_rows = 40;
+    let l = RENDERER.with(|r| r.borrow_mut().layout(&src, &p).expect("layout"));
+    assert_eq!(l.rows, 40);
+}
+
+#[test]
 fn huge_documents_stay_bounded() {
     let src = "word ".repeat(400_000);
     let mut p = params(80);
