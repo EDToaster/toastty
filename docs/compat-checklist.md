@@ -29,7 +29,7 @@ apps notice, **P2** modern feature or nicety.
 
 ### CSI sequences currently ignored
 
-Test input → expected result (xterm). Done in PR_LINK: see `crates/toastty-term/src/term/vt.rs` and its tests.
+Test input → expected result (xterm). Done in [#20](https://github.com/EDToaster/toastty/pull/20): see `crates/toastty-term/src/term/vt.rs` and its tests.
 
 - [x] **P1 — REP `CSI Ps b`** (repeat the preceding graphic character). `a\e[3b` → `aaaa`. Wide characters repeat too; the count is capped at one screenful.
 - [x] **P1 — CNL `CSI Ps E` / CPL `CSI Ps F`** (cursor to column 1 of the next or previous line — the left margin under DECSLRM).
@@ -53,7 +53,7 @@ Test input → expected result (xterm). Done in PR_LINK: see `crates/toastty-ter
 
 ### DEC private modes (`apply_decset`)
 
-All of these report through DECRQM `CSI ? Ps $ p` and reset on RIS. Done in PR_LINK.
+All of these report through DECRQM `CSI ? Ps $ p` and reset on RIS. Done in [#20](https://github.com/EDToaster/toastty/pull/20).
 
 - [x] **P1 — DECCKM `?1`** (application cursor keys).
   - Unmodified Arrow, Home and End keys send `SS3 A` / `SS3 B` / `SS3 C` / `SS3 D` / `SS3 H` / `SS3 F` while set. With a modifier they keep the CSI form, as in xterm.
