@@ -33,6 +33,20 @@ Tracking list of escape sequences, modes, and extensions toastty intends to supp
 | Palette query/set | OSC 4 | |
 | Cursor shape | DECSCUSR (CSI q) | Bar / block / underline + blink |
 | REP | CSI b | Repeat preceding character |
+| Cursor motion | CNL / CPL (`CSI E` / `F`), HPA / HPR / VPR (`` CSI ` `` / `a` / `e`) | CUU / CUD stop at the DECSTBM margins when the cursor starts inside them; CUF / CUB stop at the DECSLRM margins likewise (xterm) |
+| Insert mode | IRM (`CSI 4 h` / `l`) | Printing shifts the line right up to the right margin. ANSI DECRQM (`CSI Ps $ p`) reports it; KAM / LNM answer permanently reset, SRM permanently set |
+| Tab stops | HTS (`ESC H`), TBC (`CSI 0 g` / `CSI 3 g`), CHT (`CSI I`), CBT (`CSI Z`) | Every 8 columns by default; reset on RIS, DECSTR and resize. HT / CHT stop at the right margin |
+| Save / restore cursor | DECSC / DECRC (`ESC 7` / `8`), SCOSC / SCORC (`CSI s` / `CSI u`), DECSET 1048 | One shared slot; also saves DECOM and DECAWM. `CSI s` is DECSLRM while DECLRMM is set |
+| Left/right margins | DECLRMM (DECSET 69) + DECSLRM (`CSI Pl ; Pr s`) | Wrap, CR, IND / RI / LF scrolling, SU / SD, IL / DL and ICH / DCH stay inside the margin rectangle; nothing scrolls into scrollback while margins narrow the screen. Leaving the mode or resizing drops the margins |
+| Origin mode | DECOM (DECSET 6) | CUP / HVP / VPA / CHA / HPA relative to the margins and clamped to them; CPR reports relative coordinates. Setting or resetting homes the cursor |
+| Autowrap | DECAWM (DECSET 7) | Off: the last column is overwritten and the cursor stays put |
+| Cursor keys / keypad | DECCKM (DECSET 1), DECKPAM / DECKPNM (`ESC =` / `ESC >`), DECNKM (DECSET 66) | DECCKM: unmodified arrows / Home / End send `SS3 A`..`SS3 F` (also used for the alt-screen wheel). DECKPAM: with NumLock off the keypad sends `SS3 p`..`SS3 y`, `SS3 M` etc. (xterm's default `numLock: true`); with NumLock on it types normally. Legacy encoding only — kitty keyboard mode has its own keypad keys |
+| Reverse video | DECSCNM (DECSET 5) | Renderer swaps the theme's default fg / bg (window opacity kept) |
+| Cursor blink | att610 (DECSET 12) | Toggles blink, keeps the DECSCUSR shape |
+| Alternate scroll | DECSET 1007 | On by default: on the alt screen without mouse reporting the wheel sends cursor keys; reset to disable |
+| Meta / Alt sends escape | DECSET 1036 / 1039 | Both on by default; resetting both sends Alt-modified keys without the ESC prefix |
+| Resets / tests | RIS (`ESC c`), DECSTR (`CSI ! p`), DECALN (`ESC # 8`) | DECSTR resets IRM, DECOM, DECAWM, DECCKM, DECKPAM, margins, SGR, the saved cursor and tab stops |
+| Device attributes | DA1 / DA2 / DA3 (`CSI c` / `CSI > c` / `CSI = c`) | DA3 replies `DCS ! \| 00000000 ST` |
 | Mode query | DECRQM / DECRPM | Apps probe support |
 | Setting query | DECRQSS (`DCS $ q Pt ST`) | Replies `DCS 1 $ r <value><Pt> ST` for `m` (SGR, xterm form: leading `0`, extended colours as `38:5:N` / `38:2::R:G:B`), `r` (DECSTBM), ` q` (DECSCUSR), `"p` (DECSCL, `62;1`), `t` (rows), `$\|` (columns); anything else gets `DCS 0 $ r ST`. Bodies are capped at 4 KiB |
 
@@ -83,7 +97,6 @@ The trailing codepoints live in a per-terminal intern table referenced by a 2-by
 
 | Protocol | Notes |
 | --- | --- |
-| DECSLRM | Left/right margins; vim wants it |
 | BiDi rendering | Arabic/Hebrew correctness |
 | IME support | CJK input |
 | Ligatures + font fallback | Render-side, not protocol |

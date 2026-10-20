@@ -42,7 +42,7 @@ use toastty::font_zoom::{FontZoom, ZoomAction, zoom_action};
 use toastty::geometry::{
     content_rect_from_padding, effective_font_size_px, grid_dims_from_pixels, scaled_pads,
 };
-use toastty::keyboard::encode_key;
+use toastty::keyboard::{self, encode_key_with_modes};
 use toastty::mouse::{
     MouseEventKind, classify_button_event, drag_autoscroll_dir, encode_mouse, pixel_to_cell,
     protocol_wants_event,
@@ -406,6 +406,11 @@ struct Toastty {
     /// — i.e., when the stream genuinely ends — so the next
     /// deliberate gesture goes through.
     swallow_pixel_stream: bool,
+    /// `NumLock` state last implied by a keypad digit key (see
+    /// [`keyboard::numlock_hint`]); decides how the keypad operator keys
+    /// encode under DECKPAM. Starts `true` — typing operators, the
+    /// non-surprising default until a digit key says otherwise.
+    numlock_hint: bool,
     /// In-progress mouse drag-select state. `Some` between press and
     /// release of the left button while local selection is active.
     /// `None` otherwise, including while a mouse-tracking app owns
@@ -497,6 +502,7 @@ impl Toastty {
             close_pending: false,
             last_pixel_scroll_at: None,
             swallow_pixel_stream: false,
+            numlock_hint: true,
             selecting: None,
             last_click_at: None,
             last_click_pos: None,
@@ -1474,14 +1480,35 @@ impl Toastty {
         if is_synthetic {
             return ControlSignal::Continue;
         }
-        if let Some(bytes) = encode_key(
-            logical,
-            text,
-            modifiers,
-            self.term.kitty_flags(),
-            state,
-            repeat,
-        ) {
+        let kitty_flags = self.term.kitty_flags();
+        let physical_code = match physical {
+            PhysicalKey::Code(code) => code.as_str(),
+            PhysicalKey::Unidentified => "",
+        };
+        if state == KeyState::Pressed
+            && let Some(on) = keyboard::numlock_hint(physical_code, logical)
+        {
+            self.numlock_hint = on;
+        }
+        // DECKPAM / DECNKM: the keypad's application codes (legacy
+        // encoding only — the kitty protocol has its own keypad keys).
+        let keypad = if kitty_flags == 0 && state == KeyState::Pressed && self.term.app_keypad() {
+            keyboard::encode_app_keypad(
+                physical_code,
+                logical,
+                modifiers,
+                modifiers.contains(Modifiers::NUM_LOCK) || self.numlock_hint,
+            )
+        } else {
+            None
+        };
+        let modes = keyboard::LegacyModes {
+            app_cursor: self.term.app_cursor_keys(),
+            alt_escape: self.term.alt_sends_escape(),
+        };
+        if let Some(bytes) = keypad.or_else(|| {
+            encode_key_with_modes(logical, text, modifiers, kitty_flags, state, repeat, modes)
+        }) {
             self.write_pty(&bytes);
             // Typing into the PTY clears any visible selection — the
             // user wouldn't expect old highlight to persist over
@@ -2250,7 +2277,12 @@ impl Toastty {
         // scroll UP — folding in the running pixel accumulator so a
         // brief direction reversal mid-inertia doesn't emit an arrow
         // in the wrong direction.
+        // `CSI ? 1007 l` (alternate scroll off) opts out: the wheel does
+        // nothing on the alt screen, which has no scrollback to show.
         if self.term.is_alt_active() {
+            if !self.term.alternate_scroll() {
+                return ControlSignal::Continue;
+            }
             // Same inertia-swallow guard as the primary-grid path:
             // if typing snapped state during a Pixels stream, drop
             // the trailing inertia frames so phantom arrow keys
@@ -2260,10 +2292,12 @@ impl Toastty {
             }
             let signed = self.alt_screen_arrows_for_scroll(scroll_kind, delta_y, f64::from(cell_h));
             if signed != 0 {
-                let bytes = if signed > 0 {
-                    b"\x1b[B".as_slice()
-                } else {
-                    b"\x1b[A".as_slice()
+                // DECCKM picks the SS3 form, as for a real arrow key.
+                let bytes = match (signed > 0, self.term.app_cursor_keys()) {
+                    (true, false) => b"\x1b[B".as_slice(),
+                    (false, false) => b"\x1b[A".as_slice(),
+                    (true, true) => b"\x1bOB".as_slice(),
+                    (false, true) => b"\x1bOA".as_slice(),
                 };
                 let count = signed.unsigned_abs() as usize;
                 let mut out: Vec<u8> = Vec::with_capacity(bytes.len() * count);

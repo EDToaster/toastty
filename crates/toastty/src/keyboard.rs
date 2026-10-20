@@ -43,6 +43,48 @@ pub fn encode_key(
     state: KeyState,
     repeat: bool,
 ) -> Option<Vec<u8>> {
+    encode_key_with_modes(
+        logical,
+        text,
+        modifiers,
+        kitty_flags,
+        state,
+        repeat,
+        LegacyModes::default(),
+    )
+}
+
+/// Terminal modes that change the legacy (non-kitty) key encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyModes {
+    /// DECCKM (`CSI ? 1 h`): unmodified arrows / Home / End send
+    /// `SS3 A` .. instead of `CSI A` ...
+    pub app_cursor: bool,
+    /// `?1036` / `?1039`: Alt-modified keys are ESC-prefixed. When off,
+    /// Alt is dropped and the key's text is sent as-is.
+    pub alt_escape: bool,
+}
+
+impl Default for LegacyModes {
+    fn default() -> Self {
+        Self {
+            app_cursor: false,
+            alt_escape: true,
+        }
+    }
+}
+
+/// [`encode_key`] with the legacy-encoding modes the terminal has set.
+#[must_use]
+pub fn encode_key_with_modes(
+    logical: &LogicalKey,
+    text: Option<&str>,
+    modifiers: Modifiers,
+    kitty_flags: u8,
+    state: KeyState,
+    repeat: bool,
+    modes: LegacyModes,
+) -> Option<Vec<u8>> {
     if kitty_flags != 0 {
         return encode_key_kitty(logical, text, modifiers, kitty_flags, state, repeat);
     }
@@ -51,7 +93,66 @@ pub fn encode_key(
     if state == KeyState::Released {
         return None;
     }
-    encode_key_legacy(logical, text, modifiers)
+    encode_key_legacy(logical, text, modifiers, modes)
+}
+
+/// Application-keypad encoding (DECKPAM / DECNKM) for a numeric-keypad
+/// key, or `None` when the key should go through the normal encoder.
+///
+/// Follows xterm with its default `numLock: true` resource: while
+/// `NumLock` is on the keypad types digits / operators as usual; with
+/// `NumLock` off it sends the VT `SS3` application codes (`SS3 p`..`SS3 y`
+/// for 0-9, `SS3 M` for Enter, ...). The digit keys report `NumLock`
+/// through their logical key (a digit vs. a navigation key);
+/// `numlock_on` covers the operator keys, which look the same either
+/// way. Modified keys (Ctrl / Alt / Super) fall through.
+#[must_use]
+pub fn encode_app_keypad(
+    physical_code: &str,
+    logical: &LogicalKey,
+    modifiers: Modifiers,
+    numlock_on: bool,
+) -> Option<Vec<u8>> {
+    if modifiers.intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER) {
+        return None;
+    }
+    let key = physical_code.strip_prefix("Numpad")?;
+    let digit_like = matches!(key.as_bytes(), [b'0'..=b'9']) || key == "Decimal";
+    let numlock_on = if digit_like {
+        matches!(logical, LogicalKey::Character(_))
+    } else {
+        numlock_on
+    };
+    if numlock_on {
+        return None;
+    }
+    let fin = match key {
+        "Enter" => b'M',
+        "Multiply" => b'j',
+        "Add" => b'k',
+        "Comma" => b'l',
+        "Subtract" => b'm',
+        "Decimal" => b'n',
+        "Divide" => b'o',
+        "Equal" => b'X',
+        d if digit_like => b'p' + (d.as_bytes()[0] - b'0'),
+        _ => return None,
+    };
+    Some(vec![0x1b, b'O', fin])
+}
+
+/// `NumLock` state implied by a numeric-keypad *digit* key: `Some(true)`
+/// when it typed a digit, `Some(false)` when it acted as a navigation
+/// key, `None` for any other key. The binary remembers the last answer
+/// to decide how the operator keys behave under DECKPAM.
+#[must_use]
+pub fn numlock_hint(physical_code: &str, logical: &LogicalKey) -> Option<bool> {
+    let key = physical_code.strip_prefix("Numpad")?;
+    if matches!(key.as_bytes(), [b'0'..=b'9']) || key == "Decimal" {
+        Some(matches!(logical, LogicalKey::Character(_)))
+    } else {
+        None
+    }
 }
 
 // ---- legacy (xterm / VT) ----------------------------------------------------
@@ -60,9 +161,10 @@ fn encode_key_legacy(
     logical: &LogicalKey,
     text: Option<&str>,
     modifiers: Modifiers,
+    modes: LegacyModes,
 ) -> Option<Vec<u8>> {
     if let LogicalKey::Named(named) = logical {
-        return encode_named(*named, modifiers);
+        return encode_named(*named, modifiers, modes.app_cursor);
     }
 
     // Character / Unidentified path: fall back to `text`. If there is no
@@ -84,7 +186,7 @@ fn encode_key_legacy(
     {
         // Alt+Ctrl combos prefix ESC. Apps treat Alt+Ctrl+X as
         // ESC + Ctrl-X bytes.
-        if modifiers.contains(Modifiers::ALT) {
+        if modifiers.contains(Modifiers::ALT) && modes.alt_escape {
             return Some(vec![0x1b, byte]);
         }
         return Some(vec![byte]);
@@ -92,9 +194,9 @@ fn encode_key_legacy(
     // Ctrl pressed but the char doesn't map (e.g. Ctrl+`) --
     // fall through to the raw text.
 
-    // Alt without Ctrl prefixes ESC.
+    // Alt without Ctrl prefixes ESC (unless the app reset ?1036/?1039).
     let bytes = raw.as_bytes();
-    if modifiers.contains(Modifiers::ALT) {
+    if modifiers.contains(Modifiers::ALT) && modes.alt_escape {
         let mut out = Vec::with_capacity(1 + bytes.len());
         out.push(0x1b);
         out.extend_from_slice(bytes);
@@ -131,9 +233,29 @@ fn ctrl_map(s: &str) -> Option<u8> {
 }
 
 /// Encode a named key for the legacy (xterm/VT) path.
-fn encode_named(named: NamedKey, _modifiers: Modifiers) -> Option<Vec<u8>> {
+fn encode_named(named: NamedKey, modifiers: Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
     // TODO(modifyOtherKeys): per-modifier CSI param suffixes
     // (CSI 1 ; <Ps> <final>) -- the kitty encoder is the real fix.
+    //
+    // DECCKM: unmodified cursor keys (and Home / End, as in xterm) use
+    // SS3. Modified ones keep the CSI form, which is what xterm sends
+    // once a modifier parameter is involved.
+    let plain = !modifiers
+        .intersects(Modifiers::SHIFT | Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER);
+    if app_cursor && plain {
+        let fin = match named {
+            NamedKey::ArrowUp => Some(b'A'),
+            NamedKey::ArrowDown => Some(b'B'),
+            NamedKey::ArrowRight => Some(b'C'),
+            NamedKey::ArrowLeft => Some(b'D'),
+            NamedKey::Home => Some(b'H'),
+            NamedKey::End => Some(b'F'),
+            _ => None,
+        };
+        if let Some(fin) = fin {
+            return Some(vec![0x1b, b'O', fin]);
+        }
+    }
     let bytes: &[u8] = match named {
         NamedKey::Enter => b"\r",
         NamedKey::Backspace => b"\x7f",
@@ -1257,5 +1379,162 @@ mod tests {
         let bytes = format_kitty(97, 1, Some("1"), 'u');
         // When event-type is present, modifiers must be emitted too.
         assert_eq!(bytes, b"\x1b[97;1:1u".to_vec());
+    }
+}
+
+#[cfg(test)]
+mod legacy_mode_tests {
+    use super::*;
+
+    fn named(k: NamedKey) -> LogicalKey {
+        LogicalKey::Named(k)
+    }
+
+    fn enc(k: &LogicalKey, text: Option<&str>, m: Modifiers, modes: LegacyModes) -> Vec<u8> {
+        encode_key_with_modes(k, text, m, 0, KeyState::Pressed, false, modes).unwrap()
+    }
+
+    const APP: LegacyModes = LegacyModes {
+        app_cursor: true,
+        alt_escape: true,
+    };
+
+    #[test]
+    fn decckm_switches_cursor_keys_to_ss3() {
+        for (k, fin) in [
+            (NamedKey::ArrowUp, b'A'),
+            (NamedKey::ArrowDown, b'B'),
+            (NamedKey::ArrowRight, b'C'),
+            (NamedKey::ArrowLeft, b'D'),
+            (NamedKey::Home, b'H'),
+            (NamedKey::End, b'F'),
+        ] {
+            assert_eq!(
+                enc(&named(k), None, Modifiers::empty(), APP),
+                vec![0x1b, b'O', fin]
+            );
+            assert_eq!(
+                enc(&named(k), None, Modifiers::empty(), LegacyModes::default()),
+                vec![0x1b, b'[', fin]
+            );
+            // A modifier keeps the CSI form.
+            assert_eq!(
+                enc(&named(k), None, Modifiers::CONTROL, APP),
+                vec![0x1b, b'[', fin]
+            );
+        }
+        // Other named keys are unaffected.
+        assert_eq!(
+            enc(&named(NamedKey::PageUp), None, Modifiers::empty(), APP),
+            b"\x1b[5~"
+        );
+    }
+
+    #[test]
+    fn decckm_does_not_affect_kitty_encoding() {
+        let got = encode_key_with_modes(
+            &named(NamedKey::ArrowUp),
+            None,
+            Modifiers::empty(),
+            KITTY_FLAG_DISAMBIGUATE,
+            KeyState::Pressed,
+            false,
+            APP,
+        );
+        assert_eq!(got.as_deref(), Some(&b"\x1b[A"[..]));
+    }
+
+    #[test]
+    fn alt_escape_off_sends_plain_text() {
+        let off = LegacyModes {
+            app_cursor: false,
+            alt_escape: false,
+        };
+        let a = LogicalKey::Character("a".into());
+        assert_eq!(enc(&a, Some("a"), Modifiers::ALT, off), b"a");
+        assert_eq!(
+            enc(&a, Some("a"), Modifiers::ALT | Modifiers::CONTROL, off),
+            [1]
+        );
+        assert_eq!(
+            enc(&a, Some("a"), Modifiers::ALT, LegacyModes::default()),
+            b"\x1ba"
+        );
+    }
+
+    #[test]
+    fn app_keypad_digits_follow_numlock_from_logical_key() {
+        let nav = named(NamedKey::End); // KP_1 with NumLock off
+        assert_eq!(
+            encode_app_keypad("Numpad1", &nav, Modifiers::empty(), true).as_deref(),
+            Some(&b"\x1bOq"[..])
+        );
+        let digit = LogicalKey::Character("1".into());
+        assert_eq!(
+            encode_app_keypad("Numpad1", &digit, Modifiers::empty(), false),
+            None
+        );
+        for (code, fin) in [
+            ("Numpad0", b'p'),
+            ("Numpad9", b'y'),
+            ("NumpadDecimal", b'n'),
+        ] {
+            assert_eq!(
+                encode_app_keypad(code, &nav, Modifiers::empty(), true),
+                Some(vec![0x1b, b'O', fin])
+            );
+        }
+    }
+
+    #[test]
+    fn app_keypad_operators_use_numlock_hint() {
+        let plus = LogicalKey::Character("+".into());
+        assert_eq!(
+            encode_app_keypad("NumpadAdd", &plus, Modifiers::empty(), true),
+            None
+        );
+        for (code, fin) in [
+            ("NumpadEnter", b'M'),
+            ("NumpadMultiply", b'j'),
+            ("NumpadAdd", b'k'),
+            ("NumpadComma", b'l'),
+            ("NumpadSubtract", b'm'),
+            ("NumpadDivide", b'o'),
+            ("NumpadEqual", b'X'),
+        ] {
+            assert_eq!(
+                encode_app_keypad(code, &plus, Modifiers::empty(), false),
+                Some(vec![0x1b, b'O', fin])
+            );
+        }
+    }
+
+    #[test]
+    fn app_keypad_ignores_modified_and_non_keypad_keys() {
+        let nav = named(NamedKey::End);
+        assert_eq!(
+            encode_app_keypad("Numpad1", &nav, Modifiers::CONTROL, false),
+            None
+        );
+        assert_eq!(
+            encode_app_keypad("Digit1", &nav, Modifiers::empty(), false),
+            None
+        );
+        assert_eq!(
+            encode_app_keypad("NumpadBackspace", &nav, Modifiers::empty(), false),
+            None
+        );
+    }
+
+    #[test]
+    fn numlock_hint_from_keypad_digits() {
+        let digit = LogicalKey::Character("5".into());
+        assert_eq!(numlock_hint("Numpad5", &digit), Some(true));
+        assert_eq!(
+            numlock_hint("Numpad5", &named(NamedKey::Other)),
+            Some(false)
+        );
+        assert_eq!(numlock_hint("NumpadAdd", &digit), None);
+        assert_eq!(numlock_hint("KeyA", &digit), None);
     }
 }
