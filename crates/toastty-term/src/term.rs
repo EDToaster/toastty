@@ -33,10 +33,7 @@ use toastty_parser::{Params, Perform};
 pub use toastty_protocols::clipboard::{ClipboardTarget, ClipboardTargets};
 
 mod rich_term;
-
-/// Width of a hard tab. Eight is the canonical default; once we expose
-/// tab-stop manipulation (HTS/TBC) this becomes per-column state.
-const TAB_WIDTH: u16 = 8;
+mod vt;
 
 /// Mouse reporting protocol selected via DECSET 9/1000/1002/1003.
 ///
@@ -399,6 +396,11 @@ pub struct Term {
     /// honoring this level for the legacy `CSI 27 ; mods ; code ~`
     /// reporting is future work.
     modify_other_keys: u8,
+    /// Mode and editing state added with the VT compatibility pass
+    /// (REP, tab stops, IRM, DECOM, DECAWM, DECSLRM, ...). Grouped in
+    /// one struct so `Term::new` / RIS / DECSTR stay readable; see
+    /// [`vt::VtModes`].
+    vt: vt::VtModes,
     // ----- Rich blocks (OSC 7700) -----
     /// Layout engine injected by the binary. `None` → OSC 7700 ignored.
     rich_layout: Option<RichLayoutSlot>,
@@ -622,6 +624,7 @@ impl Term {
             scroll_top: 0,
             scroll_bot: rows - 1,
             modify_other_keys: 0,
+            vt: vt::VtModes::new(cols),
             rich_layout: None,
             rich_store: crate::rich::RichBlockStore::default(),
             rich_env: crate::rich::RichEnv::default(),
@@ -1837,6 +1840,11 @@ impl Term {
         // can't leave an out-of-range region pinned.
         self.scroll_top = 0;
         self.scroll_bot = rows - 1;
+        // Same for DECSLRM margins (DECLRMM itself stays set), and tab
+        // stops go back to every eighth column of the new width.
+        self.reset_lr_margins();
+        self.reset_tab_stops();
+        self.vt.wrap_pending_at = None;
         self.clamp_cursor();
         // Resize invalidates every cached shaped line — re-shape all.
         self.damage.resize(rows);
@@ -1895,7 +1903,13 @@ impl Term {
     /// on this for the "paint lines into the top" path (e.g. `b`/`u`
     /// paging up).
     fn reverse_index(&mut self) {
+        self.vt.wrap_pending_at = None;
         if self.cursor.row == self.scroll_top {
+            // Outside DECSLRM margins the margin rectangle doesn't
+            // scroll (VT420+): RI at the top margin is a no-op.
+            if self.lr_narrowed() && !self.cursor_in_lr() {
+                return;
+            }
             // At top of region: scroll region down by one, cursor
             // stays put. Partial regions don't touch scrollback.
             self.region_scroll_down();
@@ -1913,6 +1927,11 @@ impl Term {
 
     fn linefeed(&mut self) {
         if self.cursor.row == self.scroll_bot {
+            // Outside DECSLRM margins the margin rectangle doesn't
+            // scroll (VT420+): LF at the bottom margin is a no-op.
+            if self.lr_narrowed() && !self.cursor_in_lr() {
+                return;
+            }
             // At bottom of region: scroll region up by one, cursor
             // stays at scroll_bot. Full-region case preserves
             // scrollback semantics; partial regions don't.
@@ -1951,6 +1970,13 @@ impl Term {
     fn region_scroll_up(&mut self) {
         let top = self.scroll_top;
         let bot = self.scroll_bot.min(self.rows.saturating_sub(1));
+        if self.lr_narrowed() {
+            // DECSLRM: only the margin rectangle moves; no scrollback.
+            if top < bot {
+                self.rect_scroll_up(top, bot);
+            }
+            return;
+        }
         if top == 0 && bot == self.rows.saturating_sub(1) {
             self.active_grid_mut().scroll_up();
             if !self.alt_active {
@@ -2012,6 +2038,12 @@ impl Term {
     fn region_scroll_down(&mut self) {
         let top = self.scroll_top;
         let bot = self.scroll_bot.min(self.rows.saturating_sub(1));
+        if self.lr_narrowed() {
+            if top < bot {
+                self.rect_scroll_down(top, bot);
+            }
+            return;
+        }
         if top == 0 && bot == self.rows.saturating_sub(1) {
             self.active_grid_mut().scroll_down();
             if !self.alt_active {
@@ -2178,28 +2210,56 @@ impl Term {
             return;
         }
 
-        // Wrap before printing if the cursor is past the last column
-        // OR — for a width-2 char — there's only 1 column left. The
-        // width-2 wrap case matches xterm: a wide char never splits.
-        let needs_wrap =
-            self.cursor.col >= self.cols || (cell_w == 2 && self.cursor.col + 1 >= self.cols);
-        if needs_wrap {
-            // Mark the row we're leaving as soft-wrapped (decision #6).
+        // Wrap before printing if the cursor is past the right edge OR —
+        // for a width-2 char — there's only 1 column left. The width-2
+        // wrap case matches xterm: a wide char never splits. The right
+        // edge is the screen edge, or the DECSLRM right margin when the
+        // cursor is inside it; a print that filled the margin's last
+        // column leaves `wrap_pending` set instead of the `col == cols`
+        // sentinel.
+        let right_edge = self.print_right_edge();
+        let pending = self.wrap_pending();
+        self.vt.wrap_pending_at = None;
+        let needs_wrap = pending
+            || self.cursor.col >= right_edge
+            || (cell_w == 2 && self.cursor.col + 1 >= right_edge);
+        if needs_wrap && !self.vt.autowrap {
+            // DECAWM off: no wrap — the char overwrites the last
+            // column(s) before the edge and the cursor stays put.
+            let old_col = self.cursor.col.min(self.cols.saturating_sub(1));
+            self.cursor.col = right_edge.saturating_sub(cell_w);
+            self.mark_cell(self.cursor.row, old_col);
+        } else if needs_wrap {
+            // Mark the row we're leaving as soft-wrapped (decision #6) —
+            // only for full-width lines: text wrapped inside DECSLRM
+            // margins isn't one logical line for reflow purposes.
             // The cursor block was sitting on the last column of the
             // leaving row, so mark that cell dirty so the trailing
-            // cursor block gets overpainted. The fresh row 0-col is
-            // marked once the cursor lands there below.
+            // cursor block gets overpainted. The fresh row's start
+            // column is marked once the cursor lands there below.
             let leaving = self.cursor.row;
-            self.active_grid_mut().row_mut(leaving).soft_wrap = true;
-            let last_col = self.cols.saturating_sub(1);
+            let wrap_col = if self.vt.lr_margin_mode && self.cursor.col <= right_edge {
+                self.line_start_col()
+            } else {
+                0
+            };
+            if right_edge == self.cols && wrap_col == 0 {
+                self.active_grid_mut().row_mut(leaving).soft_wrap = true;
+            }
+            let last_col = right_edge.saturating_sub(1);
             self.mark_cell(leaving, last_col);
-            self.cursor.col = 0;
+            self.cursor.col = wrap_col;
             self.linefeed();
-            // After linefeed, mark the new row's col 0 (the cursor's
-            // resting position). Marking the cell where the cursor
-            // lands keeps the cursor block in sync under partial
-            // redraw.
-            self.mark_cell(self.cursor.row, 0);
+            // After linefeed, mark the new row's start column (the
+            // cursor's resting position). Marking the cell where the
+            // cursor lands keeps the cursor block in sync under
+            // partial redraw.
+            self.mark_cell(self.cursor.row, wrap_col);
+        }
+        // IRM: shift the rest of the line (up to the right margin) right
+        // to make room before writing.
+        if self.vt.insert_mode {
+            self.insert_char(cell_w);
         }
         let primary = Cell {
             ch: c,
@@ -2239,7 +2299,20 @@ impl Term {
         if cell_w == 2 {
             self.mark_cell(row, col + 1);
         }
-        self.cursor.col += cell_w;
+        if !toastty_graphics::is_placeholder(c) {
+            self.vt.last_graphic = Some(c);
+        }
+        let next = col + cell_w;
+        if next >= right_edge && (right_edge < self.cols || !self.vt.autowrap) {
+            // Filled the last column before a margin (or the screen edge
+            // with DECAWM off): park the cursor on that column and defer
+            // the wrap (DECAWM on) / remember the cell (DECAWM off) so
+            // the next print and grapheme extension see it.
+            self.cursor.col = right_edge.saturating_sub(1);
+            self.vt.wrap_pending_at = Some((row, self.cursor.col));
+        } else {
+            self.cursor.col = next;
+        }
     }
 
     /// Record that an HT advanced the cursor over `[from, to)` on `row`, so
@@ -2318,7 +2391,13 @@ impl Term {
     fn try_extend_grapheme(&mut self, c: char, cell_w: u16) -> bool {
         use unicode_segmentation::UnicodeSegmentation;
         let row = self.cursor.row;
-        let cur = self.cursor.col.min(self.cols);
+        // With a deferred margin wrap (or DECAWM off at the edge) the
+        // cursor sits *on* the cell just written rather than after it.
+        let cur = if self.wrap_pending() {
+            self.cursor.col + 1
+        } else {
+            self.cursor.col.min(self.cols)
+        };
         if cur == 0 {
             return false;
         }
@@ -2581,9 +2660,59 @@ impl Term {
             // cursor to column Ps (1-based) on the current row. Used
             // heavily by Claude Code to lay out tab-stop-style columns
             // of text on a single line; without it, the words pile up.
-            'G' => {
-                let col = first_param(params, 1).max(1);
-                self.cursor_position(self.cursor.row.saturating_add(1), col);
+            // HPA (`` CSI Ps ` ``) is the same motion.
+            'G' | '`' => self.horizontal_position_absolute(first_param(params, 1).max(1)),
+            // HPR — `CSI Ps a`: relative right, like CUF.
+            'a' => self.cursor_forward(first_param(params, 1).max(1)),
+            // VPR — `CSI Ps e`: relative down, like CUD.
+            'e' => self.cursor_down(first_param(params, 1).max(1)),
+            // CNL / CPL — `CSI Ps E` / `CSI Ps F`: down / up Ps lines,
+            // then to the line start.
+            'E' => self.cursor_next_prev_line(first_param(params, 1).max(1), true),
+            'F' => self.cursor_next_prev_line(first_param(params, 1).max(1), false),
+            // REP — `CSI Ps b`: repeat the preceding graphic character.
+            'b' if priv_marker.is_none() => {
+                self.repeat_last_graphic(first_param(params, 1).max(1));
+            }
+            // CHT — `CSI Ps I`: forward Ps tab stops.
+            'I' => self.tab_forward(first_param(params, 1).max(1)),
+            // CBT — `CSI Ps Z`: back Ps tab stops.
+            'Z' => self.tab_backward(first_param(params, 1).max(1)),
+            // TBC — `CSI Ps g`: clear the tab stop at the cursor (0) or
+            // all tab stops (3).
+            'g' if priv_marker.is_none() => self.clear_tab_stops(first_param(params, 0)),
+            // SM / RM — ANSI modes (IRM = 4).
+            'h' if priv_marker.is_none() => self.apply_ansi_mode(params, true),
+            'l' if priv_marker.is_none() => self.apply_ansi_mode(params, false),
+            // DECSLRM — `CSI Pl ; Pr s` while DECLRMM (?69) is set;
+            // otherwise SCOSC — `CSI s`, save the cursor (same slot as
+            // DECSC, as in xterm).
+            's' if priv_marker.is_none() => {
+                if self.vt.lr_margin_mode {
+                    let l = first_param(params, 1);
+                    let r = nth_param(params, 1, self.cols);
+                    self.set_lr_margins(l, r);
+                } else {
+                    self.save_cursor();
+                }
+            }
+            // SCORC — `CSI u` (no private marker; the kitty keyboard
+            // `CSI > u` / `CSI < u` / `CSI = u` / `CSI ? u` forms are
+            // handled below).
+            'u' if priv_marker.is_none() => self.restore_cursor(),
+            // ANSI DECRQM — `CSI Ps $ p`. Reply `CSI Ps ; Pm $ y`.
+            'p' if intermediates == b"$" => {
+                let ps = first_param(params, 0);
+                let pm = self.ansi_decrqm_status(ps);
+                let reply = format!("\x1b[{ps};{pm}$y");
+                self.pty_replies.extend_from_slice(reply.as_bytes());
+            }
+            // DECSTR — `CSI ! p`, soft terminal reset.
+            'p' if intermediates == b"!" => self.soft_reset(),
+            // DA3 — Tertiary Device Attributes (`CSI = c`). Reply with
+            // the DECRPTUI unit id `DCS ! | 00000000 ST`, as xterm does.
+            'c' if priv_marker == Some(b'=') => {
+                self.pty_replies.extend_from_slice(b"\x1bP!|00000000\x1b\\");
             }
             'H' | 'f' => {
                 let r = first_param(params, 1).max(1);
@@ -2762,30 +2891,14 @@ impl Term {
                 let ps = first_param(params, 0);
                 match ps {
                     5 => self.pty_replies.extend_from_slice(b"\x1b[0n"),
-                    6 => {
-                        let row = self.cursor.row.saturating_add(1);
-                        let col = self
-                            .cursor
-                            .col
-                            .min(self.cols.saturating_sub(1))
-                            .saturating_add(1);
-                        let reply = format!("\x1b[{row};{col}R");
-                        self.pty_replies.extend_from_slice(reply.as_bytes());
-                    }
+                    6 => self.report_cursor_position(false),
                     _ => {}
                 }
             }
             'n' if priv_marker == Some(b'?') => {
                 let ps = first_param(params, 0);
                 if ps == 6 {
-                    let row = self.cursor.row.saturating_add(1);
-                    let col = self
-                        .cursor
-                        .col
-                        .min(self.cols.saturating_sub(1))
-                        .saturating_add(1);
-                    let reply = format!("\x1b[?{row};{col}R");
-                    self.pty_replies.extend_from_slice(reply.as_bytes());
+                    self.report_cursor_position(true);
                 }
             }
             // XTVERSION — `CSI > q`. Apps probe this to identify the
@@ -2920,6 +3033,7 @@ impl Term {
         let max_col = self.cols.saturating_sub(1);
         let new_row = new_row.min(max_row);
         let new_col = new_col.min(max_col);
+        self.vt.wrap_pending_at = None;
         let old_row = self.cursor.row;
         let old_col = self.cursor.col.min(max_col);
         self.cursor.row = new_row;
@@ -2931,18 +3045,37 @@ impl Term {
         self.mark_cell(new_row, new_col);
     }
 
+    /// CUU. Stops at the top margin when the cursor starts inside the
+    /// scroll region (xterm), else at row 0.
     fn cursor_up(&mut self, n: u16) {
-        let new_row = self.cursor.row.saturating_sub(n);
+        let floor = if self.cursor.row >= self.scroll_top {
+            self.scroll_top
+        } else {
+            0
+        };
+        let new_row = self.cursor.row.saturating_sub(n).max(floor);
         self.move_cursor(new_row, self.cursor.col);
     }
 
+    /// CUD. Stops at the bottom margin when the cursor starts inside the
+    /// scroll region (xterm), else at the last row.
     fn cursor_down(&mut self, n: u16) {
-        let new_row = self.cursor.row.saturating_add(n);
+        let ceil = if self.cursor.row <= self.scroll_bot {
+            self.scroll_bot
+        } else {
+            self.rows.saturating_sub(1)
+        };
+        let new_row = self.cursor.row.saturating_add(n).min(ceil);
         self.move_cursor(new_row, self.cursor.col);
     }
 
+    /// CUF. Stops at the DECSLRM right margin when the cursor is inside
+    /// it.
     fn cursor_forward(&mut self, n: u16) {
-        let new_col = self.cursor.col.saturating_add(n);
+        let mut new_col = self.cursor.col.saturating_add(n);
+        if self.vt.lr_margin_mode && self.cursor.col <= self.vt.right {
+            new_col = new_col.min(self.vt.right);
+        }
         self.move_cursor(self.cursor.row, new_col);
     }
 
@@ -2954,13 +3087,17 @@ impl Term {
         // an extra column whenever the landing spot is a continuation
         // half, walking the cursor — and every subsequent rewrite — too far
         // left. See `wide_char_paste_redraw_keeps_alignment`.
-        let new_col = self.cursor.col.saturating_sub(n);
+        let mut new_col = self.cursor.col.saturating_sub(n);
+        if self.vt.lr_margin_mode && self.cursor.col >= self.vt.left {
+            new_col = new_col.max(self.vt.left);
+        }
         self.move_cursor(self.cursor.row, new_col);
     }
 
+    /// CUP / HVP. Coordinates are relative to the margins under DECOM.
     fn cursor_position(&mut self, row_1based: u16, col_1based: u16) {
-        let new_row = row_1based.saturating_sub(1);
-        let new_col = col_1based.saturating_sub(1);
+        let new_row = self.origin_row(row_1based);
+        let new_col = self.origin_col(col_1based);
         self.move_cursor(new_row, new_col);
     }
 
@@ -3043,10 +3180,15 @@ impl Term {
     fn delete_char(&mut self, n: u16) {
         let cur_row = self.cursor.row;
         let cur_col = self.cursor.col;
-        let cols = self.cols;
-        if cur_col >= cols || n == 0 {
+        if cur_col >= self.cols || n == 0 {
             return;
         }
+        // With DECSLRM margins the shift stops at the right margin, and
+        // DCH outside the margins is a no-op (xterm).
+        if self.lr_narrowed() && !self.cursor_in_lr() {
+            return;
+        }
+        let cols = self.lr_bounds().1 + 1;
         let style = self.cursor.style;
         let n = u16::min(n, cols - cur_col);
         let row = self.active_grid_mut().row_mut(cur_row);
@@ -3084,10 +3226,15 @@ impl Term {
     fn insert_char(&mut self, n: u16) {
         let cur_row = self.cursor.row;
         let cur_col = self.cursor.col;
-        let cols = self.cols;
-        if cur_col >= cols || n == 0 {
+        if cur_col >= self.cols || n == 0 {
             return;
         }
+        // With DECSLRM margins the shift stops at the right margin, and
+        // ICH outside the margins is a no-op (xterm).
+        if self.lr_narrowed() && !self.cursor_in_lr() {
+            return;
+        }
+        let cols = self.lr_bounds().1 + 1;
         let style = self.cursor.style;
         let n = u16::min(n, cols - cur_col);
         let row = self.active_grid_mut().row_mut(cur_row);
@@ -3143,6 +3290,26 @@ impl Term {
         let top = self.scroll_top;
         let bot = self.scroll_bot.min(self.rows.saturating_sub(1));
         if n == 0 || cur_row < top || cur_row > bot {
+            return;
+        }
+        if self.lr_narrowed() {
+            // DECSLRM: shift only the margin rectangle below the cursor;
+            // a no-op when the cursor is outside the margins.
+            if !self.cursor_in_lr() {
+                return;
+            }
+            if cur_row == bot {
+                let (l, r) = self.lr_bounds();
+                let style = self.cursor.style;
+                self.active_grid_mut()
+                    .row_mut(cur_row)
+                    .erase(l, r + 1, style);
+                self.mark_cells(cur_row, l, r + 1);
+                return;
+            }
+            for _ in 0..n.min(bot - cur_row + 1) {
+                self.rect_scroll_down(cur_row, bot);
+            }
             return;
         }
         let region_end = bot + 1; // exclusive
@@ -3210,6 +3377,26 @@ impl Term {
         if n == 0 || cur_row < top || cur_row > bot {
             return;
         }
+        if self.lr_narrowed() {
+            // DECSLRM: shift only the margin rectangle below the cursor;
+            // a no-op when the cursor is outside the margins.
+            if !self.cursor_in_lr() {
+                return;
+            }
+            if cur_row == bot {
+                let (l, r) = self.lr_bounds();
+                let style = self.cursor.style;
+                self.active_grid_mut()
+                    .row_mut(cur_row)
+                    .erase(l, r + 1, style);
+                self.mark_cells(cur_row, l, r + 1);
+                return;
+            }
+            for _ in 0..n.min(bot - cur_row + 1) {
+                self.rect_scroll_up(cur_row, bot);
+            }
+            return;
+        }
         let region_end = bot + 1; // exclusive
         let n = u16::min(n, region_end - cur_row);
         let style = self.cursor.style;
@@ -3257,8 +3444,15 @@ impl Term {
     /// VPA — Vertical Position Absolute. `CSI Ps d` moves the cursor
     /// to row `Ps` (1-based) on the same column.
     fn vertical_position_absolute(&mut self, row_1based: u16) {
-        let new_row = row_1based.saturating_sub(1);
+        let new_row = self.origin_row(row_1based);
         self.move_cursor(new_row, self.cursor.col);
+    }
+
+    /// CHA / HPA — column `Ps` (1-based) on the current row, relative to
+    /// the left margin under DECOM.
+    fn horizontal_position_absolute(&mut self, col_1based: u16) {
+        let new_col = self.origin_col(col_1based);
+        self.move_cursor(self.cursor.row, new_col);
     }
 
     fn apply_sgr(&mut self, params: &Params) {
@@ -3435,6 +3629,16 @@ impl Term {
     fn decrqm_status(&self, ps: u16) -> u16 {
         let is_set = match ps {
             25 => self.cursor_visible,
+            1 => self.vt.app_cursor_keys,
+            5 => self.vt.reverse_video,
+            6 => self.vt.origin_mode,
+            7 => self.vt.autowrap,
+            12 => self.cursor_blink,
+            66 => self.vt.app_keypad,
+            69 => self.vt.lr_margin_mode,
+            1007 => self.vt.alternate_scroll,
+            1036 => self.vt.meta_sends_escape,
+            1039 => self.vt.alt_sends_escape,
             9 => matches!(self.mouse_mode.protocol, MouseProtocol::X10Compat),
             1000 => matches!(self.mouse_mode.protocol, MouseProtocol::Normal),
             1002 => matches!(self.mouse_mode.protocol, MouseProtocol::ButtonMotion),
@@ -3488,13 +3692,9 @@ impl Term {
                 // image-grid switch.
                 1048 => {
                     if enable {
-                        self.decsc_saved = Some(self.cursor);
+                        self.save_cursor();
                     } else {
-                        let old = self.cursor;
-                        self.cursor = self.decsc_saved.unwrap_or_default();
-                        self.clamp_cursor();
-                        self.mark_cell(old.row, old.col);
-                        self.mark_cell(self.cursor.row, self.cursor.col);
+                        self.restore_cursor();
                     }
                 }
                 // 25 — DECTCEM, show/hide the cursor. `enable` = show.
@@ -3549,7 +3749,44 @@ impl Term {
                 8452 => {
                     self.sixel_cursor_right = enable;
                 }
-                // TODO(modes): 1, 7, 12, 25, etc.
+                // 1 — DECCKM, application cursor keys.
+                1 => self.vt.app_cursor_keys = enable,
+                // 5 — DECSCNM, reverse-video screen.
+                5 => self.set_reverse_video(enable),
+                // 6 — DECOM, origin mode. Homes the cursor.
+                6 => self.set_origin_mode(enable),
+                // 7 — DECAWM, autowrap.
+                7 => {
+                    self.vt.autowrap = enable;
+                    self.vt.wrap_pending_at = None;
+                }
+                // 12 — att610, start/stop cursor blinking (DECSCUSR
+                // keeps the shape; this only flips the blink bit).
+                12 => {
+                    if self.cursor_blink != enable {
+                        self.cursor_blink = enable;
+                        let col = self.cursor.col.min(self.cols.saturating_sub(1));
+                        self.mark_cell(self.cursor.row, col);
+                    }
+                }
+                // 66 — DECNKM, numeric keypad mode (set = application,
+                // same flag as DECKPAM / DECKPNM).
+                66 => self.vt.app_keypad = enable,
+                // 69 — DECLRMM, enable left/right margins (DECSLRM).
+                // Leaving the mode drops the margins.
+                69 => {
+                    self.vt.lr_margin_mode = enable;
+                    self.vt.wrap_pending_at = None;
+                    if !enable {
+                        self.reset_lr_margins();
+                    }
+                }
+                // 1007 — alternate scroll (wheel → cursor keys on the
+                // alternate screen).
+                1007 => self.vt.alternate_scroll = enable,
+                // 1036 / 1039 — metaSendsEscape / altSendsEscape.
+                1036 => self.vt.meta_sends_escape = enable,
+                1039 => self.vt.alt_sends_escape = enable,
                 _ => {}
             }
         }
@@ -3648,6 +3885,9 @@ impl Term {
         self.inband_resize_mode = false;
         self.kitty_keyboard_stack.clear();
         self.modify_other_keys = 0;
+        // REP char, tab stops, IRM / DECCKM / DECKPAM / DECOM / DECAWM /
+        // DECSCNM / DECLRMM + margins, ...
+        self.hard_reset_vt();
         // Snap the viewport back to the live bottom.
         self.viewport = crate::viewport::Viewport::new();
         // Clear any in-progress placeholder run.
@@ -3781,15 +4021,19 @@ impl Perform for Term {
         }
         match byte {
             b'\r' => {
-                // CR moves the cursor in-place to column 0. Mark old
-                // and new cells so the cursor block at the old column
-                // gets overpainted and the new one shows up.
+                // CR moves the cursor in-place to column 0 (the left
+                // margin when DECSLRM is active and the cursor is at or
+                // right of it). Mark old and new cells so the cursor
+                // block at the old column gets overpainted and the new
+                // one shows up.
                 let row = self.cursor.row;
                 let max_col = self.cols.saturating_sub(1);
                 let old_col = self.cursor.col.min(max_col);
-                self.cursor.col = 0;
+                let start = self.line_start_col();
+                self.vt.wrap_pending_at = None;
+                self.cursor.col = start;
                 self.mark_cell(row, old_col);
-                self.mark_cell(row, 0);
+                self.mark_cell(row, start);
             }
             b'\n' | 0x0B | 0x0C => self.linefeed(),
             0x08 => {
@@ -3807,6 +4051,7 @@ impl Perform for Term {
                 // the old column gets overpainted and the new one
                 // shows up under partial redraw (latent damage gap
                 // fix in M9.4).
+                self.vt.wrap_pending_at = None;
                 if self.cursor.col > 0 {
                     let row = self.cursor.row;
                     let max_col = self.cols.saturating_sub(1);
@@ -3816,19 +4061,9 @@ impl Perform for Term {
                     self.mark_cell(row, self.cursor.col);
                 }
             }
-            b'\t' => {
-                // HT: advance to next multiple of TAB_WIDTH, clamped.
-                // Same damage-gap fix as BS.
-                let row = self.cursor.row;
-                let max_col = self.cols.saturating_sub(1);
-                let old_col = self.cursor.col.min(max_col);
-                let next = (self.cursor.col / TAB_WIDTH + 1) * TAB_WIDTH;
-                let from = self.cursor.col;
-                self.cursor.col = next.min(max_col);
-                self.mark_tab_run(row, from, self.cursor.col);
-                self.mark_cell(row, old_col);
-                self.mark_cell(row, self.cursor.col);
-            }
+            // HT: advance to the next tab stop (HTS / TBC editable),
+            // clamped at the right margin. Same damage-gap fix as BS.
+            b'\t' => self.tab_forward(1),
             // BEL and everything else are no-ops for M3.
             _ => {}
         }
@@ -3851,6 +4086,13 @@ impl Perform for Term {
         if let Some(run) = self.placeholder_run.take() {
             self.finalize_placeholder_run(run);
         }
+        if intermediates == b"#" {
+            // DECALN (`ESC # 8`) — screen alignment test.
+            if byte == b'8' {
+                self.decaln();
+            }
+            return;
+        }
         if !intermediates.is_empty() {
             return;
         }
@@ -3867,25 +4109,26 @@ impl Perform for Term {
                 let row = self.cursor.row;
                 let max_col = self.cols.saturating_sub(1);
                 let old_col = self.cursor.col.min(max_col);
-                self.cursor.col = 0;
+                let start = self.line_start_col();
+                self.vt.wrap_pending_at = None;
+                self.cursor.col = start;
                 self.mark_cell(row, old_col);
-                self.mark_cell(row, 0);
+                self.mark_cell(row, start);
                 self.linefeed();
             }
+            // HTS (`ESC H`) — set a tab stop at the cursor column.
+            b'H' => self.set_tab_stop(),
+            // DECKPAM (`ESC =`) / DECKPNM (`ESC >`) — application /
+            // numeric keypad.
+            b'=' => self.vt.app_keypad = true,
+            b'>' => self.vt.app_keypad = false,
             // DECSC (`ESC 7`) — save cursor position + SGR. Used by
             // powerlevel10k's instant-prompt to snapshot before
             // printing a transient prompt, then redraw via DECRC.
-            b'7' => self.decsc_saved = Some(self.cursor),
+            b'7' => self.save_cursor(),
             // DECRC (`ESC 8`) — restore the DECSC snapshot. With no
             // prior save, xterm homes the cursor and resets SGR.
-            b'8' => {
-                let old = self.cursor;
-                let new = self.decsc_saved.unwrap_or_default();
-                self.cursor = new;
-                self.clamp_cursor();
-                self.mark_cell(old.row, old.col);
-                self.mark_cell(self.cursor.row, self.cursor.col);
-            }
+            b'8' => self.restore_cursor(),
             _ => {}
         }
     }

@@ -29,34 +29,48 @@ apps notice, **P2** modern feature or nicety.
 
 ### CSI sequences currently ignored
 
-Test input → expected result (xterm):
+Test input → expected result (xterm). Done in PR_LINK: see `crates/toastty-term/src/term/vt.rs` and its tests.
 
-- [ ] **P1 — REP `CSI Ps b`** (repeat the preceding graphic character). `a\e[3b` → `aaaa`. `docs/protocols.md` lists it as supported.
-- [ ] **P1 — CNL `CSI Ps E` / CPL `CSI Ps F`** (cursor to column 1 of the next or previous line).
-- [ ] **P1 — HPA ``CSI Ps ` ``, HPR `CSI Ps a`, VPR `CSI Ps e`** (absolute/relative horizontal moves and relative vertical moves). CHA (`G`) and VPA (`d`) already work.
-- [ ] **P1 — Tab stops.**
-  - Missing: HTS `ESC H`, TBC `CSI 0 g` / `CSI 3 g`, CHT `CSI Ps I`, CBT `CSI Ps Z`.
-  - Tabs are currently fixed at every 8 columns.
-  - Tab stops must also reset on RIS/DECSTR and resize.
-- [ ] **P1 — SCOSC / SCORC `CSI s` / `CSI u`** (save/restore cursor, no private marker). `ESC 7` / `ESC 8` work. `CSI s` must stay unambiguous with DECSLRM once left/right margins exist: it means SCOSC only when DECLRMM (`?69`) is off.
-- [ ] **P1 — IRM `CSI 4 h` / `CSI 4 l`** (insert mode). `abc\r\e[4hX` → `Xabc`.
-- [ ] **P2 — ANSI-mode DECRQM `CSI Ps $ p`** (no `?`). There's no reply today.
-- [ ] **P2 — DECALN `ESC # 8`** (fill the screen with `E`; used by vttest).
-- [ ] **P2 — DA3 `CSI = c`.** No reply today.
-- [ ] **P2 — DECSLRM / DECLRMM `?69`.** Already listed as Tier 4 in `protocols.md`.
+- [x] **P1 — REP `CSI Ps b`** (repeat the preceding graphic character). `a\e[3b` → `aaaa`. Wide characters repeat too; the count is capped at one screenful.
+- [x] **P1 — CNL `CSI Ps E` / CPL `CSI Ps F`** (cursor to column 1 of the next or previous line — the left margin under DECSLRM).
+- [x] **P1 — HPA ``CSI Ps ` ``, HPR `CSI Ps a`, VPR `CSI Ps e`** (absolute/relative horizontal moves and relative vertical moves). CHA (`G`) and VPA (`d`) already work.
+- [x] **P1 — Tab stops.**
+  - HTS `ESC H`, TBC `CSI 0 g` / `CSI 3 g`, CHT `CSI Ps I` and CBT `CSI Ps Z` are implemented on per-column stops (default every 8 columns).
+  - Tab stops reset on RIS, DECSTR and resize. HT / CHT stop at the right margin when the cursor is inside it.
+- [x] **P1 — SCOSC / SCORC `CSI s` / `CSI u`** (save/restore cursor, no private marker). They share the DECSC slot with `ESC 7` / `ESC 8` and `?1048`, as in xterm. `CSI s` means SCOSC only while DECLRMM (`?69`) is off; the kitty `CSI > u` / `CSI < u` / `CSI = u` / `CSI ? u` forms are unaffected.
+- [x] **P1 — IRM `CSI 4 h` / `CSI 4 l`** (insert mode). `abc\r\e[4hX` → `Xabc`; text shifted past the right margin is dropped.
+- [x] **P2 — ANSI-mode DECRQM `CSI Ps $ p`** (no `?`). Replies `CSI Ps ; Pm $ y`: IRM reports set/reset, KAM (2) and LNM (20) permanently reset, SRM (12) permanently set, anything else `0`.
+- [x] **P2 — DECALN `ESC # 8`** (fill the screen with `E`, reset the margins, home the cursor; used by vttest).
+- [x] **P2 — DA3 `CSI = c`.** Replies `DCS ! | 00000000 ST`, like xterm.
+- [x] **P2 — DECSLRM / DECLRMM `?69`.**
+  - `CSI Pl ; Pr s` sets the margins while `?69` is on. It homes the cursor; pairs with `Pl >= Pr` are ignored.
+  - Inside the margins: autowrap, CR / NEL / CNL, IND / RI / LF scrolling, SU / SD, IL / DL and ICH / DCH all stay within the rectangle. CUF / CUB stop at the margins.
+  - Nothing scrolls into scrollback while the margins narrow the screen. Wraps inside margins aren't marked as soft wraps, so they don't join lines on reflow.
+  - Leaving `?69` or resizing drops the margins.
+  - Image placements don't follow column-limited scrolls.
+- [x] **Also: DECSTR `CSI ! p`** (soft reset — needed for the tab-stop reset above). Resets IRM, DECOM, DECAWM, DECCKM, DECKPAM, both margin pairs, SGR, cursor visibility, the saved cursor and tab stops.
+- [x] **Also: CUU / CUD stop at the DECSTBM margins** when the cursor starts inside the scroll region (xterm; needed for DECOM).
 
-### DEC private modes (`apply_decset`, see `TODO(modes): 1, 7, 12`)
+### DEC private modes (`apply_decset`)
 
-- [ ] **P1 — DECCKM `?1`** (application cursor keys).
-  - Arrow, Home and End keys must send `SS3 A` etc. while set.
-  - `TERM=xterm-256color` advertises `kcuu1=\EOA` and `smkx=\E[?1h\E=`, so apps expect this.
-  - DECRQM `?1` currently answers `0` (not recognised).
-- [ ] **P1 — DECKPAM / DECKPNM `ESC =` / `ESC >`** (application keypad).
-- [ ] **P1 — DECAWM `?7`** (autowrap).
-  - `\e[?7l` + long line should overwrite the last column; today it wraps.
-  - DECRQM `?7` answers `0`.
-- [ ] **P1 — DECOM `?6`** (origin mode). CUP should be relative to the scroll region while set.
-- [ ] **P2 — `?5` DECSCNM** (reverse video), **`?12`** (cursor blink, att610), **`?1007`** (alternate scroll), **`?1036` / `?1039`** (meta/alt sends escape).
+All of these report through DECRQM `CSI ? Ps $ p` and reset on RIS. Done in PR_LINK.
+
+- [x] **P1 — DECCKM `?1`** (application cursor keys).
+  - Unmodified Arrow, Home and End keys send `SS3 A` / `SS3 B` / `SS3 C` / `SS3 D` / `SS3 H` / `SS3 F` while set. With a modifier they keep the CSI form, as in xterm.
+  - The alternate-screen wheel-to-arrows translation uses the same form.
+  - The kitty keyboard encoder is unaffected.
+- [x] **P1 — DECKPAM / DECKPNM `ESC =` / `ESC >`** (application keypad), plus DECNKM `?66` as the same flag.
+  - Behaviour follows xterm's default `numLock: true`: with NumLock off the keypad sends `SS3 p`..`SS3 y`, `SS3 n` (`.`), `SS3 M` (Enter), `SS3 k` / `m` / `j` / `o` / `X` / `l` (`+ - * / = ,`). With NumLock on it types as usual.
+  - Keypad digits tell NumLock apart through their logical key (a digit or a navigation key). Operator keys use the platform NumLock bit, or else the state the last keypad digit showed. The default is "on", so a shell that enables `smkx` (oh-my-zsh) keeps typing `+` and Enter normally.
+  - Legacy encoding only.
+- [x] **P1 — DECAWM `?7`** (autowrap). `\e[?7l` + long line overwrites the last column, and the cursor stays there. A wide character at the edge lands in the last two columns.
+- [x] **P1 — DECOM `?6`** (origin mode).
+  - CUP / HVP / VPA / CHA / HPA are relative to the DECSTBM (and DECSLRM) margins and clamped to them. CPR (`CSI 6 n` / `CSI ? 6 n`) reports relative coordinates.
+  - Setting or resetting the mode homes the cursor. DECSC / DECRC save and restore DECOM and DECAWM.
+- [x] **P2 — `?5` DECSCNM** (reverse video). The renderer swaps the theme's default fg / bg and keeps the background alpha.
+- [x] **P2 — `?12`** (cursor blink, att610). Toggles blinking and keeps the DECSCUSR shape.
+- [x] **P2 — `?1007`** (alternate scroll). On by default (the old behaviour). Resetting it stops the alternate screen turning wheel motion into arrow keys.
+- [x] **P2 — `?1036` / `?1039`** (meta/alt sends escape). Both are on by default. Once both are reset, Alt-modified keys are sent without the ESC prefix (Ghostty's behaviour, rather than xterm's 8-bit meta).
 
 ### Replies and queries
 

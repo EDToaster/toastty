@@ -259,8 +259,14 @@ pub struct Renderer {
     /// Text pipeline lives lazily — `with_font` initializes it; `render`
     /// (M4a path) tolerates its absence; `render_term` requires it.
     text: Option<TextState>,
-    /// Theme used by `render_term` when emitting instances.
+    /// Theme used by `render_term` when emitting instances: `base_theme`,
+    /// or its fg/bg swap while the terminal is in reverse video
+    /// (DECSCNM).
     theme: Theme,
+    /// Theme as configured via [`Renderer::set_theme`].
+    base_theme: Theme,
+    /// DECSCNM state `theme` was last derived for.
+    reverse_video: bool,
     /// True when the next frame must use `LoadOp::Clear` instead of
     /// `LoadOp::Load`. Set on construction (so the very first frame
     /// fully paints), on resize / theme / font swap, and whenever the
@@ -977,6 +983,8 @@ impl Renderer {
             clear_color: [0.07, 0.07, 0.09, 1.0],
             text: None,
             theme: Theme::default_dark(),
+            base_theme: Theme::default_dark(),
+            reverse_video: false,
             // First frame after construction always clears: the scratch
             // texture's initial contents are undefined.
             needs_full_clear: true,
@@ -1183,8 +1191,19 @@ impl Renderer {
     /// Theme changes invalidate the framebuffer (background color, all
     /// foreground colors); the next frame uses `LoadOp::Clear`.
     pub fn set_theme(&mut self, theme: Theme) {
-        self.theme = theme;
-        self.clear_color = theme.bg;
+        self.base_theme = theme;
+        self.apply_effective_theme();
+    }
+
+    /// Derive `theme` from `base_theme` + DECSCNM and resync the clear
+    /// color.
+    fn apply_effective_theme(&mut self) {
+        self.theme = if self.reverse_video {
+            reverse_video_theme(self.base_theme)
+        } else {
+            self.base_theme
+        };
+        self.clear_color = self.theme.bg;
         self.needs_full_clear = true;
     }
 
@@ -2006,7 +2025,7 @@ impl Renderer {
 
     /// Current theme.
     pub fn theme(&self) -> Theme {
-        self.theme
+        self.base_theme
     }
 
     /// Resize the surface. Width or height of 0 is clamped to 1 (configuring
@@ -2078,6 +2097,12 @@ impl Renderer {
     pub fn render_term(&mut self, term: &mut Term) -> Result<RenderOutcome, RenderError> {
         if self.text.is_none() {
             return Err(RenderError::FontNotConfigured);
+        }
+        // DECSCNM (`CSI ? 5 h`): swap the default fg/bg. The term marks
+        // every row dirty when the mode flips.
+        if term.reverse_video() != self.reverse_video {
+            self.reverse_video = term.reverse_video();
+            self.apply_effective_theme();
         }
 
         // DECSET 2026 (synchronized output) gate. The dispatcher flips
@@ -3809,5 +3834,39 @@ mod tests {
                 "frac={frac}: spanned {spanned} != surface {surface_w}"
             );
         }
+    }
+}
+
+/// DECSCNM: swap the theme's default foreground and background. The
+/// background keeps its alpha (window opacity) and the selection tint is
+/// re-derived for the swapped pair.
+#[must_use]
+pub fn reverse_video_theme(theme: Theme) -> Theme {
+    let [fr, fg_, fb, _] = theme.fg;
+    let [br, bg_, bb, ba] = theme.bg;
+    Theme {
+        fg: [br, bg_, bb, 1.0],
+        bg: [fr, fg_, fb, ba],
+        ..theme
+    }
+    .with_default_selection_bg()
+}
+
+#[cfg(test)]
+mod reverse_video_tests {
+    use super::*;
+
+    #[test]
+    fn reverse_video_swaps_fg_bg_and_keeps_bg_alpha() {
+        let base = Theme {
+            fg: [0.9, 0.8, 0.7, 1.0],
+            bg: [0.1, 0.2, 0.3, 0.5],
+            ..Theme::default_dark()
+        };
+        let rev = reverse_video_theme(base);
+        assert_eq!(rev.fg, [0.1, 0.2, 0.3, 1.0]);
+        assert_eq!(rev.bg, [0.9, 0.8, 0.7, 0.5]);
+        assert_eq!(rev.palette, base.palette);
+        assert_eq!(rev.cursor, base.cursor);
     }
 }
