@@ -124,16 +124,47 @@ enum Tok {
 }
 
 /// Vertical metrics and wrapping behaviour of a run of lines.
+///
+/// Lines snap to the terminal grid: a line is a whole number of rows
+/// (`row_h` each) tall, so stacking lines from a row boundary keeps
+/// every line top on a row boundary. A line of plain text is `rows`
+/// rows; a line holding an inline raster taller than the text grows by
+/// whole rows above and/or below.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LineCtx {
-    /// Minimum line pitch.
-    pub line_h: f32,
+    /// Row (cell) height in px.
+    pub row_h: f32,
+    /// Rows a line of plain text takes (>= 1).
+    pub rows: u32,
     /// Ascent / descent of the run's main font at its size, in px.
     pub asc: f32,
     pub desc: f32,
     /// Keep runs of spaces (code); otherwise they collapse to one.
     pub preserve_ws: bool,
     pub align: Align,
+}
+
+impl LineCtx {
+    /// Height of a plain text line: `rows` whole rows.
+    pub(crate) fn text_h(&self) -> f32 {
+        self.rows as f32 * self.row_h
+    }
+
+    /// Baseline offset from the top of a plain text line: the font's
+    /// ascent + descent box centred in the line, like the terminal
+    /// places its own baseline in a cell. Clamped so the baseline always
+    /// falls in the line's own rows (`grid::row_of`).
+    pub(crate) fn text_base(&self) -> f32 {
+        let h = self.text_h();
+        ((h - (self.asc + self.desc)) / 2.0 + self.asc)
+            .round()
+            .clamp(1.0, h)
+    }
+}
+
+/// Whole rows of `row_h` needed for `px`, ignoring the first `slack` px.
+fn rows_for(px: f32, row_h: f32, slack: f32) -> f32 {
+    ((px - slack) / row_h).ceil().max(0.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -503,9 +534,28 @@ impl Shaped {
         if !cur.items.is_empty() {
             push(&mut lines, &mut cur, &mut x);
         }
-        // Vertical metrics.
-        let leading = (ctx.line_h - (ctx.asc + ctx.desc)).max(0.0);
+        // Vertical metrics, in whole rows. Plain text takes `ctx.rows`
+        // rows with the baseline at `ctx.text_base()`. An inline raster
+        // may reach as far past those rows as the font's own ascent /
+        // descent box does, plus a tenth of a row; past that, the line
+        // grows by whole rows above / below so later lines stay on the
+        // grid. A display atom gets a line of its own, centred in the
+        // rows it needs.
+        let row_h = ctx.row_h;
+        let text_h = ctx.text_h();
+        let tb = ctx.text_base();
+        let spill_top = (ctx.asc - tb).max(0.0);
+        let spill_bot = (ctx.desc - (text_h - tb)).max(0.0);
         for l in &mut lines {
+            if l.center
+                && let Some(PlacedKind::Atom(a)) = l.items.first().map(|p| p.kind)
+            {
+                let at = &self.atoms[a];
+                l.h = rows_for(at.h, row_h, 0.5).max(1.0) * row_h;
+                let top = ((l.h - at.h) / 2.0).floor().max(0.0);
+                l.base = (top + at.asc).clamp(1.0, l.h);
+                continue;
+            }
             let (mut asc, mut desc) = (ctx.asc, ctx.desc);
             for p in &l.items {
                 if let PlacedKind::Atom(a) = p.kind {
@@ -514,14 +564,11 @@ impl Shaped {
                     desc = desc.max(at.h - at.asc);
                 }
             }
-            let tall = asc > ctx.asc + 0.5 || desc > ctx.desc + 0.5;
-            let pad = if tall {
-                (leading / 2.0).max(ctx.line_h * 0.1)
-            } else {
-                leading / 2.0
-            };
-            l.h = (asc + desc + 2.0 * pad).max(ctx.line_h).ceil();
-            l.base = ((l.h - asc - desc) / 2.0 + asc).round();
+            let slack = (row_h * 0.1).max(0.5);
+            let above = rows_for(asc - tb - spill_top, row_h, slack);
+            let below = rows_for(desc - (text_h - tb) - spill_bot, row_h, slack);
+            l.h = text_h + (above + below) * row_h;
+            l.base = above * row_h + tb;
         }
         lines
     }

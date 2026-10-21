@@ -156,10 +156,37 @@ make it so:
   at the fitted width that happens only when a tile showing it is painted,
   and is reused by the other tiles.
 
-Release build, demo document (376 rows), sweeping 120 → 40 columns
+Release build, demo document (418 rows), sweeping 120 → 40 columns
 (`cargo run --release -p toastty-markdown --example resize_bench -- doc.md`):
 layout 0.8 ms per width (was 54 ms for layout plus full paint), plus about
 2.4 ms to paint one screen of 50 rows.
+
+### Vertical grid snapping
+
+The text written into each row's cells must sit on the text drawn there,
+or selection highlights and link hit areas drift off the rendered lines.
+So the layout's vertical unit is the cell height:
+
+- Every text line starts on a row boundary and is a whole number of rows
+  tall. Body text, list items, quote lines, table cell lines, footnotes and
+  code are one row each (code lines on consecutive rows, the mono font's
+  ascent + descent box centred in the row like the terminal's own
+  baseline). Headings larger than body text take as many rows as their
+  font box needs (H1–H3 are usually two). A line holding an inline raster
+  (maths, image) that reaches further than the font's own box grows by
+  whole rows above or below.
+- A line's text is reported on the row its baseline falls in: the line's
+  row for one-row lines, a row inside the span for taller ones. Lines never
+  share rows, except the cells of one table row, which are joined into one
+  run per row.
+- Margins are whole rows: one blank row between blocks, none in tight
+  lists. Code blocks, tables, Mermaid diagrams and rules have a padding row
+  at each edge that doubles as that margin; the code panel, table borders
+  and the rule are drawn at sub-row positions inside those rows. H1/H2 get
+  an extra row for their underline. Display maths and diagrams round up to
+  whole rows and are centred in them.
+- When the last line's descenders hang below the last row, the block gets
+  one more row so they aren't cut off.
 
 ### Implementation notes (v1)
 

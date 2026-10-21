@@ -1,4 +1,4 @@
-rows 48
+rows 51
   0
   1 @1:"Toastty Markdown"
   2
@@ -23,29 +23,32 @@ rows 48
  21 @1:"[x] parse with pulldown-cmark"
  22 @1:"[ ] draw maths"
  23 @1:"[ ] draw diagrams"
- 24 @1:"> Block quotes are drawn with a bar on the left"
- 25 @1:"> and muted text."
- 26
- 27 @1:"> > Nested quotes work too."
- 28
- 29 @2:"// Highlighted with syntect."
- 30 @2:"fn main() {"
- 31 @2:"    let greeting = \"hello\";"
- 32 @2:"    println!(\"{greeting}, world: {}\","
- 33 @6:"42);"
- 34 @2:"}"
- 35
- 36 @2:"Element | Status | Notes"
+ 24
+ 25 @1:"> Block quotes are drawn with a bar on the left"
+ 26 @1:"> and muted text."
+ 27
+ 28 @1:"> > Nested quotes work too."
+ 29
+ 30 @2:"// Highlighted with syntect."
+ 31 @2:"fn main() {"
+ 32 @2:"    let greeting = \"hello\";"
+ 33 @2:"    println!(\"{greeting}, world: {}\","
+ 34 @6:"42);"
+ 35 @2:"}"
+ 36
  37
- 38 @2:"Tables | done | aligned columns"
+ 38 @2:"Element | Status | Notes"
  39
- 40 @2:"Images | partial | data: URIs only"
+ 40 @2:"Tables | done | aligned columns"
  41
- 42
- 43 @1:"Smaller heading"
- 44 @1:"Text after a rule, with an image placeholder:"
+ 42 @2:"Images | partial | data: URIs only"
+ 43
+ 44
  45
- 46 @1:"logo and an embedded image: gradient"
+ 46 @1:"Smaller heading"
  47
+ 48 @1:"Text after a rule, with an image placeholder:"
+ 49
+ 50 @1:"logo and an embedded image: gradient"
 link row 5 cols 16..20 https://example.com/docs
 link row 10 cols 34..38 https://example.com
