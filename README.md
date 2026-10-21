@@ -50,6 +50,14 @@ tmux / screen / zellij / herdr for now, it prints the plain Markdown. See
 [docs/markdown.md](docs/markdown.md) and the `[security] markdown` /
 `markdown_local_files` config keys.
 
+### Images
+
+`toastty image cat.png dog.jpg` prints images inline at their native size,
+one after another with a blank line between them, using the Kitty graphics
+protocol; `--sixel` emits Sixel instead. Reads PNG, JPEG, GIF, WebP and BMP
+(`-` reads stdin). A file that fails is reported and skipped; the command
+exits non-zero.
+
 ### Font zoom
 
 - Each step changes the font by 1 logical px, clamped to 6–72 px. A

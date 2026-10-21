@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 use toastty_config::Config;
 
+use crate::image_cmd::Protocol;
+
 /// Program + args override coming from the CLI. When `Some`, the binary
 /// launches this instead of the configured shell — same convention as
 /// `xterm -e`, `alacritty -e`, `kitty <cmd>`.
@@ -38,6 +40,12 @@ pub enum Action {
     /// (or as plain text outside toastty) and exit. `None` / `-` reads
     /// stdin.
     Markdown { file: Option<PathBuf> },
+    /// `toastty image [--sixel] <FILE|->...`: print images inline (Kitty
+    /// graphics by default, Sixel with `--sixel`) and exit.
+    Image {
+        files: Vec<PathBuf>,
+        protocol: Protocol,
+    },
 }
 
 /// An argument we didn't recognise.
@@ -89,6 +97,11 @@ where
                 arg: format!("md takes one file, got extra argument {extra}"),
             }),
         };
+    }
+    // Same rule for `toastty image …`.
+    if iter.peek().is_some_and(|a| a == "image") {
+        iter.next();
+        return parse_image(iter);
     }
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -148,6 +161,38 @@ where
     })
 }
 
+/// Parse the arguments after `toastty image`. `--sixel` may appear
+/// anywhere before `--`; after `--` every token is a path. `-` is
+/// stdin. At least one path is required.
+fn parse_image<I>(iter: I) -> Result<Action, ParseError>
+where
+    I: Iterator<Item = String>,
+{
+    let mut protocol = Protocol::Kitty;
+    let mut files = Vec::new();
+    let mut only_paths = false;
+    for arg in iter {
+        match arg.as_str() {
+            _ if only_paths => files.push(PathBuf::from(arg)),
+            "--" => only_paths = true,
+            "--sixel" => protocol = Protocol::Sixel,
+            "-" => files.push(PathBuf::from(arg)),
+            other if other.starts_with('-') => {
+                return Err(ParseError {
+                    arg: other.to_string(),
+                });
+            }
+            _ => files.push(PathBuf::from(arg)),
+        }
+    }
+    if files.is_empty() {
+        return Err(ParseError {
+            arg: "image requires at least one file".into(),
+        });
+    }
+    Ok(Action::Image { files, protocol })
+}
+
 /// Consume the remainder of `iter` as `program` + `args`. The separator
 /// (`--` / `-e` / `--command`) requires *some* following token to name
 /// the program.
@@ -182,6 +227,7 @@ USAGE:
     toastty [FLAGS] [-- | -e | --command] <command> [args...]
     toastty [FLAGS] <command> [args...]
     toastty md [FILE|-]
+    toastty image [--sixel] <FILE|->...
 
 FLAGS:
     -d, --working-directory <PATH>
@@ -197,6 +243,13 @@ MARKDOWN:
     document as a rendered block when run inside toastty, and as plain
     text elsewhere (other terminals, tmux, screen, zellij, herdr). To
     launch a program called `md`, use `toastty -- md`.
+
+IMAGE:
+    `toastty image cat.png dog.jpg` prints each image inline at its native
+    size, one after another, using the Kitty graphics protocol; `--sixel`
+    emits Sixel instead. Reads PNG, JPEG, GIF, WebP and BMP; `-` reads
+    stdin. Use `--` before paths that start with `-`. To launch a program
+    called `image`, use `toastty -- image`.
 
 COMMAND:
     Anything after the first bare positional, after `--`, or after
@@ -300,6 +353,108 @@ mod tests {
             panic!("expected Run");
         };
         assert_eq!(command.unwrap().program, PathBuf::from("md"));
+    }
+
+    fn image(files: &[&str], protocol: Protocol) -> Action {
+        Action::Image {
+            files: files.iter().map(PathBuf::from).collect(),
+            protocol,
+        }
+    }
+
+    #[test]
+    fn image_defaults_to_kitty() {
+        assert_eq!(
+            parse(["image", "a.png"]).unwrap(),
+            image(&["a.png"], Protocol::Kitty)
+        );
+    }
+
+    #[test]
+    fn image_sixel_flag_before_or_after_paths() {
+        let want = image(&["a.png", "b.png"], Protocol::Sixel);
+        assert_eq!(parse(["image", "--sixel", "a.png", "b.png"]).unwrap(), want);
+        assert_eq!(parse(["image", "a.png", "--sixel", "b.png"]).unwrap(), want);
+        assert_eq!(parse(["image", "a.png", "b.png", "--sixel"]).unwrap(), want);
+        assert_eq!(
+            parse(["image", "--sixel", "--sixel", "a.png", "b.png"]).unwrap(),
+            want
+        );
+    }
+
+    #[test]
+    fn image_multiple_paths_keep_order() {
+        assert_eq!(
+            parse(["image", "c.png", "a.png", "b.png", "a.png"]).unwrap(),
+            image(&["c.png", "a.png", "b.png", "a.png"], Protocol::Kitty)
+        );
+    }
+
+    #[test]
+    fn image_dash_is_stdin_path() {
+        assert_eq!(
+            parse(["image", "-"]).unwrap(),
+            image(&["-"], Protocol::Kitty)
+        );
+        assert_eq!(
+            parse(["image", "a.png", "-", "--sixel"]).unwrap(),
+            image(&["a.png", "-"], Protocol::Sixel)
+        );
+    }
+
+    #[test]
+    fn image_double_dash_ends_flags() {
+        assert_eq!(
+            parse(["image", "--", "--sixel", "-x.png"]).unwrap(),
+            image(&["--sixel", "-x.png"], Protocol::Kitty)
+        );
+        assert_eq!(
+            parse(["image", "--sixel", "--", "--"]).unwrap(),
+            image(&["--"], Protocol::Sixel)
+        );
+    }
+
+    #[test]
+    fn image_requires_a_path() {
+        assert!(
+            parse(["image"])
+                .unwrap_err()
+                .arg
+                .contains("at least one file")
+        );
+        assert!(parse(["image", "--sixel"]).is_err());
+        assert!(parse(["image", "--"]).is_err());
+    }
+
+    #[test]
+    fn image_unknown_flag_errors() {
+        assert_eq!(
+            parse(["image", "--kitty", "a.png"]).unwrap_err().arg,
+            "--kitty"
+        );
+        assert_eq!(parse(["image", "a.png", "-s"]).unwrap_err().arg, "-s");
+        assert_eq!(parse(["image", "--help"]).unwrap_err().arg, "--help");
+    }
+
+    #[test]
+    fn image_only_as_first_argument() {
+        let Action::Run { command, .. } = parse(["--", "image", "a.png"]).unwrap() else {
+            panic!("expected Run");
+        };
+        let cmd = command.unwrap();
+        assert_eq!(cmd.program, PathBuf::from("image"));
+        assert_eq!(cmd.args, vec![OsString::from("a.png")]);
+        let Action::Run { command, .. } = parse(["-d", "/tmp", "image"]).unwrap() else {
+            panic!("expected Run");
+        };
+        assert_eq!(command.unwrap().program, PathBuf::from("image"));
+    }
+
+    #[test]
+    fn help_text_mentions_image() {
+        let help = help_text();
+        assert!(help.contains("toastty image"));
+        assert!(help.contains("--sixel"));
     }
 
     #[test]

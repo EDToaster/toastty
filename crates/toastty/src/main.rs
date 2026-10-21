@@ -198,6 +198,13 @@ fn main() -> Result<()> {
         cli::Action::Markdown { file } => {
             return toastty::md_cmd::run(file.as_deref());
         }
+        cli::Action::Image { files, protocol } => {
+            if let Err(e) = toastty::image_cmd::run(&files, protocol) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         cli::Action::PrintDefaultConfig => {
             cli::write_default_config(&mut std::io::stdout()).context("write default config")?;
             return Ok(());
