@@ -88,6 +88,7 @@ fn check(name: &str, src: &str, cols: u16, theme: Theme) {
         theme,
         resources: ResourcePolicy::default(),
         max_rows: 2000,
+        mono_family: None,
     };
     let mut r = Renderer::hermetic();
     let block = r.render(src, &params).expect("render");

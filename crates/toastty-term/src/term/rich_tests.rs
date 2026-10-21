@@ -13,7 +13,15 @@ use crate::selection::{Pos, Selection, SelectionMode};
 use crate::{RichEnv, SecurityFlags, Term};
 
 /// `(cols, cell_w, cell_h, font_px, allow_local_files, base_dir)`
-type LastReq = (u16, u32, u32, f32, bool, Option<std::path::PathBuf>);
+type LastReq = (
+    u16,
+    u32,
+    u32,
+    f32,
+    bool,
+    Option<std::path::PathBuf>,
+    Option<String>,
+);
 
 /// Fake layout: every source line is wrapped into `cols`-wide chunks,
 /// one row each, so the row count depends on the width. The image is a
@@ -36,6 +44,7 @@ impl RichBlockLayout for Fake {
             req.font_px,
             req.allow_local_files,
             req.base_dir.map(std::path::Path::to_path_buf),
+            req.mono_family.map(str::to_owned),
         ));
         if req.source == "FAIL" {
             return None;
@@ -565,6 +574,34 @@ fn font_size_change_relayouts_on_sync() {
     t.sync_rich_blocks();
     assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
     assert!((fake.last.lock().unwrap().as_ref().unwrap().3 - 30.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn font_family_is_passed_and_a_change_relayouts_on_sync() {
+    let (mut t, fake) = term(6, 10, 10);
+    feed(&mut t, &osc("abc"));
+    assert_eq!(fake_family(&fake), None, "unset by default");
+    let mut env = t.rich_env();
+    env.mono_family = Some("JetBrains Mono".into());
+    t.set_rich_env(env.clone());
+    assert!(t.sync_rich_blocks());
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 2, "re-laid out");
+    assert_eq!(fake_family(&fake).as_deref(), Some("JetBrains Mono"));
+    // Same env again: nothing to do.
+    t.set_rich_env(env);
+    assert!(!t.sync_rich_blocks());
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+    // New blocks and reflow carry it too.
+    feed(&mut t, &osc("def"));
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(fake_family(&fake).as_deref(), Some("JetBrains Mono"));
+    t.resize(6, 12);
+    assert!(fake.calls.load(Ordering::SeqCst) >= 4);
+    assert_eq!(fake_family(&fake).as_deref(), Some("JetBrains Mono"));
+}
+
+fn fake_family(f: &Fake) -> Option<String> {
+    f.last.lock().unwrap().as_ref().unwrap().6.clone()
 }
 
 #[test]

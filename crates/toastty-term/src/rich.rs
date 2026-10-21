@@ -61,12 +61,15 @@ impl Default for RichPalette {
 
 /// Environment the binary supplies for layout (things the term doesn't
 /// otherwise know). Set with [`crate::Term::set_rich_env`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RichEnv {
     /// Base body font size in physical pixels (font size × scale).
     pub font_px: f32,
     /// Theme palette before OSC 4 overrides.
     pub palette: RichPalette,
+    /// The terminal's font family (`font.family`), for code blocks.
+    /// `None` leaves the choice to the layout engine.
+    pub mono_family: Option<Arc<str>>,
 }
 
 impl Default for RichEnv {
@@ -74,6 +77,7 @@ impl Default for RichEnv {
         Self {
             font_px: 14.0,
             palette: RichPalette::default(),
+            mono_family: None,
         }
     }
 }
@@ -90,6 +94,10 @@ pub struct RichLayoutRequest<'a> {
     pub cell_w: u32,
     pub cell_h: u32,
     pub font_px: f32,
+    /// The terminal's font family, for code blocks (so they line up
+    /// with the cell grid in the terminal's own face). The engine falls
+    /// back to its default monospace face when it has no such family.
+    pub mono_family: Option<&'a str>,
     /// Effective palette (theme + OSC 4 overrides for 0–15).
     pub palette: RichPalette,
     /// `[security] markdown_local_files`.
@@ -256,24 +264,27 @@ pub trait RichBlockLayout: Send {
 }
 
 /// The parameters a block was last rendered with.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RichParams {
     pub cols: u16,
     pub cell_w: u32,
     pub cell_h: u32,
     pub font_px: f32,
+    pub mono_family: Option<Arc<str>>,
     pub palette: RichPalette,
     pub allow_local_files: bool,
 }
 
 impl RichParams {
-    /// Same geometry (row count can't change from colours alone).
+    /// Same geometry (row count can't change from colours alone). A
+    /// different font family counts: it can rewrap code.
     #[must_use]
     pub fn same_geometry(&self, other: &Self) -> bool {
         self.cols == other.cols
             && self.cell_w == other.cell_w
             && self.cell_h == other.cell_h
             && self.font_px.to_bits() == other.font_px.to_bits()
+            && self.mono_family == other.mono_family
     }
 }
 
@@ -591,6 +602,7 @@ mod tests {
             cell_w: 8,
             cell_h: 16,
             font_px: 14.0,
+            mono_family: None,
             palette: RichPalette::default(),
             allow_local_files: false,
         }

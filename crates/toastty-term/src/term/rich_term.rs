@@ -112,6 +112,7 @@ fn run_layout(
         cell_w: params.cell_w,
         cell_h: params.cell_h,
         font_px: params.font_px,
+        mono_family: params.mono_family.as_deref(),
         palette: params.palette,
         allow_local_files: params.allow_local_files,
         base_dir: if params.allow_local_files {
@@ -153,7 +154,7 @@ impl Term {
         self.rich_layout.is_some()
     }
 
-    /// Font size + theme palette used for rich blocks. A change marks
+    /// Font size, font family and theme palette used for rich blocks. A change marks
     /// blocks for re-layout on the next [`Term::sync_rich_blocks`].
     pub fn set_rich_env(&mut self, env: RichEnv) {
         if env != self.rich_env {
@@ -164,7 +165,7 @@ impl Term {
 
     #[must_use]
     pub fn rich_env(&self) -> RichEnv {
-        self.rich_env
+        self.rich_env.clone()
     }
 
     /// Stored rich blocks (images, sources). The renderer queries
@@ -229,6 +230,7 @@ impl Term {
             cell_w: u32::from(self.cell_pixel_size.0),
             cell_h: u32::from(self.cell_pixel_size.1),
             font_px: self.rich_env.font_px,
+            mono_family: self.rich_env.mono_family.clone(),
             palette: self.rich_palette(),
             allow_local_files: self.security.markdown_local_files,
         }
@@ -326,7 +328,7 @@ impl Term {
             let out = run_layout(slot.0.as_mut(), &kind, &source, base.as_deref(), &params)?;
             let new_rows = build_block_rows(&out, block, cols, links);
             let bm = store.get_mut(block)?;
-            bm.params = params;
+            bm.params = params.clone();
             bm.rows = out.rows;
             store.set_image(block, out.image);
             Some(new_rows)
@@ -416,7 +418,7 @@ impl Term {
             .image
             .map(|img| img.with_height(u32::from(rows) * params.cell_h));
         if let Some(b) = self.rich_store.get_mut(id) {
-            b.params = *params;
+            b.params = params.clone();
         }
         self.rich_store.set_image(id, image);
     }

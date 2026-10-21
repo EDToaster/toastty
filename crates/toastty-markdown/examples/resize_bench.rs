@@ -33,6 +33,7 @@ fn main() {
         theme: Theme::default(),
         resources: ResourcePolicy::default(),
         max_rows: 2000,
+        mono_family: None,
     };
     let t = Instant::now();
     let b = r.render(&src, &p).unwrap();

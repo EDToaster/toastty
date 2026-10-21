@@ -109,20 +109,37 @@ fn pick(
 ) -> Role {
     let db = fonts.db();
     let generic_name = db.family_name(&generic).to_owned();
-    // The face's own spelling of `name`, if any face has that family.
-    let find = |name: &str| {
-        db.faces().find_map(|f| {
-            f.families
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(name))
-                .map(|(n, _)| n.clone())
-        })
-    };
     let family = std::iter::once(generic_name.as_str())
         .chain(candidates.iter().copied())
         .filter(|n| !n.is_empty())
-        .find_map(find)
+        .find_map(|n| find_family(db, n))
         .unwrap_or_else(|| bundled.to_owned());
+    role(fonts, family)
+}
+
+/// The face's own spelling of `name` (case-insensitive), if any face in
+/// the database has that family.
+fn find_family(db: &fontdb::Database, name: &str) -> Option<String> {
+    db.faces().find_map(|f| {
+        f.families
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(n, _)| n.clone())
+    })
+}
+
+/// The role for a named family (the terminal's `font.family`), or
+/// `None` when the database has no face of that family.
+pub(crate) fn named(fonts: &mut FontSystem, name: &str) -> Option<Role> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let family = find_family(fonts.db(), name)?;
+    Some(role(fonts, family))
+}
+
+fn role(fonts: &mut FontSystem, family: String) -> Role {
     let (regular, id) = resolve_weight(fonts.db(), &family);
     let metrics =
         id.and_then(|id| fonts.get_font(id, regular))
@@ -177,6 +194,12 @@ mod tests {
         assert_eq!(f.mono.regular, Weight::MEDIUM);
         assert!(f.sans.metrics.ascent > 0.9 && f.sans.metrics.ascent < 1.2);
         assert!(f.mono.metrics.descent > 0.1);
+        // A named family resolves to the face's own spelling.
+        let m = named(&mut fs, " fira MONO ").expect("bundled family");
+        assert_eq!(m.family, BUNDLED_MONO);
+        assert_eq!(m.regular, Weight::MEDIUM);
+        assert!(named(&mut fs, "No Such Font Family").is_none());
+        assert!(named(&mut fs, "  ").is_none());
         // Loading twice does not duplicate faces.
         let n = fs.db().len();
         let _ = resolve(&mut fs);

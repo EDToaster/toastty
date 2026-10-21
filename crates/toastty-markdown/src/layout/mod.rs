@@ -126,7 +126,12 @@ impl Memo {
 
 /// Per-renderer state reused across renders.
 pub(crate) struct Caches {
+    /// Fonts in use: `default_mono`, or the requested family for code.
     fonts: Fonts,
+    /// The monospace role picked without a requested family.
+    default_mono: fonts::Role,
+    /// `LayoutParams::mono_family` that `fonts.mono` was resolved for.
+    mono_request: Option<String>,
     swash: SwashCache,
     hl: Highlighter,
     memo: Memo,
@@ -145,8 +150,11 @@ impl std::fmt::Debug for Caches {
 
 impl Caches {
     pub(crate) fn new(fs: &mut FontSystem) -> Self {
+        let fonts = fonts::resolve(fs);
         Self {
-            fonts: fonts::resolve(fs),
+            default_mono: fonts.mono.clone(),
+            mono_request: None,
+            fonts,
             swash: SwashCache::new(),
             hl: Highlighter::default(),
             memo: Memo::default(),
@@ -154,6 +162,29 @@ impl Caches {
             math: crate::math::render_math,
             mermaid: MermaidBackend::Real,
         }
+    }
+
+    /// Use the family `family` for code when the font database has it,
+    /// else the default monospace face. Shaped paragraphs are cached by
+    /// content only, so they are dropped when the face changes.
+    fn select_mono(&mut self, fs: &mut FontSystem, family: Option<&str>) {
+        if self.mono_request.as_deref() == family {
+            return;
+        }
+        self.mono_request = family.map(str::to_owned);
+        let mono = family
+            .and_then(|f| fonts::named(fs, f))
+            .unwrap_or_else(|| self.default_mono.clone());
+        if mono.family != self.fonts.mono.family || mono.regular != self.fonts.mono.regular {
+            self.memo.shaped.clear();
+        }
+        self.fonts.mono = mono;
+    }
+
+    /// Family code is currently shaped with.
+    #[cfg(test)]
+    pub(crate) fn mono_family(&self) -> &str {
+        &self.fonts.mono.family
     }
 }
 
@@ -254,6 +285,7 @@ pub(crate) fn layout(
     let doc = parse::parse(markdown);
     let f = params.font_px.clamp(4.0, 512.0);
     let line_h = (cell_h as f32).max((f * 1.2).ceil());
+    caches.select_mono(fs, params.mono_family.as_deref());
     caches.memo.trim();
     let mut lay = Lay {
         fs,
@@ -1152,7 +1184,9 @@ impl Lay<'_> {
     fn code(&mut self, lang: &str, text: &str, x: f32, w: f32, y: f32) -> f32 {
         let pad_x = (self.p.cell_w as f32).max((self.f * 0.75).round());
         let pad_y = (self.line_h * 0.5).round();
-        let inner = (w - 2.0 * pad_x).max(1.0);
+        // Code sits on the terminal's column grid (see `code_grid`).
+        let (tx, inner) = code_grid(x, w, pad_x, self.p.cell_w);
+        let first_frag = self.frags.len();
         let first_op = self.ops.len();
         let key = (lang.to_owned(), text.to_owned(), self.p.theme.clone());
         let lines = if let Some(hit) = self.memo.code.get(&key) {
@@ -1191,15 +1225,24 @@ impl Lay<'_> {
                 };
                 para.text(clip(&t.text, &mut budget), span);
             }
+            para.grid = Some(self.p.cell_w);
             let shaped = self.shape(&para);
             let ls = shaped.break_lines(inner, &lctx);
             if ls.is_empty() {
                 cy += self.line_h;
                 continue;
             }
-            self.emit(&shaped, &ls, x + pad_x, cy, inner, &lctx);
+            self.emit(&shaped, &ls, tx, cy, inner, &lctx);
             cy += inline::height(&ls);
         }
+        // Every line's text starts on a whole cell, so the grid's column
+        // mapping is exact (no rounding).
+        debug_assert!(
+            self.frags[first_frag..]
+                .iter()
+                .all(|f| f.x.rem_euclid(self.p.cell_w as f32) == 0.0),
+            "code text off the cell grid"
+        );
         let end = cy + pad_y;
         let r = (self.f * 0.375).round();
         self.ops.insert(
@@ -1531,6 +1574,21 @@ impl Lay<'_> {
 }
 
 /// Take up to `budget` bytes of `t` (on a char boundary).
+/// Where a code block's text goes on the terminal's column grid, for a
+/// panel at `x` that is `w` wide with horizontal padding `pad_x`:
+/// `(text x, text width)`. The text starts on the cell boundary nearest
+/// `x + pad_x` (at least half a cell inside the panel) and is a whole
+/// number of cells wide (at least one), so with cell-snapped advances
+/// every character, including on wrapped continuation lines, lands
+/// exactly on a column and lines wrap at a whole cell.
+fn code_grid(x: f32, w: f32, pad_x: f32, cell_w: u32) -> (f32, f32) {
+    let cw = cell_w.max(1) as f32;
+    let col = ((x + pad_x) / cw).round().max(((x + cw * 0.5) / cw).ceil());
+    let tx = col * cw;
+    let cells = ((x + w - pad_x - tx) / cw).floor().max(1.0);
+    (tx, cells * cw)
+}
+
 fn clip<'t>(t: &'t str, budget: &mut usize) -> &'t str {
     if t.len() <= *budget {
         *budget -= t.len();

@@ -15,6 +15,7 @@ fn params(cols: u16) -> LayoutParams {
         theme: Theme::default(),
         resources: ResourcePolicy::default(),
         max_rows: 2000,
+        mono_family: None,
     }
 }
 
@@ -909,4 +910,227 @@ fn system_renderer_smoke() {
     let b = r.render("Hello **world** `code`", &params(40)).unwrap();
     assert_eq!(b.rows, 1);
     assert_eq!(lines(&b), vec!["Hello world code"]);
+}
+
+// --- Code blocks on the terminal's column grid -------------------------
+
+/// Realistic terminal geometries: font px, cell w (Fira Mono advance
+/// rounded), cell h (`round(1.2 * f)`).
+const GRIDS: [(f32, u32, u32); 3] = [(26.0, 16, 31), (13.0, 8, 16), (20.0, 12, 24)];
+
+fn grid_params(cols: u16, (f, cw, ch): (f32, u32, u32)) -> LayoutParams {
+    LayoutParams {
+        cols,
+        cell_w: cw,
+        cell_h: ch,
+        font_px: f,
+        ..params(cols)
+    }
+}
+
+/// Pen position (x, baseline y) and subpixel bin of every glyph drawn,
+/// in paint order.
+fn glyph_pens(l: &crate::BlockLayout) -> Vec<(i32, i32, cosmic_text::SubpixelBin)> {
+    l.laid
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            super::paint::Op::Glyph { key, x, y, .. } => Some((*x, *y, key.x_bin)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn lay_out(md: &str, p: &LayoutParams) -> crate::BlockLayout {
+    RENDERER.with(|r| r.borrow_mut().layout(md, p).expect("layout"))
+}
+
+/// The run on some row whose text is exactly `line`: (row, col).
+fn find_run(l: &crate::BlockLayout, line: &str) -> (usize, u16) {
+    let hits: Vec<(usize, u16)> = l
+        .text()
+        .iter()
+        .enumerate()
+        .flat_map(|(r, runs)| runs.iter().map(move |t| (r, t)))
+        .filter(|(_, t)| t.text == line)
+        .map(|(r, t)| (r, t.col))
+        .collect();
+    assert_eq!(hits.len(), 1, "{line:?} in {:#?}", l.text());
+    hits[0]
+}
+
+/// Assert that each code line in `code` is reported as one run whose
+/// characters, and the glyphs drawn for them, sit exactly on columns:
+/// the glyph of the char at column `c` has its pen at `c * cell_w`.
+/// Returns each line's starting column.
+fn assert_on_grid(l: &crate::BlockLayout, p: &LayoutParams, code: &[&str]) -> Vec<u16> {
+    let pens = glyph_pens(l);
+    let cw = p.cell_w as i32;
+    code.iter()
+        .map(|line| {
+            let (row, col) = find_run(l, line);
+            let mut want = vec![];
+            let mut c = i32::from(col);
+            for ch in line.chars() {
+                if !ch.is_whitespace() {
+                    want.push(c * cw);
+                }
+                c += super::inline::term_cells(ch) as i32;
+            }
+            let got: Vec<i32> = pens
+                .iter()
+                .filter(|(_, y, _)| super::grid::row_of(*y as f32, p.cell_h) == row)
+                .map(|&(x, _, bin)| {
+                    assert_eq!(
+                        bin,
+                        cosmic_text::SubpixelBin::Zero,
+                        "{line:?}: subpixel pen"
+                    );
+                    x
+                })
+                .collect();
+            assert_eq!(got, want, "glyph pens of {line:?} (row {row}, col {col})");
+            col
+        })
+        .collect()
+}
+
+#[test]
+fn code_glyphs_sit_on_the_cell_grid() {
+    // Wide CJK char (2 cells), a tab (4 spaces), runs of spaces.
+    let code = ["fn x() {", "    let s = \"\u{4e2d}\u{6587}\";\tz", "}"];
+    let src = format!("```rust\n{}\n```\n", code.join("\n"));
+    for g in GRIDS {
+        let p = grid_params(80, g);
+        let l = lay_out(&src, &p);
+        let want = ["fn x() {", "    let s = \"\u{4e2d}\u{6587}\";    z", "}"];
+        let cols = assert_on_grid(&l, &p, &want);
+        // Top level: panel at column 1, text one cell in.
+        assert_eq!(cols, vec![2, 2, 2], "{g:?}");
+    }
+}
+
+#[test]
+fn code_text_origin_snaps_inside_lists_and_quotes() {
+    let cases = [
+        "- item\n\n  ```\n  abc def\n  x\u{4e2d}y\n  ```\n",
+        "1. one\n2. two\n\n   ```\n   abc def\n   x\u{4e2d}y\n   ```\n",
+        "> quoted\n>\n> ```\n> abc def\n> x\u{4e2d}y\n> ```\n",
+        "> - nested\n>\n>   ```\n>   abc def\n>   x\u{4e2d}y\n>   ```\n",
+        "- outer\n  - inner\n\n    ```\n    abc def\n    x\u{4e2d}y\n    ```\n",
+    ];
+    for g in GRIDS {
+        let p = grid_params(60, g);
+        for src in cases {
+            let l = lay_out(src, &p);
+            let cols = assert_on_grid(&l, &p, &["abc def", "x\u{4e2d}y"]);
+            assert_eq!(cols[0], cols[1], "{src:?} {g:?}");
+            // Indented past the enclosing block's text.
+            assert!(cols[0] >= 4, "{src:?} {g:?}: col {}", cols[0]);
+        }
+    }
+}
+
+#[test]
+fn indented_code_blocks_are_on_the_grid() {
+    for g in GRIDS {
+        let p = grid_params(50, g);
+        let l = lay_out("Para.\n\n    indented\n    co\tde \u{4e2d}!\n", &p);
+        let cols = assert_on_grid(&l, &p, &["indented", "co    de \u{4e2d}!"]);
+        assert_eq!(cols, vec![2, 2]);
+    }
+}
+
+#[test]
+fn long_code_lines_wrap_at_whole_cells() {
+    for g in GRIDS {
+        let (_, cw, _) = g;
+        let p = grid_params(30, g);
+        // The panel spans cols 1..29; text starts at col 2 and the right
+        // padding is at least a cell, so 25 or 26 cells fit.
+        let x0 = cw as f32;
+        let pad_x = (cw as f32).max((g.0 * 0.75).round());
+        let cells =
+            ((x0 + 28.0 * cw as f32 - pad_x - 2.0 * cw as f32) / cw as f32).floor() as usize;
+        // An unbreakable word is split at exactly `cells` columns.
+        let word: String = ('a'..='z').cycle().take(cells * 3 + 5).collect();
+        let l = lay_out(&format!("```\n{word}\n```\n"), &p);
+        let runs: Vec<&TextRun> = l.text().iter().flatten().collect();
+        assert_eq!(runs.len(), 4, "{g:?} {runs:?}");
+        for r in &runs[..3] {
+            assert_eq!((r.col, r.text.len()), (2, cells), "{g:?}");
+        }
+        assert_eq!(runs[3].text.len(), 5);
+        let parts: Vec<String> = runs.iter().map(|r| r.text.clone()).collect();
+        let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+        assert_on_grid(&l, &p, &refs);
+        // Words wrap; continuation lines keep the line's indent, on a cell.
+        let words: Vec<String> = (10..10 + cells).map(|i| format!("w{i}")).collect();
+        let line = format!("    {}", words.join(" "));
+        let l = lay_out(&format!("```\n{line}\n```\n"), &p);
+        let runs: Vec<TextRun> = l.text().iter().flatten().cloned().collect();
+        assert!(runs.len() >= 2, "{runs:?}");
+        assert_eq!(runs[0].col, 2);
+        assert!(runs[0].text.starts_with("    w10 w11"));
+        for r in &runs[1..] {
+            assert_eq!(r.col, 6, "{g:?}: continuation at the indent: {runs:?}");
+            assert!(r.text.starts_with('w'));
+        }
+        for r in &runs {
+            let end = usize::from(r.col) + unicode_width::UnicodeWidthStr::width(r.text.as_str());
+            assert!(end <= 2 + cells, "{g:?}: {r:?} past the wrap width");
+        }
+        let parts: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_on_grid(&l, &p, &parts);
+    }
+}
+
+#[test]
+fn code_grid_origin_and_width() {
+    // Top level at f=26 / 16 px cells: panel at 16, pad 20 → text at 32.
+    assert_eq!(super::code_grid(16.0, 448.0, 20.0, 16), (32.0, 400.0));
+    // Proportional enclosing indent: rounded to the nearest cell...
+    assert_eq!(super::code_grid(62.0, 400.0, 20.0, 16), (80.0, 352.0));
+    // ...but never less than half a cell inside the panel.
+    assert_eq!(super::code_grid(41.0, 400.0, 0.0, 16), (64.0, 368.0));
+    assert_eq!(super::code_grid(40.0, 400.0, 0.0, 16), (48.0, 384.0));
+    // At least one cell wide.
+    assert_eq!(super::code_grid(16.0, 10.0, 20.0, 16), (32.0, 16.0));
+}
+
+#[test]
+fn inline_code_in_paragraphs_is_unchanged() {
+    // Inline code keeps its natural (proportional-context) advances.
+    let p = grid_params(80, GRIDS[0]);
+    let l = lay_out("a `xxxxxxxxxx` b", &p);
+    let xs: Vec<i32> = glyph_pens(&l).iter().map(|g| g.0).collect();
+    let steps: Vec<i32> = xs.windows(2).skip(1).take(8).map(|w| w[1] - w[0]).collect();
+    assert!(steps.iter().any(|&d| d != 16), "{steps:?}");
+}
+
+#[test]
+fn mono_family_picks_the_terminal_font() {
+    let mut r = Renderer::hermetic();
+    let mut p = grid_params(60, GRIDS[0]);
+    let src = "Text `inline`.\n\n```\nabc \u{4e2d} xyz\n```\n";
+    let default = r.render(src, &p).unwrap();
+    assert_eq!(r.cache.mono_family(), "Fira Mono");
+    // A family the database has (any face, even a proportional one, is
+    // forced onto the grid).
+    p.mono_family = Some("noto sans".into());
+    let l = r.layout(src, &p).unwrap();
+    assert_eq!(r.cache.mono_family(), "Noto Sans");
+    assert_on_grid(&l, &p, &["abc \u{4e2d} xyz"]);
+    let noto = r.render(src, &p).unwrap();
+    assert_ne!(noto.image, default.image);
+    assert_eq!(noto.text, default.text);
+    // Back to the default: the shaped cache was not reused across faces.
+    p.mono_family = None;
+    assert_eq!(r.render(src, &p).unwrap(), default);
+    // Unknown family: falls back to the default face, same output.
+    p.mono_family = Some("No Such Mono".into());
+    assert_eq!(r.render(src, &p).unwrap(), default);
+    assert_eq!(r.cache.mono_family(), "Fira Mono");
+    p.mono_family = Some("Fira Mono".into());
+    assert_eq!(r.render(src, &p).unwrap(), default);
 }

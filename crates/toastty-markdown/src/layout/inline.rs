@@ -70,6 +70,11 @@ pub(crate) enum Piece {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Para {
     pub pieces: Vec<Piece>,
+    /// Lay the text on a cell grid this many pixels wide (code blocks):
+    /// every cluster advances exactly `cell_w` per terminal cell it
+    /// takes (see [`term_cells`]), so character `i` of a line lands on
+    /// the same column the terminal writes it into.
+    pub grid: Option<u32>,
 }
 
 impl Para {
@@ -87,6 +92,57 @@ impl Para {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.pieces.is_empty()
+    }
+}
+
+/// Cells the terminal gives `c` when it writes a block's text into the
+/// grid (`build_block_rows` in toastty-term): 1 or 2, and 0 for
+/// controls and zero-width marks.
+pub(crate) fn term_cells(c: char) -> u32 {
+    match unicode_width::UnicodeWidthChar::width(c) {
+        Some(1) => 1,
+        Some(w) if w >= 2 => 2,
+        _ => 0,
+    }
+}
+
+/// Force each cluster (glyphs sharing a source byte range) of
+/// `glyphs` to advance exactly `cell_w` × its cell count, the way the
+/// terminal's cluster-width snap does for its own text. The whole
+/// advance goes on the cluster's first glyph and the others keep their
+/// shaped offsets from the cluster start (scaled to the new width) with
+/// no advance of their own, so pen positions stay whole cells and a
+/// line break can never split a cluster.
+fn snap_to_cells(glyphs: &mut [Glyph], text: &str, cell_w: f32) {
+    let mut i = 0;
+    while i < glyphs.len() {
+        let (s, e) = (glyphs[i].start, glyphs[i].end);
+        let mut j = i + 1;
+        while j < glyphs.len() && glyphs[j].start == s && glyphs[j].end == e {
+            j += 1;
+        }
+        let cells: u32 = text
+            .get(s..e)
+            .map_or(1, |t| t.chars().map(term_cells).sum());
+        let target = cells as f32 * cell_w;
+        let natural: f32 = glyphs[i..j].iter().map(|g| g.w).sum();
+        let k = if natural > f32::EPSILON {
+            target / natural
+        } else {
+            0.0
+        };
+        let mut off = 0.0;
+        for (n, g) in glyphs[i..j].iter_mut().enumerate() {
+            let w = g.w * k;
+            if n == 0 {
+                g.w = target;
+            } else {
+                g.x_off += off - target;
+                g.w = 0.0;
+            }
+            off += w;
+        }
+        i = j;
     }
 }
 
@@ -215,9 +271,10 @@ impl Shaped {
     pub(crate) fn new(fs: &mut FontSystem, fonts: &Fonts, para: &Para) -> Self {
         let mut s = Shaped::default();
         let mut group: Vec<(usize, usize)> = vec![]; // (text start, span)
+        let grid = para.grid.map(|c| c as f32);
         let flush = |s: &mut Shaped, group: &mut Vec<(usize, usize)>, fs: &mut FontSystem| {
             if !group.is_empty() {
-                s.shape_group(fs, fonts, group);
+                s.shape_group(fs, fonts, group, grid);
                 group.clear();
             }
         };
@@ -249,7 +306,13 @@ impl Shaped {
         s
     }
 
-    fn shape_group(&mut self, fs: &mut FontSystem, fonts: &Fonts, group: &[(usize, usize)]) {
+    fn shape_group(
+        &mut self,
+        fs: &mut FontSystem,
+        fonts: &Fonts,
+        group: &[(usize, usize)],
+        grid: Option<f32>,
+    ) {
         let end_of = |i: usize| group.get(i + 1).map_or(self.text.len(), |g| g.0);
         let first = self.spans[group[0].1];
         let mut buf = Buffer::new_empty(Metrics::new(first.size, first.size * 1.2));
@@ -303,8 +366,11 @@ impl Shaped {
                 });
             }
         }
-        // Box padding at span boundaries.
         let n = self.glyphs.len();
+        if let Some(cell_w) = grid {
+            snap_to_cells(&mut self.glyphs[g0..n], &self.text, cell_w);
+        }
+        // Box padding at span boundaries.
         for i in g0..n {
             let sp = self.glyphs[i].span;
             let info = self.spans[sp];
@@ -824,6 +890,7 @@ pub(crate) fn para_key(para: &Para) -> u128 {
         let mut h = std::hash::DefaultHasher::new();
         seed.hash(&mut h);
         para.pieces.len().hash(&mut h);
+        para.grid.hash(&mut h);
         for p in &para.pieces {
             match p {
                 Piece::Text(t, s) => {
@@ -845,4 +912,51 @@ pub(crate) fn para_key(para: &Para) -> u128 {
         out = (out << 64) | u128::from(h.finish());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn glyph(start: usize, end: usize, w: f32) -> Glyph {
+        Glyph {
+            start,
+            end,
+            w,
+            x_off: 0.0,
+            y_off: 0.0,
+            font_id: fontdb::ID::dummy(),
+            id: 1,
+            size: 16.0,
+            weight: Weight::NORMAL,
+            flags: CacheKeyFlags::empty(),
+            span: 0,
+            lead: 0.0,
+            trail: 0.0,
+        }
+    }
+
+    #[test]
+    fn clusters_snap_to_whole_cells() {
+        // "a", "中" (2 cells), "e" + combining acute as one two-glyph
+        // cluster, a lone zero-width space.
+        let text = "a\u{4e2d}e\u{301}\u{200b}";
+        let mut gs = [
+            glyph(0, 1, 9.6),
+            glyph(1, 4, 15.0),
+            glyph(4, 7, 9.6),
+            glyph(4, 7, 2.4),
+            glyph(7, 10, 0.0),
+        ];
+        snap_to_cells(&mut gs, text, 10.0);
+        let adv: Vec<f32> = gs.iter().map(|g| g.w).collect();
+        assert_eq!(adv, [10.0, 20.0, 10.0, 0.0, 0.0]);
+        // The mark keeps its shaped offset from the cluster start
+        // (scaled to the cell): drawn at start + 9.6 * 10/12, i.e. at
+        // pen (start + 10) + x_off.
+        assert!((gs[3].x_off - (8.0 - 10.0)).abs() < 1e-4, "{}", gs[3].x_off);
+        assert!(gs[2].x_off.abs() < 1e-6);
+        let cells: u32 = text.chars().map(term_cells).sum();
+        assert_eq!(cells, 4);
+    }
 }

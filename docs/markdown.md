@@ -168,9 +168,19 @@ layout 0.8 ms per width (was 54 ms for layout plus full paint), plus about
   `toastty_markdown::Renderer` (and its font database) on the first block.
   `toastty-term` has no dependency on `toastty-markdown`.
 - Layout parameters: `cols` = grid width, the renderer's integral cell size,
-  `font_px` = font size × display scale (including zoom), the theme palette
-  in sRGB with OSC 4 overrides for colours 0–15, `max_rows` = 2000
-  (`RICH_MAX_ROWS`).
+  `font_px` = font size × display scale (including zoom), `mono_family` =
+  the terminal's `font.family`, the theme palette in sRGB with OSC 4
+  overrides for colours 0–15, `max_rows` = 2000 (`RICH_MAX_ROWS`).
+- Code blocks (fenced and indented) sit on the terminal's column grid,
+  so selecting them highlights exactly the drawn glyphs. They are shaped
+  in `mono_family` (the engine's default monospace face when its font
+  database lacks that family), and every cluster advances exactly
+  `cell_w` per cell the terminal gives its characters (1 or 2, 0 for
+  zero-width marks), like the terminal's own cluster-width snap. The text
+  starts on the cell boundary nearest the panel's padding, inside list
+  items and quotes too, and long lines wrap at a whole number of cells.
+  Inline code in paragraphs keeps its natural advances. A font family
+  change re-lays blocks out like a font size change does.
 - Re-layout is deferred: geometry and palette changes mark blocks dirty and
   the binary calls `Term::sync_rich_blocks()` once per frame, which re-lays
   out (geometry change) or re-colours (palette only, keeping the row count:
