@@ -132,6 +132,8 @@ animation = "auto"   # "auto" | "always" | "never"
 
 [`cursor-glow.glsl`](examples/shaders/cursor-glow.glsl) is a smaller
 example: a subtle warm glow around the cursor.
+[`cursor-morph.glsl`](examples/shaders/cursor-morph.glsl) stretches the
+cursor from its old position to its new one whenever it jumps.
 
 Shaders that don't use time cost nothing when the screen is idle.
 toastty reads which uniforms a shader uses and only draws frames when
