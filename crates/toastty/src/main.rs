@@ -1043,12 +1043,15 @@ impl Toastty {
     /// it queued (title, clipboard, replies, BSU watchdog).
     fn handle_pty_bytes(&mut self, bytes: &[u8]) {
         self.pty_log.log(Direction::FromApp, bytes);
-        // Refresh the foreground-process CWD before parsing this
-        // batch — if an RGP `r;path=...` arrives in these bytes,
+        // Refresh the foreground-process CWD before parsing a slice that
+        // opens an APC — if it is an RGP `r;path=...`,
         // `Term::register_asset_by_path` needs to know the current
         // shell-side CWD to resolve relative paths. macOS uses
-        // `proc_pidinfo`; Linux uses `/proc/<pid>/cwd`.
-        if let Some(pty) = self.pty.as_ref()
+        // `proc_pidinfo`; Linux uses `/proc/<pid>/cwd`. Nothing else
+        // reads it, and the probe (an ioctl plus a readlink) was ~8% of
+        // flood CPU when it ran on every read.
+        if self.ingest.opens_apc(bytes)
+            && let Some(pty) = self.pty.as_ref()
             && let Some(cwd) = toastty_pty::pty_foreground_cwd(pty.master_fd())
         {
             let cwd_str = cwd.to_string_lossy();

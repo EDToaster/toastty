@@ -56,6 +56,9 @@ pub struct Ingest {
     last_render: Duration,
     /// When the ingest asked for a redraw that hasn't run yet.
     frame_requested: Option<Instant>,
+    /// The last slice ended in ESC, so a `_` opening the next one starts
+    /// an APC.
+    trailing_esc: bool,
 }
 
 impl Ingest {
@@ -99,6 +102,19 @@ impl Ingest {
     pub fn should_yield(&self, now: Instant, parse_start: Instant) -> bool {
         let min_parse = self.last_render.clamp(MIN_PARSE, FRAME_INTERVAL);
         self.frame_due(now) && now.saturating_duration_since(parse_start) >= min_parse
+    }
+
+    /// Whether `bytes` (the next slice, in stream order) opens an APC:
+    /// `ESC _`, possibly split across slices. RGP's `r;path=` registration
+    /// is an APC and resolves relative paths against the foreground
+    /// process's CWD; probing that CWD costs an ioctl plus a `readlink`,
+    /// so `handle_pty_bytes` does it only for slices where this is true.
+    pub fn opens_apc(&mut self, bytes: &[u8]) -> bool {
+        let Some(&last) = bytes.last() else {
+            return false;
+        };
+        let split = std::mem::replace(&mut self.trailing_esc, last == 0x1B) && bytes[0] == b'_';
+        split || memmem::find(bytes, b"\x1b_").is_some()
     }
 }
 
@@ -187,5 +203,21 @@ mod tests {
         assert_eq!(&s[..n], b"\x1b[?2026hAAA\x1b[?2026l");
         assert_eq!(slice_to_esu(b"no esu here"), 11);
         assert_eq!(slice_to_esu(b""), 0);
+    }
+
+    #[test]
+    fn opens_apc_finds_esc_underscore_even_across_slices() {
+        let mut ing = Ingest::default();
+        assert!(!ing.opens_apc(b"plain output\r\n"));
+        assert!(ing.opens_apc(b"x\x1b_Gr;path=a.glb\x1b\\"));
+        // Split between ESC and `_`.
+        assert!(!ing.opens_apc(b"abc\x1b"));
+        assert!(ing.opens_apc(b"_r;path=a\x1b\\"));
+        // ESC at the end of one slice, something else next.
+        assert!(!ing.opens_apc(b"\x1b"));
+        assert!(!ing.opens_apc(b"[0m"));
+        // tmux passthrough doubles the ESC; still contains `ESC _`.
+        assert!(ing.opens_apc(b"\x1bPtmux;\x1b\x1b_Ga=q\x1b\x1b\\\x1b\\"));
+        assert!(!ing.opens_apc(b""));
     }
 }

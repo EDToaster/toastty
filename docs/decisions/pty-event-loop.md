@@ -307,3 +307,7 @@ to the next ESU (`CSI ? 2026 l`), so the frame goes out between updates
 even when the app sends ESU and the next BSU back to back. A batch that
 ends mid-update asks for a wake at the BSU watchdog deadline instead of a
 redraw that `render_term` would skip.
+
+The CWD probe now runs only for slices that open an APC (`ESC _`, also
+across a slice boundary): RGP's `r;path=` registration, the only reader of
+the CWD, is an APC.
