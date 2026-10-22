@@ -628,7 +628,14 @@ impl ImageGrid {
         }
         self.bounds = None;
         for (_, p) in &mut self.placements {
-            (p.line, p.col) = f(p.line, p.col);
+            // A child left of column 0 (negative `H=`) is re-resolved
+            // from its parent below; map only real cells.
+            if let Ok(col) = u16::try_from(p.col) {
+                let (line, col) = f(p.line, col);
+                (p.line, p.col) = (line, i32::from(col));
+            } else {
+                p.line = f(p.line, 0).0;
+            }
         }
         self.resolve_relative_positions();
     }
