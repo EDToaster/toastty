@@ -27,6 +27,7 @@ pub mod chip;
 pub mod color;
 pub mod dialog;
 pub mod image;
+pub mod post;
 pub mod rgp;
 pub mod surface_format;
 #[cfg(test)]
