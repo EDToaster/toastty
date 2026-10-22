@@ -221,14 +221,15 @@ pub(crate) struct ReflowMap {
 }
 
 impl ReflowMap {
-    /// Output row holding content offset `off` of logical line `line`.
+    /// Output row holding content offset `off` of logical line `line`,
+    /// with the offset that row starts at.
     #[must_use]
-    pub(crate) fn out_row(&self, line: u32, off: u32) -> Option<usize> {
+    pub(crate) fn out_row(&self, line: u32, off: u32) -> Option<(usize, u32)> {
         let i = self
             .out_pos
             .partition_point(|&(l, s, _)| (l, s) <= (line, off));
-        let &(l, _, r) = self.out_pos.get(i.checked_sub(1)?)?;
-        (l == line).then_some(r as usize)
+        let &(l, s, r) = self.out_pos.get(i.checked_sub(1)?)?;
+        (l == line).then_some((r as usize, s))
     }
 }
 
@@ -519,7 +520,7 @@ mod tests {
         assert_eq!(map.row_map, vec![0, 0, 1, 2]);
         // The second A row started at offset 3: it lands in row 0.
         assert_eq!(map.in_pos[1], Some((0, 3)));
-        assert_eq!(map.out_row(0, 3), Some(0));
+        assert_eq!(map.out_row(0, 3), Some((0, 0)));
     }
 
     #[test]
