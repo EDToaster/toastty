@@ -328,13 +328,20 @@ fn fast_csi<P: Perform + ?Sized>(perform: &mut P, bytes: &[u8]) -> Option<usize>
     let mut at = At::Entry;
     // `csi_param_digits`: bit per parameter that held a digit.
     let (mut digits, mut idx) = (0u32, 0u32);
-    for (i, &b) in bytes.iter().enumerate() {
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
         match b {
             b'0'..=b'9' if at != At::Intermediate => {
                 if params.is_full() {
                     return None;
                 }
+                // The whole number in one go (only `;` / `:` / the final
+                // byte change the parameter count, so one check covers it).
                 param = param.saturating_mul(10).saturating_add(u16::from(b - b'0'));
+                while let Some(&d @ b'0'..=b'9') = bytes.get(i + 1) {
+                    param = param.saturating_mul(10).saturating_add(u16::from(d - b'0'));
+                    i += 1;
+                }
                 if idx < 32 {
                     digits |= 1 << idx;
                 }
@@ -382,6 +389,7 @@ fn fast_csi<P: Perform + ?Sized>(perform: &mut P, bytes: &[u8]) -> Option<usize>
             }
             _ => return None,
         }
+        i += 1;
     }
     None
 }
