@@ -428,10 +428,8 @@ impl KittyHandler {
             self.make_room(Some(key), body.len());
             self.chunk_seq += 1;
             let pending = self.pending.get_mut(&key).expect("make_room keeps `key`");
-            // Reserve exactly, so capacity stays equal to length and the
-            // byte cap counted by `pending_bytes` reflects real memory
-            // (reviewer item 7) instead of geometric over-allocation.
-            pending.buf.reserve_exact(body.len());
+            // Geometric growth is fine: `pending_bytes` counts capacity,
+            // so the global cap already accounts for the slack.
             pending.buf.extend_from_slice(body);
             pending.last_chunk = Instant::now();
             pending.last_seq = self.chunk_seq;
@@ -1706,7 +1704,9 @@ mod tests {
         // Growing 3 to 60 would make 100 > 90: 2 goes, 3 is kept.
         h.process(b"Gm=1", &[b'A'; 20], &mut sink).unwrap();
         assert!(!h.pending.contains_key(&2));
-        assert_eq!(h.pending_bytes(), 60);
+        assert_eq!(h.pending[&3].buf.len(), 60);
+        // Capacity (what `pending_bytes` counts) may round up past len.
+        assert!(h.pending_bytes() >= 60);
         assert!(sink.replies.is_empty(), "eviction is silent");
     }
 
