@@ -666,7 +666,23 @@ fn derive_selection_bg(bg: [f32; 4], fg: [f32; 4]) -> [f32; 4] {
 }
 
 /// Convert one sRGB byte channel to linear-light float.
+///
+/// Table lookup: the instance builders resolve truecolor (`Rgb`) and,
+/// without an OSC 4 palette, 256-colour cells through this for both fg
+/// and bg of every cell, and three `powf`s per colour was a measurable
+/// share of a full-screen truecolor repaint. The table holds exactly
+/// [`srgb_channel_to_linear_exact`]'s values.
+#[inline]
 pub(crate) fn srgb_channel_to_linear(v: u8) -> f32 {
+    static LUT: std::sync::LazyLock<[f32; 256]> = std::sync::LazyLock::new(|| {
+        #[allow(clippy::cast_possible_truncation)] // i < 256
+        std::array::from_fn(|i| srgb_channel_to_linear_exact(i as u8))
+    });
+    LUT[usize::from(v)]
+}
+
+/// The sRGB → linear transfer function behind [`srgb_channel_to_linear`].
+fn srgb_channel_to_linear_exact(v: u8) -> f32 {
     let c = f32::from(v) / 255.0;
     if c <= 0.040_45 {
         c / 12.92
@@ -3785,5 +3801,16 @@ mod tests {
             &opts,
         );
         assert_eq!(v.iter().filter(|i| i.flags == FLAG_NO_GLYPH).count(), 2);
+    }
+
+    #[test]
+    fn srgb_lut_matches_transfer_function() {
+        for v in 0..=255u8 {
+            assert_eq!(
+                srgb_channel_to_linear(v).to_bits(),
+                srgb_channel_to_linear_exact(v).to_bits(),
+                "channel {v}"
+            );
+        }
     }
 }
