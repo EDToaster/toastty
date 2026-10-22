@@ -499,8 +499,14 @@ UVs at draw time. Don't patch each item separately.
   - Cause: `pipeline.rs:161-163` uses linear filtering with no mipmaps.
   - Consider mipmaps, or a box prefilter on upload.
   - Fix: a texture drawn downscaled gets the mip levels that draw samples
-    (`floor(log2(ratio) - 0.5) + 2`, added to in place if it's later drawn
-    smaller). Sampling is trilinear with a -0.5 LOD bias.
+    (`floor(log2(ratio)) + 2`, added to in place if it's later drawn
+    smaller). Sampling is plain trilinear, with no LOD bias.
+    - Blur trade-off: trilinear is slightly soft on thin features (a 1 px
+      diagonal at `c=30` widens to about 3 px). A −0.5 bias sharpened it
+      but brought aliasing back at moderate downscales: on a zone plate,
+      the residual that should be flat rose from 20.9 to 41.2 at 1.5× and
+      from 17.5 to 27.9 at 2× (review of #34). The softness is kept; a
+      bias of at most −0.25 would need re-measuring first.
     - The filter is alpha-weighted and runs in linear light, with a 3-tap
       footprint for odd sizes.
     - Textures up to 256² build their levels on the CPU; larger ones use

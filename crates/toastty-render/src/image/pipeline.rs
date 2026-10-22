@@ -7,7 +7,7 @@
 //!
 //! Downscaling (SIZE-12): a kitty image drawn smaller than its source
 //! rect gets the mip levels that draw samples (see [`super::mip`]) and
-//! the sampler is trilinear with a small negative LOD bias. Small
+//! the sampler is trilinear. Small
 //! textures build their levels on the CPU; larger ones on the GPU,
 //! encoded into the frame's own command encoder
 //! ([`ImagePipeline::encode_pending_mips`]). Mip work is capped per frame
@@ -1454,13 +1454,13 @@ mod tests {
         let flat = cache.get(ImageKey(1)).unwrap();
         assert_eq!(flat.mip_levels, 1);
 
-        // ¼ scale: LOD 2 - 0.5 -> 3 levels, built now (CPU path).
+        // ¼ scale: LOD 2 -> 4 levels, built now (CPU path).
         let (stats, idx) = frame_at(&mut pipeline, &mut cache, 4.0, 2.0);
         assert_eq!((stats.uploaded, stats.mipped), (0, 1));
         assert_eq!(idx, flat.texture_index as u32);
-        assert_eq!(cache.get(ImageKey(1)).unwrap().mip_levels, 3);
-        assert_eq!(cache.total_bytes(), (128 + 32 + 8) * 4);
-        assert_eq!(slot(&pipeline, flat.texture_index).levels_ready, 3);
+        assert_eq!(cache.get(ImageKey(1)).unwrap().mip_levels, 4);
+        assert_eq!(cache.total_bytes(), (128 + 32 + 8 + 2) * 4);
+        assert_eq!(slot(&pipeline, flat.texture_index).levels_ready, 4);
 
         // 1/16 scale: the full 5-level chain, again in place.
         let (stats, idx) = frame_at(&mut pipeline, &mut cache, 1.0, 1.0);
@@ -1485,19 +1485,20 @@ mod tests {
             return;
         };
         for (limits, side) in [
-            // CPU: 32x32 at 8x8 -> levels 1, 2 = 256 + 64 texels each.
+            // CPU: 32x32 at 8x8 -> levels 1..4 = 256 + 64 + 16 texels
+            // each, so 3 fit per frame.
             (
                 MipLimits {
-                    cpu_texels_per_frame: 1000,
+                    cpu_texels_per_frame: 1050,
                     cpu_time_per_frame: std::time::Duration::MAX,
                     ..MipLimits::default()
                 },
                 32u32,
             ),
-            // GPU: 64x64 at 16x16 -> 2 passes each.
+            // GPU: 64x64 at 16x16 -> 3 passes each, 3 per frame.
             (
                 MipLimits {
-                    gpu_passes_per_frame: 4,
+                    gpu_passes_per_frame: 9,
                     ..gpu_only()
                 },
                 64,
@@ -1538,7 +1539,7 @@ mod tests {
             assert!(frames >= 4, "work should spread over frames ({frames})");
             for id in 1u32..=10 {
                 let e = cache.get(ImageKey(id)).unwrap();
-                assert_eq!(slot(&pipeline, e.texture_index).levels_ready, 3);
+                assert_eq!(slot(&pipeline, e.texture_index).levels_ready, 4);
             }
         }
     }
@@ -1566,7 +1567,7 @@ mod tests {
                 slot(&pipeline, idx).levels_ready,
                 slot(&pipeline, idx).levels_queued
             ),
-            (1, 3)
+            (1, 4)
         );
 
         if cfg!(debug_assertions) {
@@ -1578,7 +1579,7 @@ mod tests {
 
         let px = render_offscreen(&device, &queue, &mut pipeline, &frame, 16, 16);
         assert!(pipeline.pending_mips.is_empty());
-        assert_eq!(slot(&pipeline, idx).levels_ready, 3);
+        assert_eq!(slot(&pipeline, idx).levels_ready, 4);
         assert!(px.chunks(4).all(|p| p[3] == 255), "image drawn everywhere");
     }
 
@@ -1652,7 +1653,7 @@ mod tests {
 
     /// A 1:1 draw reproduces the source bytes exactly, both before and
     /// after the texture has gained mip levels (stack A draws native-size
-    /// images 1:1 and relies on this; the LOD bias changes nothing here).
+    /// images 1:1 and relies on this).
     #[test]
     fn one_to_one_draw_is_pixel_exact_with_and_without_mips() {
         let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {

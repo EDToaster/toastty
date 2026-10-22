@@ -20,11 +20,12 @@ use std::sync::OnceLock;
 use super::atlas::full_mip_count;
 use super::instance::ImageInstance;
 
-/// LOD bias applied when sampling images (`shaders/image.wgsl` uses the
-/// same literal). Slightly negative to offset trilinear's softness on
-/// thin features. At 1:1 or when upscaling the LOD is already <= 0, so
-/// the bias changes nothing there.
-pub(super) const LOD_BIAS: f32 = -0.5;
+/// LOD bias applied when sampling images (`shaders/image.wgsl` samples
+/// with the same value). Zero: a negative bias sharpens thin features
+/// but brings aliasing back at moderate downscales (review of #34, zone
+/// plate at 1.5× and 2×: about 2× the residual of unbiased trilinear),
+/// so the slight trilinear softness is the accepted trade-off.
+pub(super) const LOD_BIAS: f32 = 0.0;
 
 /// How much `inst` shrinks its source rect of a `width × height`
 /// texture: the larger of the per-axis source-px / drawn-px ratios.
@@ -389,9 +390,9 @@ mod tests {
         }
     }
 
-    /// Review of #34: only the levels the draw samples. 1:1, upscale and
-    /// mild downscale (biased LOD <= 0) need none; ½ needs 2; 128 px
-    /// drawn at 20 px needs 4; never more than the full chain.
+    /// Review of #34: only the levels the draw samples. 1:1 and upscale
+    /// need none; 1.3× needs 2; ½ needs 3; 128 px drawn at 20 px needs 4;
+    /// never more than the full chain.
     #[test]
     fn needed_levels_follow_the_draw_scale() {
         assert_eq!(needed_levels(draw_ratio(&inst(16.0, 8.0), 16, 8), 16, 8), 1);
@@ -399,10 +400,11 @@ mod tests {
             needed_levels(draw_ratio(&inst(32.0, 16.0), 16, 8), 16, 8),
             1
         );
-        assert_eq!(needed_levels(1.3, 64, 64), 1);
-        assert_eq!(needed_levels(2.0, 640, 360), 2);
+        assert_eq!(needed_levels(1.0, 64, 64), 1);
+        assert_eq!(needed_levels(1.3, 64, 64), 2);
+        assert_eq!(needed_levels(2.0, 640, 360), 3);
         assert_eq!(needed_levels(128.0 / 20.0, 128, 128), 4);
-        assert_eq!(needed_levels(5.0, 1500, 900), 3);
+        assert_eq!(needed_levels(5.0, 1500, 900), 4);
         assert_eq!(needed_levels(1e6, 16, 8), 5);
         // Ratio comes from the larger axis, and from the source rect.
         assert!((draw_ratio(&inst(4.0, 8.0), 16, 8) - 4.0).abs() < 1e-6);
