@@ -1661,10 +1661,16 @@ impl Renderer {
         // Deferred image mip work: finish it over the next frames.
         let mips = self.mip_work_pending.then_some(Duration::from_millis(16));
         // Post shaders: time-driven frames, or zero for a pending event.
-        let post = self.post.as_ref().and_then(|chain| {
-            self.post_state
-                .next_frame_in(Instant::now(), self.post_animation, chain.inputs())
-        });
+        // None while synchronized output (mode 2026) holds frames back:
+        // `render_term` skips them, so a due tick would spin until ESU.
+        let post = self
+            .post
+            .as_ref()
+            .filter(|_| !term.pause_rendering())
+            .and_then(|chain| {
+                self.post_state
+                    .next_frame_in(Instant::now(), self.post_animation, chain.inputs())
+            });
         // Whichever fires first wins. All are `Option<Duration>`.
         [blink, rgp, chip, text_blink, mips, post]
             .into_iter()
@@ -2756,7 +2762,9 @@ impl Renderer {
             self.needs_full_clear = true;
             term.mark_all_dirty();
         }
-        if self.rich_chip.is_some() {
+        // (With post shaders the chips and the dialog are drawn in the UI
+        // pass, over a fresh post output, so none of this applies.)
+        if self.rich_chip.is_some() && self.post.is_none() {
             self.needs_full_clear = true;
             term.mark_all_dirty();
         }
@@ -2777,7 +2785,7 @@ impl Renderer {
         // The chip is translucent: compositing it over a LoadOp::Load
         // partial frame would stack on last frame's chip. While it is
         // (or just was) on screen, repaint everything underneath.
-        if chip_alpha > 0.0 || self.chip_drawn_last {
+        if (chip_alpha > 0.0 || self.chip_drawn_last) && self.post.is_none() {
             self.needs_full_clear = true;
             term.mark_all_dirty();
         }
@@ -2786,7 +2794,7 @@ impl Renderer {
         // The close dialog's scrim is translucent and covers the whole
         // window: repaint everything under it each frame it's up (its
         // removal already forces a full clear in `set_close_prompt`).
-        if self.close_prompt.is_some() {
+        if self.close_prompt.is_some() && self.post.is_none() {
             self.needs_full_clear = true;
             term.mark_all_dirty();
         }
@@ -3339,10 +3347,7 @@ impl Renderer {
         } else {
             None
         };
-        let Some(frame) = self.acquire_frame()? else {
-            if post_on {
-                self.post_state.frame_dropped(now);
-            }
+        let Some(frame) = self.acquire_frame(now)? else {
             // No frame went out — caller must not clear damage / BSU
             // force-flushed flag, so report Skipped.
             return Ok(RenderOutcome::Skipped);
@@ -3733,8 +3738,7 @@ impl Renderer {
         term: &Term,
         now: Instant,
     ) -> Result<RenderOutcome, RenderError> {
-        let Some(frame) = self.acquire_frame()? else {
-            self.post_state.frame_dropped(now);
+        let Some(frame) = self.acquire_frame(now)? else {
             return Ok(RenderOutcome::Skipped);
         };
         let mut encoder = self
@@ -3881,34 +3885,38 @@ impl Renderer {
 
     /// Acquire the swapchain frame for `render_term`. `Ok(None)` when no
     /// frame can be drawn now (the caller reports `Skipped`).
-    fn acquire_frame(&mut self) -> Result<Option<wgpu::SurfaceTexture>, RenderError> {
-        match self.surface.get_current_texture() {
+    ///
+    /// Without post shaders a failed acquire forces the next frame to be
+    /// a full clear. With them it doesn't: the scratch texture wasn't
+    /// touched, and the post passes rewrite the whole swapchain image
+    /// anyway. The post schedule counts the frame as dropped instead
+    /// (slowing time-driven frames while occluded).
+    fn acquire_frame(&mut self, now: Instant) -> Result<Option<wgpu::SurfaceTexture>, RenderError> {
+        let occluded = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => Ok(Some(t)),
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => return Ok(Some(t)),
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(RenderError::SurfaceLost);
+            }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
-                // Followup C2: the reconfigured back-buffer has
-                // undefined contents (same invariant as `resize`).
-                // Without flagging a full clear here, the next frame
-                // may pick `LoadOp::Load` and read garbage. The cost
-                // is one extra clear on recovery — cheap.
-                self.needs_full_clear = true;
-                Ok(None)
+                false
             }
-            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Validation => {
-                Err(RenderError::SurfaceLost)
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                // Followup C2: defensively force the next frame to
-                // clear. Timeout means the driver missed its
-                // deadline; Occluded means the window isn't visible.
-                // In both cases the back-buffer's prior contents may
-                // be stale — flagging a full clear avoids any chance
-                // of a LoadOp::Load reading garbage on recovery.
-                self.needs_full_clear = true;
-                Ok(None)
-            }
+            wgpu::CurrentSurfaceTexture::Timeout => false,
+            wgpu::CurrentSurfaceTexture::Occluded => true,
+        };
+        if self.post.is_some() {
+            self.post_state.frame_dropped(now, occluded);
+        } else {
+            // Followup C2: after Outdated the reconfigured back-buffer has
+            // undefined contents (same invariant as `resize`); Timeout
+            // means the driver missed its deadline and Occluded that the
+            // window isn't visible. In all three the back-buffer's prior
+            // contents may be stale, so the next frame must not pick
+            // `LoadOp::Load`. The cost is one extra clear on recovery.
+            self.needs_full_clear = true;
         }
+        Ok(None)
     }
 
     /// Render one frame. M4a: just a clear-color pass.

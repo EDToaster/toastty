@@ -743,6 +743,15 @@ mod tests {
             &format!("const TOASTTY_EVENT_DURATION: f32 = 2.25;\n{WGSL_PASS}"),
         );
         assert_eq!(w.inputs.event_duration, Some(2.25));
+        // Huge values clamp instead of overflowing the schedule.
+        let g = compile_ok(
+            "d.glsl",
+            &format!("const float TOASTTY_EVENT_DURATION = 1e30;\n{GLSL_PASS}"),
+        );
+        assert_eq!(
+            g.inputs.event_duration,
+            Some(crate::post::analysis::MAX_EVENT_DURATION)
+        );
     }
 
     #[test]

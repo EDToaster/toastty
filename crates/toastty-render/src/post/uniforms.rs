@@ -170,6 +170,20 @@ pub(crate) fn focus_mask() -> u64 {
     mask_of(&["iFocus", "iTimeFocus"])
 }
 
+/// Uniforms that change when the cursor moves or changes colour/style.
+pub(crate) fn cursor_mask() -> u64 {
+    mask_of(&[
+        "iCurrentCursor",
+        "iPreviousCursor",
+        "iCurrentCursorColor",
+        "iPreviousCursorColor",
+        "iCurrentCursorStyle",
+        "iPreviousCursorStyle",
+        "iCursorVisible",
+        "iTimeCursorChange",
+    ])
+}
+
 /// Uniforms that change on a BEL.
 pub(crate) fn bell_mask() -> u64 {
     mask_of(&["iTimeBell", "iBellCursor", "iBellCount", "iBells"])
@@ -197,5 +211,6 @@ mod tests {
         assert_eq!(mouse_mask().count_ones(), 1);
         assert_eq!(focus_mask().count_ones(), 2);
         assert_eq!(bell_mask().count_ones(), 4);
+        assert_eq!(cursor_mask().count_ones(), 8);
     }
 }

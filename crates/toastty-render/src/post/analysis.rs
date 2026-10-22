@@ -113,8 +113,13 @@ fn collect_calls<'a>(
     }
 }
 
+/// Longest `TOASTTY_EVENT_DURATION` honoured (a day); larger values are
+/// clamped so the schedule's `Instant` arithmetic can't overflow.
+pub(crate) const MAX_EVENT_DURATION: f32 = 86_400.0;
+
 /// The value of a module-scope `TOASTTY_EVENT_DURATION` constant, if the
-/// shader declares one with a positive, finite number.
+/// shader declares one with a positive number (clamped to
+/// [`MAX_EVENT_DURATION`]; infinity clamps too, NaN is ignored).
 pub(crate) fn event_duration(module: &Module) -> Option<f32> {
     let (_, constant) = module
         .constants
@@ -133,5 +138,5 @@ pub(crate) fn event_duration(module: &Module) -> Option<f32> {
         },
         _ => return None,
     };
-    (value.is_finite() && value > 0.0).then_some(value)
+    (value > 0.0).then(|| value.min(MAX_EVENT_DURATION))
 }
