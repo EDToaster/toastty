@@ -1124,7 +1124,7 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
     WIRE-15), ends the DCS in vte and then handles the ESC as a fresh
     escape. Works across reads and inside tmux passthrough. Side fix: an
     `ESC _` (APC) right after a DCS body used to leave vte inside the DCS.
-    Fixed in #PRNUM.
+    Fixed in #54.
   - Deliberate difference: what follows the ESC still runs (the CSI, a new
     DCS), as in xterm and vte; kitty swallows it as DCS data until ST. So
     `ESC P $ q m ESC P $ q r ST` gets the second query's reply here and
