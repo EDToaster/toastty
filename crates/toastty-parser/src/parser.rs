@@ -48,6 +48,12 @@ enum ApcState {
     /// BEL (WIRE-13). So the scanner swallows the body itself, and vte
     /// never sees the introducer.
     SosPm,
+    /// vte is inside a CSI (`csi`) or an escape sequence still waiting
+    /// for its final byte (after intermediates or C0 controls). Bytes
+    /// flow to vte; we only watch for one >= 0x80, which kitty 0.49.2
+    /// treats as aborting the sequence: the byte is dropped and parsing
+    /// resumes in ground at the next one (WIRE-17, WIRE-18).
+    Seq { csi: bool },
 }
 
 /// Upper bound on one OSC string's payload, in bytes.
@@ -109,6 +115,90 @@ fn sos_pm_terminator(bytes: &[u8]) -> Option<usize> {
     b.or(a)
 }
 
+/// What the byte after an ESC starts, for [`ApcState::AfterEsc`]. A
+/// table so escape-heavy output pays one load per ESC.
+mod after_esc {
+    pub(super) const PLAIN: u8 = 0;
+    pub(super) const CSI: u8 = 1;
+    pub(super) const ESC_SEQ: u8 = 2;
+    pub(super) const APC: u8 = 3;
+    pub(super) const OSC: u8 = 4;
+    pub(super) const DCS: u8 = 5;
+    pub(super) const ABORT: u8 = 6;
+    pub(super) const SOS_PM: u8 = 7;
+
+    pub(super) const TABLE: [u8; 256] = {
+        let mut t = [PLAIN; 256];
+        let mut i = 0;
+        while i < 256 {
+            t[i] = match i as u8 {
+                b'[' => CSI,
+                b'_' => APC,
+                b']' => OSC,
+                b'P' => DCS,
+                b'^' | b'X' => SOS_PM,
+                // An intermediate, or a C0 control vte executes inside the
+                // escape: still no final byte.
+                0x20..=0x2F | 0x00..=0x17 | 0x19 | 0x1C..=0x1F => ESC_SEQ,
+                0x80..=0xFF => ABORT,
+                _ => PLAIN,
+            };
+            i += 1;
+        }
+        t
+    };
+}
+
+/// Index of the byte that ends the sequence vte is in, if `bytes` holds
+/// it: anything but a parameter/intermediate byte (`0x20..=0x3F` in a
+/// CSI, `0x20..=0x2F` in an escape) or a C0 control vte executes in
+/// place (everything but CAN, SUB and ESC). Checks 8 bytes at a time:
+/// sequences are short, and escape-heavy output has one every few bytes.
+#[inline(always)]
+fn seq_end(bytes: &[u8], csi: bool) -> Option<usize> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    let mask: u8 = if csi { 0xE0 } else { 0xF0 };
+    let (wmask, want) = (u64::from(mask) * ONES, 0x20 * ONES);
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(w) = bytes.get(i..i + 8) {
+            let x = u64::from_le_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]);
+            let t = (x & wmask) ^ want;
+            if t == 0 {
+                i += 8;
+                continue;
+            }
+            // The lowest set bit is in the first byte out of range.
+            i += (t.trailing_zeros() / 8) as usize;
+        }
+        let b = bytes[i];
+        if b & mask == 0x20 || (b < 0x20 && b != 0x18 && b != 0x1A && b != 0x1B) {
+            i += 1;
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
+/// Outcome of [`Scanner::step_seq`].
+enum Step<'b> {
+    /// Go on with this input.
+    Rest(&'b [u8]),
+    /// All of the input was consumed.
+    Done,
+    /// The sequence was aborted (WIRE-17); go on with this input, which
+    /// may start mid-character.
+    Aborted(&'b [u8]),
+}
+
+/// The scanner's entry into vte for real events (one copy of vte's large
+/// `advance` rather than one per call site).
+#[inline(never)]
+fn vte_advance<P: Perform + ?Sized>(vte: &mut vte::Parser, perform: &mut P, bytes: &[u8]) {
+    vte.advance(&mut VteAdapter { inner: perform }, bytes);
+}
+
 /// The APC / OSC-cap pre-scanner plus vte: everything the parser does
 /// except tmux passthrough unwrapping, which [`Parser`] layers on top
 /// so unwrapped payloads can be fed back through this same path.
@@ -120,6 +210,12 @@ struct Scanner {
     /// Rewrites invalid UTF-8 in ground text to U+FFFD the way kitty
     /// does, before vte sees it (WIRE-14).
     utf8: Utf8Sanitizer,
+    /// In an all-ASCII input no byte can abort a sequence (WIRE-17), so
+    /// the scanner leaves CSI / escape sequences to vte and only notes
+    /// here (`Some(csi)`) that the last one may still be open. If it
+    /// still is when the input ends, the state becomes
+    /// [`ApcState::Seq`] so the next input is checked.
+    open_seq: Option<bool>,
 }
 
 impl Scanner {
@@ -129,6 +225,7 @@ impl Scanner {
             apc: ApcState::default(),
             max_osc_len,
             utf8: Utf8Sanitizer::default(),
+            open_seq: None,
         }
     }
 
@@ -153,7 +250,7 @@ impl Scanner {
         // inside the clean span (all of an ASCII or valid chunk).
         if clean.0 <= at && at + text.len() <= clean.1 && !self.utf8.holds_partial() {
             if !text.is_empty() {
-                self.vte.advance(&mut VteAdapter { inner: perform }, text);
+                vte_advance(&mut self.vte, perform, text);
             }
             return;
         }
@@ -176,7 +273,7 @@ impl Scanner {
             // An ESC right away still ends a held partial character.
             if cut_by_esc && self.utf8.holds_partial() {
                 self.utf8.feed(text, true, &mut |s| {
-                    vte.advance(&mut VteAdapter { inner: perform }, s);
+                    vte_advance(vte, perform, s);
                 });
             }
             return;
@@ -188,15 +285,15 @@ impl Scanner {
         if !head.is_empty() {
             self.utf8
                 .feed(head, cut_by_esc && a == text.len(), &mut |s| {
-                    vte.advance(&mut VteAdapter { inner: perform }, s);
+                    vte_advance(vte, perform, s);
                 });
         }
         if !mid.is_empty() {
-            vte.advance(&mut VteAdapter { inner: perform }, mid);
+            vte_advance(vte, perform, mid);
         }
         if !tail.is_empty() {
             self.utf8.feed(tail, cut_by_esc, &mut |s| {
-                vte.advance(&mut VteAdapter { inner: perform }, s);
+                vte_advance(vte, perform, s);
             });
         }
     }
@@ -205,163 +302,329 @@ impl Scanner {
     /// after an `ESC P tmux ;` introducer and returns the unconsumed
     /// rest (vte is left in ground state, as after a cancelled
     /// escape); otherwise consumes everything and returns `None`.
+    #[allow(clippy::too_many_lines)] // One state machine; splitting it costs (#41).
     fn advance<'b, P: Perform + ?Sized>(
         &mut self,
         perform: &mut P,
         mut bytes: &'b [u8],
         detect_tmux: bool,
     ) -> Option<&'b [u8]> {
-        // Check this input's UTF-8 once, not per run between escapes.
-        let total = bytes.len();
-        let clean = self.utf8.clean_span(bytes);
-        while !bytes.is_empty() {
-            match self.apc {
-                ApcState::Ground => {
-                    // Scan for next ESC. Everything before is normal vte
-                    // input, cleaned of invalid UTF-8 first.
-                    if let Some(pos) = memchr::memchr(0x1B, bytes) {
-                        let at = total - bytes.len();
-                        self.feed_ground(perform, &bytes[..pos], at, clean, true);
-                        // Don't feed the ESC to vte yet — peek the next byte.
-                        self.apc = ApcState::AfterEsc;
-                        bytes = &bytes[pos + 1..];
-                    } else {
-                        let at = total - bytes.len();
-                        self.feed_ground(perform, bytes, at, clean, false);
-                        return None;
+        // Check this input's UTF-8 once, not per run between escapes. An
+        // aborted sequence (WIRE-17/18) can leave the rest off a character
+        // boundary: it then restarts this loop with no clean span, so
+        // `clean` stays constant inside the hot loop.
+        let mut span_ok = true;
+        'input: loop {
+            let total = bytes.len();
+            let (clean, ascii) = if span_ok {
+                self.utf8.clean_span_ascii(bytes)
+            } else {
+                ((0, 0), false)
+            };
+            while !bytes.is_empty() {
+                match self.apc {
+                    ApcState::Ground => {
+                        // Scan for next ESC. Everything before is normal vte
+                        // input, cleaned of invalid UTF-8 first.
+                        if let Some(pos) = memchr::memchr(0x1B, bytes) {
+                            let at = total - bytes.len();
+                            self.feed_ground(perform, &bytes[..pos], at, clean, true);
+                            // Whatever sequence was open, this ESC ends it.
+                            self.open_seq = None;
+                            // Don't feed the ESC to vte yet — peek the next byte.
+                            self.apc = ApcState::AfterEsc;
+                            bytes = &bytes[pos + 1..];
+                        } else {
+                            let at = total - bytes.len();
+                            self.feed_ground(perform, bytes, at, clean, false);
+                            self.close_open_seq(bytes);
+                            return None;
+                        }
                     }
-                }
-                ApcState::AfterEsc => {
-                    let byte = bytes[0];
-                    bytes = &bytes[1..];
-                    self.after_esc(perform, byte, detect_tmux);
-                }
-                ApcState::DcsIntro { matched } => {
-                    if bytes[0] == TMUX_PREFIX[matched] {
+                    ApcState::AfterEsc => {
+                        let byte = bytes[0];
                         bytes = &bytes[1..];
-                        if matched + 1 < TMUX_PREFIX.len() {
-                            self.apc = ApcState::DcsIntro {
-                                matched: matched + 1,
-                            };
+                        let csi = match after_esc::TABLE[usize::from(byte)] {
+                            after_esc::APC => {
+                                perform.apc_start();
+                                self.apc = ApcState::Apc;
+                                continue;
+                            }
+                            after_esc::OSC => {
+                                vte_advance(&mut self.vte, perform, &[0x1B, byte]);
+                                self.apc = ApcState::Osc { len: 0 };
+                                continue;
+                            }
+                            after_esc::DCS if detect_tmux => {
+                                // Give vte the ESC now (it ends any string or
+                                // sequence in progress, exactly as the direct
+                                // byte stream would) and hold the `P` until we
+                                // know whether this is `ESC P tmux ;`.
+                                vte_advance(&mut self.vte, perform, &[0x1B]);
+                                self.apc = ApcState::DcsIntro { matched: 0 };
+                                continue;
+                            }
+                            after_esc::SOS_PM => {
+                                // PM / SOS (#36). The ESC still ends whatever
+                                // vte had in progress; CAN then returns vte to
+                                // ground (the null performer swallows its
+                                // execute), and the scanner eats the body.
+                                vte_advance(&mut self.vte, perform, &[0x1B]);
+                                self.vte.advance(&mut NullPerform, &[0x18]);
+                                self.apc = ApcState::SosPm;
+                                continue;
+                            }
+                            after_esc::DCS => {
+                                // Ordinary DCS: vte parses it, the scanner
+                                // tracks its body (0x9C, BEL, CAN / SUB, ESC;
+                                // #32, #36, #45, #54).
+                                vte_advance(&mut self.vte, perform, &[0x1B, byte]);
+                                self.apc = ApcState::Dcs;
+                                continue;
+                            }
+                            after_esc::ABORT => {
+                                // WIRE-18: kitty drops an ESC followed by a
+                                // non-ASCII byte, and the byte; what follows is
+                                // ground text (so a multi-byte character's
+                                // continuation bytes show as U+FFFD). The ESC
+                                // still ends any string vte is in; CAN then
+                                // returns it to ground without dispatching.
+                                self.abort_sequence(perform, true);
+                                self.apc = ApcState::Ground;
+                                span_ok = false; // No longer on a character boundary.
+                                continue 'input;
+                            }
+                            after_esc::CSI => true,
+                            after_esc::ESC_SEQ => false,
+                            _ => {
+                                // A complete escape: replay ESC + this byte.
+                                vte_advance(&mut self.vte, perform, &[0x1B, byte]);
+                                self.apc = ApcState::Ground;
+                                continue;
+                            }
+                        };
+                        vte_advance(&mut self.vte, perform, &[0x1B, byte]);
+                        if ascii {
+                            // Nothing here can abort it: vte alone parses it.
+                            self.open_seq = Some(csi);
+                            self.apc = ApcState::Ground;
                             continue;
                         }
-                        // Full introducer. vte is in its escape state
-                        // from the ESC; CAN returns it to ground (the
-                        // null performer swallows CAN's execute).
-                        self.vte.advance(&mut NullPerform, &[0x18]);
-                        self.apc = ApcState::Ground;
-                        return Some(bytes);
-                    }
-                    // Ordinary DCS: replay what we held back and
-                    // reprocess this byte as DCS body — it may itself
-                    // be an ESC.
-                    self.vte.advance(&mut VteAdapter { inner: perform }, b"P");
-                    if matched > 0 {
-                        self.vte
-                            .advance(&mut VteAdapter { inner: perform }, &TMUX_PREFIX[..matched]);
-                    }
-                    self.apc = ApcState::Dcs;
-                }
-                ApcState::Dcs => bytes = self.advance_dcs(perform, bytes),
-                ApcState::DcsAfterEsc => {
-                    let byte = bytes[0];
-                    bytes = &bytes[1..];
-                    if byte == b'\\' {
-                        self.vte
-                            .advance(&mut VteAdapter { inner: perform }, b"\x1b\\");
-                        self.apc = ApcState::Ground;
-                    } else {
-                        // Not ST. End the DCS without acting on it
-                        // (vte unhooks on the ESC; CAN then returns it
-                        // to ground, swallowed by the null performer)
-                        // and reprocess the ESC as a fresh escape.
-                        perform.dcs_cancel();
-                        self.vte
-                            .advance(&mut VteAdapter { inner: perform }, &[0x1B]);
-                        self.vte.advance(&mut NullPerform, &[0x18]);
-                        self.after_esc(perform, byte, detect_tmux);
-                    }
-                }
-                ApcState::SosPm => bytes = self.advance_sos_pm(perform, bytes),
-                ApcState::Apc => {
-                    // Terminators: ESC (ST is `ESC \\`) or BEL, not 0x9C.
-                    if let Some(pos) = memchr::memchr2(0x1B, 0x07, bytes) {
-                        if pos > 0 {
-                            perform.apc_chunk(&bytes[..pos]);
+                        // Usually the sequence ends (final byte, CAN, SUB
+                        // or an ESC) before any byte >= 0x80: then vte
+                        // alone parses it and the ground path takes the
+                        // rest, as without this check. Otherwise (a
+                        // non-ASCII byte or DEL first, or the input ends
+                        // inside it) step through it.
+                        if let Some(pos) = seq_end(bytes, csi)
+                            && bytes[pos] < 0x7F
+                        {
+                            self.apc = ApcState::Ground;
+                            continue;
                         }
-                        let term = bytes[pos];
-                        bytes = &bytes[pos + 1..];
-                        match term {
-                            0x1B => self.apc = ApcState::ApcAfterEsc,
-                            0x07 => {
+                        match self.step_seq(perform, bytes, csi, total, clean) {
+                            Step::Rest(rest) => bytes = rest,
+                            Step::Done => return None,
+                            Step::Aborted(rest) => {
+                                bytes = rest;
+                                span_ok = false; // No longer on a character boundary.
+                                continue 'input;
+                            }
+                        }
+                    }
+                    ApcState::Seq { csi } => {
+                        match self.step_seq(perform, bytes, csi, total, clean) {
+                            Step::Rest(rest) => bytes = rest,
+                            Step::Done => return None,
+                            Step::Aborted(rest) => {
+                                bytes = rest;
+                                span_ok = false; // No longer on a character boundary.
+                                continue 'input;
+                            }
+                        }
+                    }
+                    ApcState::DcsIntro { matched } => {
+                        if bytes[0] == TMUX_PREFIX[matched] {
+                            bytes = &bytes[1..];
+                            if matched + 1 < TMUX_PREFIX.len() {
+                                self.apc = ApcState::DcsIntro {
+                                    matched: matched + 1,
+                                };
+                                continue;
+                            }
+                            // Full introducer. vte is in its escape state
+                            // from the ESC; CAN returns it to ground (the
+                            // null performer swallows CAN's execute).
+                            self.vte.advance(&mut NullPerform, &[0x18]);
+                            self.apc = ApcState::Ground;
+                            return Some(bytes);
+                        }
+                        // Ordinary DCS: replay what we held back and
+                        // reprocess this byte as DCS body — it may itself
+                        // be an ESC.
+                        vte_advance(&mut self.vte, perform, b"P");
+                        if matched > 0 {
+                            vte_advance(&mut self.vte, perform, &TMUX_PREFIX[..matched]);
+                        }
+                        self.apc = ApcState::Dcs;
+                    }
+                    ApcState::Dcs => bytes = self.advance_dcs(perform, bytes),
+                    ApcState::DcsAfterEsc => {
+                        if bytes[0] == b'\\' {
+                            bytes = &bytes[1..];
+                            vte_advance(&mut self.vte, perform, b"\x1b\\");
+                            self.apc = ApcState::Ground;
+                        } else {
+                            // Not ST (WIRE-16). End the DCS without acting
+                            // on it (vte unhooks on the ESC; CAN then returns
+                            // it to ground, swallowed by the null performer)
+                            // and reprocess the ESC, with this byte, as a
+                            // fresh escape.
+                            perform.dcs_cancel();
+                            vte_advance(&mut self.vte, perform, &[0x1B]);
+                            self.vte.advance(&mut NullPerform, &[0x18]);
+                            self.apc = ApcState::AfterEsc;
+                        }
+                    }
+                    ApcState::SosPm => bytes = self.advance_sos_pm(perform, bytes),
+                    ApcState::Apc => {
+                        // Terminators: ESC (ST is `ESC \\`) or BEL, not 0x9C.
+                        if let Some(pos) = memchr::memchr2(0x1B, 0x07, bytes) {
+                            if pos > 0 {
+                                perform.apc_chunk(&bytes[..pos]);
+                            }
+                            let term = bytes[pos];
+                            bytes = &bytes[pos + 1..];
+                            match term {
+                                0x1B => self.apc = ApcState::ApcAfterEsc,
+                                0x07 => {
+                                    perform.apc_end();
+                                    self.apc = ApcState::Ground;
+                                }
+                                _ => unreachable!(),
+                            }
+                        } else {
+                            perform.apc_chunk(bytes);
+                            return None;
+                        }
+                    }
+                    ApcState::ApcAfterEsc => {
+                        let byte = bytes[0];
+                        bytes = &bytes[1..];
+                        match byte {
+                            b'\\' => {
                                 perform.apc_end();
                                 self.apc = ApcState::Ground;
                             }
-                            _ => unreachable!(),
-                        }
-                    } else {
-                        perform.apc_chunk(bytes);
-                        return None;
-                    }
-                }
-                ApcState::ApcAfterEsc => {
-                    let byte = bytes[0];
-                    bytes = &bytes[1..];
-                    match byte {
-                        b'\\' => {
-                            perform.apc_end();
-                            self.apc = ApcState::Ground;
-                        }
-                        0x1B => {
-                            // Prior ESC was data; this might still be ST.
-                            perform.apc_chunk(&[0x1B]);
-                            // stay in ApcAfterEsc
-                        }
-                        _ => {
-                            perform.apc_chunk(&[0x1B, byte]);
-                            self.apc = ApcState::Apc;
+                            0x1B => {
+                                // Prior ESC was data; this might still be ST.
+                                perform.apc_chunk(&[0x1B]);
+                                // stay in ApcAfterEsc
+                            }
+                            _ => {
+                                perform.apc_chunk(&[0x1B, byte]);
+                                self.apc = ApcState::Apc;
+                            }
                         }
                     }
+                    ApcState::Osc { len } => bytes = self.advance_osc(perform, bytes, len),
+                    ApcState::OscDiscard => bytes = self.discard_osc(bytes),
                 }
-                ApcState::Osc { len } => bytes = self.advance_osc(perform, bytes, len),
-                ApcState::OscDiscard => bytes = self.discard_osc(bytes),
             }
+            self.close_open_seq(&[]);
+            return None;
         }
-        None
     }
 
-    /// `ApcState::AfterEsc` step: the byte after an ESC picks what the
-    /// scanner tracks next.
-    fn after_esc<P: Perform + ?Sized>(&mut self, perform: &mut P, byte: u8, detect_tmux: bool) {
-        if byte == b'_' {
-            perform.apc_start();
-            self.apc = ApcState::Apc;
-        } else if byte == b'P' && detect_tmux {
-            // Give vte the ESC now (it ends any string or sequence in
-            // progress, exactly as the direct byte stream would) and
-            // hold the `P` until we know whether this is `ESC P tmux ;`.
-            self.vte
-                .advance(&mut VteAdapter { inner: perform }, &[0x1B]);
-            self.apc = ApcState::DcsIntro { matched: 0 };
-        } else if matches!(byte, b'^' | b'X') {
-            // PM / SOS. The ESC still ends whatever vte had in progress;
-            // CAN then returns vte to ground (the null performer
-            // swallows its execute), and the scanner eats the body.
-            self.vte
-                .advance(&mut VteAdapter { inner: perform }, &[0x1B]);
-            self.vte.advance(&mut NullPerform, &[0x18]);
-            self.apc = ApcState::SosPm;
-        } else {
-            // Replay ESC + this byte to vte, then track the body of an
-            // OSC (length cap) or DCS (0x9C, BEL).
-            self.vte
-                .advance(&mut VteAdapter { inner: perform }, &[0x1B, byte]);
-            self.apc = match byte {
-                b']' => ApcState::Osc { len: 0 },
-                b'P' => ApcState::Dcs,
-                _ => ApcState::Ground,
-            };
+    /// End of an input: if an ASCII-mode sequence (see
+    /// [`Scanner::open_seq`]) is still open after `last_run`, the next
+    /// input continues it, so track it from now on.
+    #[inline]
+    fn close_open_seq(&mut self, last_run: &[u8]) {
+        if let Some(csi) = self.open_seq.take()
+            && self.apc == ApcState::Ground
+            && seq_end(last_run, csi).is_none()
+        {
+            self.apc = ApcState::Seq { csi };
         }
+    }
+
+    /// Pass a CSI (`csi`) or unfinished escape sequence to vte up to the
+    /// byte that ends it: its final byte, CAN/SUB (vte aborts), ESC (vte
+    /// starts over), or a non-ASCII byte (kitty aborts, WIRE-17). A
+    /// sequence still open at the end of `bytes` leaves the state at
+    /// [`ApcState::Seq`].
+    #[inline]
+    fn step_seq<'b, P: Perform + ?Sized>(
+        &mut self,
+        perform: &mut P,
+        mut bytes: &'b [u8],
+        csi: bool,
+        total: usize,
+        clean: (usize, usize),
+    ) -> Step<'b> {
+        loop {
+            let Some(pos) = seq_end(bytes, csi) else {
+                if !bytes.is_empty() {
+                    vte_advance(&mut self.vte, perform, bytes);
+                }
+                self.apc = ApcState::Seq { csi };
+                return Step::Done;
+            };
+            let b = bytes[pos];
+            if b == 0x7F {
+                // DEL: vte ignores it inside a sequence. Pass it, go on.
+                vte_advance(&mut self.vte, perform, &bytes[..=pos]);
+                bytes = &bytes[pos + 1..];
+                continue;
+            }
+            if b == 0x1B {
+                if pos > 0 {
+                    vte_advance(&mut self.vte, perform, &bytes[..pos]);
+                }
+                self.apc = ApcState::AfterEsc;
+                return Step::Rest(&bytes[pos + 1..]);
+            }
+            if b >= 0x80 {
+                if pos > 0 {
+                    vte_advance(&mut self.vte, perform, &bytes[..pos]);
+                }
+                self.abort_sequence(perform, false);
+                self.apc = ApcState::Ground;
+                return Step::Aborted(&bytes[pos + 1..]);
+            }
+            // Ended normally (final byte, CAN or SUB). Hand vte the ground
+            // text up to the next ESC in the same call when it is
+            // known-clean, as the ground path would.
+            let rest = &bytes[pos + 1..];
+            let at = total - rest.len();
+            let next_esc = memchr::memchr(0x1B, rest);
+            let run = next_esc.unwrap_or(rest.len());
+            if clean.0 <= at && at + run <= clean.1 && !self.utf8.holds_partial() {
+                vte_advance(&mut self.vte, perform, &bytes[..=pos + run]);
+                let Some(e) = next_esc else {
+                    self.apc = ApcState::Ground;
+                    return Step::Done;
+                };
+                self.apc = ApcState::AfterEsc;
+                return Step::Rest(&rest[e + 1..]);
+            }
+            vte_advance(&mut self.vte, perform, &bytes[..=pos]);
+            self.apc = ApcState::Ground;
+            return Step::Rest(rest);
+        }
+    }
+
+    /// Abort the escape or CSI sequence vte is in, with no dispatch, the
+    /// way kitty drops one cut by a non-ASCII byte (WIRE-17, WIRE-18).
+    /// `with_esc` first gives vte the held ESC, which ends any string in
+    /// progress as usual. CAN then returns vte to ground; the null
+    /// performer swallows CAN's own execute.
+    fn abort_sequence<P: Perform + ?Sized>(&mut self, perform: &mut P, with_esc: bool) {
+        if with_esc {
+            vte_advance(&mut self.vte, perform, &[0x1B]);
+        }
+        self.vte.advance(&mut NullPerform, &[0x18]);
     }
 
     /// `ApcState::SosPm` step: drop the string body up to its
@@ -380,8 +643,7 @@ impl Scanner {
             0x1B => self.apc = ApcState::AfterEsc,
             // CAN / SUB: executed, as vte does when they end a string.
             byte => {
-                self.vte
-                    .advance(&mut VteAdapter { inner: perform }, &[byte]);
+                vte_advance(&mut self.vte, perform, &[byte]);
                 self.apc = ApcState::Ground;
             }
         }
@@ -396,12 +658,11 @@ impl Scanner {
         bytes: &'b [u8],
     ) -> &'b [u8] {
         let Some(pos) = dcs_special(bytes) else {
-            self.vte.advance(&mut VteAdapter { inner: perform }, bytes);
+            vte_advance(&mut self.vte, perform, bytes);
             return &[];
         };
         if pos > 0 {
-            self.vte
-                .advance(&mut VteAdapter { inner: perform }, &bytes[..pos]);
+            vte_advance(&mut self.vte, perform, &bytes[..pos]);
         }
         match bytes[pos] {
             // Data, not ST: drop it.
@@ -410,8 +671,7 @@ impl Scanner {
             0x1B => self.apc = ApcState::DcsAfterEsc,
             // BEL ends the DCS exactly like ST.
             0x07 => {
-                self.vte
-                    .advance(&mut VteAdapter { inner: perform }, b"\x1b\\");
+                vte_advance(&mut self.vte, perform, b"\x1b\\");
                 self.apc = ApcState::Ground;
             }
             // CAN / SUB cancel the DCS (xterm, vte). vte unhooks it as
@@ -419,8 +679,7 @@ impl Scanner {
             // it must not be acted on (WIRE-15).
             byte => {
                 perform.dcs_cancel();
-                self.vte
-                    .advance(&mut VteAdapter { inner: perform }, &[byte]);
+                vte_advance(&mut self.vte, perform, &[byte]);
                 self.apc = ApcState::Ground;
             }
         }
@@ -447,8 +706,7 @@ impl Scanner {
             return &bytes[body..];
         }
         if body > 0 {
-            self.vte
-                .advance(&mut VteAdapter { inner: perform }, &bytes[..body]);
+            vte_advance(&mut self.vte, perform, &bytes[..body]);
         }
         let Some(pos) = term else {
             self.apc = ApcState::Osc { len: len + body };
@@ -458,8 +716,7 @@ impl Scanner {
             // Possibly ST; let the ESC peek logic replay it.
             self.apc = ApcState::AfterEsc;
         } else {
-            self.vte
-                .advance(&mut VteAdapter { inner: perform }, &bytes[pos..=pos]);
+            vte_advance(&mut self.vte, perform, &bytes[pos..=pos]);
             self.apc = ApcState::Ground;
         }
         &bytes[pos + 1..]
@@ -751,6 +1008,108 @@ mod tests {
         let mut r = Recorder::default();
         p.advance(&mut r, bytes);
         r
+    }
+
+    /// `bytes` whole and byte by byte must give the same events.
+    fn parse_both(bytes: &[u8]) -> Recorder {
+        let whole = parse(bytes);
+        let mut p = Parser::new();
+        let mut r = Recorder::default();
+        for b in bytes {
+            p.advance(&mut r, std::slice::from_ref(b));
+        }
+        assert_eq!(whole, r, "byte-at-a-time differs for {bytes:?}");
+        whole
+    }
+
+    /// WIRE-17, checked on kitty 0.49.2 with `kitten @ get-text`: a byte
+    /// of 0x80 or more inside a CSI aborts it (no dispatch) and is dropped; the
+    /// rest is ground text, so a multi-byte character's continuation
+    /// bytes show as U+FFFD.
+    #[test]
+    fn high_byte_inside_csi_aborts_it_like_kitty() {
+        let cases: &[(&[u8], &str)] = &[
+            (b"\x1b[3\x9c1mX", "1mX"),
+            (b"\x1b[31\x9cmX", "mX"),
+            (b"\x1b[\x9c31mX", "31mX"),
+            (b"\x1b[3\x801mX", "1mX"),
+            (b"\x1b[3\xff1mX", "1mX"),
+            (b"\x1b[3\xe2\x82\xac1mX", "\u{fffd}\u{fffd}1mX"),
+            (b"\x1b[3\xc3\xa91mX", "\u{fffd}1mX"),
+            (b"\x1b[?25\x9chX", "hX"),
+            (b"\x1b[1;2\x9cHX", "HX"),
+            (b"\x1b[3\xc2\x9c1mX", "\u{fffd}1mX"),
+            (b"\x1b[3\xc2\x851mX", "\u{fffd}1mX"),
+            (b"\x1b[1 \x9cqX", "qX"),
+        ];
+        for &(input, want) in cases {
+            let r = parse_both(input);
+            assert_eq!(r.text, want, "{input:?}");
+            assert!(r.csi.is_empty() && r.esc.is_empty(), "{input:?}: {r:?}");
+        }
+        // The next sequence after an aborted one works.
+        let r = parse_both(b"\x1b[3\x9c\x1b[32mG");
+        assert_eq!((r.text.as_str(), r.csi.len()), ("G", 1));
+        assert_eq!(r.csi[0].0, vec![vec![32u16]]);
+        // C0 inside a CSI is still executed and the CSI goes on (kitty
+        // `ESC[3 BS 1mX` applies SGR 31).
+        let r = parse_both(b"\x1b[3\x081mX");
+        assert_eq!((r.text.as_str(), r.execs.as_slice()), ("X", &[0x08u8][..]));
+        assert_eq!(r.csi[0].0, vec![vec![31u16]]);
+    }
+
+    /// WIRE-18 (kitty 0.49.2): ESC followed by a non-ASCII byte is
+    /// dropped with that byte, at any point before the escape's final
+    /// byte; the rest is ground text.
+    #[test]
+    fn esc_followed_by_non_ascii_is_dropped_like_kitty() {
+        let cases: &[(&[u8], &str)] = &[
+            (b"\x1b\xe2\x82\xacA", "\u{fffd}\u{fffd}A"),
+            (b"\x1b\xc3\xa9A", "\u{fffd}A"),
+            (b"\x1b\x9cA", "A"),
+            (b"\x1b\x80A", "A"),
+            (b"\x1b\xffA", "A"),
+            (b"\x1b\xc2\x9cA", "\u{fffd}A"),
+            (b"\x1b(\xe2\x82\xacA", "\u{fffd}\u{fffd}A"),
+            (b"\x1b\xf0\x9f\x98\x80A", "\u{fffd}\u{fffd}\u{fffd}A"),
+            (b"\x1b(\x9cBX", "BX"),
+            (b"\x1b#\x9c8X", "8X"),
+        ];
+        for &(input, want) in cases {
+            let r = parse_both(input);
+            assert_eq!(r.text, want, "{input:?}");
+            assert!(r.esc.is_empty() && r.csi.is_empty(), "{input:?}: {r:?}");
+        }
+        // Ordinary escapes are untouched.
+        let r = parse_both(b"\x1b(BX\x1b7\x1b8ok");
+        assert_eq!(r.text, "Xok");
+        assert_eq!(r.esc.len(), 3);
+    }
+
+    /// The dropped byte can be split from its continuation bytes by a
+    /// read boundary: those still show as U+FFFD.
+    #[test]
+    fn abort_split_across_reads() {
+        let mut p = Parser::new();
+        let mut r = Recorder::default();
+        p.advance(&mut r, b"\x1b[3\xe2");
+        p.advance(&mut r, b"\x82\xac1mX");
+        assert_eq!(r.text, "\u{fffd}\u{fffd}1mX");
+        assert!(r.csi.is_empty());
+        // An all-ASCII read that ends inside a sequence (the fast path
+        // that leaves sequences to vte) still lets the next read abort it.
+        for (a, b, want) in [
+            (&b"x\x1b[3"[..], &b"\x9c1mX"[..], "x1mX"),
+            (b"x\x1b[", b"\x9c31mX", "x31mX"),
+            (b"x\x1b(", b"\xe2\x82\xacA", "x\u{fffd}\u{fffd}A"),
+        ] {
+            let mut p = Parser::new();
+            let mut r = Recorder::default();
+            p.advance(&mut r, a);
+            p.advance(&mut r, b);
+            assert_eq!(r.text, want, "{a:?} | {b:?}");
+            assert!(r.csi.is_empty() && r.esc.is_empty(), "{r:?}");
+        }
     }
 
     #[test]
