@@ -128,6 +128,8 @@ pub(crate) struct Wrapped {
     pub prelude_lines: u32,
     /// Lines in the user's file.
     pub user_lines: u32,
+    /// Byte offset where the epilogue starts.
+    pub epilogue_at: usize,
 }
 
 impl Wrapped {
@@ -142,11 +144,13 @@ impl Wrapped {
             text.push('\n');
             user_lines += 1;
         }
+        let epilogue_at = text.len();
         text.push_str(epilogue);
         Self {
             text,
             prelude_lines,
             user_lines,
+            epilogue_at,
         }
     }
 
@@ -157,6 +161,11 @@ impl Wrapped {
         (1..=self.user_lines)
             .contains(&line)
             .then_some((line, loc.line_position))
+    }
+
+    /// True when `span` starts in the epilogue (after the user's file).
+    fn in_epilogue(&self, span: Span) -> bool {
+        span.to_range().is_some_and(|r| r.start >= self.epilogue_at)
     }
 
     fn span_location(&self, span: Span) -> Option<(u32, u32)> {
@@ -292,31 +301,41 @@ pub(crate) fn compile(src: &PostShaderSource) -> Result<CompiledShader, Vec<Shad
                         .iter()
                         .map(|e| {
                             let loc = wrapped.span_location(e.meta);
-                            err(loc, explain(lang, &e.kind.to_string(), loc.is_some()))
+                            let message = e.kind.to_string();
+                            // The epilogue's `main()` can't call `mainImage`.
+                            let message = if loc.is_none() && message.contains("mainImage") {
+                                GLSL_SIGNATURE.to_owned()
+                            } else {
+                                hint(&message)
+                            };
+                            err(loc, message)
                         })
                         .collect::<Vec<_>>()
                 })?
         }
         Language::Wgsl => naga::front::wgsl::parse_str(&wrapped.text).map_err(|e| {
-            let loc = e.labels().find_map(|(span, _)| wrapped.span_location(span));
-            let mut message = e.message().to_owned();
-            if let Some((_, label)) = e.labels().next()
-                && !label.is_empty()
-                && label != message
-            {
-                message = format!("{message} ({label})");
-            }
-            vec![err(loc, explain(lang, &message, loc.is_some()))]
+            let (loc, message) = wgsl_parse_error(&e, &wrapped);
+            vec![err(loc, message)]
         })?,
     };
+    // A file ending inside `/*` comments the whole prelude out, which can
+    // still parse.
+    if lang == Language::Wgsl && !module.entry_points.iter().any(|ep| ep.name == WGSL_ENTRY) {
+        return Err(vec![err(
+            Some((wrapped.user_lines, 1)),
+            UNCLOSED.to_owned(),
+        )]);
+    }
     let info = Validator::new(ValidationFlags::all(), Capabilities::default())
         .validate(&module)
         .map_err(|e| {
             let loc = pick_location(&wrapped, e.spans().map(|(span, _)| span));
-            vec![err(
-                loc,
-                explain(lang, &error_chain(e.as_inner()), loc.is_some()),
-            )]
+            let message = if lang == Language::Wgsl && is_main_image_call_error(e.as_inner()) {
+                WGSL_SIGNATURE.to_owned()
+            } else {
+                hint(&error_chain(e.as_inner()))
+            };
+            vec![err(loc, message)]
         })?;
     let entry_point = match lang {
         Language::Glsl => module
@@ -386,27 +405,74 @@ const GLSL_SIGNATURE: &str =
     "the shader must define `void mainImage(out vec4 fragColor, in vec2 fragCoord)`";
 const WGSL_SIGNATURE: &str = "the shader must define `fn mainImage(fragCoord: vec2f) -> vec4f`";
 
-/// Rewrite messages that commonly need it. An error outside the user's
-/// file that involves `mainImage` (or the WGSL entry point calling it)
-/// means a missing `mainImage` or one with the wrong signature: say what
-/// it must look like.
-fn explain(lang: Language, message: &str, in_user_file: bool) -> String {
+/// Parse errors that ran past the end of the user's WGSL file.
+const UNEXPECTED_EOF: &str = "unexpected end of file (unclosed `{` or comment?)";
+const UNCLOSED: &str = "file ends inside a comment or an unclosed block";
+
+/// Location and message for a WGSL parse error.
+fn wgsl_parse_error(
+    e: &naga::front::wgsl::ParseError,
+    wrapped: &Wrapped,
+) -> (Option<(u32, u32)>, String) {
+    let loc = e.labels().find_map(|(span, _)| wrapped.span_location(span));
+    let mut message = e.message().to_owned();
+    if let Some((_, label)) = e.labels().next()
+        && !label.is_empty()
+        && label != message
+    {
+        message = format!("{message} ({label})");
+    }
+    if loc.is_none() && message.contains("mainImage") {
+        // The prelude's entry point can't find `mainImage`.
+        return (None, WGSL_SIGNATURE.to_owned());
+    }
+    if e.labels()
+        .next()
+        .is_some_and(|(span, _)| wrapped.in_epilogue(span))
+    {
+        // The parser ran on into the prelude: the user's file left a
+        // block or comment open.
+        return (Some((wrapped.user_lines, 1)), UNEXPECTED_EOF.to_owned());
+    }
+    (loc, hint(&message))
+}
+
+/// Add a hint to messages that commonly need one.
+fn hint(message: &str) -> String {
     if ["iChannel1", "iChannel2", "iChannel3"]
         .iter()
         .any(|c| message.contains(c))
     {
         return format!("{message} (only iChannel0, the terminal image, is available)");
     }
-    if !in_user_file {
-        match lang {
-            Language::Glsl if message.contains("mainImage") => return GLSL_SIGNATURE.to_owned(),
-            Language::Wgsl if message.contains("mainImage") || message.contains(WGSL_ENTRY) => {
-                return WGSL_SIGNATURE.to_owned();
-            }
-            _ => {}
-        }
-    }
     message.to_owned()
+}
+
+/// True when a WGSL validation error is about the prelude's entry point
+/// calling `mainImage` with the wrong signature (argument count or type,
+/// or a return value that isn't a `vec4f`), not about what `mainImage`
+/// does.
+fn is_main_image_call_error(e: &naga::valid::ValidationError) -> bool {
+    use naga::valid::{CallError, EntryPointError, FunctionError, ValidationError};
+    let ValidationError::EntryPoint {
+        name,
+        source: EntryPointError::Function(f),
+        ..
+    } = e
+    else {
+        return false;
+    };
+    name == WGSL_ENTRY
+        && matches!(
+            f,
+            FunctionError::InvalidReturnType { .. }
+                | FunctionError::InvalidCall {
+                    error: CallError::ArgumentCount { .. }
+                        | CallError::ArgumentType { .. }
+                        | CallError::Argument { .. },
+                    ..
+                }
+        )
 }
 
 /// The location to report for an error with these spans: the narrowest
@@ -630,6 +696,37 @@ mod tests {
             assert_eq!(errs[0].line, None, "{name}");
             assert_eq!(errs[0].message, GLSL_SIGNATURE, "{name}");
         }
+    }
+
+    #[test]
+    fn real_errors_through_the_entry_point_are_kept() {
+        // `workgroupBarrier` is forbidden in a fragment shader: naga
+        // reports it on the prelude's entry point, but it is not a
+        // signature problem.
+        let errs = compile_err(
+            "barrier.wgsl",
+            "fn mainImage(p: vec2f) -> vec4f {\n    workgroupBarrier();\n    return vec4f(1.0);\n}\n",
+        );
+        assert_ne!(errs[0].message, WGSL_SIGNATURE);
+        assert!(errs[0].message.contains("forbidden"), "{}", errs[0]);
+    }
+
+    #[test]
+    fn wgsl_left_open_at_the_end_is_reported_at_the_last_line() {
+        // Unclosed comment: swallows the prelude, which still parses.
+        let errs = compile_err(
+            "comment.wgsl",
+            "fn mainImage(p: vec2f) -> vec4f {\n    return vec4f(1.0);\n}\n/* trailing\n",
+        );
+        assert_eq!(errs[0].message, UNCLOSED);
+        assert_eq!(errs[0].line, Some(4));
+        // Unclosed block: the parser trips over the prelude.
+        let errs = compile_err(
+            "brace.wgsl",
+            "fn mainImage(p: vec2f) -> vec4f {\n    return vec4f(1.0);\n",
+        );
+        assert_eq!(errs[0].message, UNEXPECTED_EOF);
+        assert_eq!(errs[0].line, Some(2));
     }
 
     #[test]

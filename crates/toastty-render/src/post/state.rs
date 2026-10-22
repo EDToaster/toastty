@@ -520,11 +520,23 @@ impl PostState {
     /// swapchain image: occluded, outdated, timed out). Counts as shown for
     /// the schedule, so an animating chain doesn't spin on a hidden window;
     /// the next frame that draws shows the current state anyway. While
-    /// `occluded`, time-driven frames slow to [`OCCLUDED_INTERVAL`].
+    /// `occluded`, time-driven frames slow to [`OCCLUDED_INTERVAL`] and a
+    /// pending event frame is dropped (the window is hidden). Otherwise
+    /// (timeout, outdated surface) the event frame stays pending, to be
+    /// drawn on the next try: those don't repeat without blocking, so
+    /// this can't spin.
     pub(crate) fn frame_dropped(&mut self, now: Instant, occluded: bool) {
         self.last_frame = Some(now);
-        self.event_pending = false;
+        if occluded {
+            self.event_pending = false;
+        }
         self.occluded = occluded;
+    }
+
+    /// Start the local UTC offset lookup now (a chain that reads `iDate`
+    /// was installed), so the first frames aren't shown in UTC.
+    pub(crate) fn prepare_date(&self) {
+        self.local_offset.get(unix_now().as_secs());
     }
 
     /// `iDate`: `(year, month - 1, day, seconds since local midnight)`.
@@ -917,6 +929,31 @@ mod tests {
         s.set_focused(false, t0, &any, PostAnimation::Auto);
         s.set_focused(true, t0 + ms(5), &any, PostAnimation::Auto);
         assert!(s.frame_due(t0 + ms(5), PostAnimation::Auto, &any));
+    }
+
+    #[test]
+    fn dropped_event_frame_is_kept_unless_occluded() {
+        let t0 = Instant::now();
+        let inputs = reads(&["iMouse"], None);
+        let mut s = PostState::default();
+        s.set_pointer((1.0, 1.0), true, &inputs);
+        s.frame_dropped(t0, false);
+        assert!(s.frame_due(t0, PostAnimation::Auto, &inputs));
+        s.frame_dropped(t0, true);
+        assert!(!s.frame_due(t0, PostAnimation::Auto, &inputs));
+    }
+
+    #[test]
+    fn prepare_date_starts_the_offset_lookup() {
+        let s = PostState::default();
+        s.prepare_date();
+        // The helper thread schedules the next lookup when it's done
+        // (whether or not `date` exists).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while s.local_offset.0.refresh_at.load(Ordering::Relaxed) == 0 {
+            assert!(Instant::now() < deadline, "lookup never finished");
+            std::thread::sleep(ms(5));
+        }
     }
 
     #[test]
