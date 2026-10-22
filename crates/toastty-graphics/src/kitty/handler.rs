@@ -21,6 +21,7 @@ use base64::Engine;
 
 use super::decode::{DecodeError, decode};
 use super::header::{Action, Compression, DeleteSpec, Header, Quiet, Transmission};
+use super::placeholder::VirtualPlacement;
 use super::reply::{ErrorCode, encode_error, encode_ok};
 use crate::image_grid::{Placement, RelativeError, SrcRect};
 use crate::registry::ImageData;
@@ -67,6 +68,12 @@ pub trait KittySink {
     fn place_relative(&mut self, _placement: Placement) -> Result<(), RelativeError> {
         Err(RelativeError::NoParent)
     }
+
+    /// Create (or, for a non-zero placement id, replace) a *virtual*
+    /// placement: `U=1` on `a=T` / `a=p`. Nothing is drawn and the cursor
+    /// doesn't move; Unicode placeholder cells refer to it. Default is a
+    /// no-op so simple test sinks don't need to track them.
+    fn place_virtual(&mut self, _placement: VirtualPlacement) {}
 
     /// Delete by spec. Receives both the header (for `i=` / `I=` /
     /// `delete` fields) and the resolved id (or `0` for "no specific
@@ -592,11 +599,13 @@ impl KittyHandler {
         //
         // B12: `U=1` requests a VIRTUAL placement — the image is
         // registered (done above) but NOT displayed at the cursor, and
-        // the cursor must NOT advance. The visible references come from
-        // subsequent U+10EEEE placeholder cells (handled elsewhere). So
-        // for `U=1` we skip both the visible placement and the cursor
+        // the cursor must NOT advance. The host stores the virtual
+        // placement; U+10EEEE placeholder cells refer to it. So for
+        // `U=1` we skip both the visible placement and the cursor
         // advance, but still reply OK.
-        if matches!(header.action, Action::TransmitAndPlace) && !header.unicode_placeholder {
+        if matches!(header.action, Action::TransmitAndPlace) && header.unicode_placeholder {
+            sink.place_virtual(virtual_placement_from_header(&header, final_id));
+        } else if matches!(header.action, Action::TransmitAndPlace) {
             let (cell_pw, cell_ph) = sink.cell_pixel_size();
             let placement =
                 default_placement_from_header(&header, final_id, img_w, img_h, cell_pw, cell_ph);
@@ -625,12 +634,13 @@ impl KittyHandler {
             reply_error_if_verbose(&header, sink, ErrorCode::Einval, "place requires i=");
             return;
         }
-        // B12: `U=1` is a virtual placement — register-only, no visible
-        // placement at the cursor and no cursor motion. The image was
-        // already transmitted; the placeholder pipeline (handled
-        // elsewhere) provides the visible references. Reply OK and
-        // return without calling `place_image`.
+        // B12: `U=1` is a virtual placement — no visible placement at
+        // the cursor and no cursor motion. The image was already
+        // transmitted; the host stores the virtual placement and the
+        // placeholder cells provide the visible references. Reply OK
+        // and return without calling `place_image`.
         if header.unicode_placeholder {
+            sink.place_virtual(virtual_placement_from_header(&header, header.image_id));
             reply_ok_if_verbose_with_id(&header, sink, header.image_id);
             return;
         }
@@ -904,6 +914,19 @@ fn default_placement_from_header(
         // overrides these for `a=p` with `P=`/`Q=` set (M13).
         parent: None,
         rel_offset: (0, 0),
+    }
+}
+
+/// The virtual placement a `U=1` command creates. `c=`/`r=` are kept
+/// raw: `0` means "natural size", resolved against the cell size when
+/// the placeholder cells are drawn.
+fn virtual_placement_from_header(header: &Header, id: u32) -> VirtualPlacement {
+    VirtualPlacement {
+        image_id: id,
+        placement_id: header.placement_id,
+        cols: header.cols,
+        rows: header.rows,
+        z: header.z,
     }
 }
 
@@ -1585,6 +1608,7 @@ mod blocker_graphics_tests {
     struct RecordingSink {
         registered: Vec<(u32, ImageData)>,
         placements: Vec<Placement>,
+        virtuals: Vec<VirtualPlacement>,
         replies: Vec<Vec<u8>>,
         cursor_advances: usize,
         assign_next: u32,
@@ -1629,6 +1653,9 @@ mod blocker_graphics_tests {
         fn delete_image(&mut self, _delete: DeleteSpec, _header: &Header) {}
         fn queue_reply(&mut self, bytes: &[u8]) {
             self.replies.push(bytes.to_vec());
+        }
+        fn place_virtual(&mut self, placement: VirtualPlacement) {
+            self.virtuals.push(placement);
         }
         fn advance_cursor_after_placement(&mut self, _rows: u16, _cols: u16, _start_col: u16) {
             self.cursor_advances += 1;
@@ -1762,6 +1789,17 @@ mod blocker_graphics_tests {
             "U=1 must not create a visible placement"
         );
         assert_eq!(sink.cursor_advances, 0, "U=1 must not advance the cursor");
+        // The virtual placement is handed to the host with its box.
+        assert_eq!(
+            sink.virtuals,
+            vec![VirtualPlacement {
+                image_id: 5,
+                placement_id: 0,
+                cols: 2,
+                rows: 2,
+                z: 0,
+            }]
+        );
         // Still replies OK (id present).
         assert!(sink.joined_replies().contains(";OK"));
     }
@@ -1771,7 +1809,19 @@ mod blocker_graphics_tests {
         let mut h = KittyHandler::new();
         let mut sink = RecordingSink::new();
         // a=p with U=1 — no visible placement, no cursor advance.
-        h.process(b"Ga=p,i=5,U=1", b"", &mut sink).unwrap();
+        h.process(b"Ga=p,i=5,p=3,U=1,c=7,z=-4", b"", &mut sink)
+            .unwrap();
+        assert_eq!(
+            sink.virtuals,
+            vec![VirtualPlacement {
+                image_id: 5,
+                placement_id: 3,
+                cols: 7,
+                rows: 0,
+                z: -4,
+            }],
+            "c=/r= stay raw (0 = natural size, resolved at draw time)"
+        );
         assert!(
             sink.placements.is_empty(),
             "a=p,U=1 must not create a visible placement"
