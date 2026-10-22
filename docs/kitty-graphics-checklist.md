@@ -178,7 +178,7 @@ UVs at draw time. Don't patch each item separately.
   - Cause: `resolve_relative_positions` (`image_grid.rs:201-249`) uses the
     parent's clamped row. Once the parent is dropped, the child loses its
     anchor.
-- [ ] **P1 — SCR-9 (text bug found while testing scrolling). SD and RI at
+- [x] **P1 — SCR-9 (text bug found while testing scrolling). SD and RI at
   the top pull scrollback back onto the screen.**
   - Repro: `seq 1 100`, then `K raw '\x1b[3T'`.
   - Expected (xterm, kitty): blank lines are inserted at the top.
@@ -187,6 +187,9 @@ UVs at draw time. Don't patch each item separately.
   - Cause: `crates/toastty-term/src/grid.rs:299-316`. `Grid::scroll_down`
     rotates the `head - 1` history slot back in, despite its doc comment
     ("a fresh blank row appears at the top"). Called from `term.rs:2050`.
+  - Fix: `scroll_down` now rotates the visible slots in place and leaves
+    `history_lines` and `bottom_id` alone, matching kitty 0.49.2. Fixed in
+    #23.
 - [ ] **P0 — SCR-10. An image that doesn't fit below the cursor always
   scrolls the screen, even with `C=1` and in the alt screen.**
   - Repro:
