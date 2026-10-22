@@ -4085,7 +4085,7 @@ mod below_cell_bg_tests {
         let place = |id: u32, rows: std::ops::Range<u16>, cols: std::ops::Range<u16>| {
             let mut p = Placement::new(id, rows.end - rows.start, cols.end - cols.start);
             p.line = i64::from(rows.start);
-            p.col = cols.start;
+            p.col = i32::from(cols.start);
             p.key = toastty_term::ImageKey(id);
             p.src_rect = SrcRect::FULL;
             p.z = i32::MIN;
