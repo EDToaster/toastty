@@ -818,7 +818,8 @@ Seen during app testing, not a graphics bug:
     - Each stack holds 8 entries and evicts the oldest when full.
     - `CSI = u` modes 1, 2 and 3 behave the same as in kitty, including
       on an empty stack.
-    - RIS clears both stacks.
+    - RIS and DECSTR (`CSI ! p`, which `tput init` sends) clear both
+      stacks.
     - Fixed in #33.
 
 Performance notes (Xvfb, software present; not conclusive):
