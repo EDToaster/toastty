@@ -312,3 +312,21 @@ redraw that `render_term` would skip.
 The CWD probe now runs only for slices that open an APC (`ESC _`, also
 across a slice boundary): RGP's `r;path=` registration, the only reader of
 the CWD, is an APC.
+
+Measured with `bench/run.py` (Xvfb, 128×42 cells), interleaved single
+runs of the old and new binaries, median of 4 each, on a shared and busy
+machine (absolute MB/s swing ±40 % between runs; compare within a row):
+
+| workload | MB/s old → new | frames/s during flood | peak RSS MB |
+|---|---|---|---|
+| `cat` 64 MB ascii | 22 → 39 | 0 → 60 | 336 → 104 |
+| `cat` 32 MB SGR | 34 → 56 | 0 → 60 | 194 → 103 |
+| `cat` 16 MB unicode | 17 → 19 | 0 → 51 | 161 → 106 |
+| `cat` 23 MB `seq` | 10 → 21 | 0 → 59 | 289 → 103 |
+| `dense_cells` (mode 2026 frames) | 64 → 100 | 0 → 58 | 124 → 104 |
+
+Key → frame latency was unchanged (p50 0.89 → 0.63 ms); idle RSS is
+~98–102 MB. Output → frame during a flood is now one frame interval
+(~17 ms) instead of the length of the flood. Unicode is the case where
+drawing frames costs throughput: its frames take ~6 ms (vs < 1 ms for
+ASCII), so the render share is close to the one-third cap.
