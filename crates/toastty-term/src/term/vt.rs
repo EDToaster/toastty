@@ -463,6 +463,7 @@ impl Term {
             ch: 'E',
             style: Style::RESET,
             is_continuation: false,
+            wrap_pad: false,
             hyperlink_id: None,
             extra: None,
         };

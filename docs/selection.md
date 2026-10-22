@@ -57,8 +57,10 @@ highlight is cleared by:
   of the selection. Spaces that happen to sit at a soft-wrap boundary
   are kept, so `abcd efgh` wrapped after the space still copies as
   `abcd efgh`.
-- A blank pad cell is dropped when it was left in the last column
-  because a wide character didn't fit there and wrapped.
+- The blank pad cell a wide character leaves in the last column, when
+  it didn't fit there and wrapped, is dropped. toastty marks that cell
+  when it prints the wide char, so a real space in the last column is
+  kept even when the next row starts with a wide character.
 - Block selections copy one line per row, trimmed per row.
 - If part of a selection has been evicted from scrollback while you
   were dragging, the rows that are still retained are copied.
