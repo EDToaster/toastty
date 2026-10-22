@@ -38,7 +38,12 @@ uses it too. A full-screen scroll up moves the ids, not the placements, so:
 
 - a placement rides along with its text into scrollback for free, with no
   per-scroll work;
-- history eviction is a range check against `Grid::oldest_retained_id()`;
+- history eviction is a range check against the oldest retained line,
+  computed as `top_line - history_lines` in signed space (not
+  `Grid::oldest_retained_id()`, which saturates at 0 after SD with no
+  history). `ImageGrid` caches the min/max shown line across its
+  placements, so the check on every LF is O(1) unless something can
+  actually be evicted;
 - output that arrives while the user is scrolled back moves text and images
   together, because the viewport compensates for both in the same way.
 
@@ -47,7 +52,7 @@ uses it too. A full-screen scroll up moves the ids, not the placements, so:
 | Operation | What happens to placements |
 |---|---|
 | LF / IND / SU at full-screen margins | Nothing (ids move). Then `retain_lines` evicts anything that left the history. |
-| SD / RI at full-screen margins | With #23, `Grid::scroll_down` moves the visible text under fixed ids, so `shift_rows_from(top, 0, +1)` moves placements that start on screen down by one, untrimmed. (Before #23 the grid renumbered rows with the text. The term detects that from `top_line` changing and does nothing, because the anchors already track.) A box pushed partly below the bottom keeps its whole box, so a later SU brings it all back (kitty does the same). |
+| SD / RI at full-screen margins | With #23, `Grid::scroll_down` moves the visible text under fixed ids, so `shift_rows_from(top, 0, +1)` moves every placement whose shown rows reach the screen down by one, untrimmed, including one straddling the top edge (its hidden rows come back, as in kitty), and re-resolves relative children. Placements entirely in scrollback stay on their history text; kitty shifts those too, and this is a deliberate divergence. (Before #23 the grid renumbered rows with the text. The term detects that from `top_line` changing and does nothing, because the anchors already track.) A box pushed partly below the bottom keeps its whole box, so a later SU brings it all back (kitty does the same). |
 | DECSTBM partial-region scroll | `scroll_region`: only placements whose shown rows lie **entirely** inside the margins move (spec, SCR-5). They are clipped at the margin through `clip_rows`, and the clip is permanent, as in kitty. |
 | IL / DL | Same `scroll_region` call over `[cursor row, bottom margin]`. SCR-6 (kitty doesn't move images on IL/DL) is left for A2. |
 | Placing an image (`a=T`, `a=p`, sixel) | The box is anchored at the cursor line and **never** scrolls the screen by itself. |
@@ -82,6 +87,10 @@ an `ImageView { top_line, scroll_px, clip }`:
   box plus `pix_offset`, and intersects it with `clip` (the content area) and
   with the `clip_rows` band. It then crops the UVs by the same fractions. A
   partly hidden image is cropped and never squashed.
+- The clip matches what the text pass covers: the grid itself
+  (`cols × rows` cells) at the live bottom. While scrolled back or mid
+  smooth-scroll it also includes the partial row above the top and the
+  rows that fill the content area below, exactly as text.
 - It is O(placements) per frame, with no per-cell work. Fully clipped
   placements are culled before the registry and texture-cache lookups, so a
   lazy texture uploader (stack C, #24) only sees what is visible.
