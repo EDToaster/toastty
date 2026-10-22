@@ -3138,9 +3138,26 @@ impl Term {
                 }
                 self.mark_cells(cur_row, 0, cur_col.saturating_add(1));
             }
-            // 2/3: entire screen (3 = also scrollback, which we treat the same in M3).
+            // 2: entire screen. 3 (ED 3, "erase saved lines"): kitty
+            // 0.49.2 erases the screen *and* the scrollback (SCR-13);
+            // xterm erases only the saved lines, and we follow kitty. On
+            // the alt screen it leaves the primary's scrollback alone, as
+            // in kitty. Note `clear` sends ED 3 only when the terminfo has
+            // `E3`: toastty runs with TERM=xterm-256color, which does, so
+            // `clear` erases history here as in xterm, VTE and alacritty;
+            // kitty's own xterm-kitty terminfo has no `E3`, so `clear`
+            // keeps the scrollback there.
             _ => {
                 grid.clear_visible(style);
+                if mode == 3 && !self.alt_active {
+                    self.primary.clear_history();
+                    // The history is gone: a scrolled-back view snaps to
+                    // the live screen, including a pixel-only (touchpad)
+                    // offset. The screen and history are both blank now,
+                    // so any selection goes too.
+                    self.viewport.clamp_to(0);
+                    self.drop_selection();
+                }
                 self.damage.mark_all();
                 // Per the kitty graphics protocol: "The clear screen
                 // escape code (usually ESC[2J) should also clear all
@@ -5505,6 +5522,74 @@ mod tests {
                 "init={init:?} op={op:?}",
             );
         }
+    }
+
+    #[test]
+    fn ed3_erases_screen_and_scrollback() {
+        // SCR-13: kitty 0.49.2 erases both on `CSI 3 J` (checked live);
+        // the cursor stays put.
+        let mut t = Term::new(4, 8, 100);
+        let lines: Vec<String> = (1..=10).map(|i| i.to_string()).collect();
+        feed(&mut t, lines.join("\r\n").as_bytes());
+        assert_eq!(t.history_lines(), 6);
+        let cursor = (t.cursor().row, t.cursor().col);
+        feed(&mut t, b"\x1b[3J");
+        assert_eq!(t.history_lines(), 0);
+        for r in 0..4 {
+            assert_eq!(row_text(&t, r), "", "row {r}");
+        }
+        assert_eq!((t.cursor().row, t.cursor().col), cursor);
+        // `clear`'s full sequence, then new output builds fresh history.
+        feed(&mut t, b"\x1b[H\x1b[2J\x1b[3Jnew\r\n\r\n\r\n\r\nx");
+        assert_eq!(t.history_lines(), 1);
+        let first: String = t.view_row(0).cells.iter().map(|c| c.ch).collect();
+        assert!(first.trim_end().is_empty(), "{first:?}");
+    }
+
+    #[test]
+    fn ed3_snaps_a_scrolled_back_view_to_the_live_screen() {
+        let mut t = Term::new(4, 8, 100);
+        feed(&mut t, b"1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8");
+        t.scroll_view_by(3, 0.0, 16.0);
+        t.force_snap_view();
+        assert_eq!(t.view_offset_lines(), 3);
+        feed(&mut t, b"\x1b[3J");
+        t.force_snap_view();
+        assert_eq!(t.view_offset_lines(), 0);
+        assert!(t.at_view_bottom());
+    }
+
+    #[test]
+    fn ed3_snaps_a_pixel_only_scrolled_view() {
+        // A touchpad nudge: scrolled back by less than one row.
+        let mut t = Term::new(4, 8, 100);
+        feed(&mut t, b"1\r\n2\r\n3\r\n4\r\n5\r\n6");
+        t.scroll_view_by(0, 5.0, 16.0);
+        t.force_snap_view();
+        assert_eq!(t.view_offset_lines(), 0);
+        assert!(t.view_offset_pixel() > 0.0);
+        feed(&mut t, b"\x1b[3J");
+        assert!(t.view_offset_pixel().abs() < f32::EPSILON);
+        assert!(t.at_view_bottom());
+    }
+
+    #[test]
+    fn ed3_on_alt_screen_keeps_primary_scrollback() {
+        let mut t = Term::new(4, 8, 100);
+        feed(&mut t, b"1\r\n2\r\n3\r\n4\r\n5\r\n6");
+        assert_eq!(t.history_lines(), 2);
+        feed(&mut t, b"\x1b[?1049hALT\x1b[3J");
+        assert_eq!(row_text(&t, 0), "", "alt screen erased");
+        feed(&mut t, b"\x1b[?1049l");
+        assert_eq!(t.history_lines(), 2, "primary history kept (kitty)");
+    }
+
+    #[test]
+    fn ed2_keeps_scrollback() {
+        let mut t = Term::new(4, 8, 100);
+        feed(&mut t, b"1\r\n2\r\n3\r\n4\r\n5\r\n6");
+        feed(&mut t, b"\x1b[2J");
+        assert_eq!(t.history_lines(), 2);
     }
 
     #[test]

@@ -621,6 +621,32 @@ mod selection {
     }
 
     #[test]
+    fn ed3_drops_a_selection_on_erased_scrollback() {
+        // SCR-13: ED 3 erases the scrollback (and the screen), so the
+        // selection is dropped right away, committed or mid-drag.
+        let mut t = Term::new(2, 8, 8);
+        feed(&mut t, b"old\r\nmid\r\nbot");
+        let old = pos_for(&t, 0, 0).line_id - 1;
+        let mut sel = Selection::new(Pos::new(old, 0), SelectionMode::Char);
+        sel.set_active(Pos::new(old, 2));
+        t.set_selection(sel);
+        t.commit_selection();
+        assert_eq!(t.extract_selection_text().as_deref(), Some("old"));
+        feed(&mut t, b"\x1b[3J");
+        assert!(t.selection().is_none());
+        assert!(!t.revalidate_selection(), "nothing left to revalidate");
+        // Drag in progress (not committed) spanning history and screen.
+        feed(&mut t, b"\x1b[Hab\r\ncd\r\nef");
+        let top = pos_for(&t, 0, 0).line_id - 1;
+        let mut sel = Selection::new(Pos::new(top, 0), SelectionMode::Char);
+        sel.set_active(pos_for(&t, 1, 1));
+        t.set_selection(sel);
+        feed(&mut t, b"\x1b[3J");
+        assert!(t.selection().is_none());
+        assert_eq!(t.extract_selection_text(), None);
+    }
+
+    #[test]
     fn committed_selection_survives_scroll_but_not_eviction() {
         let mut t = Term::new(2, 8, 2);
         feed(&mut t, b"sel");
