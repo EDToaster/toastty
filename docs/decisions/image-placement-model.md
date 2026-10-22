@@ -209,8 +209,9 @@ an `ImageView { top_line, scroll_px, clip }`:
       the child on another placement of the image.
     - Replacing a placement in place (`upsert`) keeps its handle, so its
       children stay bound.
-    - A child of a Unicode-placeholder parent (a group of tiles) is still
-      found by ids, until #28.
+    - A child of a virtual (Unicode-placeholder) parent has no handle: the
+      parent is no grid placement, so it is found by ids in the grid's
+      virtual-parent snapshot (see "Placeholder parents").
     - The orphan sweep builds a set of live handles once per pass and
       removes with one drain, so it is O(n) per pass.
   - **Freeing child images.** The cascaded children are returned
@@ -252,8 +253,14 @@ an `ImageView { top_line, scroll_px, clip }`:
   - **Placeholder parents.** A child of a Unicode-placeholder parent
     measures from the minimum line and the minimum column over the
     parent's placeholder images (`ImageGrid::parent_origin`, REL-5).
-    This uses placeholder tiles until #28 lands; after that it asks
-    `Term::placeholder_origin`.
+    With #28 the origin comes from `Term::placeholder_origin`:
+    `Term::refresh_virtual_parents` hands the grid a snapshot of every
+    virtual placement's origin (`ImageGrid::set_virtual_parents`) before
+    each relative placement and whenever virtual placements go, and the
+    children of a virtual placement that went are dropped with it. A
+    child doesn't follow placeholder cells moved by a text edit (not a
+    scroll) until the next relative placement or virtual-placement
+    removal.
 - **Unicode placeholders (#28).** Placeholder images are not in the image
   grid. They are resolved from the placeholder cells at render time, so
   everything in this document that moves text moves them too.

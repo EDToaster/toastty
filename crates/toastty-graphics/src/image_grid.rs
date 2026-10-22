@@ -112,9 +112,9 @@ pub struct Placement {
     /// image's oldest placement at that moment and keeps it). Positions,
     /// cycle checks and the delete cascade all follow this handle, never
     /// [`Self::parent`]'s ids again. `None` for an ordinary placement, and
-    /// for a child of a Unicode-placeholder parent, which is a group of
-    /// tiles rather than one placement and is found by ids.
-    // TODO(#28): placeholder parents stop being tiles there.
+    /// for a child of a virtual (Unicode-placeholder) parent, which is no
+    /// grid placement: it is found by ids in the grid's virtual-parent
+    /// snapshot (REL-5, #28).
     pub parent_ref: Option<PlacementHandle>,
     /// M13: `(cols, rows)` cell offset from the parent placement's origin
     /// (kitty's `H=`/`V=`). Only meaningful when [`Self::parent`] is
@@ -376,9 +376,35 @@ pub struct ImageGrid {
     /// LF) is O(1) when nothing can be evicted. `None` = stale; every
     /// mutation clears it and the next `retain_lines` recomputes it.
     bounds: Option<(i64, i64)>,
+    /// Origins of the virtual (`U=1`) placements that relative children
+    /// may name as parent (REL-5): the min line / min col over the
+    /// Unicode-placeholder cells that draw each one (#28). Virtual
+    /// placements aren't grid placements; the term refreshes this
+    /// snapshot (`Term::refresh_virtual_parents`) before relative
+    /// placements are created and whenever virtual placements go.
+    /// `(image, 0)` = any virtual placement of the image.
+    virtual_parents: HashMap<(u32, u32), (i64, i32)>,
 }
 
 impl ImageGrid {
+    /// Replace the virtual-parent origin snapshot (see the field), then
+    /// re-resolve children and drop those whose virtual parent is gone.
+    /// Returns the dropped placements.
+    pub fn set_virtual_parents(&mut self, map: HashMap<(u32, u32), (i64, i32)>) -> Vec<Placement> {
+        if map == self.virtual_parents {
+            return Vec::new();
+        }
+        self.virtual_parents = map;
+        self.resolve_relative_positions();
+        let mut dropped = Vec::new();
+        self.sweep_orphans(&mut dropped);
+        dropped
+    }
+
+    fn virtual_parent(&self, image_id: u32, placement_id: u32) -> Option<(i64, i32)> {
+        self.virtual_parents.get(&(image_id, placement_id)).copied()
+    }
+
     /// Fresh empty grid.
     #[must_use]
     pub fn new() -> Self {
@@ -442,6 +468,16 @@ impl ImageGrid {
             } else {
                 RelativeError::NoParent
             });
+        }
+        // A virtual (Unicode-placeholder) parent isn't a grid placement:
+        // it can't be relative itself, so there's no chain to walk.
+        if self.find_entry(pimg, pplace).is_none()
+            && let Some(origin) = self.virtual_parent(pimg, pplace)
+        {
+            child.parent_ref = None;
+            (child.line, child.col) = offset_origin(origin, child.rel_offset);
+            child.clip_rows = 0..child.rows;
+            return Ok(self.upsert(child));
         }
         // Bind the reference to one concrete placement, now.
         let (ph, parent) = self
@@ -564,10 +600,17 @@ impl ImageGrid {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, (_, p))| {
-                    p.parent?;
+                    let (pimg, pplace) = p.parent?;
                     let parent = match p.parent_ref {
                         Some(h) => &self.placements[*index.get(&h)?].1,
-                        None => self.parent_entry(p)?.1,
+                        None => match self.parent_entry(p) {
+                            Some((_, parent)) => parent,
+                            None => {
+                                // Virtual parent (REL-5).
+                                let origin = self.virtual_parent(pimg, pplace)?;
+                                return Some((i, offset_origin(origin, p.rel_offset), 0..p.rows));
+                            }
+                        },
                     };
                     let origin = offset_origin(self.origin_of(parent), p.rel_offset);
                     Some((i, origin, inherited_clip(parent, p.rows)))
@@ -593,8 +636,10 @@ impl ImageGrid {
     /// means the image's oldest placement.
     #[must_use]
     pub fn parent_origin(&self, image_id: u32, placement_id: u32) -> Option<(i64, i32)> {
-        let (_, parent) = self.find_entry(image_id, placement_id)?;
-        Some(self.origin_of(parent))
+        match self.find_entry(image_id, placement_id) {
+            Some((_, parent)) => Some(self.origin_of(parent)),
+            None => self.virtual_parent(image_id, placement_id),
+        }
     }
 
     /// Remove by handle. Returns the removed placement if it was
@@ -664,9 +709,12 @@ impl ImageGrid {
             let orphan: Vec<bool> = self
                 .placements
                 .iter()
-                .map(|(_, p)| match p.parent_ref {
-                    Some(h) => !live.contains(&h),
-                    None => p.parent.is_some() && self.parent_entry(p).is_none(),
+                .map(|(_, p)| match (p.parent_ref, p.parent) {
+                    (Some(h), _) => !live.contains(&h),
+                    (None, Some((img, place))) => {
+                        self.parent_entry(p).is_none() && self.virtual_parent(img, place).is_none()
+                    }
+                    (None, None) => false,
                 })
                 .collect();
             if !orphan.contains(&true) {
@@ -736,8 +784,8 @@ impl ImageGrid {
     /// time anyway, and this keeps cell hit-tests (`d=p/c/x/y`, `covers`,
     /// eviction bounds) on the cells the image actually covers. `src_of`
     /// gives a placement's resolved source size, `None` if its image is
-    /// unknown (left as is). Placements with both `c=` and `r=` (and the
-    /// placeholder tiles) don't change.
+    /// unknown (left as is). Placements with both `c=` and `r=` don't
+    /// change.
     pub fn reserve_all(
         &mut self,
         mut src_of: impl FnMut(&Placement) -> Option<(u32, u32)>,
@@ -1489,6 +1537,23 @@ mod tests {
         assert_eq!(g.len(), 2);
         let child = g.find(2, 20).unwrap();
         assert_eq!((child.line, child.col), (1, 3));
+    }
+
+    #[test]
+    fn virtual_parent_origin_comes_from_the_snapshot() {
+        // REL-5 with #28: the term hands over the min line / min col of
+        // the placeholder cells; children follow it and go with it.
+        let mut g = ImageGrid::new();
+        g.set_virtual_parents(HashMap::from([((7, 3), (3, 2))]));
+        assert_eq!(g.parent_origin(7, 3), Some((3, 2)));
+        g.add_relative(rel(8, 1, (7, 3), (1, 1))).unwrap();
+        let child = g.find(8, 1).unwrap();
+        assert_eq!((child.line, child.col), (4, 3));
+        g.set_virtual_parents(HashMap::from([((7, 3), (5, 0))]));
+        assert_eq!(g.find(8, 1).map(|c| (c.line, c.col)), Some((6, 1)));
+        let gone = g.set_virtual_parents(HashMap::new());
+        assert_eq!(gone.len(), 1, "the child goes with its virtual parent");
+        assert!(g.is_empty());
     }
 
     /// `reserved_cells` for `fit = (c, r)` and `off = (X, Y)` on a
