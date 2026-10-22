@@ -42,5 +42,9 @@ naga.workspace = true
 name = "render_term"
 harness = false
 
+[[bench]]
+name = "placeholder"
+harness = false
+
 [lints]
 workspace = true
