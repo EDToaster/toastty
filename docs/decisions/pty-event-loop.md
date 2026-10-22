@@ -290,8 +290,9 @@ again; while it waits for space it isn't polling at all.
 drained before a frame interval passes is drawn at once, as before
 (`RedrawIn(ZERO)`; small writes see no added latency). When output keeps
 coming, the handler stops once a frame is due (16.7 ms after the last
-frame started, and after parsing at least as long as that frame took to
-render) and answers the new `ControlSignal::Yield`. The `toastty-window`
+frame started, and after parsing at least twice as long as that frame
+took to render, so slow frames lower the frame rate rather than take more
+than a third of the main thread) and answers the new `ControlSignal::Yield`. The `toastty-window`
 runner treats it as `RedrawIn(ZERO)`, drops reader wakes until
 `about_to_wait`, and there delivers `Event::PtyReady` again. Every
 platform winit supports runs `about_to_wait` after that iteration's

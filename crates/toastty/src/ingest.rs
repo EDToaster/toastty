@@ -31,10 +31,16 @@ pub const SLICE: usize = 16 * 1024;
 pub const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 
 /// Least time to parse before yielding again, so a flood always makes
-/// progress. The longer of this and the last frame's render time is
-/// used, which keeps parsing at >= half the main thread when frames are
-/// slow (e.g. a huge window).
+/// progress. The longer of this and twice the last frame's render time
+/// is used (capped at [`MAX_MIN_PARSE`]): when frames are slow (a huge
+/// window, or a frame full of glyphs new to the atlas) the frame rate
+/// drops rather than rendering eating more than a third of the main
+/// thread. Frames of up to ~5 ms still go out at 60 Hz.
 const MIN_PARSE: Duration = Duration::from_millis(1);
+
+/// Upper bound on the render-scaled parse time, so even very slow frames
+/// come at least every ~33 ms of parsing.
+const MAX_MIN_PARSE: Duration = Duration::from_micros(33_333);
 
 /// How long a requested frame may hold up parsing. Redraws arrive within
 /// the same loop iteration on every platform winit supports, so this only
@@ -100,7 +106,7 @@ impl Ingest {
     /// since that frame would be skipped.
     #[must_use]
     pub fn should_yield(&self, now: Instant, parse_start: Instant) -> bool {
-        let min_parse = self.last_render.clamp(MIN_PARSE, FRAME_INTERVAL);
+        let min_parse = (self.last_render * 2).clamp(MIN_PARSE, MAX_MIN_PARSE);
         self.frame_due(now) && now.saturating_duration_since(parse_start) >= min_parse
     }
 
@@ -160,16 +166,23 @@ mod tests {
     }
 
     #[test]
-    fn slow_frames_get_at_least_as_much_parse_time() {
+    fn slow_frames_get_twice_their_time_in_parsing() {
         let mut ing = Ingest::default();
         let t0 = Instant::now();
-        // A 30 ms frame: one is due as soon as it ends, but parse for as
-        // long as it took first.
+        // A 10 ms frame: one is due 6.7 ms after it ends, but parse for
+        // twice as long as it took first.
+        ing.frame_drawn(t0, t0 + ms(10));
+        let parse_start = t0 + ms(10);
+        assert!(!ing.should_yield(parse_start + ms(19), parse_start));
+        assert!(ing.should_yield(parse_start + ms(20), parse_start));
+        // Fast frames don't change the 60 Hz cadence.
+        ing.frame_drawn(t0, t0 + ms(5));
+        assert!(ing.should_yield(t0 + ms(17), t0 + ms(5)));
+        // Capped: a 30 ms frame gets 33 ms, not 60.
         ing.frame_drawn(t0, t0 + ms(30));
         let parse_start = t0 + ms(30);
-        assert!(!ing.should_yield(t0 + ms(40), parse_start));
-        // Capped at one frame interval.
-        assert!(ing.should_yield(parse_start + FRAME_INTERVAL, parse_start));
+        assert!(!ing.should_yield(parse_start + ms(33), parse_start));
+        assert!(ing.should_yield(parse_start + MAX_MIN_PARSE, parse_start));
     }
 
     #[test]
