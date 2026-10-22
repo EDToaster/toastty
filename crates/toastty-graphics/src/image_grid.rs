@@ -89,12 +89,6 @@ pub struct Placement {
     /// placement on the same text instead of drifting to the line start.
     /// `None` until a reflow sets it. Only resize code reads or writes it.
     pub wrap_offset: Option<u32>,
-    /// Set on the per-cell tiles the Unicode-placeholder pipeline makes.
-    /// Those are text: IL/DL move them with their cells, unlike ordinary
-    /// placements.
-    // TODO(#28): delete once placeholders are resolved from the cells at
-    // render time and no longer live in `ImageGrid`.
-    pub from_placeholder: bool,
 }
 
 impl Placement {
@@ -118,7 +112,6 @@ impl Placement {
             parent: None,
             rel_offset: (0, 0),
             wrap_offset: None,
-            from_placeholder: false,
         }
     }
 
