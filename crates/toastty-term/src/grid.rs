@@ -132,6 +132,40 @@ pub struct Grid {
     bottom_id: u64,
 }
 
+/// How a reflow ([`Grid::resize_reflow_mapped`]) renumbered the retained
+/// rows, so line-anchored state (image placements) can follow its text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LineRemap {
+    /// Line id of the oldest retained row before the reflow.
+    old_first: i64,
+    /// New line id of the row each old retained row's first cell landed
+    /// on, oldest first (non-decreasing).
+    new_ids: Vec<i64>,
+}
+
+impl LineRemap {
+    /// New line id for the row that had id `line` before the reflow.
+    /// Rows past the reflowed span (blank padding the reflow trims, or
+    /// rows below the screen) keep their distance from its last row; rows
+    /// older than it keep their distance from its first.
+    #[must_use]
+    pub fn map(&self, line: i64) -> i64 {
+        let Some(&last) = self.new_ids.last() else {
+            return line;
+        };
+        let k = line - self.old_first;
+        let len = self.new_ids.len() as i64;
+        if k < 0 {
+            self.new_ids[0] + k
+        } else if k < len {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            self.new_ids[k as usize]
+        } else {
+            last + (k - (len - 1))
+        }
+    }
+}
+
 /// Where a given `line_id` currently sits in the grid, if it's still
 /// retained. Returned by [`Grid::locate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -447,7 +481,26 @@ impl Grid {
         cursor: (u16, u16),
         relayout: &mut RelayoutFn<'_>,
     ) -> (u16, u16) {
+        self.resize_reflow_mapped(visible_rows, cols, cap, cursor, relayout)
+            .0
+    }
+
+    /// [`Grid::resize_reflow_with`], also returning how the retained rows
+    /// were renumbered ([`LineRemap`]): line ids don't survive a rewrap,
+    /// so anything anchored to one (image placements) maps its old id
+    /// through this to stay on the same text.
+    #[must_use]
+    pub fn resize_reflow_mapped(
+        &mut self,
+        visible_rows: u16,
+        cols: u16,
+        cap: usize,
+        cursor: (u16, u16),
+        relayout: &mut RelayoutFn<'_>,
+    ) -> ((u16, u16), LineRemap) {
         let cap = cap.max(visible_rows as usize).max(1);
+        #[allow(clippy::cast_possible_wrap)]
+        let old_first = self.oldest_retained_id() as i64;
 
         // Collect retained rows oldest→newest: scrollback (oldest first)
         // then the visible region.
@@ -473,8 +526,15 @@ impl Grid {
             .min(retained.len().saturating_sub(1));
         retained.truncate(end + 1);
 
-        let (flat, (cur_idx, cur_col)) =
-            reflow_segments(&retained, cols, cursor_idx, cursor.1, relayout);
+        let mut row_map = Vec::with_capacity(retained.len());
+        let (flat, (cur_idx, cur_col)) = reflow_segments(
+            &retained,
+            cols,
+            cursor_idx,
+            cursor.1,
+            relayout,
+            &mut row_map,
+        );
 
         // Lay the rewrapped rows into a fresh ring with `head = 0`, so
         // logical row `i` sits at slot `i` and scrollback row `n` at slot
@@ -528,7 +588,17 @@ impl Grid {
         let span = u64::from(new_history) + u64::from(visible_rows.saturating_sub(1));
         self.bottom_id = self.bottom_id.max(span);
 
-        (cursor_row, cur_col.min(cols))
+        // Flat index `f` sits at visible row `f - (n - vis)` (negative =
+        // scrollback), i.e. at line id `top + f - (n - vis)`.
+        #[allow(clippy::cast_possible_wrap)]
+        let top = self.bottom_id as i64 - i64::from(visible_rows.saturating_sub(1));
+        #[allow(clippy::cast_possible_wrap)]
+        let shift = n.saturating_sub(vis) as i64;
+        #[allow(clippy::cast_possible_wrap)]
+        let new_ids = row_map.iter().map(|&f| top + f as i64 - shift).collect();
+        let remap = LineRemap { old_first, new_ids };
+
+        ((cursor_row, cur_col.min(cols)), remap)
     }
 }
 
@@ -536,13 +606,20 @@ impl Grid {
 /// [`crate::reflow::reflow_rows`]) and rich-block runs (handed to
 /// `relayout`), and concatenate the results. With no tagged rows this is
 /// exactly `reflow_rows` over the whole slice.
+///
+/// `row_map` receives the output index each input row's first cell lands
+/// on (rows of a re-laid-out rich block map to the same index within the
+/// new run, clamped to its end).
 fn reflow_segments(
     rows: &[Row],
     cols: u16,
     cursor_idx: usize,
     cursor_col: u16,
     relayout: &mut RelayoutFn<'_>,
+    row_map: &mut Vec<usize>,
 ) -> (Vec<Row>, (usize, u16)) {
+    row_map.clear();
+    let mut seg_map = Vec::new();
     let mut out: Vec<Row> = Vec::with_capacity(rows.len());
     let mut cur = (0usize, 0u16);
     let mut i = 0usize;
@@ -573,6 +650,8 @@ fn reflow_segments(
                 let off = (cursor_idx - start).min(out.len() - base - 1);
                 cur = (base + off, cursor_col.min(cols));
             }
+            let last = out.len() - base - 1;
+            row_map.extend((0..i - start).map(|j| base + j.min(last)));
         } else {
             while i < rows.len() && rows[i].rich.is_none() {
                 i += 1;
@@ -583,11 +662,18 @@ fn reflow_segments(
             } else {
                 usize::MAX
             };
-            let (seg, (ci, cc)) =
-                crate::reflow::reflow_rows(&rows[start..i], cols, want, cursor_col);
+            let (seg, (ci, cc)) = crate::reflow::reflow_rows_mapped(
+                &rows[start..i],
+                cols,
+                want,
+                cursor_col,
+                &mut seg_map,
+            );
             if has_cursor {
                 cur = (out.len() + ci, cc);
             }
+            let base = out.len();
+            row_map.extend(seg_map.iter().map(|&r| base + r));
             out.extend(seg);
         }
     }
@@ -595,6 +681,7 @@ fn reflow_segments(
         out.push(Row::blank(cols));
         cur = (0, 0);
     }
+    row_map.resize(rows.len(), out.len() - 1);
     (out, cur)
 }
 
@@ -1208,6 +1295,33 @@ mod tests {
         let oldest = g.oldest_retained_id();
         let span = u64::from(g.history_lines()) + u64::from(g.visible_rows() - 1);
         assert_eq!(g.bottom_id() - oldest, span);
+    }
+
+    #[test]
+    fn resize_reflow_mapped_follows_lines() {
+        // Row 0 holds a 4-cell line; narrowing to 2 cols doubles it, so
+        // the row below it moves down by one line id.
+        let mut g = Grid::new(4, 4, 4 + 10);
+        for c in 0..4 {
+            g.row_mut(0).put(
+                c,
+                Cell {
+                    ch: 'a',
+                    ..Cell::BLANK
+                },
+                4,
+            );
+        }
+        put_at(&mut g, 1, 'b');
+        #[allow(clippy::cast_possible_wrap)]
+        let top = |g: &Grid| g.bottom_id() as i64 - i64::from(g.visible_rows() - 1);
+        let (old_top, b_line) = (top(&g), top(&g) + 1);
+        let (_, remap) = g.resize_reflow_mapped(4, 2, 4 + 10, (1, 1), &mut |_, _| None);
+        assert_eq!(remap.map(old_top), top(&g));
+        assert_eq!(remap.map(b_line), top(&g) + 2, "'b' is now on row 2");
+        assert_eq!(g.row(2).cells[0].ch, 'b');
+        // Past the reflowed span: same distance from its last row.
+        assert_eq!(remap.map(b_line + 3), top(&g) + 5);
     }
 
     #[test]
