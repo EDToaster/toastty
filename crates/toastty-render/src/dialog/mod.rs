@@ -21,7 +21,7 @@ pub mod pipeline;
 use toastty_protocols::unicode_core::char_cell_width;
 
 use crate::chip::{linear_to_srgb, srgb_to_linear};
-use pipeline::{UI_KIND_PROMPT_ICON, UI_KIND_SHADOW, UiRect};
+use pipeline::{UI_KIND_PROMPT_ICON, UI_KIND_RETURN_ICON, UI_KIND_SHADOW, UiRect};
 
 /// Preferred panel width, logical px (grows to fit large fonts, shrinks
 /// to fit small windows).
@@ -38,6 +38,8 @@ pub const ICON_DIAMETER: f32 = 28.0;
 pub const ICON_GAP: f32 = 14.0;
 /// Icon stroke width, logical px.
 pub const ICON_STROKE: f32 = 1.6;
+/// Return-arrow keycap icon stroke width, logical px.
+pub const RETURN_STROKE: f32 = 1.4;
 /// Gap between the text and the button row, logical px.
 pub const BUTTON_ROW_GAP: f32 = 18.0;
 /// Gap between the two buttons, logical px.
@@ -245,14 +247,32 @@ pub struct TextRun {
     pub spans: Vec<Span>,
 }
 
+/// What a keycap shows.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyGlyph {
+    /// A key name in the terminal font (`Esc`).
+    Text(TextRun),
+    /// The return-arrow icon, drawn by the UI pipeline in this box. (The
+    /// font's `↵` is a wide fallback glyph that overflows a one-column
+    /// keycap and renders thin.)
+    Return([f32; 4]),
+}
+
+/// A button's keycap hint.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Keycap {
+    pub rect: [f32; 4],
+    pub glyph: KeyGlyph,
+}
+
 /// A button's geometry, physical px. Rects are `[x0, y0, x1, y1]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ButtonLayout {
     pub kind: DialogButton,
     pub rect: [f32; 4],
     pub label: TextRun,
-    pub keycap: [f32; 4],
-    pub key: TextRun,
+    /// `None` when the window is too narrow for the keycaps.
+    pub keycap: Option<Keycap>,
 }
 
 /// Where everything goes, physical px (absolute framebuffer coords).
@@ -287,6 +307,24 @@ impl DialogLayout {
     }
 }
 
+/// A keycap's key.
+#[derive(Debug, Clone, Copy)]
+enum Key {
+    Text(&'static str),
+    Return,
+}
+
+/// How the button row fits the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowFit {
+    /// Natural widths with keycaps.
+    Full,
+    /// Natural widths, keycaps dropped.
+    Compact,
+    /// Two equal buttons filling the row, labels truncated to fit.
+    Squeezed,
+}
+
 /// Button sizing for one scale / cell size, physical px.
 struct ButtonMetrics {
     scale: f32,
@@ -311,46 +349,136 @@ impl ButtonMetrics {
         cols(s) as f32 * self.cell.0
     }
 
-    fn keycap_w(&self, key: &str) -> f32 {
-        (2.0 * KEYCAP_PAD_X * self.scale + self.text_w(key)).round()
+    /// Width of the keycap's content: the key name, or the return icon
+    /// (sized from the cell height so it follows the font).
+    fn key_w(&self, key: Key) -> f32 {
+        match key {
+            Key::Text(t) => self.text_w(t),
+            Key::Return => (self.cell.1 * 0.75).round(),
+        }
     }
 
-    fn width(&self, label: &str, key: &str) -> f32 {
+    fn keycap_w(&self, key: Key) -> f32 {
+        (2.0 * KEYCAP_PAD_X * self.scale + self.key_w(key)).round()
+    }
+
+    /// Natural width with (`Full`) or without (`Compact`) the keycap.
+    fn width(&self, label: &str, key: Key, fit: RowFit) -> f32 {
         let s = self.scale;
-        (BUTTON_PAD_LEFT * s + self.text_w(label) + LABEL_KEYCAP_GAP * s + BUTTON_PAD_RIGHT * s)
-            .round()
-            + self.keycap_w(key)
+        if fit == RowFit::Full {
+            (BUTTON_PAD_LEFT * s + self.text_w(label) + LABEL_KEYCAP_GAP * s + BUTTON_PAD_RIGHT * s)
+                .round()
+                + self.keycap_w(key)
+        } else {
+            (2.0 * BUTTON_PAD_LEFT * s + self.text_w(label)).round()
+        }
     }
 
-    /// The button ending at `right`, with its top at `y`.
+    /// The button filling `rect`. With keycaps the label sits at the left
+    /// padding; without, it is centred (and truncated to fit when
+    /// `Squeezed`).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn place(
         &self,
         kind: DialogButton,
         label: &str,
-        key: &str,
-        right: f32,
-        y: f32,
+        key: Key,
+        rect: [f32; 4],
+        fit: RowFit,
     ) -> ButtonLayout {
         let s = self.scale;
-        let rect = [right - self.width(label, key), y, right, y + self.height];
+        let w = rect[2] - rect[0];
+        let y = rect[1];
         let text_top = (y + (self.height - self.cell.1) * 0.5).round();
+        let mut spans = vec![Span::new(label, Tone::Strong)];
+        if fit == RowFit::Squeezed {
+            let room = (w - 2.0 * BUTTON_PAD_LEFT * s).max(0.0);
+            spans = fit_spans(&spans, (room / self.cell.0).floor() as usize);
+        }
+        let label_w = self.text_w(&spans.iter().map(|sp| sp.text.as_str()).collect::<String>());
+        if fit != RowFit::Full {
+            return ButtonLayout {
+                kind,
+                rect,
+                label: TextRun {
+                    origin: [(rect[0] + (w - label_w) * 0.5).round(), text_top],
+                    spans,
+                },
+                keycap: None,
+            };
+        }
         let label_x = (rect[0] + BUTTON_PAD_LEFT * s).round();
-        let kc_x = (label_x + self.text_w(label) + LABEL_KEYCAP_GAP * s).round();
+        let kc_x = (label_x + label_w + LABEL_KEYCAP_GAP * s).round();
         let kc_y = (y + (self.height - self.keycap_h) * 0.5).round();
         let kc_w = self.keycap_w(key);
+        let content_x = (kc_x + (kc_w - self.key_w(key)) * 0.5).round();
+        let glyph = match key {
+            Key::Text(t) => KeyGlyph::Text(TextRun {
+                origin: [content_x, text_top],
+                spans: vec![Span::new(t, Tone::Muted)],
+            }),
+            Key::Return => {
+                let side = self.key_w(key);
+                let top = (kc_y + (self.keycap_h - side) * 0.5).round();
+                KeyGlyph::Return([content_x, top, content_x + side, top + side])
+            }
+        };
         ButtonLayout {
             kind,
             rect,
             label: TextRun {
                 origin: [label_x, text_top],
-                spans: vec![Span::new(label, Tone::Strong)],
+                spans,
             },
-            keycap: [kc_x, kc_y, kc_x + kc_w, kc_y + self.keycap_h],
-            key: TextRun {
-                origin: [(kc_x + (kc_w - self.text_w(key)) * 0.5).round(), text_top],
-                spans: vec![Span::new(key, Tone::Muted)],
-            },
+            keycap: Some(Keycap {
+                rect: [kc_x, kc_y, kc_x + kc_w, kc_y + self.keycap_h],
+                glyph,
+            }),
         }
+    }
+
+    /// Lay the two buttons out right-aligned in `[x0, x1]` at `y`,
+    /// shedding keycaps and then squeezing the buttons so the row never
+    /// leaves that span.
+    fn row(
+        &self,
+        buttons: &[(DialogButton, &str, Key); 2],
+        x0: f32,
+        x1: f32,
+        y: f32,
+    ) -> [ButtonLayout; 2] {
+        let gap_full = (BUTTON_GAP * self.scale).round();
+        let avail = (x1 - x0).max(0.0);
+        let row_w = |fit| {
+            buttons
+                .iter()
+                .map(|b| self.width(b.1, b.2, fit))
+                .sum::<f32>()
+                + gap_full
+        };
+        let fit = if row_w(RowFit::Full) <= avail {
+            RowFit::Full
+        } else if row_w(RowFit::Compact) <= avail {
+            RowFit::Compact
+        } else {
+            RowFit::Squeezed
+        };
+        let gap = gap_full.min(avail);
+        let squeezed_w = ((avail - gap) * 0.5).floor().max(0.0);
+        let mut right = x0 + avail;
+        let mut place = |&(kind, label, key): &(DialogButton, &str, Key)| {
+            let w = if fit == RowFit::Squeezed {
+                squeezed_w
+            } else {
+                self.width(label, key, fit)
+            };
+            let rect = [right - w, y, right, y + self.height];
+            right = rect[0] - gap;
+            self.place(kind, label, key, rect, fit)
+        };
+        let close = place(&buttons[1]);
+        let cancel = place(&buttons[0]);
+        [cancel, close]
     }
 }
 
@@ -387,11 +515,14 @@ pub fn dialog_layout(copy: &PromptCopy, m: &DialogMetrics) -> Option<DialogLayou
     let icon_gap = (ICON_GAP * s).round();
     let bm = ButtonMetrics::new(s, m.cell);
     let buttons = [
-        (DialogButton::Cancel, "Cancel", "Esc"),
-        (DialogButton::Close, "Close", "↵"),
+        (DialogButton::Cancel, "Cancel", Key::Text("Esc")),
+        (DialogButton::Close, "Close", Key::Return),
     ];
-    let btn_gap = (BUTTON_GAP * s).round();
-    let row_w: f32 = buttons.iter().map(|b| bm.width(b.1, b.2)).sum::<f32>() + btn_gap;
+    let row_w: f32 = buttons
+        .iter()
+        .map(|b| bm.width(b.1, b.2, RowFit::Full))
+        .sum::<f32>()
+        + (BUTTON_GAP * s).round();
 
     let lines_src: Vec<&[Span]> = std::iter::once(copy.headline.as_slice())
         .chain(copy.detail.as_ref().map(std::slice::from_ref))
@@ -429,15 +560,9 @@ pub fn dialog_layout(copy: &PromptCopy, m: &DialogMetrics) -> Option<DialogLayou
         .collect();
 
     let btn_y = (y0 + pad + header_h + BUTTON_ROW_GAP * s).round();
-    let mut right = panel[2] - pad;
-    let mut placed = Vec::with_capacity(2);
-    for &(kind, label, key) in buttons.iter().rev() {
-        let b = bm.place(kind, label, key, right, btn_y);
-        right = b.rect[0] - btn_gap;
-        placed.push(b);
-    }
-    let cancel = placed.pop()?;
-    let close = placed.pop()?;
+    let inner_x0 = (x0 + pad).min(panel[2]);
+    let inner_x1 = (panel[2] - pad).max(inner_x0);
+    let [cancel, close] = bm.row(&buttons, inner_x0, inner_x1, btn_y);
     Some(DialogLayout {
         scrim: [0.0, 0.0, m.surface.0.max(0.0), m.surface.1.max(0.0)],
         panel,
@@ -581,7 +706,7 @@ pub fn dialog_colors(bg: [f32; 4], fg: [f32; 4], hover: Option<DialogButton>) ->
 
 /// The dialog's shapes, back to front: scrim, shadow, panel, icon disc,
 /// icon, then each button (the default one with its focus ring) and its
-/// keycap.
+/// keycap (plus the return icon in Close's).
 #[must_use]
 #[allow(clippy::many_single_char_names)]
 pub fn dialog_rects(l: &DialogLayout, c: &DialogColors) -> Vec<UiRect> {
@@ -635,13 +760,21 @@ pub fn dialog_rects(l: &DialogLayout, c: &DialogColors) -> Vec<UiRect> {
             BUTTON_RADIUS * s,
             hair,
         ));
-        v.push(UiRect::rect(
-            b.keycap,
-            clear,
-            bc.keycap_ring,
-            KEYCAP_RADIUS * s,
-            hair,
-        ));
+        if let Some(kc) = &b.keycap {
+            v.push(UiRect::rect(
+                kc.rect,
+                clear,
+                bc.keycap_ring,
+                KEYCAP_RADIUS * s,
+                hair,
+            ));
+            if let KeyGlyph::Return(icon) = kc.glyph {
+                v.push(UiRect {
+                    kind: UI_KIND_RETURN_ICON,
+                    ..UiRect::rect(icon, bc.keycap_text, clear, 0.0, RETURN_STROKE * s)
+                });
+            }
+        }
     }
     v
 }
@@ -778,13 +911,84 @@ mod tests {
             cancel.rect[2] - cancel.rect[0],
             12.0 + 60.0 + 8.0 + 40.0 + 8.0
         );
-        assert_eq!(cancel.keycap[2] - cancel.keycap[0], 40.0);
-        assert_eq!(cancel.keycap[2], cancel.rect[2] - 8.0);
+        let kc = cancel.keycap.as_ref().unwrap();
+        assert_eq!(kc.rect[2] - kc.rect[0], 40.0);
+        assert_eq!(kc.rect[2], cancel.rect[2] - 8.0);
+        let KeyGlyph::Text(esc) = &kc.glyph else {
+            panic!("Esc is text")
+        };
+        assert_eq!(esc.origin[1], cancel.label.origin[1]);
         assert_eq!(close.label.origin[0], close.rect[0] + 12.0);
+        // Close's keycap holds the return icon, sized from the cell
+        // height (0.75 × 19 → 14) and centred in the keycap.
+        let kc = close.keycap.as_ref().unwrap();
+        let KeyGlyph::Return(icon) = kc.glyph else {
+            panic!("Close shows the return icon")
+        };
+        assert_eq!(icon[2] - icon[0], 14.0);
+        assert_eq!(kc.rect[2] - kc.rect[0], 24.0);
+        assert!(icon[0] >= kc.rect[0] && icon[2] <= kc.rect[2]);
+        assert!(icon[1] >= kc.rect[1] && icon[3] <= kc.rect[3]);
         // Keycaps sit inside their button.
         for b in l.buttons() {
-            assert!(b.keycap[1] >= b.rect[1] && b.keycap[3] <= b.rect[3]);
-            assert_eq!(b.key.origin[1], b.label.origin[1]);
+            let kc = b.keycap.as_ref().unwrap();
+            assert!(kc.rect[0] > b.rect[0] && kc.rect[2] <= b.rect[2]);
+            assert!(kc.rect[1] >= b.rect[1] && kc.rect[3] <= b.rect[3]);
+        }
+    }
+
+    /// Everything in the button row stays inside the panel's padding,
+    /// and every label inside its button, at any width.
+    #[allow(clippy::cast_precision_loss)]
+    fn assert_row_inside(l: &DialogLayout, cell_w: f32) {
+        // (A panel narrower than its padding collapses the row to its edge.)
+        let x0 = (l.panel[0] + 18.0).min(l.panel[2]);
+        let x1 = (l.panel[2] - 18.0).max(x0);
+        for b in l.buttons() {
+            assert!(
+                b.rect[0] >= x0 - 0.01 && b.rect[2] <= x1 + 0.01,
+                "{b:?} in {x0}..{x1}"
+            );
+            assert!(b.rect[0] <= b.rect[2]);
+            let w = spans_cols(&b.label.spans) as f32 * cell_w;
+            if w > 0.0 {
+                assert!(b.label.origin[0] >= b.rect[0], "{b:?}");
+                assert!(b.label.origin[0] + w <= b.rect[2] + 0.5, "{b:?}");
+            }
+            if let Some(kc) = &b.keycap {
+                assert!(kc.rect[0] >= b.rect[0] && kc.rect[2] <= b.rect[2]);
+            }
+        }
+        assert!(l.cancel.rect[2] <= l.close.rect[0], "no overlap");
+    }
+
+    #[test]
+    fn narrow_windows_drop_keycaps_then_squeeze_the_buttons() {
+        let copy = prompt_copy(&prompt(Some("sleep"), true));
+        // 330 wide: room for the keycaps.
+        let l = dialog_layout(&copy, &metrics(330.0, 220.0)).unwrap();
+        assert!(l.cancel.keycap.is_some() && l.close.keycap.is_some());
+        assert_row_inside(&l, 10.0);
+        // 260 wide: the full row (238) doesn't fit the 192 inner width,
+        // so the keycaps go and the labels are centred.
+        let l = dialog_layout(&copy, &metrics(260.0, 160.0)).unwrap();
+        assert_eq!(l.panel[2] - l.panel[0], 228.0);
+        assert!(l.cancel.keycap.is_none() && l.close.keycap.is_none());
+        assert_eq!(text(&l.cancel.label.spans), "Cancel");
+        assert_eq!(l.cancel.rect[2] - l.cancel.rect[0], 84.0);
+        assert_row_inside(&l, 10.0);
+        // 150 wide: even that doesn't fit; two equal buttons, truncated.
+        let l = dialog_layout(&copy, &metrics(150.0, 160.0)).unwrap();
+        assert!(l.cancel.keycap.is_none());
+        let wc = l.cancel.rect[2] - l.cancel.rect[0];
+        assert_eq!(wc, l.close.rect[2] - l.close.rect[0]);
+        assert!(text(&l.cancel.label.spans).ends_with('…'));
+        assert_row_inside(&l, 10.0);
+        // And nothing ever leaves the panel, down to nothing at all.
+        for w in (0..=1300).step_by(5) {
+            #[allow(clippy::cast_precision_loss)]
+            let l = dialog_layout(&copy, &metrics(w as f32, 300.0)).unwrap();
+            assert_row_inside(&l, 10.0);
         }
     }
 
@@ -834,6 +1038,7 @@ mod tests {
         let copy = prompt_copy(&prompt(Some("a-rather-long-program-name"), true));
         let l = dialog_layout(&copy, &metrics(300.0, 120.0)).unwrap();
         assert_eq!(l.panel[2] - l.panel[0], 300.0 - 32.0);
+        assert_row_inside(&l, 10.0);
         let avail = ((268.0 - 36.0 - 28.0 - 14.0) / 10.0_f32).floor() as usize;
         for line in &l.lines {
             assert!(spans_cols(&line.spans) <= avail, "{:?}", line.spans);
@@ -956,19 +1161,26 @@ mod tests {
         let l = dialog_layout(&copy, &metrics(1280.0, 800.0)).unwrap();
         let c = dialog_colors(lin(0x12_12_14), lin(0xd9_d9_d9), None);
         let r = dialog_rects(&l, &c);
-        assert_eq!(r.len(), 10);
+        assert_eq!(r.len(), 11);
         assert_eq!(r[0].rect, l.scrim);
         assert_eq!(r[1].kind, UI_KIND_SHADOW);
         assert_eq!(r[1].rect[1], l.panel[1] + 12.0);
         assert_eq!(r[2].rect, l.panel);
         assert_eq!(r[2].radius, 14.0);
         assert_eq!(r[4].kind, UI_KIND_PROMPT_ICON);
-        // Cancel, its keycap, Close's focus ring, Close, its keycap.
+        // Cancel, its keycap, Close's focus ring, Close, its keycap and
+        // the return icon in it.
+        let kc = |b: &ButtonLayout| b.keycap.as_ref().unwrap().rect;
         assert_eq!(r[5].rect, l.cancel.rect);
-        assert_eq!(r[6].rect, l.cancel.keycap);
+        assert_eq!(r[6].rect, kc(&l.cancel));
         assert_eq!(r[7].rect[0], l.close.rect[0] - 4.0);
         assert_eq!(r[7].border_width, 2.0);
         assert_eq!(r[8].rect, l.close.rect);
-        assert_eq!(r[9].rect, l.close.keycap);
+        assert_eq!(r[9].rect, kc(&l.close));
+        assert_eq!(r[10].kind, UI_KIND_RETURN_ICON);
+        assert_eq!(r[10].fill, c.close.keycap_text);
+        // Without keycaps (narrow), no keycap rects or icon.
+        let l = dialog_layout(&copy, &metrics(260.0, 160.0)).unwrap();
+        assert_eq!(dialog_rects(&l, &c).len(), 8);
     }
 }

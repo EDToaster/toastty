@@ -18,6 +18,9 @@ pub const UI_KIND_SHADOW: u32 = 1;
 /// [`UiRect::kind`]: the `›_` terminal-prompt icon centred in `rect`,
 /// stroked `border_width` wide in `fill`.
 pub const UI_KIND_PROMPT_ICON: u32 = 2;
+/// [`UiRect::kind`]: the return-key arrow (`↵`) fitted to `rect`,
+/// stroked `border_width` wide in `fill`.
+pub const UI_KIND_RETURN_ICON: u32 = 3;
 
 /// One UI shape instance (64 bytes). Positions are physical framebuffer
 /// px (absolute, no content origin added); colours are straight-alpha

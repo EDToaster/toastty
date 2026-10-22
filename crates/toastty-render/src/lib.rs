@@ -2866,7 +2866,11 @@ impl Renderer {
             }
             for button in layout.buttons() {
                 let bc = colors.button(button.kind);
-                for run in [&button.label, &button.key] {
+                let key_text = button.keycap.as_ref().and_then(|kc| match &kc.glyph {
+                    dialog::KeyGlyph::Text(run) => Some(run),
+                    dialog::KeyGlyph::Return(_) => None,
+                });
+                for run in std::iter::once(&button.label).chain(key_text) {
                     push_dialog_text(
                         &self.queue,
                         text,

@@ -1,5 +1,5 @@
 // UI shapes: the close-confirmation dialog's scrim, shadow, panel,
-// buttons, keycaps and icon.
+// buttons, keycaps and icons.
 //
 // One instanced quad per shape; the fragment shader evaluates a signed
 // distance to a rounded rect so every edge is anti-aliased at device
@@ -17,6 +17,7 @@ struct Globals {
 const KIND_RECT: u32 = 0u;
 const KIND_SHADOW: u32 = 1u;
 const KIND_PROMPT_ICON: u32 = 2u;
+const KIND_RETURN_ICON: u32 = 3u;
 
 struct Inst {
     @location(0) rect: vec4<f32>,
@@ -112,6 +113,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let e0 = vec2<f32>(0.5, 3.5) * u;
         let e1 = vec2<f32>(5.5, 3.5) * u;
         let dist = min(min(seg_dist(rel, a, b), seg_dist(rel, b, c)), seg_dist(rel, e0, e1));
+        let cov = clamp(0.5 - (dist - in.params.y * 0.5), 0.0, 1.0);
+        acc = vec4<f32>(in.fill.rgb * in.fill.a * cov, in.fill.a * cov);
+    } else if in.kind == KIND_RETURN_ICON {
+        // Return arrow: a stem down the right, a bar back to the left
+        // and an arrowhead there, in a unit box centred in the rect.
+        let u = min(half.x, half.y);
+        let top = vec2<f32>(0.75, -0.7) * u;
+        let corner = vec2<f32>(0.75, 0.3) * u;
+        let tip = vec2<f32>(-0.75, 0.3) * u;
+        let head_up = vec2<f32>(-0.3, -0.15) * u;
+        let head_down = vec2<f32>(-0.3, 0.75) * u;
+        let dist = min(
+            min(seg_dist(rel, top, corner), seg_dist(rel, corner, tip)),
+            min(seg_dist(rel, tip, head_up), seg_dist(rel, tip, head_down)),
+        );
         let cov = clamp(0.5 - (dist - in.params.y * 0.5), 0.0, 1.0);
         acc = vec4<f32>(in.fill.rgb * in.fill.a * cov, in.fill.a * cov);
     } else {
