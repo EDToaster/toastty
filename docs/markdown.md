@@ -185,13 +185,14 @@ So the layout's vertical unit is the cell height:
   lists. Code blocks, tables, Mermaid diagrams and rules have a padding row
   at each edge that doubles as that margin; the code panel, table borders
   and the rule are drawn at sub-row positions inside those rows (a rule
-  next to a panel moves a quarter row so it stays centred). Tables are
-  N + 4 rows: the padding rows, the header, a border row after it, and one
-  row per body line, with alternate rows striped. H1/H2 get an extra row
-  for their underline. Display maths and diagrams round up to whole rows
-  and are centred in them.
-- When the last line's font descent hangs more than a tenth of a row below
-  the last row, the block gets one more row so descenders aren't cut off.
+  next to a panel moves a quarter row so it stays centred). A table is its
+  padding rows, the header lines, a border row after them (when there are
+  body rows) and one row per body line, with alternate body rows striped.
+  H1/H2 get an extra row for their underline. Display maths and diagrams
+  round up to whole rows and are centred in them.
+- When the last line's descender ink (measured from the glyph bitmaps)
+  hangs below the last row, the block gets one more row so it isn't cut
+  off.
 
 ### Implementation notes (v1)
 

@@ -770,14 +770,25 @@ impl Shaped {
                     PlacedKind::Glyph(gi) => {
                         let g = &self.glyphs[gi];
                         let info = &self.spans[g.span];
+                        // On the block's first row a raised glyph
+                        // (footnote reference) would poke out of the top
+                        // of the block: raise it only as far as its
+                        // ascent still fits.
+                        let rise = if top < 0.5 && info.rise > 0.0 {
+                            let m = if info.mono {
+                                fonts.mono.metrics
+                            } else {
+                                fonts.sans.metrics
+                            };
+                            info.rise.min((base - m.ascent * info.size).max(0.0))
+                        } else {
+                            info.rise
+                        };
                         let (key, gx, gy) = CacheKey::new(
                             g.font_id,
                             g.id,
                             g.size,
-                            (
-                                ox + p.x + g.lead + g.x_off,
-                                (base - info.rise - g.y_off).trunc(),
-                            ),
+                            (ox + p.x + g.lead + g.x_off, (base - rise - g.y_off).trunc()),
                             g.weight,
                             g.flags,
                         );

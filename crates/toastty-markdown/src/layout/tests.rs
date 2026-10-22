@@ -1772,10 +1772,14 @@ fn rasters_on_the_first_line_are_not_clipped() {
 
 #[test]
 fn body_text_has_no_trailing_row_at_terminal_cell_sizes() {
-    for f in 10..=40 {
+    for f in 10..=72 {
         let p = term_params(60, f as f32);
         let ctx = format!("f {f} cell {}", p.cell_h);
-        assert_eq!(grid_layout("para", &p).rows, 1, "{ctx}");
+        // Descenders need no extra row at 1x sizes (bigger ones may).
+        if f <= 26 {
+            assert_eq!(grid_layout("para", &p).rows, 1, "{ctx}");
+        }
+        assert_eq!(grid_layout("a lot of text", &p).rows, 1, "{ctx}");
         assert_eq!(grid_layout("- a\n- b", &p).rows, 2, "{ctx}");
         assert_eq!(grid_layout("one\n\ntwo `code`", &p).rows, 3, "{ctx}");
     }
@@ -1884,4 +1888,100 @@ fn rules_next_to_panels_are_centred() {
             );
         }
     }
+}
+
+#[test]
+fn last_line_descenders_are_not_clipped() {
+    // Documents ending in descenders, in every context a last line can
+    // be in, at every size up to 3x zoom: no ink below the block.
+    let docs = [
+        "gjpqy",
+        "- gjpqy",
+        "1. gjpqy",
+        "> gjpqy",
+        "> > gjpqy",
+        "*gjpqy*",
+        "**gjpqy**",
+        "[gjpqy](u)",
+        "`gjpqy`",
+        "### gjpqy",
+        "###### gjpqy",
+        "| a |\n|--|\n| gjpqy |",
+        "x[^1]\n\n[^1]: gjpqy",
+        // A footnote reference on the first line stays inside the block.
+        "[^1]x\n\n[^1]: gjpqy",
+        "- [ ] gjpqy",
+    ];
+    for f in 10..=72 {
+        let p = term_params(60, f as f32);
+        for md in docs {
+            let laid = grid_layout(md, &p);
+            check_grid(&laid, &p);
+            let height = laid.height as f32;
+            for op in &laid.ops {
+                match op {
+                    super::paint::Op::Glyph { key, y, .. } => {
+                        if let Some((_, bottom)) = glyph_ink(*key, *y) {
+                            assert!(
+                                bottom <= height,
+                                "{md:?} f {f}: ink to {bottom} of {height}"
+                            );
+                        }
+                    }
+                    super::paint::Op::Rect { y, h, .. } => {
+                        assert!(
+                            y + h <= height,
+                            "{md:?} f {f}: rect to {} of {height}",
+                            y + h
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rule_nudge_looks_into_lists() {
+    let pal = Palette::new(&Theme::default());
+    let p = term_params(60, 16.0);
+    let ch = p.cell_h as f32;
+    // Where the (last) rule's middle sits in its row, in rows.
+    let rule_at = |md: &str| {
+        let laid = grid_layout(md, &p);
+        check_grid(&laid, &p);
+        let (y, h) = laid
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                super::paint::Op::Rect { y, h, color, .. } if *color == pal.rule => Some((*y, *h)),
+                _ => None,
+            })
+            .next_back()
+            .unwrap();
+        ((y + h / 2.0) % ch) / ch
+    };
+    // A list ending in a heading or a rule has no panel edge: the rule
+    // stays on the line between its rows.
+    for md in ["- # Big\n\n---", "- item\n\n  ***\n\n---", "---\n\n- # Big"] {
+        let at = rule_at(md);
+        assert!(!(0.1..=0.9).contains(&at), "{md:?}: rule at {at}");
+    }
+    // A list ending / starting with a code block does: nudged a quarter row.
+    let at = rule_at("- x\n\n  ```\n  y\n  ```\n\n---");
+    assert!((at - 0.75).abs() < 0.1, "after a list's code panel: {at}");
+    let at = rule_at("---\n\n- ```\n  y\n  ```");
+    assert!((at - 0.25).abs() < 0.1, "before a list's code panel: {at}");
+    // A heading after a list ending in an H2 keeps the underline row as
+    // its margin; after a list ending in code it gets a blank row.
+    let top_of = |md: &str| {
+        let laid = grid_layout(md, &p);
+        let b = laid.boxes.iter().find(|b| b.text == "After").unwrap();
+        b.top / ch
+    };
+    let h2 = top_of("- ## Big\n\n## After");
+    let code = top_of("- ```\n  y\n  ```\n\n## After");
+    assert_eq!(h2, 3.0, "two heading rows + underline row");
+    assert_eq!(code, 4.0, "padding row, code, padding row, blank row");
 }

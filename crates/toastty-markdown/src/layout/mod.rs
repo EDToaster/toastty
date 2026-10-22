@@ -248,9 +248,6 @@ struct Lay<'a> {
     scale: f32,
     /// Stop laying out blocks below this y (truncation).
     y_limit: f32,
-    /// Lowest text descent drawn: a last line whose descenders hang
-    /// below the block gets a row more, so they aren't cut off.
-    ink_bottom: f32,
     /// Vertical offset of the next rule from its default spot (see
     /// [`Lay::blocks`]).
     rule_shift: f32,
@@ -349,7 +346,6 @@ pub(crate) fn layout(
         ch,
         scale: f / 16.0,
         y_limit: f32::from(row_cap) * ch + ch,
-        ink_bottom: 0.0,
         rule_shift: 0.0,
         #[cfg(test)]
         boxes: vec![],
@@ -365,7 +361,9 @@ pub(crate) fn layout(
         tight: false,
     };
     let end = lay.blocks(&doc.blocks, x0, inner, 0.0, ctx);
-    let end = if lay.ink_bottom > end + INK_SLACK * ch {
+    // The last line's descenders may hang below the last row; if real
+    // ink would be cut off, add a row.
+    let end = if ink_below(&lay.ops, &mut *lay.fs, &mut caches.swash, end, ch) {
         end + ch
     } else {
         end
@@ -437,10 +435,20 @@ pub(crate) fn layout(
     }
 }
 
-/// How far (in rows) the last line's font descent may hang below the
-/// block before it gets an extra row. The font box's descent is deeper
-/// than real descender ink, so a small overhang only clips empty space.
-const INK_SLACK: f32 = 0.1;
+/// Whether any glyph's ink reaches below `end`. Only glyphs whose
+/// baseline is in the last two rows can (a descender is shorter than a
+/// row); their bitmaps are cached for painting anyway.
+fn ink_below(ops: &[Op], fs: &mut FontSystem, swash: &mut SwashCache, end: f32, ch: f32) -> bool {
+    ops.iter().any(|op| match op {
+        Op::Glyph { key, y, .. } if *y as f32 > end - 2.0 * ch => {
+            swash.get_image(fs, *key).as_ref().is_some_and(|img| {
+                let p = img.placement;
+                p.height > 0 && (y - p.top) as f32 + p.height as f32 > end
+            })
+        }
+        _ => false,
+    })
+}
 
 /// Extra rows painted (and cropped) around a band; see [`paint_band`].
 const BAND_MARGIN: u32 = 8;
@@ -552,9 +560,26 @@ fn heading_scale(level: u8) -> f32 {
 /// edge (code, table, diagram) drawn through its middle, rather than
 /// blank space (rules, the H1/H2 underline row).
 fn panel_edge(b: &Block, bottom: bool) -> bool {
-    let (lead, trail) = space(b);
-    let rows = if bottom { trail } else { lead };
-    rows > 0.0 && !matches!(b, Block::Rule | Block::Heading(..))
+    let edge = |blocks: &[Block]| {
+        if bottom {
+            blocks.last()
+        } else {
+            blocks.first()
+        }
+        .is_some_and(|b| panel_edge(b, bottom))
+    };
+    match b {
+        // A list's / footnote's edge is its first / last child's.
+        Block::List { items, .. } => {
+            if bottom { items.last() } else { items.first() }.is_some_and(|i| edge(&i.blocks))
+        }
+        Block::Footnote(_, blocks) => edge(blocks),
+        Block::Rule | Block::Heading(..) => false,
+        _ => {
+            let (lead, trail) = space(b);
+            (if bottom { trail } else { lead }) > 0.0
+        }
+    }
 }
 
 /// Rows of blank space at the (top, bottom) of a block's own box: the
@@ -626,7 +651,9 @@ impl Lay<'_> {
             if matches!(b, Block::Rule) {
                 // A panel edge sits half way into its padding row, so
                 // nudge the rule a quarter row away from it to keep the
-                // space on both sides equal.
+                // space on both sides equal. Only siblings count: a rule
+                // at the edge of a list item next to a panel in the
+                // neighbouring item isn't centred.
                 let before_panel = blocks.get(i + 1).is_some_and(|n| panel_edge(n, false));
                 self.rule_shift = (f32::from(u8::from(before_panel))
                     - f32::from(u8::from(after_panel)))
@@ -991,10 +1018,6 @@ impl Lay<'_> {
 
     fn emit(&mut self, shaped: &Shaped, lines: &[Line], x: f32, y: f32, w: f32, lctx: &LineCtx) {
         let (texts, links) = shaped.emit(lines, x, y, w, lctx, &mut self.ops, self.fonts);
-        if let Some(last) = lines.last() {
-            let top = y + inline::height(lines) - last.h;
-            self.ink_bottom = self.ink_bottom.max(top + last.base + lctx.desc);
-        }
         #[cfg(test)]
         self.record(
             lines,
