@@ -1696,10 +1696,9 @@ impl Term {
                 sel.contains(line_id, col) || wide_partner_selected(sel, row, line_id, col)
             };
             let len = row.cells.len();
-            if let (Some(lo), Some(hi)) = (
-                (0..len).find(|&i| selected(i)),
-                (0..len).rev().find(|&i| selected(i)),
-            ) {
+            if let (Some(lo), Some(hi)) =
+                ((0..len).find(|&i| selected(i)), (0..len).rev().find(|&i| selected(i)))
+            {
                 let mut col = lo;
                 while col <= hi {
                     if Some(col) == pad_col {
@@ -3773,9 +3772,20 @@ impl Term {
                 2027 => {
                     self.grapheme_cluster_mode = enable;
                 }
-                // 2048 — in-band resize notifications.
+                // 2048 — in-band resize notifications. Like kitty, every
+                // set (even when already on) reports the current size
+                // straight away, so the app learns the geometry without
+                // waiting for a resize. Same numbers as the binary's
+                // resize reports and `TIOCGWINSZ`: whole-cell pixels.
                 2048 => {
                     self.inband_resize_mode = enable;
+                    if enable {
+                        let (w, h) = self.text_area_pixel_size();
+                        let w = u16::try_from(w).unwrap_or(u16::MAX);
+                        let h = u16::try_from(h).unwrap_or(u16::MAX);
+                        let reply = format!("\x1b[48;{};{};{h};{w}t", self.rows, self.cols);
+                        self.pty_replies.extend_from_slice(reply.as_bytes());
+                    }
                 }
                 // 80 — DECSDM (sixel display mode). SET disables sixel
                 // scrolling (image stays anchored); RESET enables it
@@ -8038,6 +8048,23 @@ mod tests {
         t.set_cell_pixel_size(9, 18);
         feed(&mut t, b"\x1b[14;2t");
         assert_eq!(&t.drain_pty_replies()[..], b"\x1b[4;432;720t");
+    }
+
+    #[test]
+    fn decset_2048_reports_size_on_every_enable() {
+        // kitty 0.49.2: `CSI ? 2048 h` answers with an in-band resize
+        // report right away, also when the mode is already on; reset
+        // sends nothing.
+        let mut t = Term::new(21, 80, 0);
+        t.set_cell_pixel_size(10, 19);
+        t.set_window_pixel_size(803, 411);
+        feed(&mut t, b"\x1b[?2048h");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[48;21;80;399;800t");
+        feed(&mut t, b"\x1b[?2048h");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[48;21;80;399;800t");
+        feed(&mut t, b"\x1b[?2048l");
+        assert!(t.drain_pty_replies().is_empty());
+        assert!(!t.inband_resize_mode());
     }
 
     #[test]

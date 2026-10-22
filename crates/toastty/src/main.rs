@@ -880,22 +880,12 @@ impl Toastty {
     /// everything else on the PTY (no SIGWINCH race). The encoder returns
     /// `None` when 2048 is off, so the default case doesn't touch the PTY.
     ///
-    /// The pixel fields report the CONTENT dims (surface minus padding),
-    /// matching `resync_grid`, not the full surface. Shared by window
-    /// resize, font zoom and font-changing config reloads.
+    /// The pixel fields are the PTY winsize ones (whole cells, see
+    /// [`winsize_pixels`]), so the report and `TIOCGWINSZ` always agree.
+    /// Shared by window resize, font zoom and font-changing config
+    /// reloads. (Enabling the mode reports straight away from Term.)
     fn report_inband_resize(&mut self) {
-        let (rows, cols) = self.term.size();
-        let pad = &self.config.window.padding;
-        let (_ox, _oy, content_w, content_h) = content_rect_from_padding(
-            self.physical_size,
-            (pad.top, pad.right, pad.bottom, pad.left),
-            self.scale_factor,
-        );
-        let pixel_w = u16::try_from(content_w).unwrap_or(u16::MAX);
-        let pixel_h = u16::try_from(content_h).unwrap_or(u16::MAX);
-        if let Some(bytes) =
-            encode_resize_report(rows, cols, pixel_h, pixel_w, self.term.inband_resize_mode())
-        {
+        if let Some(bytes) = inband_resize_report(&self.term) {
             self.write_pty(&bytes);
         }
     }
@@ -2542,7 +2532,8 @@ impl App for Toastty {
                 // clear only on an actual change.
                 self.push_padding_to_renderer();
                 self.resync_grid();
-                // DECSET 2048 in-band resize report (content dims).
+                // DECSET 2048 in-band resize report (whole-cell pixels,
+                // same as TIOCGWINSZ).
                 self.report_inband_resize();
                 ControlSignal::RedrawIn(Duration::ZERO)
             }
@@ -2820,8 +2811,6 @@ impl App for Toastty {
     }
 }
 
-/// True when `(button, modifiers)` is the "open hyperlink under cursor"
-/// Convert a linear-light channel value (0.0..1.0) back to an 8-bit
 /// PTY `TIOCGWINSZ` pixel fields (`ws_xpixel`, `ws_ypixel`) for the
 /// current grid: [`Term::text_area_pixel_size`], saturated to `u16`. Whole
 /// cells only, so `ws_ypixel / ws_row` is exactly the cell height that
@@ -2834,6 +2823,16 @@ fn winsize_pixels(term: &Term) -> (u16, u16) {
     )
 }
 
+/// DECSET 2048 in-band resize report for the current grid, or `None`
+/// when the app hasn't opted in. The pixel fields are the same
+/// whole-cell numbers as `TIOCGWINSZ` ([`winsize_pixels`]), like kitty.
+fn inband_resize_report(term: &Term) -> Option<Vec<u8>> {
+    let (rows, cols) = term.size();
+    let (pixel_w, pixel_h) = winsize_pixels(term);
+    encode_resize_report(rows, cols, pixel_h, pixel_w, term.inband_resize_mode())
+}
+
+/// Convert a linear-light channel value (0.0..1.0) back to an 8-bit
 /// sRGB byte. Inverse of `srgb_to_linear` in toastty-render. Used to
 /// feed Term's OSC 10/11/12 query handlers a byte triplet apps can
 /// understand.
@@ -2848,6 +2847,7 @@ fn linear_to_srgb_u8(x: f32) -> u8 {
     (srgb * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
+/// True when `(button, modifiers)` is the "open hyperlink under cursor"
 /// binding. On macOS it's `Cmd-Left`; on every other platform it's
 /// `Ctrl-Left` (matching iTerm2 / Alacritty conventions).
 fn is_open_link_binding(button: MouseButton, modifiers: Modifiers) -> bool {
@@ -2962,6 +2962,24 @@ mod tests {
         t.set_cell_pixel_size(12, 23);
         assert_eq!((rows, cols), (26, 83));
         assert_eq!(winsize_pixels(&t), (996, 598));
+    }
+
+    #[test]
+    fn inband_resize_report_matches_winsize() {
+        // #25 review: after a resize to 803x411 (10x19 cells, 80x21)
+        // the 2048 report carries TIOCGWINSZ's 800x399, not the window.
+        let (cols, rows) = grid_dims_from_pixels(803, 411, 10.0, 19.0);
+        let mut t = Term::new(rows, cols, 0);
+        t.set_cell_pixel_size(10, 19);
+        t.set_window_pixel_size(803, 411);
+        assert_eq!(inband_resize_report(&t), None, "off by default");
+        Parser::new().advance(&mut t, b"\x1b[?2048h");
+        let _ = t.drain_pty_replies();
+        assert_eq!(winsize_pixels(&t), (800, 399));
+        assert_eq!(
+            inband_resize_report(&t).as_deref(),
+            Some(&b"\x1b[48;21;80;399;800t"[..])
+        );
     }
 
     #[test]
