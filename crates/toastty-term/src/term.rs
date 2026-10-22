@@ -2964,10 +2964,15 @@ impl Term {
             // brand string containing "kitty" so apps treat us as
             // kitty-protocol-grade.
             //
-            // Reply format: DCS > | <brand> <version> ST.
+            // Reply format: DCS > | <brand> <version> ST, here
+            // `toastty <version> (kitty 0.42.0)`: toastty's own version
+            // first (QRY-1), the kitty brand kept for the apps above.
             'q' if priv_marker == Some(b'>') => {
-                self.pty_replies
-                    .extend_from_slice(b"\x1bP>|toastty (kitty 0.42.0)\x1b\\");
+                let reply = format!(
+                    "\x1bP>|toastty {} (kitty 0.42.0)\x1b\\",
+                    env!("CARGO_PKG_VERSION")
+                );
+                self.pty_replies.extend_from_slice(reply.as_bytes());
             }
             // XTWINOPS — window-manipulation reports.
             //   CSI 14 t → report text-area pixel size: CSI 4 ; H ; W t.
@@ -8273,6 +8278,36 @@ mod tests {
         feed(&mut t, b"\x1b[?2048l");
         assert!(t.drain_pty_replies().is_empty());
         assert!(!t.inband_resize_mode());
+    }
+
+    #[test]
+    fn xtversion_names_toastty_with_its_version_and_the_kitty_brand() {
+        let mut t = Term::new(24, 80, 0);
+        feed(&mut t, b"\x1b[>q");
+        let want = format!(
+            "\x1bP>|toastty {} (kitty 0.42.0)\x1b\\",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(t.drain_pty_replies(), want.as_bytes());
+        // `CSI > 0 q` is the same query.
+        feed(&mut t, b"\x1b[>0q");
+        assert_eq!(t.drain_pty_replies(), want.as_bytes());
+    }
+
+    #[test]
+    fn yazi_startup_queries_are_all_answered_in_order() {
+        // QRY-1: yazi's batch, in one write, exactly as it sends it.
+        // Colour replies end with ST whatever the query used, as in
+        // kitty 0.49.2 (checked live).
+        let mut t = Term::new(31, 100, 0);
+        t.set_cell_pixel_size(10, 19);
+        t.set_default_bg([0x12, 0x12, 0x14]);
+        feed(&mut t, b"\x1b7\x1b[>q\x1b[16t\x1b]11;?\x07\x1b[0c\x1b8");
+        let want = format!(
+            "\x1bP>|toastty {} (kitty 0.42.0)\x1b\\\x1b[6;19;10t\x1b]11;rgb:1212/1212/1414\x1b\\\x1b[?62;4;22c",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(String::from_utf8_lossy(&t.drain_pty_replies()), want);
     }
 
     #[test]
