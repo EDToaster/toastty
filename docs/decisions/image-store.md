@@ -47,7 +47,7 @@ Each store holds:
 |---|---|
 | `registry: ImageRegistry<ImageKey>` | Decoded bytes keyed by **key**. It owns the LRU and the byte quota. |
 | `by_client` / `client_of` | Map between client id (`i=`) and key, in both directions. Anonymous images have client id `0` and are absent from `by_client`. |
-| `numbers` | Map from image number (`I=`) to the client id of the most recent image transmitted with that number. |
+| `numbers` | Map from image number (`I=`) to the client ids of the live images transmitted with that number, oldest first. The newest live one answers; once it is freed the next newest does, and an image re-sent by `i=` keeps its number (#35, #37; matches kitty 0.49.2). |
 
 ### Client ids and keys
 
@@ -160,8 +160,8 @@ Each store holds:
   - Render-time placeholder lookups go client id → `ImageStore::key_of` →
     `registry().get(key)`.
 - **#35 (`d=F` frames, number → ids list).**
-  - The number map is `ImageStore::numbers`. If it becomes a list per
-    number, change it there.
+  - The number map is `ImageStore::numbers`, a list of ids per number
+    (done in the merge train).
   - `Term::delete_image_frames` must work on `self.image_store` only, which
     makes `d=F` on alt unable to free main's images.
 - **#37 (replies).** `register_image` returns the client id, which is `0`
