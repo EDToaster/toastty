@@ -699,13 +699,18 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
   - Fix: the APC scanner ends only on `ESC \\` / BEL. A new scanner state
     drops 0x9C inside a DCS before vte sees it (vte ignores bytes >= 0x80
     in a DCS anyway). OSC, PM and SOS were already right. Fixed in #32.
-- [ ] **P3 — WIRE-13. BEL doesn't end a DCS, PM or SOS; kitty ends all string
+- [x] **P3 — WIRE-13. BEL doesn't end a DCS, PM or SOS; kitty ends all string
   types on BEL.** Found while checking WIRE-5.
   - Repro: `ESC P z hello BEL world ESC \\` (likewise `ESC ^` and `ESC X`).
   - kitty 0.49.2 ends the string at BEL and prints ` world`. toastty (vte)
     keeps going to `ESC \\` and prints nothing.
   - OSC and APC already end on BEL in both.
   - xterm only accepts BEL for OSC, so this is a kitty-ism. Low impact.
+  - Fix: as in kitty, a DCS ended by BEL is dispatched as if it ended on
+    ST. XTGETTCAP, DECRQSS and sixel all work that way, checked live.
+    PM and SOS bodies are swallowed by the scanner up to BEL, ESC, CAN or
+    SUB. tmux passthrough is unaffected: a BEL inside the wrapped payload
+    is still data. Fixed in #36.
 - [ ] **P2 — WIRE-6. Malformed headers get an EINVAL reply; kitty stays
   silent.**
   - Cases: `s=abc`, `s=`, `q=3`, `m=2`, `a=X`, `t=x`, `o=y`, `x=-5`,
