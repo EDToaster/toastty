@@ -155,7 +155,7 @@ UVs at draw time. Don't patch each item separately.
     they also need `end <= scroll_bottom`.
   - Fixed in #29. Only placements entirely inside the margins scroll, and
     they are clipped at the margin.
-- [ ] **P1 — SCR-6. IL/DL (`CSI L` / `CSI M`) move images; kitty doesn't.**
+- [x] **P1 — SCR-6. IL/DL (`CSI L` / `CSI M`) move images; kitty doesn't.**
   - Repro: place an image, put the cursor above it, then `K raw '\x1b[2L'`
     or `'\x1b[2M'`.
   - Expected: kitty 0.49.2 leaves images in place and moves only the text.
@@ -167,7 +167,11 @@ UVs at draw time. Don't patch each item separately.
     contradicts.
   - Decide deliberately: following the text is arguably more useful. If
     toastty keeps it, document it as a divergence.
-- [ ] **P1 — SCR-7. Resize and reflow separate images from their text and
+  - Fixed in #31. Matches kitty: IL/DL move only the text. Re-checked on
+    kitty-ref: kitty also keeps an image whole when DL deletes the rows
+    under it, so toastty does not clip it either. Placeholder images move,
+    because they are text.
+- [x] **P1 — SCR-7. Resize and reflow separate images from their text and
   truncate them permanently.**
   - Repro: place an image, shrink the window to 8 rows, then grow it back.
     Or narrow it to 15 columns and widen it again.
@@ -181,6 +185,16 @@ UVs at draw time. Don't patch each item separately.
     - `term.rs:1813-1869`: `reflow_primary` doesn't move placements.
     - `ImageGrid::clip_to` (`image_grid.rs:491-514`) trims the span for
       good, without touching `src_rect`.
+  - Fixed in #31. The primary reflow now reports where each retained row
+    went (`Grid::resize_reflow_mapped` / `LineRemap`), and placements follow
+    their text, including the stashed primary grid while on the alt screen.
+    Alt placements keep their rows. Boxes are never trimmed or dropped for
+    hanging off the edge, so shrinking then growing restores the image.
+  - Correction to "Expected", from kitty-ref: kitty follows the text only on
+    height changes. On a width change kitty leaves the image at its screen
+    row while the text rewraps under it. toastty follows the text on width
+    changes too, as the PM decided (a deliberate divergence; see
+    [`decisions/image-placement-model.md`](decisions/image-placement-model.md)).
 - [ ] **P1 — SCR-8. Relative placements drift once their parent scrolls off
   the top.**
   - Repro: a child placed at `V=6` under a parent, then output that scrolls
@@ -223,7 +237,7 @@ UVs at draw time. Don't patch each item separately.
     overshoot. kitty-ref check: with `C=0` kitty *does* scroll the alt
     screen too, so toastty does the same; only `C=1` prevents the scroll
     on both screens.
-- [ ] **P2 — SCR-11. Scrolling inside DECSLRM left/right margins leaves
+- [x] **P2 — SCR-11. Scrolling inside DECSLRM left/right margins leaves
   images in place.**
   - Repro: `K raw '\x1b[?69h\x1b[5;40s\x1b[3;12r'`, then line feeds inside
     the margins.
@@ -233,6 +247,9 @@ UVs at draw time. Don't patch each item separately.
     image stays over different text.
   - Cause: `term.rs:1975-1981, 2042-2046` return before touching
     `image_grid`.
+  - Fixed in #31. Matches kitty: inside DECSLRM margins the text still
+    moves only within the margin rectangle, but images get a plain region
+    scroll over the top/bottom margins and are clipped at them.
 - [ ] **P2 — SCR-12. Alt screen modes 47 and 1047 clear text and images on
   re-entry; kitty keeps them.**
   - The spec requires clearing only for 1049.
