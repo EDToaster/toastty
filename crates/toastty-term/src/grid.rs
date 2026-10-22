@@ -110,9 +110,9 @@ pub type RelayoutFn<'a> = dyn FnMut(RichBlockId, &[Row]) -> Option<Vec<Row>> + '
 /// recent `history_lines` slots immediately preceding `head` (mod `cap`)
 /// and holds a valid scrollback row, or (b) blank. `scroll_up` (which
 /// rotates a row into scrollback and pre-blanks the slot it brings on
-/// screen) and `resize` (which rebuilds the ring) are the only places
-/// that touch off-screen slots, and they uphold this invariant.
-/// `scroll_down` only permutes the visible slots.
+/// screen), `clear_history` and `resize` (which rebuild the ring) are the
+/// only places that touch off-screen slots, and they uphold this
+/// invariant. `scroll_down` only permutes the visible slots.
 #[derive(Debug)]
 pub struct Grid {
     rows: Box<[Row]>,
@@ -313,6 +313,22 @@ impl Grid {
         let top_slot = self.slot(0);
         self.rows[top_slot].clear();
         self.rows[top_slot].resize_cols(self.cols);
+    }
+
+    /// Erase all scrollback (ED 3): every retained history row becomes
+    /// a blank off-screen slot and `history_lines` drops to 0, upholding
+    /// the off-screen invariant (b). The visible rows and `bottom_id` are
+    /// untouched, so visible line ids stay valid and every former
+    /// history id now falls below [`Self::oldest_retained_id`] (as if
+    /// evicted).
+    pub fn clear_history(&mut self) {
+        let cap = self.rows.len();
+        for n in 0..self.history_lines as usize {
+            let slot = (self.head + cap - 1 - n) % cap;
+            self.rows[slot].clear();
+            self.rows[slot].resize_cols(self.cols);
+        }
+        self.history_lines = 0;
     }
 
     /// Clear every visible row. Scrollback is left untouched (used by the
@@ -1062,6 +1078,33 @@ mod tests {
         g.scroll_down();
         g.scroll_down();
         assert_eq!(g.history_lines(), 0);
+    }
+
+    #[test]
+    fn grid_clear_history_blanks_scrollback_only() {
+        let mut g = Grid::new(2, 3, 6);
+        for ch in ['a', 'b', 'c', 'd', 'e'] {
+            g.scroll_up();
+            put_at(&mut g, 1, ch);
+        }
+        assert_eq!(g.history_lines(), 4);
+        let bottom = g.bottom_id();
+        g.clear_history();
+        assert_eq!(g.history_lines(), 0);
+        assert!(g.scrollback_row(0).is_none());
+        assert_eq!(g.bottom_id(), bottom);
+        assert_eq!(g.oldest_retained_id(), bottom - 1);
+        assert_eq!(g.row(0).cells[0].ch, 'd');
+        assert_eq!(g.row(1).cells[0].ch, 'e');
+        // New history accumulates again, and no old row resurfaces as
+        // the ring wraps.
+        for _ in 0..10 {
+            g.scroll_up();
+            for n in 0..g.history_lines() {
+                let ch = g.scrollback_row(n).unwrap().cells[0].ch;
+                assert!(ch == ' ' || ch == 'd' || ch == 'e', "stale {ch:?}");
+            }
+        }
     }
 
     #[test]

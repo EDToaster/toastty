@@ -220,6 +220,26 @@ UVs at draw time. Don't patch each item separately.
   - toastty is consistent between text and images, so the impact is low.
   - Code: `term.rs:3795-3850`.
 
+- [x] **P2 — SCR-13. ED 3 (`CSI 3 J`) keeps the scrollback text; kitty erases
+  it.** Found in the #29 review.
+  - Expected (kitty 0.49.2, checked live): `CSI 3 J` erases the screen
+    (text and images) and the whole scrollback. The cursor doesn't move. A
+    view scrolled back at the time snaps to the live screen. On the alt
+    screen it erases the alt screen and leaves the main scrollback alone.
+  - xterm differs: its ED 3 erases only the saved lines and leaves the
+    screen. toastty follows kitty.
+  - `clear` sends ED 3 only when the terminfo has `E3`.
+    - toastty runs with `TERM=xterm-256color`, which has it, so `clear`
+      erases the history, as in xterm, VTE and alacritty. That is the
+      intended behaviour (PM decision).
+    - kitty's own `xterm-kitty` terminfo has no `E3`, so `clear` keeps the
+      scrollback in kitty.
+  - Actual: toastty treated 3 exactly like 2, so the scrollback text
+    survived ED 3, and therefore `clear`.
+  - Fix: `Grid::clear_history` blanks the history ring. ED 3 calls it on
+    the primary screen, snaps the viewport to the live screen (a pixel-only
+    touchpad offset included), and drops any selection. Fixed in #38.
+
 ## 2. Sizing, scaling and rendering
 
 - [ ] **P0 — SIZE-1. Images are stretched to whole cells instead of drawn at
