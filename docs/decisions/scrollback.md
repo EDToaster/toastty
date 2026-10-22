@@ -140,7 +140,7 @@ bitflags             = "=2.11.1"
 ## Open questions for the real implementation
 
 1. **Outer ring capacity.** Today the ring is sized in *physical rows* (= 2x logical rows worst-case for an 80-col terminal). Realistically we want it sized in *logical lines* with an upper bound on physical rows derivable from current width. Reflow at the maximum width is the right way to size it.
-2. **Spacer cells and selection.** When a wide char gets bumped, our spacer is `' '` width=1. For text selection / copy, the spacer should produce zero output and the wide char should produce one grapheme. Add a `Cell::is_spacer()` flag and have copy-out skip spacers.
+2. **Spacer cells and selection.** When a wide char gets bumped, our spacer is `' '` width=1. For text selection / copy, the spacer should produce zero output and the wide char should produce one grapheme. Add a `Cell::is_spacer()` flag and have copy-out skip spacers. *Done as `Cell::wrap_pad`: `Term::print_char` and reflow write `Cell::WRAP_PAD` there, reflow drops only that cell when it rejoins a soft-wrapped row (a real space at the wrap point stays), and copy and URL detection skip it.*
 3. **Span table for SGR runs.** All three prototypes store style per-cell. A space-optimized version stores `Span { start, end, style }` separately. This is a *cell-shape* refactor — orthogonal to the container choice. Defer until profiling shows it matters.
 4. **Reflow is not the hot path.** Median 66 ms for the ring is fine; users resize maybe once per session. The hot path is **append**, where the ring is 250 ns p50 — comfortably under one frame budget at any refresh rate.
 
