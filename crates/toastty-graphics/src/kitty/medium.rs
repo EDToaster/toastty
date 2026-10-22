@@ -619,9 +619,9 @@ fn read_shm_object_linux(req: &ShmRequest<'_>) -> Result<Vec<u8>, FileError> {
 /// and this crate is `#![forbid(unsafe_code)]`. So the command fails with
 /// the usual uniform error. We still unlink a valid name
 /// (`rustix::shm::unlink` is safe), so a client that doesn't check the
-/// reply doesn't leak objects. Known limitation, recorded in
-/// `docs/decisions/kitty-file-medium.md`; whether to read it on macOS is
-/// pending a decision.
+/// reply doesn't leak objects. Decided: unsupported on macOS (keeps
+/// `#![forbid(unsafe_code)]`; clients fall back to file/base64), see
+/// `docs/decisions/kitty-file-medium.md`.
 #[cfg(not(target_os = "linux"))]
 fn read_shm_object_unsupported(req: &ShmRequest<'_>) -> Result<Vec<u8>, FileError> {
     shm_leaf(req.name)?;
