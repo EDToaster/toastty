@@ -3,6 +3,12 @@
 use serde::{Deserialize, Serialize};
 
 /// When to prompt for confirmation before closing the window.
+///
+/// The prompt is a modal dialog over the dimmed window that names the
+/// running program ("vim is still running") and offers Cancel (Esc / `n`)
+/// and Close (Enter / `y`, the default) buttons, which can also be
+/// clicked. With `Always` at a bare shell it just asks "Close this
+/// window?". While it's up, keys and mouse input go only to the dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ConfirmClose {

@@ -165,6 +165,11 @@ Raw Vulkan was rejected: ~1000 LoC boilerplate before drawing a triangle, no nat
                     so 3D can occlude text or sit beneath it
 4. Post-process     user-supplied fragment shader; built-in effects
                     (CRT, scanline, film grain) optional
+5. UI overlays      SDF chips (scroll-to-bottom, Copy Markdown), then
+                    the close-confirmation dialog on top: instanced
+                    rounded rects (scrim, shadow, panel, buttons) and
+                    its terminal-font text (toastty-render `chip/`,
+                    `dialog/`)
 ```
 
 ### Redraw policy (decision #7)
