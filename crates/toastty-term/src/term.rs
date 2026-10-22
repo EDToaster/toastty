@@ -327,12 +327,13 @@ pub struct Term {
     /// screen's grid here and install a fresh one as `image_grid`.
     /// `None` while on the primary screen (nothing stashed).
     stashed_image_grid: Option<ImageGrid>,
-    /// Image *number* (`I=`) → most-recently-registered image *id* map.
+    /// Image *number* (`I=`) → the ids registered with it, oldest first.
     /// The kitty spec lets a client refer to "the most recent image with
-    /// this number" via `d=n`/`d=N`. Updated on every registration that
-    /// carried a non-zero `I=`; pruned when the target id leaves the
-    /// registry (delete / eviction).
-    image_number_to_id: std::collections::HashMap<u32, u32>,
+    /// this number" (`a=p,I=`, `d=n`/`d=N`, animation). Updated on every
+    /// registration that carried a non-zero `I=`; pruned when an id leaves
+    /// the registry (delete / eviction), so the next-newest image with
+    /// that number takes over, as in kitty.
+    image_number_to_id: std::collections::HashMap<u32, Vec<u32>>,
     /// Monotonic counter bumped whenever the registry or grid mutates.
     /// The renderer compares against its cached value to decide when
     /// to re-sync GPU textures (and force a full clear of the frame).
@@ -4477,8 +4478,23 @@ impl Term {
     /// a freed id.
     fn remove_image_bytes(&mut self, id: u32) {
         self.image_registry.remove(id);
-        self.image_number_to_id.retain(|_, v| *v != id);
+        self.forget_image_number(id);
         self.forget_virtual_placements(id);
+    }
+
+    /// Drop `id` from the image-number map.
+    fn forget_image_number(&mut self, id: u32) {
+        self.image_number_to_id.retain(|_, ids| {
+            ids.retain(|x| *x != id);
+            !ids.is_empty()
+        });
+    }
+
+    /// The newest stored image registered with number `number`.
+    fn newest_image_with_number(&self, number: u32) -> Option<u32> {
+        self.image_number_to_id
+            .get(&number)
+            .and_then(|ids| ids.last().copied())
     }
 
     /// Free image bytes for every image that just lost its last
@@ -4630,12 +4646,17 @@ impl KittySink for Term {
                     for p in dropped {
                         mark_placement_dirty(self, &p);
                     }
-                    self.image_number_to_id.retain(|_, id| id != evicted);
+                    self.forget_image_number(*evicted);
                 }
                 // Record this id as the most-recent for its image number
                 // (M11: `d=n`/`d=N` resolution).
+                // A re-sent id loses its old number.
+                self.forget_image_number(inserted.id);
                 if image_number != 0 {
-                    self.image_number_to_id.insert(image_number, inserted.id);
+                    self.image_number_to_id
+                        .entry(image_number)
+                        .or_default()
+                        .push(inserted.id);
                 }
                 self.image_revision = self.image_revision.wrapping_add(1);
                 Some(inserted.id)
@@ -4888,7 +4909,7 @@ impl KittySink for Term {
             // when no placement of that image survives.
             b'n' | b'N' => {
                 if header.image_number != 0 {
-                    if let Some(&img) = self.image_number_to_id.get(&header.image_number) {
+                    if let Some(img) = self.newest_image_with_number(header.image_number) {
                         dropped_placements.extend(self.image_grid.remove_image(img));
                         virtual_dropped |= self.virtual_placements.remove_image(img);
                         if drop_bytes && !self.image_grid.iter().any(|p| p.image_id == img) {
@@ -5047,6 +5068,15 @@ impl KittySink for Term {
 
     fn image_exists(&self, id: u32) -> bool {
         self.image_registry.contains(id)
+    }
+
+    fn image_id_for_number(&self, number: u32) -> Option<u32> {
+        self.newest_image_with_number(number)
+            .filter(|id| self.image_registry.contains(*id))
+    }
+
+    fn next_image_id(&self) -> u32 {
+        self.image_registry.next_free_id()
     }
 
     fn image_dimensions(&self, id: u32) -> Option<(u32, u32)> {
@@ -8705,12 +8735,75 @@ mod tests {
     }
 
     #[test]
-    fn apc_kitty_animate_replies_enotsup() {
+    fn apc_kitty_animation_replies_like_kitty() {
         let mut t = Term::new(2, 4, 0);
+        // WIRE-12: unknown image → ENOENT.
         feed(&mut t, b"\x1b_Ga=a,i=1\x1b\\");
-        let replies = t.drain_pty_replies();
-        let s = String::from_utf8_lossy(&replies);
-        assert!(s.contains("ENOTSUP"), "got {s:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&t.drain_pty_replies()),
+            "\x1b_Gi=1;ENOENT:Animation command refers to non-existent image with id: 1 and number: 0\x1b\\"
+        );
+        // WIRE-3: stored image → silent no-op (kitten icat's `a=a`
+        // commands carry no `q=`).
+        let mut payload = b"\x1b_Ga=t,f=32,s=1,v=1,i=1,q=2;".to_vec();
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\\x1b_Ga=a,i=1,s=3,v=1\x1b\\\x1b_Ga=c,i=1,C=2\x1b\\");
+        feed(&mut t, &payload);
+        assert!(t.drain_pty_replies().is_empty());
+        assert!(t.image_registry().contains(1));
+    }
+
+    /// PLC-1 / PLC-3 / DEL-1 round trip through `Term`.
+    #[test]
+    fn apc_kitty_place_and_delete_replies_like_kitty() {
+        let mut t = Term::new(8, 20, 0);
+        // PLC-1: unknown id → ENOENT, no placement, cursor stays.
+        feed(&mut t, b"\x1b_Ga=p,i=77,q=1\x1b\\");
+        assert_eq!(
+            String::from_utf8_lossy(&t.drain_pty_replies()),
+            "\x1b_Gi=77;ENOENT:Put command refers to non-existent image with id: 77 and number: 0\x1b\\"
+        );
+        assert_eq!((t.cursor().row, t.cursor().col), (0, 0));
+        assert_eq!(t.image_grid().len(), 0);
+        // PLC-3: two images numbered 144 → `a=p,I=144` places the newest.
+        let mut payload = Vec::new();
+        for _ in 0..2 {
+            payload.extend_from_slice(b"\x1b_Ga=t,f=32,s=1,v=1,I=144;");
+            payload.extend_from_slice(&b64_red_1x1());
+            payload.extend_from_slice(b"\x1b\\");
+        }
+        payload.extend_from_slice(b"\x1b_Ga=p,I=144,C=1\x1b\\");
+        feed(&mut t, &payload);
+        assert_eq!(
+            String::from_utf8_lossy(&t.drain_pty_replies()),
+            "\x1b_Gi=1,I=144;OK\x1b\\\x1b_Gi=2,I=144;OK\x1b\\\x1b_Gi=2,I=144;OK\x1b\\"
+        );
+        assert_eq!(t.image_grid().len(), 1);
+        // WIRE-7: an `I=`-only failure reports the id the registry would
+        // assign next (kitty: `i=3,I=156;ENODATA:…`).
+        let mut payload = b"\x1b_Ga=t,f=32,s=2,v=2,I=156;".to_vec();
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        assert_eq!(
+            String::from_utf8_lossy(&t.drain_pty_replies()),
+            "\x1b_Gi=3,I=156;ENODATA:Insufficient image data: 4 < 16\x1b\\"
+        );
+        // DEL-1: deletes never reply. Freeing the newest image numbered
+        // 144 makes the older one the target again (kitty: `i=1,I=990`).
+        feed(&mut t, b"\x1b_Ga=d,d=I,i=2\x1b\\\x1b_Ga=d,d=i,i=999\x1b\\");
+        assert!(t.drain_pty_replies().is_empty());
+        feed(&mut t, b"\x1b_Ga=p,I=144,C=1\x1b\\");
+        assert_eq!(
+            String::from_utf8_lossy(&t.drain_pty_replies()),
+            "\x1b_Gi=1,I=144;OK\x1b\\"
+        );
+        // Once both are freed, ENOENT.
+        feed(&mut t, b"\x1b_Ga=d,d=I,i=1\x1b\\\x1b_Ga=p,I=144\x1b\\");
+        assert_eq!(
+            String::from_utf8_lossy(&t.drain_pty_replies()),
+            "\x1b_GI=144;ENOENT:Put command refers to non-existent image with id: 0 and number: 144\x1b\\"
+        );
     }
 
     /// Regression: placing an image taller than the rows remaining
