@@ -154,9 +154,16 @@ Per `[shader] animation`:
 
 | Mode | Shader reads time, declares a duration | Reads time, no duration | No time inputs |
 |---|---|---|---|
-| `auto` | ~60 Hz for `duration` after any bell, cursor change or focus gain (focused or not), else idle | ~60 Hz while focused; idle while unfocused | Idle |
+| `auto` | ~60 Hz for `duration` after an event the shader reads (below), focused or not; else idle | ~60 Hz while focused; idle while unfocused | Idle |
 | `always` | ~60 Hz | ~60 Hz | ~60 Hz |
 | `never` | Event frames only | Event frames only | Event frames only |
+
+The events that open the `duration` window are a bell, a cursor change
+and a focus gain, but only those whose uniforms the chain reads (bell:
+`iTimeBell`, `iBellCursor`, `iBellCount`, `iBells`; cursor: the
+`iCurrentCursor*` / `iPreviousCursor*` / `iTimeCursorChange` family; focus:
+`iFocus`, `iTimeFocus`). A chain that reads none of them is opened by all
+three. So a bell-only shader stays idle while you type.
 
 "Idle" means the existing skip-submit gate applies. The chain's
 duration is the max over its shaders. Time-driven frames are scheduled
