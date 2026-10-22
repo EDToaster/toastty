@@ -1259,6 +1259,50 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
     vim-style redraw +3.3%. That is one SIMD validation pass, about
     0.95 instructions per byte of non-ASCII text.
 
+- [x] **P3 — WIRE-17. A byte >= 0x80 inside a CSI is ignored; kitty aborts
+  the CSI and prints the rest.** Found in the #41 review.
+  - Repro and expected (kitty 0.49.2, read back with `kitten @ get-text`):
+    - `ESC[3 \x9c 1mX` prints plain `1mX`; the SGR is not applied.
+    - `ESC[31 \x9c mX` prints `mX`, and `ESC[ \x9c 31mX` prints `31mX`.
+    - The high byte itself is dropped, so a multi-byte character there
+      leaves its continuation bytes as U+FFFD: `ESC[3 € 1mX` prints
+      `��1mX`, and `ESC[3 é 1mX` prints `�1mX`.
+    - The same holds after an intermediate (`ESC[1 \x9c qX` prints `qX`).
+    - A C0 control inside a CSI is still executed and the CSI goes on
+      (`ESC[3 BS 1mX` applies SGR 31).
+  - Actual: vte ignores the byte (after #41 it sees U+FFFD's bytes) and
+    dispatches `CSI 31 m`, so `X` is red and `1m` vanishes.
+  - Fix: the scanner tracks when vte is inside a CSI or escape sequence. A
+    byte >= 0x80 there aborts it: CAN goes to vte through a null performer
+    (no dispatch), the byte is dropped, and parsing resumes in ground at
+    the next byte. All-ASCII reads skip the check (nothing in them can
+    abort a sequence). Fixed in #52.
+  - Cost, in parser instructions per byte against #41: text +0.1 to 0.7%,
+    `ls --color` style +1.9%, vim-like redraw with box drawing +6.9%. The
+    last is the check on every sequence in reads that contain non-ASCII
+    text.
+  - Also seen on kitty-ref, but left as is (vte's behaviour, which matches
+    xterm):
+    - DEL inside a CSI aborts it in kitty (`ESC[3 DEL 1mX` prints `1mX`).
+      vte ignores DEL and applies SGR 31.
+    - ESC inside a CSI aborts it in kitty and the ESC is dropped
+      (`ESC[3 ESC[32mG` prints `[32mG`). vte and xterm start the new
+      sequence, giving a green `G`, which is kinder to truncated output.
+- [x] **P3 — WIRE-18. ESC followed by a non-ASCII character uses the next
+  ASCII byte as the escape's final; kitty prints the text.** Found in the
+  #41 review.
+  - Repro and expected (kitty 0.49.2, `kitten @ get-text`):
+    - `ESC € A` prints `��A`, and `ESC é A` prints `�A`.
+    - `ESC \x9c A`, `ESC \x80 A` and `ESC \xff A` print `A`.
+    - `ESC 😀 A` prints three U+FFFD then `A`.
+    - Likewise inside an escape with intermediates: `ESC ( € A` prints
+      `��A`, and `ESC ( \x9c B X` prints `BX`.
+  - Actual: vte ignores the non-ASCII bytes in the escape state and
+    dispatches the next ASCII byte (`ESC A`) as the final, swallowing it.
+  - Fix: the same rule as WIRE-17. An ESC followed by a byte >= 0x80 is
+    dropped with that byte (the ESC still ends any string vte is in), and
+    the rest is ground text. Fixed in #52.
+
 ## 9. Not implemented
 
 - [ ] **P1 — Animation** (`a=f` frames, `a=a` control, `a=c` composition,
