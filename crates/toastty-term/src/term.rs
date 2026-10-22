@@ -1517,10 +1517,12 @@ impl Term {
                         break;
                     }
                     Some(_) => {}
-                    // A selected row that was in (immutable) scrollback
-                    // at commit time and has since rotated back on
-                    // screen (reverse index): adopt its current content
-                    // as the baseline.
+                    // A selected row with no baseline: it was in
+                    // (immutable) scrollback at commit time and is on
+                    // screen now. SD / RI no longer do that (SCR-9:
+                    // they leave history alone), but adopt its current
+                    // content as the baseline rather than call it
+                    // changed.
                     None => snap.push((line_id, fp)),
                 }
             }
@@ -2045,10 +2047,9 @@ impl Term {
             return;
         }
         if top == 0 && bot == self.rows.saturating_sub(1) {
+            // History is untouched (SCR-9), so the viewport needs no
+            // clamp: a scrolled-back view keeps showing the same rows.
             self.active_grid_mut().scroll_down();
-            if !self.alt_active {
-                self.viewport.clamp_to(self.primary.history_lines());
-            }
             self.mark_all_dirty();
             let dropped = self.image_grid.shift_rows_down(1, 0, self.rows);
             self.image_grid.resolve_relative_positions();
@@ -2765,7 +2766,12 @@ impl Term {
             // treat the single-param form as SD; anything with more params
             // falls through to the catch-all.
             'T' if priv_marker.is_none() && params.len() <= 1 => {
-                let n = first_param(params, 1).max(1);
+                // Scrolling the region by its height or more blanks it
+                // either way, so clamp: `CSI 65535 T` would otherwise
+                // run 65535 full-region shifts.
+                let bot = self.scroll_bot.min(self.rows.saturating_sub(1));
+                let height = bot.saturating_sub(self.scroll_top) + 1;
+                let n = first_param(params, 1).clamp(1, height);
                 for _ in 0..n {
                     self.region_scroll_down();
                 }
@@ -5400,6 +5406,123 @@ mod tests {
         assert_eq!(row_text(&t, 1), "X1");
         assert_eq!(row_text(&t, 2), "X2");
         assert_eq!(row_text(&t, 3), "P0");
+    }
+
+    /// `1\r\n2\r\n…\r\n<n>` — like `seq 1 n` without the trailing newline.
+    fn seq_bytes(n: u32) -> Vec<u8> {
+        (1..=n)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\r\n")
+            .into_bytes()
+    }
+
+    fn scrollback_text(t: &Term, n: u32) -> String {
+        let mut s: String = t
+            .primary
+            .scrollback_row(n)
+            .expect("scrollback row retained")
+            .cells
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        while s.ends_with(' ') {
+            s.pop();
+        }
+        s
+    }
+
+    #[test]
+    fn sd_full_screen_leaves_scrollback_alone() {
+        // SCR-9: `seq 1 10` on a 4-row screen leaves 1..6 in history and
+        // 7..10 visible. SD 2 must insert two blank lines at the top and
+        // drop 9 and 10 off the bottom (xterm, kitty), not pull 5 and 6
+        // back out of history.
+        let mut t = Term::new(4, 8, 100);
+        feed(&mut t, &seq_bytes(10));
+        assert_eq!(t.history_lines(), 6);
+        feed(&mut t, b"\x1b[2T");
+        assert_eq!(row_text(&t, 0), "");
+        assert_eq!(row_text(&t, 1), "");
+        assert_eq!(row_text(&t, 2), "7");
+        assert_eq!(row_text(&t, 3), "8");
+        assert_eq!(t.history_lines(), 6);
+        for n in 0..6 {
+            assert_eq!(scrollback_text(&t, n), (6 - n).to_string());
+        }
+    }
+
+    #[test]
+    fn ri_at_top_leaves_scrollback_alone() {
+        // SCR-9, RI flavour: the same rule holds for ESC M on row 0.
+        let mut t = Term::new(4, 8, 100);
+        feed(&mut t, &seq_bytes(10));
+        feed(&mut t, b"\x1b[H\x1bM\x1bM\x1bM");
+        assert_eq!(row_text(&t, 0), "");
+        assert_eq!(row_text(&t, 1), "");
+        assert_eq!(row_text(&t, 2), "");
+        assert_eq!(row_text(&t, 3), "7");
+        assert_eq!(t.history_lines(), 6);
+        assert_eq!(scrollback_text(&t, 0), "6");
+        // Subsequent output scrolls normally: the blank top rows go
+        // into history above the untouched 1..6.
+        feed(&mut t, b"\x1b[4;1H\r\nX");
+        assert_eq!(t.history_lines(), 7);
+        assert_eq!(scrollback_text(&t, 0), "");
+        assert_eq!(scrollback_text(&t, 1), "6");
+        assert_eq!(row_text(&t, 2), "7");
+        assert_eq!(row_text(&t, 3), "X");
+    }
+
+    #[test]
+    fn sd_count_is_clamped_to_region_height() {
+        // A huge SD count acts like SD by the region height: the region
+        // is blanked, rows outside it and the scrollback are untouched.
+        let mut t = Term::new(6, 8, 100);
+        feed(&mut t, &seq_bytes(10));
+        // Region rows 2..=5 (1-based), i.e. "6".."9" on screen.
+        feed(&mut t, b"\x1b[2;5r\x1b[65535T");
+        assert_eq!(row_text(&t, 0), "5");
+        for r in 1..5 {
+            assert_eq!(row_text(&t, r), "", "row {r}");
+        }
+        assert_eq!(row_text(&t, 5), "10");
+        assert_eq!(t.history_lines(), 4);
+        // Full screen: same, history kept.
+        feed(&mut t, b"\x1b[r\x1b[1;1Htop\x1b[65535T");
+        for r in 0..6 {
+            assert_eq!(row_text(&t, r), "", "row {r}");
+        }
+        assert_eq!(t.history_lines(), 4);
+        assert_eq!(scrollback_text(&t, 0), "4");
+    }
+
+    #[test]
+    fn sd_keeps_scrolled_back_view_on_same_history() {
+        // With the view scrolled back, SD changes only the live screen;
+        // the offset and the history rows it shows stay put.
+        let mut t = Term::new(4, 8, 100);
+        feed(&mut t, &seq_bytes(10));
+        t.scroll_view_by(3, 0.0, 16.0);
+        t.force_snap_view();
+        assert_eq!(t.view_offset_lines(), 3);
+        let top = |t: &Term| -> String { t.view_row(0).cells.iter().map(|c| c.ch).collect() };
+        let before = top(&t);
+        assert!(before.starts_with('4'), "view top = {before:?}");
+        feed(&mut t, b"\x1b[T");
+        assert_eq!(t.view_offset_lines(), 3);
+        assert_eq!(top(&t), before);
+    }
+
+    #[test]
+    fn sd_on_alt_screen_inserts_blank_top() {
+        // The alt grid has no history (`cap == visible_rows`); the
+        // in-place rotation must still behave.
+        let mut t = Term::new(3, 8, 100);
+        feed(&mut t, b"\x1b[?1049ha\r\nb\r\nc\x1b[T");
+        assert_eq!(row_text(&t, 0), "");
+        assert_eq!(row_text(&t, 1), "a");
+        assert_eq!(row_text(&t, 2), "b");
     }
 
     #[test]
