@@ -718,7 +718,13 @@ fn virtual_placements_follow_the_47_1047_alt_screen() {
     feed(&mut t, b"\x1b[?47l");
     assert!(!t.virtual_placements().contains_image(2), "not on main");
     feed(&mut t, b"\x1b[?1047h");
-    assert!(t.virtual_placements().contains_image(2), "back with the alt text");
+    assert!(
+        t.virtual_placements().contains_image(2),
+        "back with the alt text"
+    );
     feed(&mut t, b"\x1b[?1047l\x1b[?1049h");
-    assert!(!t.virtual_placements().contains_image(2), "1049 starts fresh");
+    assert!(
+        !t.virtual_placements().contains_image(2),
+        "1049 starts fresh"
+    );
 }
