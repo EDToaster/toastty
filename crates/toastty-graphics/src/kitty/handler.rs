@@ -2176,17 +2176,19 @@ mod major_relative_handler_tests {
     fn relative_placement_cycle_replies_ecycle() {
         let mut h = KittyHandler::new();
         let mut sink = GridSink::default();
-        // Seed (1,10) whose parent is (2,20).
+        // (2,20) is a child of (1,10); re-placing (1,10) relative to
+        // (2,20) would close the loop.
         sink.registered.push(1);
         sink.registered.push(2);
-        let mut looped = Placement::new(1, 1, 1);
-        looped.placement_id = 10;
-        looped.parent = Some((2, 20));
-        sink.grid.add(looped);
-        // Now add (2,20) parented to (1,10) — closes the loop.
-        h.process(b"Ga=p,i=2,p=20,P=1,Q=10,H=1,V=1", b"", &mut sink)
+        let mut root = Placement::new(1, 1, 1);
+        root.placement_id = 10;
+        sink.grid.add(root);
+        h.process(b"Ga=p,i=2,p=20,P=1,Q=10,H=1,V=1,q=2", b"", &mut sink)
             .unwrap();
-        assert!(sink.grid.find(2, 20).is_none());
+        assert!(sink.grid.find(2, 20).is_some());
+        h.process(b"Ga=p,i=1,p=10,P=2,Q=20,H=1,V=1", b"", &mut sink)
+            .unwrap();
+        assert!(sink.grid.find(1, 10).unwrap().parent.is_none(), "unchanged");
         assert!(
             sink.replies_joined().contains("ECYCLE"),
             "got {:?}",

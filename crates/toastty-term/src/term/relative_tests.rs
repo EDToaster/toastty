@@ -229,3 +229,199 @@ fn rel5_child_of_a_placeholder_image_anchors_to_its_min_x_and_y() {
     assert!(cmd(&mut t, "a=p,i=8,p=1,P=7,Q=3,H=1,V=1,c=1,r=1").contains("OK"));
     assert_eq!(at(&t, 8, 1), Some((4, 3)));
 }
+
+// ---- #40 review: `P=` without `Q=` binds once; per-delete image freeing ----
+
+#[test]
+fn p_without_q_cycle_is_ecycle() {
+    // kitty-ref: 1 -> (2 via P=1 only) -> 1 is a cycle.
+    let mut t = Term::new(30, 80, 100);
+    transmit(&mut t, 1);
+    transmit(&mut t, 2);
+    assert!(cmd(&mut t, "a=p,i=1,p=1,c=2,r=1,C=1").contains("OK"));
+    assert!(cmd(&mut t, "a=p,i=2,p=1,P=1,H=6,c=2,r=1").contains("OK"));
+    let r = cmd(&mut t, "a=p,i=1,p=1,P=2,Q=1,c=2,r=1");
+    assert!(r.contains("ECYCLE"), "{r}");
+    assert_eq!(t.image_grid().find(1, 1).unwrap().parent, None, "unchanged");
+    // And nothing drifts on later resolves.
+    let before = (at(&t, 1, 1), at(&t, 2, 1));
+    feed(&mut t, b"\x1b[5;20r\x1b[20;1H\n\n\x1b[r");
+    assert_eq!((at(&t, 1, 1), at(&t, 2, 1)), before);
+}
+
+#[test]
+fn p_without_q_self_reference_is_einval() {
+    // kitty-ref: "Put command refers to itself as its own parent".
+    let mut t = Term::new(30, 80, 100);
+    transmit(&mut t, 1);
+    assert!(cmd(&mut t, "a=p,i=1,p=1,c=2,r=1,C=1").contains("OK"));
+    let r = cmd(&mut t, "a=p,i=1,p=1,P=1,H=4,c=2,r=1");
+    assert!(r.contains("EINVAL"), "{r}");
+    assert_eq!(t.image_grid().find(1, 1).unwrap().parent, None);
+}
+
+#[test]
+fn p_without_q_binds_to_the_oldest_placement_once() {
+    // kitty-ref: image 1 at p=1 and p=2, a child of `P=1` (bound to the
+    // oldest, p=1); deleting p=1 deletes the child and frees its image,
+    // instead of re-anchoring it onto p=2.
+    let mut t = Term::new(30, 80, 100);
+    transmit(&mut t, 1);
+    transmit(&mut t, 2);
+    feed(&mut t, b"\x1b[3;5H");
+    assert!(cmd(&mut t, "a=p,i=1,p=1,c=2,r=1,C=1").contains("OK"));
+    feed(&mut t, b"\x1b[10;30H");
+    assert!(cmd(&mut t, "a=p,i=1,p=2,c=2,r=1,C=1").contains("OK"));
+    assert!(cmd(&mut t, "a=p,i=2,p=1,P=1,H=6,c=2,r=1").contains("OK"));
+    assert_eq!(at(&t, 2, 1), Some((2, 10)), "bound to p=1 at (2, 4)");
+    cmd(&mut t, "a=d,d=i,i=1,p=1");
+    assert!(at(&t, 2, 1).is_none(), "the child went with its parent");
+    assert!(at(&t, 1, 2).is_some());
+    // (kitty-ref probes with `a=p,i=2`: ENOENT.)
+    assert!(!t.image_registry().contains(2), "child image freed");
+}
+
+#[test]
+fn p_without_q_child_image_is_freed_by_a_lowercase_id_delete() {
+    // kitty-ref: child `P=41` (no Q), then `a=d,d=i,i=41`: the child's
+    // image is freed.
+    let mut t = Term::new(30, 80, 100);
+    transmit(&mut t, 41);
+    transmit(&mut t, 2);
+    feed(&mut t, b"\x1b[3;5H");
+    assert!(cmd(&mut t, "a=p,i=41,p=1,c=2,r=1,C=1").contains("OK"));
+    assert!(cmd(&mut t, "a=p,i=2,p=1,P=41,H=6,c=2,r=1").contains("OK"));
+    cmd(&mut t, "a=d,d=i,i=41");
+    assert!(t.image_grid().is_empty());
+    assert!(!t.image_registry().contains(2));
+    assert!(t.image_registry().contains(41), "lowercase: parent's kept");
+}
+
+/// Family with the parent at cell (5, 3) and z=3; returns after `del`
+/// whether the child's image (2) is still stored.
+fn child_image_kept_after(del: &str) -> bool {
+    let mut t = Term::new(30, 80, 100);
+    transmit(&mut t, 1);
+    transmit(&mut t, 2);
+    feed(&mut t, b"\x1b[3;5H");
+    assert!(cmd(&mut t, "a=p,i=1,p=1,I=0,z=3,c=2,r=1,C=1").contains("OK"));
+    assert!(cmd(&mut t, "a=p,i=2,p=1,P=1,Q=1,H=40,V=10,c=2,r=1").contains("OK"));
+    cmd(&mut t, del);
+    assert!(
+        at(&t, 2, 1).is_none(),
+        "{del}: the child went with its parent"
+    );
+    t.image_registry().contains(2)
+}
+
+#[test]
+fn cascaded_child_image_freeing_matches_kitty_per_delete() {
+    // kitty-ref 0.49.2, probing the child's image with `a=p` afterwards:
+    // positional lowercase deletes keep it, id-like ones free it.
+    for del in ["a=d,d=p,x=5,y=3", "a=d,d=x,x=5", "a=d,d=y,y=3", "a=d,d=a"] {
+        assert!(child_image_kept_after(del), "{del} keeps the child's image");
+    }
+    for del in [
+        "a=d,d=z,z=3",
+        "a=d,d=r,x=1,y=1",
+        "a=d,d=i,i=1",
+        "a=d,d=I,i=1",
+        "a=d,d=P,x=5,y=3",
+        "a=d,d=q,x=5,y=3,z=3",
+    ] {
+        assert!(
+            !child_image_kept_after(del),
+            "{del} frees the child's image"
+        );
+    }
+    // d=c needs the cursor on the parent.
+    let mut t = Term::new(30, 80, 100);
+    transmit(&mut t, 1);
+    transmit(&mut t, 2);
+    feed(&mut t, b"\x1b[3;5H");
+    cmd(&mut t, "a=p,i=1,p=1,c=2,r=1,C=1");
+    cmd(&mut t, "a=p,i=2,p=1,P=1,Q=1,H=40,c=2,r=1");
+    cmd(&mut t, "a=d,d=c");
+    assert!(at(&t, 2, 1).is_none());
+    assert!(t.image_registry().contains(2), "d=c keeps it");
+}
+
+#[test]
+fn cascaded_child_image_freed_by_number_delete() {
+    // kitty-ref: d=n on the parent's number frees the cascaded child's
+    // image.
+    let mut t = Term::new(30, 80, 100);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(vec![200u8; 4 * 4 * 4]);
+    feed(
+        &mut t,
+        format!("\x1b_Ga=t,f=32,s=4,v=4,I=50,q=2;{b64}\x1b\\").as_bytes(),
+    );
+    transmit(&mut t, 41);
+    feed(&mut t, b"\x1b[3;5H");
+    assert!(cmd(&mut t, "a=p,i=1,p=1,c=2,r=1,C=1").contains("OK"));
+    assert!(cmd(&mut t, "a=p,i=41,p=1,P=1,Q=1,H=25,c=2,r=1").contains("OK"));
+    cmd(&mut t, "a=d,d=n,I=50");
+    assert!(t.image_grid().is_empty());
+    assert!(!t.image_registry().contains(41));
+}
+
+#[test]
+fn a_parent_leaving_history_keeps_the_childs_image() {
+    // kitty-ref (scrollback 20): the child goes with its parent, but
+    // both images stay.
+    let mut t = Term::new(10, 40, 8);
+    transmit(&mut t, 1);
+    transmit(&mut t, 2);
+    feed(&mut t, b"\x1b[3;5H");
+    cmd(&mut t, "a=p,i=1,p=1,c=4,r=2,C=1");
+    cmd(&mut t, "a=p,i=2,p=1,P=1,Q=1,V=6,c=4,r=2");
+    feed(&mut t, b"\x1b[10;1H");
+    feed(&mut t, &[b'\n'; 20]);
+    assert!(t.image_grid().is_empty());
+    assert!(t.image_registry().contains(1) && t.image_registry().contains(2));
+}
+
+#[test]
+fn a_child_inside_the_region_with_its_parent_loses_the_parents_cut() {
+    // kitty-ref: parent rows 6..8 and child rows 8..11 inside margins
+    // 5..=19; two LFs at the bottom cut the parent's top row at the margin
+    // and the child, still inside the region, loses its top row too.
+    let mut t = Term::new(30, 80, 100);
+    transmit(&mut t, 1);
+    transmit(&mut t, 2);
+    feed(&mut t, b"\x1b[7;50H");
+    cmd(&mut t, "a=p,i=1,p=1,c=10,r=2,C=1");
+    cmd(&mut t, "a=p,i=2,p=1,P=1,Q=1,V=2,H=-20,c=10,r=3");
+    feed(&mut t, b"\x1b[6;20r\x1b[20;1H\n\n\x1b[r");
+    let parent = t.image_grid().find(1, 1).unwrap();
+    assert_eq!(t.prows(parent), 5..6);
+    let child = t.image_grid().find(2, 1).unwrap();
+    assert_eq!(
+        (child.line - t.image_top_line(), child.clip_rows.clone()),
+        (6, 1..3)
+    );
+}
+
+#[test]
+fn orphan_sweep_on_history_eviction_is_linear() {
+    // #40 review: 2000 parent/child pairs leaving the history took
+    // seconds. Count the work instead of timing it: the whole eviction
+    // is a handful of O(n) passes.
+    let mut t = Term::new(10, 40, 50);
+    transmit(&mut t, 1);
+    for i in 1..=2000u32 {
+        feed(&mut t, b"\x1b[1;1H");
+        cmd(&mut t, &format!("a=p,i=1,p={},c=1,r=1,C=1,q=2", 2 * i));
+        cmd(
+            &mut t,
+            &format!("a=p,i=1,p={},P=1,Q={},V=1,c=1,r=1,q=2", 2 * i + 1, 2 * i),
+        );
+    }
+    assert_eq!(t.image_grid().len(), 4000);
+    let start = std::time::Instant::now();
+    feed(&mut t, &[b'\n'; 80]);
+    assert!(t.image_grid().is_empty());
+    // Generous even for a debug build; the quadratic version took
+    // seconds in release.
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+}

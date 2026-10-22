@@ -143,13 +143,41 @@ an `ImageView { top_line, scroll_px, clip }`:
     descendants, recursively. That includes a parent scrolling out of
     the history while the child's rows are still retained (SCR-8; kitty
     does the same).
-  - **Freeing child images.** A child removed *because its parent was*
-    (`ImageGrid::removed_with_parent`) frees its image once the image
-    has no placement left, even on a lowercase delete. A child deleted
-    directly keeps its image (REL-2).
-  - **Parent references.** `P=` without `Q=` is relative to the parent
-    image's oldest placement, and `Q=` without `P=` is an ordinary
-    placement. Self-reference gives EINVAL if the placement exists and
+  - **Binding.** `add_relative` resolves the parent reference to one
+    concrete placement when the child is created, and stores its handle
+    in `Placement::parent_ref`. From then on, positions, the self and
+    cycle checks, the depth cap and the delete cascade all follow
+    handles, never the ids.
+    - This matters for `P=` without `Q=`. kitty binds that to the parent
+      image's oldest placement *at that moment*, so a later delete of
+      that placement takes the child with it, instead of re-anchoring
+      the child on another placement of the image.
+    - Replacing a placement in place (`upsert`) keeps its handle, so its
+      children stay bound.
+    - A child of a Unicode-placeholder parent (a group of tiles) is still
+      found by ids, until #28.
+    - The orphan sweep builds a set of live handles once per pass and
+      removes with one drain, so it is O(n) per pass.
+  - **Freeing child images.** The cascaded children are returned
+    separately (`ImageGrid::remove_where_split`). Whether a child removed
+    *because its parent was* also loses its image depends on the delete,
+    as on kitty-ref 0.49.2:
+    - **Image freed** once it has no placement left: `d=i/I`, `d=n/N`,
+      `d=r/R`, `d=z/Z` and `d=q/Q` (lowercase too), plus every uppercase
+      delete.
+    - **Image kept:** lowercase `d=a`, `d=p`, `d=x`, `d=y` and `d=c`, and a
+      parent leaving the history.
+    - A child deleted directly keeps its image on a lowercase delete
+      (REL-2).
+  - **Margin scrolls.** Relative children don't scroll on their own. They
+    follow their parent through the resolve (#31), and they take on the
+    rows their parent lost to a margin (`inherited_clip`). kitty-ref:
+    - a child inside the region whose parent is outside stays whole;
+    - with both inside, two LFs cut the parent's top row at the margin,
+      and the child loses its top row too.
+  - **Parent references.** `P=` without `Q=` is bound to the parent
+    image's oldest placement (see "Binding"), and `Q=` without `P=` is an
+    ordinary placement. Self-reference gives EINVAL if the placement exists and
     ENOPARENT if not. `a=p,U=1` with `P=` gives EINVAL, while
     `a=T,U=1,P=…` is accepted and makes the virtual placement (REL-7).
     `a=T` with `P=` is relative like `a=p` and never moves the cursor

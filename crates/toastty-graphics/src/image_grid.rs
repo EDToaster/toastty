@@ -30,6 +30,7 @@
 //! few, so this is pragmatic. If it ever shows up in profiling, swap for
 //! an interval tree.
 
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 /// A single image placement.
@@ -83,6 +84,15 @@ pub struct Placement {
     /// `line`/`col` are resolved from the parent's origin plus
     /// [`Self::rel_offset`], and re-resolved whenever the parent moves.
     pub parent: Option<(u32, u32)>,
+    /// The parent placement this child is bound to, resolved **once**
+    /// when it is created (kitty: `P=` without `Q=` picks the parent
+    /// image's oldest placement at that moment and keeps it). Positions,
+    /// cycle checks and the delete cascade all follow this handle, never
+    /// [`Self::parent`]'s ids again. `None` for an ordinary placement, and
+    /// for a child of a Unicode-placeholder parent, which is a group of
+    /// tiles rather than one placement and is found by ids.
+    // TODO(#28): placeholder parents stop being tiles there.
+    pub parent_ref: Option<PlacementHandle>,
     /// M13: `(cols, rows)` cell offset from the parent placement's origin
     /// (kitty's `H=`/`V=`). Only meaningful when [`Self::parent`] is
     /// `Some`. Signed. Defaults to `(0, 0)`.
@@ -114,6 +124,7 @@ impl Placement {
             z: 0,
             pix_offset: (0, 0),
             parent: None,
+            parent_ref: None,
             rel_offset: (0, 0),
             from_placeholder: false,
         }
@@ -277,36 +288,103 @@ impl ImageGrid {
         let (pimg, pplace) = child.parent.ok_or(RelativeError::NoParent)?;
         let me = (child.image_id, child.placement_id);
         let named = child.image_id != 0 && child.placement_id != 0;
+        // The placement this command would replace, if any.
+        let existing = if named {
+            self.find_entry(me.0, me.1).map(|(h, _)| h)
+        } else {
+            None
+        };
         if (pimg, pplace) == me {
-            return Err(if named && self.find(me.0, me.1).is_some() {
+            return Err(if existing.is_some() {
                 RelativeError::SelfParent
             } else {
                 RelativeError::NoParent
             });
         }
-        let parent = self.find(pimg, pplace).ok_or(RelativeError::NoParent)?;
-        let parent_origin = self
-            .parent_origin(pimg, pplace)
+        // Bind the reference to one concrete placement, now.
+        let (ph, parent) = self
+            .find_entry(pimg, pplace)
             .ok_or(RelativeError::NoParent)?;
-        // Walk the parent chain from the parent upward: detect a cycle
-        // back to the child, and enforce the depth cap. Depth counts the
-        // number of ancestors (parent = depth 1). The walk follows the
-        // links as they are now, i.e. through the child's *old* parent if
-        // the chain passes through it: exactly a cycle.
+        // `P=` alone can land on the placement being replaced: still a
+        // self-reference (kitty: EINVAL).
+        if Some(ph) == existing {
+            return Err(RelativeError::SelfParent);
+        }
+        let parent_origin = self.origin_of(parent);
+        let bind = (!parent.from_placeholder).then_some(ph);
+        // Walk the bound chain from the parent upward: detect a cycle back
+        // to the placement being replaced, and enforce the depth cap.
+        // Depth counts the ancestors (parent = depth 1).
         let mut depth = 1usize;
-        let mut cursor = parent.parent;
-        while let Some((aimg, aplace)) = cursor {
-            if named && (aimg, aplace) == me {
+        let mut cursor = parent;
+        while let Some((ah, ancestor)) = self.parent_entry(cursor) {
+            if Some(ah) == existing {
                 return Err(RelativeError::Cycle);
             }
             depth += 1;
             if depth > MAX_RELATIVE_DEPTH {
                 return Err(RelativeError::TooDeep);
             }
-            cursor = self.find(aimg, aplace).and_then(|p| p.parent);
+            cursor = ancestor;
         }
+        child.parent_ref = bind;
         (child.line, child.col) = offset_origin(parent_origin, child.rel_offset);
+        child.clip_rows = inherited_clip(parent, child.rows);
         Ok(self.upsert(child))
+    }
+
+    /// `(handle, placement)` for `(image_id, placement_id)`;
+    /// `placement_id == 0` matches the image's oldest placement.
+    fn find_entry(
+        &self,
+        image_id: u32,
+        placement_id: u32,
+    ) -> Option<(PlacementHandle, &Placement)> {
+        self.placements
+            .iter()
+            .find(|(_, p)| {
+                p.image_id == image_id && (placement_id == 0 || p.placement_id == placement_id)
+            })
+            .map(|(h, p)| (*h, p))
+    }
+
+    /// The placement `p` is bound to, with its handle.
+    fn parent_entry(&self, p: &Placement) -> Option<(PlacementHandle, &Placement)> {
+        if let Some(h) = p.parent_ref {
+            return self
+                .placements
+                .iter()
+                .find(|(q, _)| *q == h)
+                .map(|(h, q)| (*h, q));
+        }
+        let (img, place) = p.parent?;
+        self.find_entry(img, place)
+    }
+
+    /// The `(line, col)` a child measures its offset from: the parent's
+    /// top-left cell, or for a Unicode-placeholder parent the minimum x
+    /// and minimum y over its tiles (REL-5).
+    fn origin_of(&self, parent: &Placement) -> (i64, i32) {
+        if !parent.from_placeholder {
+            return (parent.line, parent.col);
+        }
+        self.placeholder_origin(parent.image_id, parent.placement_id)
+            .unwrap_or((parent.line, parent.col))
+    }
+
+    /// Min line / min col over the placeholder tiles of `(image_id,
+    /// placement_id)`.
+    // TODO(#28): becomes `Term::placeholder_origin`.
+    fn placeholder_origin(&self, image_id: u32, placement_id: u32) -> Option<(i64, i32)> {
+        self.placements
+            .iter()
+            .map(|(_, p)| p)
+            .filter(|p| {
+                p.from_placeholder && p.image_id == image_id && p.placement_id == placement_id
+            })
+            .fold(None, |acc: Option<(i64, i32)>, p| {
+                Some(acc.map_or((p.line, p.col), |(l, c)| (l.min(p.line), c.min(p.col))))
+            })
     }
 
     /// Insert `p`, or, when it is named (`image_id` and `placement_id`
@@ -349,24 +427,35 @@ impl ImageGrid {
             return;
         }
         self.bounds = None;
+        let index: HashMap<PlacementHandle, usize> = self
+            .placements
+            .iter()
+            .enumerate()
+            .map(|(i, (h, _))| (*h, i))
+            .collect();
         for _ in 0..MAX_RELATIVE_DEPTH {
             // Compute every child's target from a consistent view of the
             // parents before mutating.
-            let targets: Vec<(usize, (i64, i32))> = self
+            let targets: Vec<(usize, (i64, i32), Range<u16>)> = self
                 .placements
                 .iter()
                 .enumerate()
                 .filter_map(|(i, (_, p))| {
-                    let (pimg, pplace) = p.parent?;
-                    let origin = self.parent_origin(pimg, pplace)?;
-                    Some((i, offset_origin(origin, p.rel_offset)))
+                    p.parent?;
+                    let parent = match p.parent_ref {
+                        Some(h) => &self.placements[*index.get(&h)?].1,
+                        None => self.parent_entry(p)?.1,
+                    };
+                    let origin = offset_origin(self.origin_of(parent), p.rel_offset);
+                    Some((i, origin, inherited_clip(parent, p.rows)))
                 })
                 .collect();
             let mut changed = false;
-            for (i, origin) in targets {
+            for (i, origin, clip) in targets {
                 let p = &mut self.placements[i].1;
-                if (p.line, p.col) != origin {
+                if (p.line, p.col) != origin || p.clip_rows != clip {
                     (p.line, p.col) = origin;
+                    p.clip_rows = clip;
                     changed = true;
                 }
             }
@@ -377,30 +466,12 @@ impl ImageGrid {
     }
 
     /// The `(line, col)` a relative child of `(image_id, placement_id)`
-    /// measures its offset from: the parent placement's top-left cell.
-    ///
-    /// When the parent is a Unicode-placeholder image (a virtual `U=1`
-    /// placement drawn through placeholder cells), the spec says its
-    /// position "is derived from all the actual Unicode placeholder images
-    /// that refer to it": the minimum x and the minimum y over them,
-    /// independently (REL-5).
-    // TODO(#28): placeholder images stop being `ImageGrid` tiles once they
-    // render from the cells; this branch then asks the term for
-    // `Term::placeholder_origin` instead.
+    /// measures its offset from (see `origin_of`). `placement_id == 0`
+    /// means the image's oldest placement.
     #[must_use]
     pub fn parent_origin(&self, image_id: u32, placement_id: u32) -> Option<(i64, i32)> {
-        let parent = self.find(image_id, placement_id)?;
-        if !parent.from_placeholder {
-            return Some((parent.line, parent.col));
-        }
-        let pid = parent.placement_id;
-        self.placements
-            .iter()
-            .map(|(_, p)| p)
-            .filter(|p| p.from_placeholder && p.image_id == image_id && p.placement_id == pid)
-            .fold(None, |acc: Option<(i64, i32)>, p| {
-                Some(acc.map_or((p.line, p.col), |(l, c)| (l.min(p.line), c.min(p.col))))
-            })
+        let (_, parent) = self.find_entry(image_id, placement_id)?;
+        Some(self.origin_of(parent))
     }
 
     /// Remove by handle. Returns the removed placement if it was
@@ -421,10 +492,23 @@ impl ImageGrid {
     /// Relative placements whose parent is gone go too, recursively: the
     /// spec ties a relative placement's lifetime to its parent's, and kitty
     /// deletes the whole group (REL-2). They are returned after the direct
-    /// matches; [`Self::removed_with_parent`] tells them apart.
-    pub fn remove_where(&mut self, mut pred: impl FnMut(&Placement) -> bool) -> Vec<Placement> {
+    /// matches; [`Self::remove_where_split`] keeps them apart.
+    pub fn remove_where(&mut self, pred: impl FnMut(&Placement) -> bool) -> Vec<Placement> {
+        let (mut removed, cascaded) = self.remove_where_split(pred);
+        removed.extend(cascaded);
+        removed
+    }
+
+    /// [`Self::remove_where`], returning the direct matches and the
+    /// relative placements that went with them (because a parent went)
+    /// separately. kitty frees a cascaded child's image on some deletes
+    /// and not others, so the caller needs to tell them apart.
+    pub fn remove_where_split(
+        &mut self,
+        mut pred: impl FnMut(&Placement) -> bool,
+    ) -> (Vec<Placement>, Vec<Placement>) {
         if !self.placements.iter().any(|(_, p)| pred(p)) {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let mut removed = Vec::new();
         let mut kept = Vec::with_capacity(self.placements.len());
@@ -437,45 +521,45 @@ impl ImageGrid {
         }
         self.placements = kept;
         self.bounds = None;
-        self.sweep_orphans(&mut removed);
-        removed
+        let mut cascaded = Vec::new();
+        self.sweep_orphans(&mut cascaded);
+        (removed, cascaded)
     }
 
-    /// Remove (into `removed`) every relative placement whose parent no
-    /// longer exists, repeating until the chains are cut. Bounded by
-    /// [`MAX_RELATIVE_DEPTH`] + 1 passes (chains can't be deeper).
+    /// Remove (into `removed`) every relative placement whose bound
+    /// parent no longer exists, repeating until the chains are cut.
+    /// O(n) per pass (a set of live handles, then one `retain`), at most
+    /// [`MAX_RELATIVE_DEPTH`] + 1 passes; nothing to do when no placement
+    /// has a parent.
     fn sweep_orphans(&mut self, removed: &mut Vec<Placement>) {
         for _ in 0..=MAX_RELATIVE_DEPTH {
-            let orphans: Vec<usize> = (0..self.placements.len())
-                .filter(|&i| {
-                    self.placements[i]
-                        .1
-                        .parent
-                        .is_some_and(|(img, place)| self.find(img, place).is_none())
-                })
-                .collect();
-            if orphans.is_empty() {
+            if !self.placements.iter().any(|(_, p)| p.parent.is_some()) {
                 return;
             }
-            for i in orphans.into_iter().rev() {
-                removed.push(self.placements.remove(i).1);
+            let live: HashSet<PlacementHandle> = self.placements.iter().map(|(h, _)| *h).collect();
+            // Placeholder-parented children are found by ids (rare).
+            let orphan: Vec<bool> = self
+                .placements
+                .iter()
+                .map(|(_, p)| match p.parent_ref {
+                    Some(h) => !live.contains(&h),
+                    None => p.parent.is_some() && self.parent_entry(p).is_none(),
+                })
+                .collect();
+            if !orphan.contains(&true) {
+                return;
             }
+            let mut kept = Vec::with_capacity(self.placements.len());
+            for (i, entry) in self.placements.drain(..).enumerate() {
+                if orphan[i] {
+                    removed.push(entry.1);
+                } else {
+                    kept.push(entry);
+                }
+            }
+            self.placements = kept;
             self.bounds = None;
         }
-    }
-
-    /// True when `p`, one of the placements a removal just returned, went
-    /// because its parent went: its parent is among `removed` too. kitty
-    /// frees the image of such a child when it has no placements left,
-    /// even for a lowercase delete (REL-2); a child deleted directly keeps
-    /// its image.
-    #[must_use]
-    pub fn removed_with_parent(p: &Placement, removed: &[Placement]) -> bool {
-        p.parent.is_some_and(|(img, place)| {
-            removed
-                .iter()
-                .any(|q| q.image_id == img && q.placement_id == place)
-        })
     }
 
     /// Drop every placement of `image_id`. Returns the dropped
@@ -702,6 +786,18 @@ impl ImageGrid {
     pub fn any_on_row(&self, top_line: i64, row: u16) -> bool {
         self.placements.iter().any(|(_, p)| p.on_row(top_line, row))
     }
+}
+
+/// The rows of a `rows`-tall child left showing when its parent has been
+/// cut by a margin scroll: the child loses as many rows at the top (and
+/// bottom) as its parent did. Measured on kitty-ref 0.49.2: with parent
+/// and child inside a DECSTBM region, two LFs cut the parent's top row at
+/// the margin, and the child, though still inside the region, lost its
+/// top row too. A parent outside the region keeps a whole child.
+fn inherited_clip(parent: &Placement, rows: u16) -> Range<u16> {
+    let top = parent.clip_rows.start.min(rows);
+    let bottom = parent.rows.saturating_sub(parent.clip_rows.end).min(rows);
+    top..rows.saturating_sub(bottom).max(top)
 }
 
 /// Apply a signed `(cols, rows)` cell offset to a `(line, col)` origin.
@@ -1045,12 +1141,13 @@ mod tests {
     #[test]
     fn add_relative_loop_back_is_cycle() {
         let mut g = ImageGrid::new();
-        // (1,10) -> parent (2,20); now add (2,20) -> parent (1,10): cycle.
+        // (2,20) is a child of (1,10); re-placing (1,10) as a child of
+        // (2,20) would close the loop.
         let mut a = p(1, 0..1, 0..1, 0);
         a.placement_id = 10;
-        a.parent = Some((2, 20));
         g.add(a);
-        let err = g.add_relative(rel(2, 20, (1, 10), (1, 1))).unwrap_err();
+        g.add_relative(rel(2, 20, (1, 10), (1, 1))).unwrap();
+        let err = g.add_relative(rel(1, 10, (2, 20), (1, 1))).unwrap_err();
         assert_eq!(err, RelativeError::Cycle);
     }
 
@@ -1184,17 +1281,12 @@ mod tests {
         g.add(p(9, 0..1, 0..1, 0));
         g.add_relative(rel(2, 20, (1, 10), (1, 0))).unwrap();
         g.add_relative(rel(3, 30, (2, 20), (0, 1))).unwrap();
-        let gone = g.remove_where(|p| p.image_id == 1);
-        let ids: Vec<u32> = gone.iter().map(|p| p.image_id).collect();
-        assert_eq!(ids[0], 1);
-        assert_eq!(ids.len(), 3);
+        let (direct, cascaded) = g.remove_where_split(|p| p.image_id == 1);
+        let ids: Vec<u32> = direct.iter().map(|p| p.image_id).collect();
+        assert_eq!(ids, vec![1]);
+        let ids: Vec<u32> = cascaded.iter().map(|p| p.image_id).collect();
+        assert_eq!(ids.len(), 2);
         assert!(ids.contains(&2) && ids.contains(&3));
-        assert!(!ImageGrid::removed_with_parent(&gone[0], &gone));
-        assert!(
-            gone[1..]
-                .iter()
-                .all(|c| ImageGrid::removed_with_parent(c, &gone))
-        );
         assert_eq!(g.len(), 1, "the unrelated placement stays");
     }
 

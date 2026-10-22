@@ -506,6 +506,14 @@ erasing, scrolling, scrollback and reflow all work for free.
   - Fixed in #40. Every removal path cascades, including history
     eviction and ED 2. Children deleted directly keep their image, as in
     kitty.
+  - Whether a cascaded child's image is freed depends on the delete, as on
+    kitty-ref 0.49.2:
+    - freed on `d=i/I`, `n/N`, `r/R`, `z/Z`, `q/Q` (lowercase too), and on
+      every uppercase delete;
+    - kept on lowercase `d=a`, `p`, `x`, `y`, `c`, and when the parent
+      leaves the history.
+    The "freed even on lowercase `d=i`" above is that rule's id-like
+    half.
 - [x] **P1 — REL-3. Children don't follow a parent moved by re-sending the
   same `i`+`p`.**
   - Cause: `place_image` (`term.rs:4729-4743`) never calls
@@ -540,7 +548,9 @@ erasing, scrolling, scrollback and reflow all work for free.
   | `P` without `Q`, or `Q` without `P` | EINVAL | OK |
 
   - Fixed in #40. All four rows now match kitty. `P` without `Q` is
-    relative to the parent image's oldest placement, and `Q` without `P`
+    bound once, at creation, to the parent image's oldest placement, so
+    a P-only cycle is ECYCLE, a P-only self-reference is EINVAL, and
+    deleting that placement deletes the child. `Q` without `P`
     is an ordinary placement.
   - kitty accepts `a=T,U=1` with `P=`/`Q=` (it makes the virtual
     placement), unlike `a=p`. toastty does the same.
