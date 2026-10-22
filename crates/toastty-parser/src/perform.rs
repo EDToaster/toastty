@@ -40,12 +40,13 @@ pub trait Perform {
     /// have", which is a no-op when there is none.
     fn dcs_cancel(&mut self) {}
 
-    /// Called just before a CSI is dispatched: whether its parameter
-    /// bytes held any digit. vte reports `CSI < u` and `CSI < 0 u` with
-    /// the same params (`[0]`); this tells them apart for handlers where
-    /// an explicit 0 differs from the default (kitty's `CSI < 0 u` pops
-    /// nothing, `CSI < u` pops one).
-    fn csi_params_explicit(&mut self, _any_digit: bool) {}
+    /// Called just before a CSI is dispatched: which of its parameters
+    /// held a digit (bit `i` for parameter `i`, `;`-separated; parameters
+    /// past 31 aren't tracked). vte reports `CSI < u` and `CSI < 0 u`, or
+    /// `CSI = 5 ; u` and `CSI = 5 ; 0 u`, with the same params; this tells
+    /// an explicit 0 from an empty parameter for handlers where they
+    /// differ (kitty's `CSI < 0 u` pops nothing, `CSI < u` pops one).
+    fn csi_param_digits(&mut self, _mask: u32) {}
 
     /// Beginning of an APC payload (`ESC _`). The header parameters
     /// (e.g. kitty graphics `a=T,f=24,s=...`) appear in subsequent
@@ -131,8 +132,8 @@ impl<H: BufferedApc> Perform for BufferingApcHandler<H> {
     fn dcs_cancel(&mut self) {
         self.inner.dcs_cancel();
     }
-    fn csi_params_explicit(&mut self, any_digit: bool) {
-        self.inner.csi_params_explicit(any_digit);
+    fn csi_param_digits(&mut self, mask: u32) {
+        self.inner.csi_param_digits(mask);
     }
 
     fn apc_start(&mut self) {
