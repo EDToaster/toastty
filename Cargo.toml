@@ -29,7 +29,10 @@ publish = false
 [workspace.dependencies]
 # Pinned exactly — validated by decision prototypes; see docs/decisions/.
 winit = "=0.30.13"
-wgpu = "=29.0.3"
+# No `gles`/`webgpu`: the renderer only ever requests `Backends::PRIMARY`
+# (Vulkan / Metal / DX12), so wgpu's GL backend (glow + EGL loader) was
+# compiled and linked in but unreachable, ~0.6 MB of the binary.
+wgpu = { version = "=29.0.3", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl"] }
 naga = { version = "29", features = ["wgsl-in", "wgsl-out", "glsl-in"] }
 vte = "=0.15.0"
 cosmic-text = "=0.19.0"
