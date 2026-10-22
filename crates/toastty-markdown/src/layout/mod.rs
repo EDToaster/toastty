@@ -1573,14 +1573,13 @@ impl Lay<'_> {
     }
 }
 
-/// Take up to `budget` bytes of `t` (on a char boundary).
 /// Where a code block's text goes on the terminal's column grid, for a
 /// panel at `x` that is `w` wide with horizontal padding `pad_x`:
 /// `(text x, text width)`. The text starts on the cell boundary nearest
 /// `x + pad_x` (at least half a cell inside the panel) and is a whole
 /// number of cells wide (at least one), so with cell-snapped advances
-/// every character, including on wrapped continuation lines, lands
-/// exactly on a column and lines wrap at a whole cell.
+/// every grapheme cluster, including on wrapped continuation lines,
+/// lands exactly on a column and lines wrap at a whole cell.
 fn code_grid(x: f32, w: f32, pad_x: f32, cell_w: u32) -> (f32, f32) {
     let cw = cell_w.max(1) as f32;
     let col = ((x + pad_x) / cw).round().max(((x + cw * 0.5) / cw).ceil());
@@ -1589,6 +1588,7 @@ fn code_grid(x: f32, w: f32, pad_x: f32, cell_w: u32) -> (f32, f32) {
     (tx, cells * cw)
 }
 
+/// Take up to `budget` bytes of `t` (on a char boundary).
 fn clip<'t>(t: &'t str, budget: &mut usize) -> &'t str {
     if t.len() <= *budget {
         *budget -= t.len();

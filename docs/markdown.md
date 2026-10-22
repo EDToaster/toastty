@@ -172,11 +172,17 @@ layout 0.8 ms per width (was 54 ms for layout plus full paint), plus about
   the terminal's `font.family`, the theme palette in sRGB with OSC 4
   overrides for colours 0–15, `max_rows` = 2000 (`RICH_MAX_ROWS`).
 - Code blocks (fenced and indented) sit on the terminal's column grid,
-  so selecting them highlights exactly the drawn glyphs. They are shaped
-  in `mono_family` (the engine's default monospace face when its font
-  database lacks that family), and every cluster advances exactly
-  `cell_w` per cell the terminal gives its characters (1 or 2, 0 for
-  zero-width marks), like the terminal's own cluster-width snap. The text
+  so selecting them highlights exactly the drawn glyphs. All monospace
+  text (code blocks and inline code) is shaped in `mono_family` (the
+  engine's default monospace face when its font database lacks that
+  family). In code blocks every grapheme cluster advances exactly
+  `cell_w` per cell it takes, like the terminal's own cluster-width snap:
+  its Unicode width capped at 2, so `❤️`, flags and ZWJ emoji sequences
+  are 2 cells (as under DECSET 2027, whatever the mode), combining marks
+  stay in their base's cell, and controls and zero-width clusters take
+  none. The terminal writes the block's text into the cells by the same
+  rule, one cluster per cell (trailing codepoints as the cell's grapheme
+  tail). A ligature over several clusters takes all their cells. The text
   starts on the cell boundary nearest the panel's padding, inside list
   items and quotes too, and long lines wrap at a whole number of cells.
   Inline code in paragraphs keeps its natural advances. A font family

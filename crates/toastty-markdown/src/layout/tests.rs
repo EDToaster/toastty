@@ -960,36 +960,48 @@ fn find_run(l: &crate::BlockLayout, line: &str) -> (usize, u16) {
 }
 
 /// Assert that each code line in `code` is reported as one run whose
-/// characters, and the glyphs drawn for them, sit exactly on columns:
-/// the glyph of the char at column `c` has its pen at `c * cell_w`.
-/// Returns each line's starting column.
+/// grapheme clusters, and the glyphs drawn for them, sit exactly on
+/// columns: the first glyph of the cluster at column `c` has its pen at
+/// exactly `c * cell_w` (no subpixel offset), and any further glyphs of
+/// the cluster (marks, ZWJ parts the font didn't ligate) stay inside its
+/// cells. Whitespace draws no glyph. Returns each line's starting column.
 fn assert_on_grid(l: &crate::BlockLayout, p: &LayoutParams, code: &[&str]) -> Vec<u16> {
+    use cosmic_text::SubpixelBin;
     let pens = glyph_pens(l);
     let cw = p.cell_w as i32;
     code.iter()
         .map(|line| {
             let (row, col) = find_run(l, line);
+            // (pen x, cells) of each inked cluster, in order.
             let mut want = vec![];
             let mut c = i32::from(col);
-            for ch in line.chars() {
-                if !ch.is_whitespace() {
-                    want.push(c * cw);
+            for g in unicode_segmentation::UnicodeSegmentation::graphemes(*line, true) {
+                let cells = super::grid::grapheme_cells(g) as i32;
+                if cells > 0 && !g.chars().all(char::is_whitespace) {
+                    want.push((c * cw, cells));
                 }
-                c += super::inline::term_cells(ch) as i32;
+                c += cells;
             }
-            let got: Vec<i32> = pens
+            let got: Vec<(i32, SubpixelBin)> = pens
                 .iter()
                 .filter(|(_, y, _)| super::grid::row_of(*y as f32, p.cell_h) == row)
-                .map(|&(x, _, bin)| {
-                    assert_eq!(
-                        bin,
-                        cosmic_text::SubpixelBin::Zero,
-                        "{line:?}: subpixel pen"
-                    );
-                    x
-                })
+                .map(|&(x, _, bin)| (x, bin))
                 .collect();
-            assert_eq!(got, want, "glyph pens of {line:?} (row {row}, col {col})");
+            let ctx = || format!("{line:?} (row {row}, col {col}): want {want:?}, got {got:?}");
+            let mut k = 0;
+            for &(x, bin) in &got {
+                if k < want.len() && x == want[k].0 && bin == SubpixelBin::Zero {
+                    k += 1;
+                    continue;
+                }
+                // Not a cluster start: part of the previous cluster (an
+                // invisible VS16 / ZWJ glyph may sit on its right edge), or
+                // a zero-width cluster's glyph (drawn at the next column).
+                let inside = k > 0 && x >= want[k - 1].0 && x <= want[k - 1].0 + want[k - 1].1 * cw;
+                let zero_width = want.get(k).is_some_and(|w| x == w.0);
+                assert!(inside || zero_width, "stray glyph at {x}: {}", ctx());
+            }
+            assert_eq!(k, want.len(), "missing cluster glyphs: {}", ctx());
             col
         })
         .collect()
@@ -1133,4 +1145,124 @@ fn mono_family_picks_the_terminal_font() {
     assert_eq!(r.cache.mono_family(), "Fira Mono");
     p.mono_family = Some("Fira Mono".into());
     assert_eq!(r.render(src, &p).unwrap(), default);
+}
+
+/// Every run of `l` that is a piece of one of the `code` lines and
+/// whose text occurs once is on the grid.
+fn assert_all_code_on_grid(l: &crate::BlockLayout, p: &LayoutParams, code: &[&str]) {
+    let texts: Vec<String> = l
+        .text()
+        .iter()
+        .flatten()
+        .map(|t| t.text.clone())
+        .filter(|t| code.iter().any(|c| c.contains(t.as_str())))
+        .collect();
+    let unique: Vec<&str> = texts
+        .iter()
+        .filter(|t| texts.iter().filter(|u| u == t).count() == 1)
+        .map(String::as_str)
+        .collect();
+    assert!(!unique.is_empty());
+    assert_on_grid(l, p, &unique);
+}
+
+#[test]
+fn combining_marks_stay_in_their_cell() {
+    // Precomposable (é) and stacked marks (ạ̈), and a mark after a CJK char.
+    let line = "e\u{301}x a\u{308}\u{323}b \u{4e2d}\u{301}z";
+    for g in GRIDS {
+        let p = grid_params(60, g);
+        let l = lay_out(&format!("```\n{line}\n```\n"), &p);
+        assert_eq!(assert_on_grid(&l, &p, &[line]), vec![2]);
+        assert_eq!(super::grid::text_cells(line), 9);
+    }
+}
+
+#[test]
+fn emoji_sequences_take_their_cluster_width() {
+    // VS16 emoji presentation (2 cells), a ZWJ family (2), a flag (2),
+    // a text-presentation heart (1).
+    let line = "x\u{2764}\u{fe0f}y \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}z \u{1f1e8}\u{1f1e6}! \u{2764}w";
+    for g in GRIDS {
+        let (_, cw, _) = g;
+        let p = grid_params(60, g);
+        let l = lay_out(&format!("```\n{line}\n```\n"), &p);
+        assert_on_grid(&l, &p, &[line]);
+        // `y` right after the 2-cell heart, `z` right after the 2-cell
+        // family (not 6 cells on), `w` after the 1-cell text heart.
+        let (row, col) = find_run(&l, line);
+        let xs: Vec<i32> = glyph_pens(&l)
+            .iter()
+            .filter(|(_, y, _)| super::grid::row_of(*y as f32, p.cell_h) == row)
+            .map(|g| g.0)
+            .collect();
+        let at = |c: u16| (i32::from(col) + i32::from(c)) * cw as i32;
+        for c in [0, 1, 3, 5, 7, 9, 11, 13, 14] {
+            assert!(xs.contains(&at(c)), "{g:?}: nothing at col +{c}: {xs:?}");
+        }
+        assert_eq!(super::grid::text_cells(line), 15);
+    }
+}
+
+#[test]
+fn zero_width_chars_take_no_cell() {
+    let line = "a\u{200b}b\u{200d}c\u{2060}d";
+    for g in GRIDS {
+        let p = grid_params(40, g);
+        let l = lay_out(&format!("```\n{line}\n```\n"), &p);
+        assert_on_grid(&l, &p, &[line]);
+        assert_eq!(super::grid::text_cells(line), 4);
+    }
+}
+
+#[test]
+fn very_narrow_panels_stay_on_the_grid() {
+    // No code character occurs in the list item's text ("item").
+    let code = ["abc dfg", "x\u{4e2d}y \u{2764}\u{fe0f}!", "fn xy() {}"];
+    let src = format!(
+        "- item\n\n  ```\n  {}\n  {}\n  ```\n\n```\n{}\n```\n",
+        code[0], code[1], code[2]
+    );
+    for g in GRIDS {
+        for cols in 1..=9 {
+            let p = grid_params(cols, g);
+            let b = render_with(&src, &p);
+            assert!(b.rows >= 2, "{cols} {g:?}");
+            let l = lay_out(&src, &p);
+            assert_all_code_on_grid(&l, &p, &code);
+        }
+    }
+}
+
+#[test]
+fn ligature_fonts_stay_on_the_grid() {
+    // Needs an installed font with programming ligatures; skipped
+    // otherwise (like `system_renderer_smoke`, it uses system fonts).
+    let mut r = Renderer::new();
+    let candidates = [
+        "Fira Code",
+        "JetBrains Mono",
+        "JetBrainsMono Nerd Font",
+        "Cascadia Code",
+        "Iosevka",
+        "Hasklig",
+    ];
+    let line = "a->b != c === d <= e |> f :: g www ==> h";
+    let mut tried = 0;
+    for family in candidates {
+        let p = LayoutParams {
+            mono_family: Some(family.into()),
+            ..grid_params(80, GRIDS[0])
+        };
+        let l = r.layout(&format!("```\n{line}\n```\n"), &p).unwrap();
+        if !r.cache.mono_family().eq_ignore_ascii_case(family) {
+            continue;
+        }
+        tried += 1;
+        eprintln!("ligature_fonts_stay_on_the_grid: checking {family}");
+        assert_on_grid(&l, &p, &[line]);
+    }
+    if tried == 0 {
+        eprintln!("ligature_fonts_stay_on_the_grid: no ligature font installed, skipped");
+    }
 }

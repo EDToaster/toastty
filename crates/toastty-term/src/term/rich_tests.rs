@@ -650,3 +650,42 @@ fn block_with_scroll_region_respects_linefeed() {
     assert_eq!(t.history_lines(), 2);
     assert_eq!((t.cursor().row, t.cursor().col), (3, 0));
 }
+
+#[test]
+fn block_text_is_written_one_grapheme_cluster_per_cell() {
+    let (mut t, _) = term(3, 20, 0);
+    let line = "x\u{2764}\u{fe0f}y \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}z e\u{301}!\u{200b}.";
+    feed(&mut t, &osc(line));
+    let cells = &t.row(0).cells;
+    let shape: Vec<(char, bool, &str)> = cells[..12]
+        .iter()
+        .map(|c| (c.ch, c.is_continuation, t.grapheme_tail(c)))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ('x', false, ""),
+            ('\u{2764}', false, "\u{fe0f}"),
+            ('\0', true, ""),
+            ('y', false, ""),
+            (' ', false, ""),
+            ('\u{1f468}', false, "\u{200d}\u{1f469}\u{200d}\u{1f467}"),
+            ('\0', true, ""),
+            ('z', false, ""),
+            (' ', false, ""),
+            ('e', false, "\u{301}"),
+            ('!', false, ""),
+            ('.', false, ""),
+        ]
+    );
+    // Copy gives the clusters back (the zero-width space takes no cell
+    // and is dropped).
+    let top = t.bottom_id() - 2;
+    let mut sel = Selection::new(Pos::new(top, 0), SelectionMode::Char);
+    sel.set_active(Pos::new(top, 11));
+    t.set_selection(sel);
+    assert_eq!(
+        t.extract_selection_text().as_deref(),
+        Some("x\u{2764}\u{fe0f}y \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}z e\u{301}!.")
+    );
+}

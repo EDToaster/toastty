@@ -16,6 +16,7 @@ tiny-skia = { version = "0.11", default-features = false, features = ["std", "si
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 base64 = "0.22"
 unicode-width.workspace = true
+unicode-segmentation.workspace = true
 # Maths: RaTeX (KaTeX-compatible), fonts embedded. >= 0.1.11 for the
 # CVE-2026-53531 nesting-depth fix.
 ratex-parser = "0.1.15"

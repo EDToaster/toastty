@@ -67,8 +67,9 @@ pub struct RichEnv {
     pub font_px: f32,
     /// Theme palette before OSC 4 overrides.
     pub palette: RichPalette,
-    /// The terminal's font family (`font.family`), for code blocks.
-    /// `None` leaves the choice to the layout engine.
+    /// The terminal's font family (`font.family`), for monospace text
+    /// (code blocks and inline code). `None` leaves the choice to the
+    /// layout engine.
     pub mono_family: Option<Arc<str>>,
 }
 
@@ -94,9 +95,10 @@ pub struct RichLayoutRequest<'a> {
     pub cell_w: u32,
     pub cell_h: u32,
     pub font_px: f32,
-    /// The terminal's font family, for code blocks (so they line up
-    /// with the cell grid in the terminal's own face). The engine falls
-    /// back to its default monospace face when it has no such family.
+    /// The terminal's font family, for monospace text (code blocks,
+    /// which also line up with the cell grid, and inline code). The
+    /// engine falls back to its default monospace face when it has no
+    /// such family.
     pub mono_family: Option<&'a str>,
     /// Effective palette (theme + OSC 4 overrides for 0–15).
     pub palette: RichPalette,

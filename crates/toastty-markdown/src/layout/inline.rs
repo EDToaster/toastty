@@ -11,7 +11,10 @@ use cosmic_text::{
     Wrap, fontdb,
 };
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use super::fonts::Fonts;
+use super::grid::grapheme_cells;
 use super::paint::{Op, Src};
 use crate::Rgba;
 
@@ -71,9 +74,9 @@ pub(crate) enum Piece {
 pub(crate) struct Para {
     pub pieces: Vec<Piece>,
     /// Lay the text on a cell grid this many pixels wide (code blocks):
-    /// every cluster advances exactly `cell_w` per terminal cell it
-    /// takes (see [`term_cells`]), so character `i` of a line lands on
-    /// the same column the terminal writes it into.
+    /// every grapheme cluster advances exactly `cell_w` per terminal
+    /// cell it takes (see [`grapheme_cells`]), so it lands on the same
+    /// column the terminal writes it into.
     pub grid: Option<u32>,
 }
 
@@ -95,35 +98,46 @@ impl Para {
     }
 }
 
-/// Cells the terminal gives `c` when it writes a block's text into the
-/// grid (`build_block_rows` in toastty-term): 1 or 2, and 0 for
-/// controls and zero-width marks.
-pub(crate) fn term_cells(c: char) -> u32 {
-    match unicode_width::UnicodeWidthChar::width(c) {
-        Some(1) => 1,
-        Some(w) if w >= 2 => 2,
-        _ => 0,
-    }
-}
-
-/// Force each cluster (glyphs sharing a source byte range) of
-/// `glyphs` to advance exactly `cell_w` × its cell count, the way the
-/// terminal's cluster-width snap does for its own text. The whole
-/// advance goes on the cluster's first glyph and the others keep their
-/// shaped offsets from the cluster start (scaled to the new width) with
-/// no advance of their own, so pen positions stay whole cells and a
-/// line break can never split a cluster.
+/// Force each cluster of `glyphs` to advance exactly `cell_w` times
+/// the cells the terminal gives its text, the way the terminal's
+/// cluster-width snap does for its own text. A unit is a run of glyphs
+/// whose source ranges touch the same grapheme clusters (a shaping
+/// cluster, a ligature over several graphemes, or a grapheme the shaper
+/// split over several glyphs); it takes the sum of its graphemes'
+/// [`grapheme_cells`]. The whole advance goes on the unit's first glyph
+/// and the others keep their shaped offsets from the unit start (scaled
+/// to the new width) with no advance of their own, so pen positions stay
+/// whole cells and a line break can never split a unit.
 fn snap_to_cells(glyphs: &mut [Glyph], text: &str, cell_w: f32) {
+    let (Some(lo), Some(hi)) = (
+        glyphs.iter().map(|g| g.start).min(),
+        glyphs.iter().map(|g| g.end).max(),
+    ) else {
+        return;
+    };
+    let Some(src) = text.get(lo..hi) else {
+        return;
+    };
+    // (start byte, cells) of each grapheme in `lo..hi`.
+    let graphemes: Vec<(usize, u32)> = src
+        .grapheme_indices(true)
+        .map(|(i, g)| (lo + i, grapheme_cells(g)))
+        .collect();
+    let index = |b: usize| graphemes.partition_point(|g| g.0 <= b).saturating_sub(1);
+    let span = |g: &Glyph| (index(g.start), index(g.end.saturating_sub(1).max(g.start)));
     let mut i = 0;
     while i < glyphs.len() {
-        let (s, e) = (glyphs[i].start, glyphs[i].end);
+        let (mut a, mut b) = span(&glyphs[i]);
         let mut j = i + 1;
-        while j < glyphs.len() && glyphs[j].start == s && glyphs[j].end == e {
+        while j < glyphs.len() {
+            let (s, e) = span(&glyphs[j]);
+            if s > b || e < a {
+                break;
+            }
+            (a, b) = (a.min(s), b.max(e));
             j += 1;
         }
-        let cells: u32 = text
-            .get(s..e)
-            .map_or(1, |t| t.chars().map(term_cells).sum());
+        let cells: u32 = graphemes[a..=b].iter().map(|g| g.1).sum();
         let target = cells as f32 * cell_w;
         let natural: f32 = glyphs[i..j].iter().map(|g| g.w).sum();
         let k = if natural > f32::EPSILON {
@@ -517,7 +531,10 @@ impl Shaped {
                             let split = w > width && cur.items.is_empty();
                             for gi in r.clone() {
                                 let a = self.glyphs[gi].adv();
-                                if split && !cur.items.is_empty() && x + a > width + 0.01 {
+                                // Zero-advance glyphs (marks, the tail of
+                                // a cell-snapped cluster) never start a line.
+                                if split && a > 0.0 && !cur.items.is_empty() && x + a > width + 0.01
+                                {
                                     push(&mut lines, &mut cur, &mut x);
                                     after_wrap = true;
                                 }
@@ -952,11 +969,44 @@ mod tests {
         let adv: Vec<f32> = gs.iter().map(|g| g.w).collect();
         assert_eq!(adv, [10.0, 20.0, 10.0, 0.0, 0.0]);
         // The mark keeps its shaped offset from the cluster start
-        // (scaled to the cell): drawn at start + 9.6 * 10/12, i.e. at
-        // pen (start + 10) + x_off.
+        // (scaled to the cell): drawn at start + 9.6 * 10/12 = start + 8,
+        // i.e. at pen (start + 10) + x_off.
         assert!((gs[3].x_off - (8.0 - 10.0)).abs() < 1e-4, "{}", gs[3].x_off);
         assert!(gs[2].x_off.abs() < 1e-6);
-        let cells: u32 = text.chars().map(term_cells).sum();
-        assert_eq!(cells, 4);
+    }
+
+    #[test]
+    fn graphemes_split_over_shaping_clusters_are_one_unit() {
+        // A family emoji shaped without an emoji font: one glyph per
+        // codepoint, each its own shaping cluster. The grapheme is 2
+        // cells, all on the first glyph.
+        let text = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}z";
+        let mut gs = [
+            glyph(0, 4, 8.0),
+            glyph(4, 7, 0.0),
+            glyph(7, 11, 8.0),
+            glyph(11, 14, 0.0),
+            glyph(14, 18, 8.0),
+            glyph(18, 19, 8.0),
+        ];
+        snap_to_cells(&mut gs, text, 10.0);
+        let adv: Vec<f32> = gs.iter().map(|g| g.w).collect();
+        assert_eq!(adv, [20.0, 0.0, 0.0, 0.0, 0.0, 10.0]);
+        // ❤ + VS16: emoji presentation, 2 cells.
+        let text = "x\u{2764}\u{fe0f}y";
+        let mut gs = [
+            glyph(0, 1, 8.0),
+            glyph(1, 4, 9.0),
+            glyph(4, 7, 0.0),
+            glyph(7, 8, 8.0),
+        ];
+        snap_to_cells(&mut gs, text, 10.0);
+        let adv: Vec<f32> = gs.iter().map(|g| g.w).collect();
+        assert_eq!(adv, [10.0, 20.0, 0.0, 10.0]);
+        // A ligature glyph over two graphemes ("->") takes both cells.
+        let mut gs = [glyph(0, 2, 7.0), glyph(2, 3, 9.6)];
+        snap_to_cells(&mut gs, "->x", 10.0);
+        let adv: Vec<f32> = gs.iter().map(|g| g.w).collect();
+        assert_eq!(adv, [20.0, 10.0]);
     }
 }
