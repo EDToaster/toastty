@@ -145,7 +145,7 @@ pub fn chip_colors(bg: [f32; 4], fg: [f32; 4], hovered: bool) -> ChipColors {
     }
 }
 
-fn linear_to_srgb(c: f32) -> f32 {
+pub(crate) fn linear_to_srgb(c: f32) -> f32 {
     let c = c.clamp(0.0, 1.0);
     if c <= 0.003_130_8 {
         c * 12.92
@@ -154,7 +154,7 @@ fn linear_to_srgb(c: f32) -> f32 {
     }
 }
 
-fn srgb_to_linear(c: f32) -> f32 {
+pub(crate) fn srgb_to_linear(c: f32) -> f32 {
     let c = c.clamp(0.0, 1.0);
     if c <= 0.040_45 {
         c / 12.92

@@ -160,9 +160,10 @@ impl Term {
     /// [`MAX_SCAN_ROWS`] rows each way) with a byte → cell map, runs
     /// [`url_detect::url_at`] on it and maps the byte range back to cells.
     /// Graphemes contribute all their codepoints to their one cell; the
-    /// blank pad a wide char leaves at a soft-wrapped row's end is
-    /// skipped (like copy does) so it doesn't split the URL; unwritten
-    /// (NUL) cells read as spaces and so end a URL.
+    /// blank pad a wide char leaves at a soft-wrapped row's end
+    /// ([`Cell::wrap_pad`](crate::Cell::wrap_pad)) is skipped (like copy
+    /// does) so it doesn't split the URL; unwritten (NUL) cells read as
+    /// spaces and so end a URL.
     #[must_use]
     pub fn detected_url_at(&self, at: Pos) -> Option<LinkHit> {
         let at = self.primary_pos(at)?;
@@ -174,21 +175,8 @@ impl Term {
         let mut map: Vec<(usize, Pos)> = Vec::new();
         for line_id in lo..=hi {
             let row = self.row_by_line_id(line_id)?;
-            let pad_col = if line_id < hi
-                && row.soft_wrap
-                && self
-                    .row_by_line_id(line_id + 1)
-                    .is_some_and(|next| next.cells().get(1).is_some_and(|c| c.is_continuation))
-            {
-                row.cells()
-                    .len()
-                    .checked_sub(1)
-                    .filter(|&i| matches!(row.cells()[i].ch, ' ' | '\0'))
-            } else {
-                None
-            };
             for (i, cell) in row.cells().iter().enumerate() {
-                if cell.is_continuation || Some(i) == pad_col {
+                if cell.is_continuation || cell.wrap_pad {
                     continue;
                 }
                 let col = u16::try_from(i).unwrap_or(u16::MAX);

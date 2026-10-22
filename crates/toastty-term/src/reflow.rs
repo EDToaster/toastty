@@ -9,8 +9,9 @@
 //! The wrap rules here mirror `Term::print_char` exactly, NOT the
 //! `scrollback.md` prototype's `wrap_line`:
 //!   - a width-2 cluster that would land on the last column starts a fresh
-//!     row, leaving the last column blank — there is **no explicit spacer
-//!     cell** (toastty never emits one);
+//!     row, leaving [`Cell::WRAP_PAD`] in the last column. The pad is the
+//!     only trailing cell a soft-wrapped row loses when lines are joined
+//!     back up; a real space at the wrap point is a plain blank and stays;
 //!   - every produced row except the last of a logical line gets
 //!     `soft_wrap = true`.
 
@@ -32,15 +33,24 @@ fn cluster_width(cells: &[Cell], i: usize) -> u16 {
     }
 }
 
-/// Number of trailing cells equal to `Cell::BLANK`. Only exact-default
-/// blanks count, so a cell erased to a coloured background (non-default
-/// style) or a hyperlinked space is preserved.
+/// Number of trailing cells that are `Cell::BLANK` or a wide-char
+/// [`Cell::WRAP_PAD`]. Only exact-default blanks count, so a cell erased
+/// to a coloured background (non-default style) or a hyperlinked space is
+/// preserved.
 fn trailing_blank_run(cells: &[Cell]) -> usize {
     cells
         .iter()
         .rev()
-        .take_while(|c| **c == Cell::BLANK)
+        .take_while(|c| **c == Cell::BLANK || **c == Cell::WRAP_PAD)
         .count()
+}
+
+/// 1 when a soft-wrapped row ends in the pad a bumped wide char left
+/// behind, else 0. That pad is the only cell such a row drops: a trailing
+/// blank there is a real space at the wrap point ("foo bar" wrapping
+/// right after the space), and dropping it would join the words.
+fn trailing_wrap_pad(cells: &[Cell]) -> usize {
+    usize::from(cells.last() == Some(&Cell::WRAP_PAD))
 }
 
 /// Build logical lines from a flat, oldest→newest slice of retained rows.
@@ -48,10 +58,10 @@ fn trailing_blank_run(cells: &[Cell]) -> usize {
 /// A logical line is a maximal run of rows in which every row but the last
 /// has `soft_wrap == true`. The content cells are concatenated with
 /// trailing-blank trimming:
-///   - a non-final (soft-wrapped) row drops **at most one** trailing
-///     `Cell::BLANK` (the wide-char wrap pad — see module docs);
-///   - the final row drops **all** trailing `Cell::BLANK` (empty space to
-///     the right of the last glyph).
+///   - a non-final (soft-wrapped) row drops only a trailing
+///     [`Cell::WRAP_PAD`] (see module docs). Its trailing blanks are text;
+///   - the final row drops **all** trailing `Cell::BLANK` / pad cells
+///     (empty space to the right of the last glyph).
 ///
 /// `cursor_idx` / `cursor_col` locate the cursor within `rows`. Returns
 /// the logical lines plus `(line_index, content_offset)` for the cursor —
@@ -81,7 +91,7 @@ fn build_logical_lines(
             let trim = if is_last {
                 trailing_blank_run(row.cells())
             } else {
-                trailing_blank_run(row.cells()).min(1)
+                trailing_wrap_pad(row.cells())
             };
             let keep = row.cells().len() - trim;
             row_starts.push((lines.len(), content.len()));
@@ -136,8 +146,15 @@ fn wrap_line(
     out_starts.clear();
     out_starts.push(0);
 
+    // A soft-wrapped row is only ever short when a width-2 cluster didn't
+    // fit in its last column; that column becomes the pad.
     let finish_row = |rows: &mut Vec<Row>, cur: &mut Vec<Cell>, soft_wrap: bool| {
-        cur.resize(cols_usize, Cell::BLANK);
+        let fill = if soft_wrap {
+            Cell::WRAP_PAD
+        } else {
+            Cell::BLANK
+        };
+        cur.resize(cols_usize, fill);
         rows.push(Row::from_cells(std::mem::take(cur), soft_wrap));
     };
 
@@ -319,6 +336,7 @@ mod tests {
             ch,
             style: Style::RESET,
             is_continuation: false,
+            wrap_pad: false,
             hyperlink_id: None,
             extra: None,
         }
@@ -341,6 +359,7 @@ mod tests {
                 ..Style::RESET
             },
             is_continuation: false,
+            wrap_pad: false,
             hyperlink_id: None,
             extra: None,
         }
@@ -378,7 +397,7 @@ mod tests {
         let mut rejoined: Vec<Cell> = Vec::new();
         for (idx, r) in narrow.iter().enumerate() {
             let trim = if idx + 1 < narrow.len() {
-                trailing_blank_run(r.cells()).min(1)
+                trailing_wrap_pad(r.cells())
             } else {
                 trailing_blank_run(r.cells())
             };
@@ -393,17 +412,13 @@ mod tests {
     fn wrap_line_wide_char_never_straddles_boundary() {
         // 3 ASCII then a wide char, wrapped at 4: the wide char would land
         // on the last column, so it starts a fresh row and col 3 of row 0
-        // is left blank.
+        // is the wrap pad.
         let mut content = vec![cell('a'), cell('b'), cell('c')];
         content.extend_from_slice(&wide('世'));
         let (rows, _) = wrap_line(&content, 4, None, &mut Vec::new());
         assert_eq!(rows.len(), 2);
         assert!(rows[0].soft_wrap);
-        assert_eq!(
-            rows[0].cells()[3],
-            Cell::BLANK,
-            "last col left blank, no spacer"
-        );
+        assert_eq!(rows[0].cells()[3], Cell::WRAP_PAD, "last col is the pad");
         assert_eq!(rows[1].cells()[0].ch, '世');
         assert!(rows[1].cells()[1].is_continuation);
     }
@@ -441,16 +456,61 @@ mod tests {
     }
 
     #[test]
-    fn build_logical_lines_soft_wrap_drops_one_pad_blank() {
-        // A soft-wrapped row ending in two default blanks drops exactly one.
+    fn build_logical_lines_soft_wrap_keeps_trailing_spaces() {
+        // A soft-wrapped row's trailing blanks are real spaces at the wrap
+        // point: all of them survive the join.
         let cells = vec![cell('a'), cell('b'), Cell::BLANK, Cell::BLANK];
         let rows = vec![row(cells, true), row(vec![cell('c')], false)];
         let (lines, _) = build_logical_lines(&rows, 0, 0, &mut Vec::new());
         assert_eq!(lines.len(), 1);
-        // "ab" + one surviving blank (the second was dropped) + "c" = 4 cells.
-        assert_eq!(lines[0].len(), 4);
-        assert_eq!(lines[0][2], Cell::BLANK);
-        assert_eq!(lines[0][3].ch, 'c');
+        assert_eq!(text(&lines[0]), "ab  c");
+    }
+
+    #[test]
+    fn build_logical_lines_soft_wrap_drops_the_wide_char_pad() {
+        // "ab" + a real space + the pad a bumped wide char left: only the
+        // pad goes.
+        let cells = vec![cell('a'), cell('b'), Cell::BLANK, Cell::WRAP_PAD];
+        let mut next = wide('世').to_vec();
+        next.push(cell('c'));
+        let rows = vec![row(cells, true), row(next, false)];
+        let (lines, _) = build_logical_lines(&rows, 0, 0, &mut Vec::new());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(text(&lines[0]), "ab 世c");
+        assert!(lines[0].iter().all(|c| !c.wrap_pad));
+    }
+
+    #[test]
+    fn reflow_rows_space_in_last_column_survives_narrow_then_widen() {
+        // "foo bar" at 4 cols wraps right after the space, which lands in
+        // the last column. Widening must not join the words.
+        let content: Vec<Cell> = "foo bar".chars().map(cell).collect();
+        let rows = vec![row(content, false)];
+        let (narrow, _) = reflow_rows(&rows, 4, 0, 0);
+        assert_eq!(text(&narrow[0].cells()), "foo ");
+        assert!(narrow[0].soft_wrap);
+        let (widened, _) = reflow_rows(&narrow, 20, 0, 0);
+        assert_eq!(widened.len(), 1);
+        assert_eq!(text(&widened[0].cells()).trim_end(), "foo bar");
+    }
+
+    #[test]
+    fn reflow_rows_wide_chars_round_trip_without_extra_spaces() {
+        // "a世界世界世界" at 4 cols bumps a wide char at every row end. Going
+        // through several widths and back must not turn the pads into
+        // spaces.
+        let mut content = vec![cell('a')];
+        for _ in 0..3 {
+            content.extend_from_slice(&wide('世'));
+            content.extend_from_slice(&wide('界'));
+        }
+        let rows = vec![row(content, false)];
+        let mut cur = rows;
+        for cols in [4, 5, 3, 7, 4, 20] {
+            cur = reflow_rows(&cur, cols, 0, 0).0;
+        }
+        assert_eq!(cur.len(), 1);
+        assert_eq!(text(&cur[0].cells()).trim_end(), "a世界世界世界");
     }
 
     #[test]

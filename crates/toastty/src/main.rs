@@ -22,7 +22,7 @@ use toastty_parser::Parser;
 use toastty_protocols::resize_inband::encode_resize_report;
 use toastty_protocols::synchronized::{BSU_TIMEOUT, should_force_flush};
 use toastty_pty::{Pty, PtySpec, WinSize};
-use toastty_render::{RenderOutcome, Renderer};
+use toastty_render::{ClosePrompt, DialogButton, RenderOutcome, Renderer};
 use toastty_term::{
     ClipboardRequest, Pos, SecurityFlags, Selection, SelectionMode, Smoothing, Term,
 };
@@ -94,14 +94,6 @@ const FRESH_STARTED_GAP: Duration = Duration::from_millis(50);
 /// enough that an intentional double-click is reliable, slow enough to
 /// be forgiving for a relaxed triple-click.
 const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(350);
-
-/// Body text for the close-confirmation dialog (kitty's confirm-on-close).
-/// Embedded newlines split into rows; the renderer wraps these in a
-/// centered, padded "window" box and dims the rest of the screen behind it.
-/// The blank middle line becomes a spacer row between the message and the
-/// key hints.
-const CLOSE_PROMPT_TEXT: &str =
-    "A program is still running.\n\nEnter / y → Close      Esc / n → Cancel";
 
 /// In-progress drag-select. Persisted between `handle_mouse` press and
 /// `handle_mouse_motion` so motion knows which mode/anchor to extend.
@@ -428,9 +420,28 @@ struct Toastty {
     /// True while the close-confirmation prompt is showing (kitty's
     /// confirm-on-close). Set when a close is requested with a program
     /// still running (per `[window] confirm_close`); while set the window
-    /// is modal — keystrokes drive the prompt instead of the PTY. Cleared
-    /// on confirm (we exit) or cancel.
+    /// is modal — keystrokes and mouse input drive the prompt instead of
+    /// the PTY, selection, links or chips. Cleared on confirm (we exit) or
+    /// cancel.
     close_pending: bool,
+    /// Close-dialog button a left press landed on; a release on the same
+    /// button activates it (see [`close_prompt_click`]).
+    close_prompt_press: Option<DialogButton>,
+    /// Mouse buttons pressed while the close prompt was modal. If the
+    /// prompt is dismissed (e.g. with Esc) before they're let go, their
+    /// releases are swallowed too, so the PTY never sees half a click.
+    modal_buttons_down: Vec<MouseButton>,
+    /// Mouse buttons physically held right now (every press / release,
+    /// modal or not).
+    buttons_down: Vec<MouseButton>,
+    /// Buttons that were already held when the close prompt opened. Their
+    /// releases still take the normal [`Self::handle_mouse`] path, so a
+    /// tracking app that got the press gets the release, and a consumed
+    /// link / "Copy Markdown" click eats its own release.
+    pre_prompt_buttons: Vec<MouseButton>,
+    /// Bytes sent to the PTY, captured for tests.
+    #[cfg(test)]
+    pty_sent: Vec<u8>,
     /// Timestamp of the most recent `ScrollKind::Pixels` event we
     /// observed, regardless of routing. Together with
     /// `swallow_pixel_stream` this drives the inertia-swallow
@@ -548,6 +559,12 @@ impl Toastty {
             banner_text: None,
             pending_load_error: load_err,
             close_pending: false,
+            close_prompt_press: None,
+            modal_buttons_down: Vec::new(),
+            buttons_down: Vec::new(),
+            pre_prompt_buttons: Vec::new(),
+            #[cfg(test)]
+            pty_sent: Vec::new(),
             last_pixel_scroll_at: None,
             swallow_pixel_stream: false,
             numlock_hint: true,
@@ -629,6 +646,8 @@ impl Toastty {
 
     fn write_pty(&mut self, bytes: &[u8]) {
         self.pty_log.log(Direction::ToApp, bytes);
+        #[cfg(test)]
+        self.pty_sent.extend_from_slice(bytes);
         // Enqueue on the writer thread rather than calling `Pty::write`
         // directly: the master is non-blocking, so a lone `write()` only
         // accepts one tty-ring's worth (~1 KiB) and drops the rest. The
@@ -1488,35 +1507,156 @@ impl Toastty {
         if self.close_pending {
             return self.close_now();
         }
-        let should_prompt = match self.config.window.confirm_close {
-            ConfirmClose::Never => false,
-            ConfirmClose::Always => true,
-            ConfirmClose::IfRunningProgram => {
-                self.pty.as_ref().is_some_and(Pty::has_running_program)
-            }
-        };
-        if should_prompt {
-            self.close_pending = true;
-            if let Some(r) = self.renderer.as_mut() {
-                r.set_close_prompt(Some(CLOSE_PROMPT_TEXT));
-            }
-            // RedrawIn(ZERO) — not Continue — so the prompt frame is
-            // guaranteed: the loop's RedrawIn handler issues the
-            // `request_redraw` + `ControlFlow::Poll` wake, which a bare
-            // `request_redraw()` from `Wait` doesn't do reliably on macOS
-            // (same reasoning as the `Event::PtyReady` path).
-            ControlSignal::RedrawIn(Duration::ZERO)
-        } else {
-            self.close_now()
+        let confirm = self.config.window.confirm_close;
+        if confirm == ConfirmClose::Never {
+            return self.close_now();
         }
+        let running = self.pty.as_ref().is_some_and(Pty::has_running_program);
+        if confirm == ConfirmClose::IfRunningProgram && !running {
+            return self.close_now();
+        }
+        let program = if running {
+            self.pty.as_ref().and_then(Pty::running_program_name)
+        } else {
+            None
+        };
+        self.open_close_prompt(ClosePrompt { program, running });
+        // RedrawIn(ZERO) — not Continue — so the prompt frame is
+        // guaranteed: the loop's RedrawIn handler issues the
+        // `request_redraw` + `ControlFlow::Poll` wake, which a bare
+        // `request_redraw()` from `Wait` doesn't do reliably on macOS
+        // (same reasoning as the `Event::PtyReady` path).
+        ControlSignal::RedrawIn(Duration::ZERO)
+    }
+
+    /// Arm the modal close prompt. Mouse input stops reaching the
+    /// terminal from here on, so wrap up anything in flight: a drag
+    /// selection ends where it is, and chip / link hovers are dropped.
+    /// Buttons already held keep their normal release path (see
+    /// `pre_prompt_buttons`), except the left button of a local drag
+    /// selection: nothing else saw that press, so its release is
+    /// swallowed whenever it comes.
+    fn open_close_prompt(&mut self, prompt: ClosePrompt) {
+        self.close_pending = true;
+        self.close_prompt_press = None;
+        let local_drag = self.selecting.is_some();
+        self.finish_selection_drag();
+        self.pre_prompt_buttons.clone_from(&self.buttons_down);
+        if local_drag {
+            self.pre_prompt_buttons.retain(|b| *b != MouseButton::Left);
+            if self.buttons_down.contains(&MouseButton::Left)
+                && !self.modal_buttons_down.contains(&MouseButton::Left)
+            {
+                self.modal_buttons_down.push(MouseButton::Left);
+            }
+            if self.mouse_held == Some(MouseButton::Left) {
+                self.mouse_held = None;
+            }
+        }
+        self.clear_link_hover();
+        self.refresh_rich_chip();
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_scroll_button_hover(false);
+            r.set_close_prompt(Some(prompt));
+        }
+        self.refresh_close_dialog_hover();
     }
 
     /// Dismiss the close-confirmation prompt. State-only — the caller
     /// returns the `RedrawIn` that repaints the now-cleared overlay.
     fn cancel_close_prompt(&mut self) {
         self.close_pending = false;
+        self.close_prompt_press = None;
+        // Releases now take the normal path anyway.
+        self.pre_prompt_buttons.clear();
         if let Some(r) = self.renderer.as_mut() {
             r.set_close_prompt(None);
+        }
+        // The pointer may be over a chip or link the dialog covered.
+        if self.pointer_inside {
+            self.refresh_scroll_chip_hover();
+            self.refresh_rich_chip();
+            self.refresh_link_hover();
+        }
+    }
+
+    /// Re-evaluate which close-dialog button the pointer is over and push
+    /// that to the renderer. Returns `true` when the hover changed.
+    fn refresh_close_dialog_hover(&mut self) -> bool {
+        #[allow(clippy::cast_possible_truncation)]
+        let (x, y) = (self.mouse_pos.0 as f32, self.mouse_pos.1 as f32);
+        let inside = self.pointer_inside;
+        let Some(r) = self.renderer.as_mut() else {
+            return false;
+        };
+        let hovered = if inside {
+            r.close_dialog_button_at(x, y)
+        } else {
+            None
+        };
+        r.set_close_dialog_hover(hovered)
+    }
+
+    /// The close-dialog button under `position`, if the dialog is shown.
+    fn close_dialog_button_at(&self, position: (f64, f64)) -> Option<DialogButton> {
+        #[allow(clippy::cast_possible_truncation)]
+        let (x, y) = (position.0 as f32, position.1 as f32);
+        self.renderer
+            .as_ref()
+            .and_then(|r| r.close_dialog_button_at(x, y))
+    }
+
+    /// Mouse button while the close prompt is modal: a left click on a
+    /// dialog button activates it; everything else is swallowed, so no
+    /// click that starts under the prompt reaches selection, links, chips
+    /// or the PTY. The release of a button held since before the prompt
+    /// opened finishes its click the normal way.
+    fn handle_close_prompt_mouse(
+        &mut self,
+        button: MouseButton,
+        state: KeyState,
+        position: (f64, f64),
+        modifiers: Modifiers,
+    ) -> ControlSignal {
+        if state == KeyState::Released
+            && let Some(i) = self.pre_prompt_buttons.iter().position(|b| *b == button)
+        {
+            self.pre_prompt_buttons.swap_remove(i);
+            let signal = self.handle_mouse(button, state, position, modifiers);
+            // That path may have touched selection / link state; the
+            // dialog stays the only thing that reacts to the pointer.
+            self.clear_link_hover();
+            return signal;
+        }
+        self.mouse_pos = position;
+        match state {
+            KeyState::Pressed => {
+                if !self.modal_buttons_down.contains(&button) {
+                    self.modal_buttons_down.push(button);
+                }
+            }
+            KeyState::Released => self.modal_buttons_down.retain(|b| *b != button),
+        }
+        let hit = self.close_dialog_button_at(position);
+        match close_prompt_click(&mut self.close_prompt_press, button, state, hit) {
+            Some(DialogButton::Close) => self.close_now(),
+            Some(DialogButton::Cancel) => {
+                self.cancel_close_prompt();
+                ControlSignal::RedrawIn(Duration::ZERO)
+            }
+            None => ControlSignal::Continue,
+        }
+    }
+
+    /// Pointer motion while the close prompt is modal: only tracks the
+    /// button hover (never reaches selection, links, chips or the PTY).
+    fn handle_close_prompt_motion(&mut self, position: (f64, f64)) -> ControlSignal {
+        self.mouse_pos = position;
+        self.pointer_inside = true;
+        if self.refresh_close_dialog_hover() {
+            ControlSignal::RedrawIn(Duration::ZERO)
+        } else {
+            ControlSignal::Continue
         }
     }
 
@@ -1995,6 +2135,13 @@ impl Toastty {
         modifiers: Modifiers,
     ) -> ControlSignal {
         self.mouse_pos = position;
+        // Release of a button pressed while the close prompt was up.
+        if state == KeyState::Released
+            && let Some(i) = self.modal_buttons_down.iter().position(|b| *b == button)
+        {
+            self.modal_buttons_down.swap_remove(i);
+            return ControlSignal::Continue;
+        }
         match state {
             KeyState::Pressed => self.mouse_held = Some(button),
             KeyState::Released => {
@@ -2389,8 +2536,10 @@ impl Toastty {
     /// matching the click, which opens links even when an app tracks
     /// the mouse. Returns `true` when the underline changed (redraw).
     fn refresh_link_hover(&mut self) -> bool {
-        let want =
-            toastty::links::is_open_link_modifiers(self.link_modifiers) && self.selecting.is_none();
+        // Nothing behind the close prompt reacts to the pointer.
+        let want = toastty::links::is_open_link_modifiers(self.link_modifiers)
+            && self.selecting.is_none()
+            && !self.close_pending;
         if !want && self.term.link_hover().is_none() && !self.link_pointer {
             return false;
         }
@@ -2767,6 +2916,40 @@ impl App for Toastty {
     }
 
     fn event(&mut self, event: Event) -> ControlSignal {
+        if let Event::Mouse { button, state, .. } = &event {
+            self.track_button_down(*button, *state);
+        }
+        // A resize, scale change or config / font reload re-centres the
+        // dialog, which can move a button under (or out from under) the
+        // still pointer.
+        let relayout = matches!(event, Event::Resize { .. } | Event::User);
+        let signal = self.dispatch_event(event);
+        if relayout
+            && self.close_pending
+            && self.refresh_close_dialog_hover()
+            && signal == ControlSignal::Continue
+        {
+            return ControlSignal::RedrawIn(Duration::ZERO);
+        }
+        signal
+    }
+}
+
+impl Toastty {
+    /// Record a mouse button going down or up (see `buttons_down`).
+    fn track_button_down(&mut self, button: MouseButton, state: KeyState) {
+        match state {
+            KeyState::Pressed => {
+                if !self.buttons_down.contains(&button) {
+                    self.buttons_down.push(button);
+                }
+            }
+            KeyState::Released => self.buttons_down.retain(|b| *b != button),
+        }
+    }
+
+    /// Route one window event (the body of [`App::event`]).
+    fn dispatch_event(&mut self, event: Event) -> ControlSignal {
         match event {
             Event::Close => self.handle_close_request(),
             Event::Resize {
@@ -3045,6 +3228,15 @@ impl App for Toastty {
                     ControlSignal::Continue
                 }
             }
+            Event::PointerLeft if self.close_pending => {
+                self.pointer_inside = false;
+                self.close_prompt_press = None;
+                if self.refresh_close_dialog_hover() {
+                    ControlSignal::RedrawIn(Duration::ZERO)
+                } else {
+                    ControlSignal::Continue
+                }
+            }
             Event::PointerLeft => {
                 self.pointer_inside = false;
                 let chip = self.refresh_rich_chip();
@@ -3054,16 +3246,30 @@ impl App for Toastty {
                     ControlSignal::Continue
                 }
             }
+            // While the close prompt is up, the mouse drives only the
+            // dialog: nothing reaches selection, links, chips or the PTY.
+            Event::Mouse {
+                button,
+                state,
+                position,
+                modifiers,
+            } if self.close_pending => {
+                self.handle_close_prompt_mouse(button, state, position, modifiers)
+            }
             Event::Mouse {
                 button,
                 state,
                 position,
                 modifiers,
             } => self.handle_mouse(button, state, position, modifiers),
+            Event::MouseMotion { position, .. } if self.close_pending => {
+                self.handle_close_prompt_motion(position)
+            }
             Event::MouseMotion {
                 position,
                 modifiers,
             } => self.handle_mouse_motion(position, modifiers),
+            Event::Scroll { .. } if self.close_pending => ControlSignal::Continue,
             Event::Scroll {
                 kind,
                 phase,
@@ -3232,6 +3438,29 @@ fn is_paste_binding(logical: &LogicalKey, modifiers: Modifiers) -> bool {
     false
 }
 
+/// Click routing for the modal close dialog. A left press remembers
+/// the button under it (`hit`) in `pressed`; a left release activates
+/// that button only if it's still under the pointer, so pressing on one
+/// button and releasing elsewhere (or on the other one) does nothing,
+/// like a native dialog. Other buttons never activate anything.
+fn close_prompt_click(
+    pressed: &mut Option<DialogButton>,
+    button: MouseButton,
+    state: KeyState,
+    hit: Option<DialogButton>,
+) -> Option<DialogButton> {
+    if button != MouseButton::Left {
+        return None;
+    }
+    match state {
+        KeyState::Pressed => {
+            *pressed = hit;
+            None
+        }
+        KeyState::Released => pressed.take().filter(|p| hit == Some(*p)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3280,6 +3509,231 @@ mod tests {
 
     fn ch(s: &str) -> LogicalKey {
         LogicalKey::Character(s.to_string())
+    }
+
+    fn headless_app() -> Toastty {
+        Toastty::new(
+            Config::defaults(),
+            None,
+            None,
+            (800, 600),
+            None,
+            Preload::default(),
+        )
+    }
+
+    fn mouse(button: MouseButton, state: KeyState, position: (f64, f64)) -> Event {
+        Event::Mouse {
+            button,
+            state,
+            position,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    fn wheel_up() -> Event {
+        Event::Scroll {
+            kind: toastty_window::ScrollKind::Pixels,
+            phase: toastty_window::ScrollPhase::Moved,
+            delta_x: 0.0,
+            delta_y: 3.0,
+        }
+    }
+
+    #[test]
+    fn close_prompt_click_activates_on_release_over_the_pressed_button() {
+        use DialogButton::{Cancel, Close};
+        let (l, press, release) = (MouseButton::Left, KeyState::Pressed, KeyState::Released);
+        let mut p = None;
+        assert_eq!(close_prompt_click(&mut p, l, press, Some(Close)), None);
+        assert_eq!(
+            close_prompt_click(&mut p, l, release, Some(Close)),
+            Some(Close)
+        );
+        assert_eq!(p, None);
+        // Press on Cancel, release on Close (or off the buttons): nothing.
+        close_prompt_click(&mut p, l, press, Some(Cancel));
+        assert_eq!(close_prompt_click(&mut p, l, release, Some(Close)), None);
+        close_prompt_click(&mut p, l, press, Some(Cancel));
+        assert_eq!(close_prompt_click(&mut p, l, release, None), None);
+        // Press off the buttons, release on one: nothing.
+        close_prompt_click(&mut p, l, press, None);
+        assert_eq!(close_prompt_click(&mut p, l, release, Some(Cancel)), None);
+        // A release with no press: nothing.
+        assert_eq!(close_prompt_click(&mut p, l, release, Some(Cancel)), None);
+        // Other buttons never activate, and don't disturb a left press.
+        close_prompt_click(&mut p, l, press, Some(Cancel));
+        for b in [MouseButton::Right, MouseButton::Middle] {
+            assert_eq!(close_prompt_click(&mut p, b, press, Some(Cancel)), None);
+            assert_eq!(close_prompt_click(&mut p, b, release, Some(Cancel)), None);
+        }
+        assert_eq!(
+            close_prompt_click(&mut p, l, release, Some(Cancel)),
+            Some(Cancel)
+        );
+    }
+
+    #[test]
+    fn mouse_is_modal_while_the_close_prompt_is_up() {
+        let mut app = headless_app();
+        // Control: without the prompt a left press arms a selection and
+        // a trackpad scroll reaches the scroll handler (which, headless,
+        // only records the gesture: there's no cell size to scroll by).
+        app.event(mouse(MouseButton::Left, KeyState::Pressed, (5.0, 5.0)));
+        assert!(app.selecting.is_some());
+        app.event(mouse(MouseButton::Left, KeyState::Released, (5.0, 5.0)));
+        assert!(app.selecting.is_none());
+        app.event(wheel_up());
+        assert!(app.last_pixel_scroll_at.is_some());
+        app.last_pixel_scroll_at = None;
+
+        app.open_close_prompt(ClosePrompt::default());
+        assert!(app.close_pending);
+        let sig = app.event(mouse(MouseButton::Left, KeyState::Pressed, (5.0, 5.0)));
+        assert_eq!(sig, ControlSignal::Continue);
+        assert!(app.selecting.is_none(), "no selection behind the prompt");
+        assert_eq!(app.mouse_held, None);
+        app.event(Event::MouseMotion {
+            position: (200.0, 200.0),
+            modifiers: Modifiers::empty(),
+        });
+        assert!(app.selecting.is_none());
+        assert!(app.term.selection().is_none());
+        app.event(mouse(MouseButton::Left, KeyState::Released, (200.0, 200.0)));
+        app.event(mouse(MouseButton::Middle, KeyState::Pressed, (5.0, 5.0)));
+        app.event(mouse(MouseButton::Middle, KeyState::Released, (5.0, 5.0)));
+        assert!(!app.middle_paste_consumed);
+        app.event(wheel_up());
+        assert!(app.last_pixel_scroll_at.is_none(), "scroll swallowed");
+        assert!(app.close_pending, "clicks off the buttons don't dismiss");
+    }
+
+    #[test]
+    fn release_after_esc_dismissal_is_swallowed() {
+        let mut app = headless_app();
+        app.open_close_prompt(ClosePrompt::default());
+        app.event(mouse(MouseButton::Right, KeyState::Pressed, (5.0, 5.0)));
+        let sig = app.handle_close_prompt_key(&LogicalKey::Named(NamedKey::Escape), None);
+        assert_eq!(sig, ControlSignal::RedrawIn(Duration::ZERO));
+        assert!(!app.close_pending);
+        // The right button is let go after the prompt went away.
+        assert_eq!(
+            app.event(mouse(MouseButton::Right, KeyState::Released, (5.0, 5.0))),
+            ControlSignal::Continue
+        );
+        assert!(app.modal_buttons_down.is_empty());
+        // Back to normal: a left press selects again.
+        app.event(mouse(MouseButton::Left, KeyState::Pressed, (5.0, 5.0)));
+        assert!(app.selecting.is_some());
+    }
+
+    #[test]
+    fn tracking_app_gets_the_release_of_a_press_from_before_the_prompt() {
+        // Review #1: `cat -v` under `?1000;1006h` saw `M` with no `m`.
+        for dismiss_first in [false, true] {
+            let mut app = headless_app();
+            app.parser.advance(&mut app.term, b"\x1b[?1000;1006h");
+            app.event(mouse(MouseButton::Left, KeyState::Pressed, (5.0, 5.0)));
+            assert!(app.pty_sent.ends_with(b"M"), "{:?}", app.pty_sent);
+            app.pty_sent.clear();
+            app.open_close_prompt(ClosePrompt::default());
+            // A click that starts under the prompt never reaches the app.
+            app.event(mouse(MouseButton::Right, KeyState::Pressed, (5.0, 5.0)));
+            app.event(mouse(MouseButton::Right, KeyState::Released, (5.0, 5.0)));
+            assert!(app.pty_sent.is_empty(), "{:?}", app.pty_sent);
+            if dismiss_first {
+                app.handle_close_prompt_key(&LogicalKey::Named(NamedKey::Escape), None);
+            }
+            app.event(mouse(MouseButton::Left, KeyState::Released, (5.0, 5.0)));
+            let sent = String::from_utf8_lossy(&app.pty_sent).into_owned();
+            assert!(
+                sent.starts_with("\x1b[<0;") && sent.ends_with('m'),
+                "{sent:?}"
+            );
+            assert_eq!(app.mouse_held, None);
+            assert_eq!(app.close_pending, !dismiss_first);
+        }
+    }
+
+    #[test]
+    fn consumed_link_and_chip_clicks_eat_their_release_across_the_prompt() {
+        // Review #2: a Ctrl-click on a link (or a "Copy Markdown" click)
+        // whose release landed under the prompt left `link_click_button`
+        // / `rich_chip_click` set, so the next real click lost its release.
+        for chip in [false, true] {
+            let mut app = headless_app();
+            // The consumed press, as `handle_mouse` records it.
+            app.event(mouse(MouseButton::Left, KeyState::Pressed, (5.0, 5.0)));
+            app.selecting = None;
+            app.term.clear_selection();
+            if chip {
+                app.rich_chip_click = Some(MouseButton::Left);
+            } else {
+                app.link_click_button = Some(MouseButton::Left);
+            }
+            app.mouse_held = None;
+            app.open_close_prompt(ClosePrompt::default());
+            app.event(mouse(MouseButton::Left, KeyState::Released, (5.0, 5.0)));
+            assert_eq!(app.link_click_button, None);
+            assert_eq!(app.rich_chip_click, None);
+            app.handle_close_prompt_key(&LogicalKey::Named(NamedKey::Escape), None);
+            // The next ordinary click's release isn't eaten: the drag it
+            // armed ends.
+            app.event(mouse(MouseButton::Left, KeyState::Pressed, (5.0, 5.0)));
+            assert!(app.selecting.is_some());
+            app.event(mouse(MouseButton::Left, KeyState::Released, (5.0, 5.0)));
+            assert!(app.selecting.is_none(), "release reached the selection");
+        }
+    }
+
+    #[test]
+    fn no_link_hover_behind_the_prompt() {
+        // Review #4. Headless there's no cell grid to hit-test a link
+        // against, so this checks the guard's effect on a hand cursor
+        // that was showing: under the prompt, Ctrl and new output only
+        // ever clear it. (Checked against a real link on Xvfb.)
+        struct Wake(std::sync::mpsc::Sender<()>);
+        impl toastty_io::EventSink for Wake {
+            fn send(&self, _: toastty_io::UserEvent) -> Result<(), toastty_io::SinkClosed> {
+                self.0.send(()).map_err(|_| toastty_io::SinkClosed)
+            }
+        }
+        let mut app = headless_app();
+        let ctrl = if cfg!(target_os = "macos") {
+            Modifiers::SUPER
+        } else {
+            Modifiers::CONTROL
+        };
+        app.pointer_inside = true;
+        app.open_close_prompt(ClosePrompt::default());
+        app.link_pointer = true;
+        app.event(Event::ModifiersChanged(ctrl));
+        assert!(!app.link_pointer && app.term.link_hover().is_none());
+        app.link_pointer = true;
+        // New output arrives the real way: through a reader on a pipe,
+        // drained on `PtyReady`.
+        let (rx, mut tx) = std::io::pipe().unwrap();
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let reader =
+            toastty_io::spawn_pty_reader_with_sink(std::os::fd::AsFd::as_fd(&rx), Wake(wake_tx))
+                .unwrap();
+        std::io::Write::write_all(&mut tx, b"x").unwrap();
+        wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        app.reader = Some(reader);
+        app.event(Event::PtyReady);
+        assert_eq!(app.term.cursor().col, 1, "the output was parsed");
+        assert!(app.term.link_hover().is_none());
+    }
+
+    #[test]
+    fn arming_the_prompt_ends_a_drag_in_progress() {
+        let mut app = headless_app();
+        app.event(mouse(MouseButton::Left, KeyState::Pressed, (5.0, 5.0)));
+        assert!(app.selecting.is_some());
+        app.open_close_prompt(ClosePrompt::default());
+        assert!(app.selecting.is_none());
+        assert_eq!(app.mouse_held, None);
+        assert_eq!(app.selection_autoscroll, 0);
     }
 
     #[test]

@@ -36,6 +36,10 @@ pub const FLAG_STRIKETHROUGH: u32 = 1 << 4;
 /// Flag bit: this instance is an overline strip (SGR 53).
 pub const FLAG_OVERLINE: u32 = 1 << 5;
 
+/// Flag bit: UI overlay glyph (the close dialog's text). Never recoloured
+/// for the text cursor, which sits under the overlay, not on it.
+pub const FLAG_OVERLAY: u32 = 1 << 6;
+
 /// Every decoration-strip bit. The shader paints any instance with one
 /// of these as a solid foreground-coloured rect in the glyph pass
 /// (colour in `bg`, see [`underline_instance`]).
