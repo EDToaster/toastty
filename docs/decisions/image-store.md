@@ -135,7 +135,7 @@ id." I couldn't reproduce it.
 - Live in toastty on Xvfb, 20 same-id `a=T` re-sends at the same cell in
   each of two runs: alternating red and blue, then identical red.
 - The screen was grabbed 0.25 s after each send. All 40 showed the right
-  colour.
+  colour, both on this PR's build and on #39's (before the store change).
 
 With A5 every re-send gets a fresh key, so the renderer sees new content
 under a new texture key, and nothing keyed on the id can go stale.
