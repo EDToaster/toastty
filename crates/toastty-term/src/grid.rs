@@ -119,11 +119,12 @@ pub struct Grid {
     cols: u16,
     visible_rows: u16,
     /// Number of scrollback rows currently retained above the visible
-    /// region. Grows on `scroll_up`, capped at `cap - visible_rows`.
+    /// region. Grows on `scroll_up`, capped at `cap - visible_rows`;
+    /// `scroll_down` leaves it alone.
     /// For the alt grid (`cap == visible_rows`) this is always 0.
     history_lines: u32,
     /// Monotonic id of the current live bottom row. Incremented on
-    /// `scroll_up`, saturating-decremented on `scroll_down`. Each
+    /// `scroll_up`, adjusted by `resize`, untouched by `scroll_down`. Each
     /// retained row (visible or scrollback) has a stable id derived
     /// from this counter, so callers (e.g. mouse selection) can pin
     /// to a row across scrolls and eviction. The absolute value of
@@ -290,29 +291,26 @@ impl Grid {
 
     /// Scroll down by one: a fresh blank row appears at the top, the
     /// bottom visible row falls off (xterm-style — *not* preserved as
-    /// new scrollback). Used by RI / DECSTBM-less reverse scrolling.
+    /// new scrollback). Used by RI / SD at full-screen margins.
     ///
-    /// If there's existing scrollback, the most-recent scrollback row
-    /// rotates back in as the new top (it occupies the slot at
-    /// `head - 1`, which becomes the new logical row 0 after the head
-    /// decrement). Otherwise the new top is a blank off-screen slot.
-    /// Either way, `history_lines` shrinks by 1 (saturating at 0).
+    /// Scrollback is left untouched: xterm and kitty never pull history
+    /// back onto the screen here. Unlike [`Self::scroll_up`] this can't
+    /// be a head bump (that would expose the `head - 1` history slot as
+    /// the new top), so the visible slots are rotated in place —
+    /// O(`visible_rows`) `Row` swaps, no cell copies. `history_lines`
+    /// and `bottom_id` don't change: retained scrollback keeps its line
+    /// ids, and the visible rows' content moves under fixed ids exactly
+    /// as it does for a partial-region scroll.
     pub fn scroll_down(&mut self) {
-        // Clear the visible-bottom slot *before* moving the head, so the
-        // row that's about to scroll off-screen goes out blank.
-        let bottom_slot = self.slot(self.visible_rows.saturating_sub(1));
-        self.rows[bottom_slot].clear();
-        self.rows[bottom_slot].resize_cols(self.cols);
-        // Decrement head with wrap-around. The slot that was at logical
-        // row `-1` (the most recent scrollback row, blank if no history)
-        // becomes the new logical row 0.
-        self.head = if self.head == 0 {
-            self.rows.len() - 1
-        } else {
-            self.head - 1
-        };
-        self.history_lines = self.history_lines.saturating_sub(1);
-        self.bottom_id = self.bottom_id.saturating_sub(1);
+        // Walk the old bottom row up to the top one swap at a time;
+        // every other visible row moves down by one on the way.
+        for r in (1..self.visible_rows).rev() {
+            let (a, b) = (self.slot(r), self.slot(r - 1));
+            self.rows.swap(a, b);
+        }
+        let top_slot = self.slot(0);
+        self.rows[top_slot].clear();
+        self.rows[top_slot].resize_cols(self.cols);
     }
 
     /// Clear every visible row. Scrollback is left untouched (used by the
@@ -780,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn grid_scroll_down_rotates_head() {
+    fn grid_scroll_down_inserts_blank_top() {
         let mut g = Grid::new(2, 3, 2);
         g.row_mut(0).put(
             0,
@@ -807,7 +805,8 @@ mod tests {
         g.scroll_down();
         // Row 0 is fresh blank (the inserted line at the top).
         assert_eq!(g.row(0).cells[0], Cell::BLANK);
-        // Row 1 holds what was row 0 ('a' moved down by one).
+        // Row 1 holds what was row 0 ('a' moved down by one); 'b' fell
+        // off the bottom.
         assert_eq!(g.row(1).cells[0].ch, 'a');
     }
 
@@ -1008,15 +1007,49 @@ mod tests {
     }
 
     #[test]
-    fn grid_scroll_down_consumes_history() {
+    fn grid_scroll_down_keeps_history() {
+        // SCR-9: SD / RI at the top insert a blank line and drop the
+        // bottom one; scrollback is never pulled back onto the screen.
         let mut g = Grid::new(2, 3, 4);
         put_at(&mut g, 0, 'a');
         put_at(&mut g, 1, 'b');
         g.scroll_up();
+        put_at(&mut g, 1, 'c');
+        // History: 'a'. Visible: 'b', 'c'.
         assert_eq!(g.history_lines(), 1);
         g.scroll_down();
-        // History row consumed as new top; counter decremented.
-        assert_eq!(g.history_lines(), 0);
+        assert_eq!(g.history_lines(), 1);
+        assert_eq!(g.scrollback_row(0).unwrap().cells[0].ch, 'a');
+        assert_eq!(g.row(0).cells[0], Cell::BLANK);
+        assert_eq!(g.row(1).cells[0].ch, 'b');
+    }
+
+    #[test]
+    fn grid_scroll_down_across_ring_wrap() {
+        // Drive `head` around the ring so the visible slots straddle the
+        // end of the backing slice, then scroll down: the in-place
+        // rotation must follow the ring, and history stays intact.
+        let mut g = Grid::new(3, 3, 5);
+        for ch in ['a', 'b', 'c', 'd', 'e', 'f', 'g'] {
+            g.scroll_up();
+            put_at(&mut g, 2, ch);
+        }
+        // History (most recent first): 'd', 'c'. Visible: 'e', 'f', 'g'.
+        assert_eq!(g.history_lines(), 2);
+        g.scroll_down();
+        assert_eq!(g.row(0).cells[0], Cell::BLANK);
+        assert_eq!(g.row(1).cells[0].ch, 'e');
+        assert_eq!(g.row(2).cells[0].ch, 'f');
+        assert_eq!(g.history_lines(), 2);
+        assert_eq!(g.scrollback_row(0).unwrap().cells[0].ch, 'd');
+        assert_eq!(g.scrollback_row(1).unwrap().cells[0].ch, 'c');
+        // Scrolling up again pushes the blank top into history and
+        // brings a fresh bottom row; nothing stale resurfaces.
+        g.scroll_up();
+        assert_eq!(g.scrollback_row(0).unwrap().cells[0], Cell::BLANK);
+        assert_eq!(g.row(0).cells[0].ch, 'e');
+        assert_eq!(g.row(1).cells[0].ch, 'f');
+        assert_eq!(g.row(2).cells[0], Cell::BLANK);
     }
 
     #[test]
@@ -1050,18 +1083,19 @@ mod tests {
     }
 
     #[test]
-    fn bottom_id_decrements_on_scroll_down_saturating() {
+    fn bottom_id_unchanged_by_scroll_down() {
+        // Retained scrollback keeps its line ids across SD / RI, and the
+        // id window never underflows however many times it runs.
         let mut g = Grid::new(2, 3, 4);
         g.scroll_up();
         g.scroll_up();
         let mid = g.bottom_id();
-        g.scroll_down();
-        assert_eq!(g.bottom_id(), mid - 1);
-        // Walk past 0 — must saturate, not underflow.
+        let oldest = g.oldest_retained_id();
         for _ in 0..20 {
             g.scroll_down();
         }
-        assert_eq!(g.bottom_id(), 0);
+        assert_eq!(g.bottom_id(), mid);
+        assert_eq!(g.oldest_retained_id(), oldest);
     }
 
     #[test]

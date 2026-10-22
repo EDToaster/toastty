@@ -637,10 +637,10 @@ mod selection {
     }
 
     #[test]
-    fn committed_selection_adopts_rows_returning_from_scrollback() {
-        // A selected row in scrollback at commit time that rotates back
-        // on screen (reverse index at the top) is re-baselined, then a
-        // later change to it still clears the selection.
+    fn committed_selection_in_scrollback_survives_reverse_index() {
+        // RI at the top inserts a blank line on screen and leaves
+        // scrollback alone (SCR-9), so a selection on a scrollback row
+        // keeps pointing at the same text.
         let mut t = Term::new(2, 8, 4);
         feed(&mut t, b"top\r\nmid\r\nbot");
         let top = pos_for(&t, 0, 0).line_id - 1;
@@ -648,12 +648,24 @@ mod selection {
         sel.set_active(Pos::new(top, 2));
         t.set_selection(sel);
         t.commit_selection();
-        // RI at the top row scrolls down; "top" comes back on screen.
         feed(&mut t, b"\x1b[1;1H\x1bM");
         assert!(!t.revalidate_selection());
         assert_eq!(t.extract_selection_text().as_deref(), Some("top"));
-        feed(&mut t, b"\x1b[1;1HTOP");
+        assert_eq!(t.history_lines(), 1);
+    }
+
+    #[test]
+    fn committed_selection_on_screen_clears_when_reverse_index_moves_it() {
+        // On-screen rows keep their line ids across RI while their
+        // content moves down a row, so a committed selection there sees
+        // its text change and is dropped.
+        let mut t = Term::new(2, 8, 4);
+        feed(&mut t, b"mid\r\nbot");
+        select(&mut t, SelectionMode::Char, (0, 0), (0, 2));
+        t.commit_selection();
+        feed(&mut t, b"\x1b[1;1H\x1bM");
         assert!(t.revalidate_selection());
+        assert!(t.selection().is_none());
     }
 
     #[test]
