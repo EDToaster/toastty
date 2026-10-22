@@ -11605,6 +11605,30 @@ mod placement_resize_tests {
     }
 
     #[test]
+    fn height_resize_keeps_scrollback_image_on_its_text() {
+        // #29 review probe: an image in scrollback near the oldest line
+        // used to keep its screen row on a height change, so it drifted
+        // off its text (or was evicted when growing shrank the history).
+        for new_rows in [12u16, 8, 4] {
+            let mut t = Term::new(10, 20, 100);
+            feed(&mut t, b"\x1b[1;11HM\x1b[1;1H");
+            place(&mut t, 4, 2, ",C=1");
+            for i in 0..16 {
+                feed(&mut t, format!("\r\nl{i}").as_bytes());
+            }
+            assert_eq!(rows(&t), -7..-5);
+            t.resize(new_rows, 20);
+            let p = only(&t);
+            #[allow(clippy::cast_sign_loss)]
+            let row = t.primary_row_by_line_id(p.line as u64).expect("retained");
+            assert_eq!(
+                row.cells[10].ch, 'M',
+                "image still on its text ({new_rows} rows)"
+            );
+        }
+    }
+
+    #[test]
     fn shrink_pushes_image_into_scrollback_not_away() {
         let mut t = Term::new(10, 20, 100);
         place(&mut t, 4, 3, ""); // rows 0..3, cursor row 2
