@@ -933,20 +933,26 @@ mod tests {
             )
         };
 
-        registry.insert(ImageKey(77), bordered(16, 16, [255, 0, 0])).unwrap();
+        registry
+            .insert(ImageKey(77), bordered(16, 16, [255, 0, 0]))
+            .unwrap();
         let (stats, px) = draw(&mut pipeline, &mut cache, &registry);
         assert_eq!(stats.uploaded, 1);
         assert_eq!(centre(&px), [255, 0, 0]);
 
         // Re-send without a sync in between (one PTY read, no render).
-        registry.insert(ImageKey(77), bordered(16, 16, [0, 255, 0])).unwrap();
+        registry
+            .insert(ImageKey(77), bordered(16, 16, [0, 255, 0]))
+            .unwrap();
         let (stats, px) = draw(&mut pipeline, &mut cache, &registry);
         assert_eq!(stats.uploaded, 1, "stale texture reused");
         assert_eq!(centre(&px), [0, 255, 0]);
         assert_eq!(pipeline.live_slots(), 1, "old texture freed");
 
         // Re-send with the sync in between (normal revision path).
-        registry.insert(ImageKey(77), bordered(16, 16, [0, 0, 255])).unwrap();
+        registry
+            .insert(ImageKey(77), bordered(16, 16, [0, 0, 255]))
+            .unwrap();
         assert!(pipeline.sync_registry(&registry, &mut cache));
         let (stats, px) = draw(&mut pipeline, &mut cache, &registry);
         assert_eq!(stats.uploaded, 1);
