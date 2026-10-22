@@ -342,6 +342,14 @@ struct Toastty {
     /// (`ESC[118;1:3u` after Ctrl+Shift+V), so we swallow it too. Keyed
     /// by [`key_identity`]; a handful of entries at most.
     swallowed_releases: Vec<String>,
+    /// Logical key of every key currently held, by physical key. A
+    /// release is reported as the key that was pressed, as kitty does:
+    /// `NumLock` can turn a keypad key's meaning around in between (KBD-2).
+    pressed_keys: Vec<(String, LogicalKey)>,
+    /// Physical modifier keys currently held (`ShiftLeft`, ...). On the
+    /// release of one side, the modifier's bit stays set while the other
+    /// side is still down (kitty keyboard spec, KBD-2).
+    held_modifier_keys: Vec<String>,
     /// True when a middle-button press was consumed as a PRIMARY
     /// paste, so its release isn't forwarded to a mouse-tracking app
     /// (Shift+middle-click under tracking).
@@ -492,6 +500,8 @@ impl Toastty {
             last_reported_cell: None,
             clipboard: None,
             swallowed_releases: Vec::new(),
+            pressed_keys: Vec::new(),
+            held_modifier_keys: Vec::new(),
             middle_paste_consumed: false,
             pty_log: PtyLogger::from_env(),
             alt_scroll_pixel_accum: 0.0,
@@ -1364,6 +1374,92 @@ impl Toastty {
         }
     }
 
+    /// KBD-2 key bookkeeping: the pressed key a release stands for (see
+    /// `track_pressed_key`) and the modifiers to report (see
+    /// `track_modifier_keys`). `None` for an orphan release, one whose
+    /// press never reached us as a key event (an input method consumed
+    /// it, e.g. the `e` of a dead-key composition, or the key went down
+    /// before the window had focus): kitty only reports releases of keys
+    /// it reported pressed, so the caller drops it.
+    fn track_key_state(
+        &mut self,
+        logical: &LogicalKey,
+        physical: &PhysicalKey,
+        state: KeyState,
+        repeat: bool,
+        modifiers: Modifiers,
+    ) -> Option<(Option<LogicalKey>, Modifiers)> {
+        let orphan = state == KeyState::Released
+            && matches!(physical, PhysicalKey::Code(c)
+                if !self.pressed_keys.iter().any(|(k, _)| k == c));
+        let released_logical = self.track_pressed_key(logical, physical, state, repeat);
+        let modifiers = self.track_modifier_keys(physical, state, modifiers);
+        (!orphan).then_some((released_logical, modifiers))
+    }
+
+    /// Remember the logical key of a press; for a release, return the
+    /// remembered one (if any) so it's reported as the key that was
+    /// pressed. See `pressed_keys`.
+    fn track_pressed_key(
+        &mut self,
+        logical: &LogicalKey,
+        physical: &PhysicalKey,
+        state: KeyState,
+        repeat: bool,
+    ) -> Option<LogicalKey> {
+        let PhysicalKey::Code(code) = physical else {
+            return None;
+        };
+        let held = self.pressed_keys.iter().position(|(c, _)| c == code);
+        match state {
+            KeyState::Pressed if !repeat => {
+                if held.is_none() {
+                    self.pressed_keys.push((code.clone(), logical.clone()));
+                }
+                None
+            }
+            KeyState::Pressed => None,
+            KeyState::Released => held.map(|i| self.pressed_keys.swap_remove(i).1),
+        }
+    }
+
+    /// Track held modifier keys; for the release of one, keep its bit in
+    /// `modifiers` iff the same modifier's other key is still held. See
+    /// `held_modifier_keys`.
+    fn track_modifier_keys(
+        &mut self,
+        physical: &PhysicalKey,
+        state: KeyState,
+        modifiers: Modifiers,
+    ) -> Modifiers {
+        let PhysicalKey::Code(code) = physical else {
+            return modifiers;
+        };
+        let Some(bit) = keyboard::modifier_key_bit(code) else {
+            return modifiers;
+        };
+        match state {
+            KeyState::Pressed => {
+                if !self.held_modifier_keys.contains(code) {
+                    self.held_modifier_keys.push(code.clone());
+                }
+                modifiers | bit
+            }
+            KeyState::Released => {
+                self.held_modifier_keys.retain(|c| c != code);
+                let other_held = self
+                    .held_modifier_keys
+                    .iter()
+                    .any(|c| keyboard::modifier_key_bit(c) == Some(bit));
+                if other_held || bit.is_empty() {
+                    modifiers | bit
+                } else {
+                    modifiers - bit
+                }
+            }
+        }
+    }
+
     /// Route a key press while the close-confirmation prompt is modal.
     /// Enter / `y` confirms (closes); Esc / `n` cancels; anything else is
     /// swallowed so it can't leak to the PTY behind the prompt.
@@ -1393,6 +1489,7 @@ impl Toastty {
     fn handle_key(
         &mut self,
         logical: &LogicalKey,
+        unmodified: &LogicalKey,
         physical: &PhysicalKey,
         text: Option<&str>,
         modifiers: Modifiers,
@@ -1409,6 +1506,15 @@ impl Toastty {
             }
             return self.handle_close_prompt_key(logical, text);
         }
+        // KBD-2: report a release as the key that was pressed, and keep a
+        // modifier's bit while its other side is held. Before any early
+        // return, so synthetic focus-loss releases are tracked too.
+        let Some((released_logical, modifiers)) =
+            self.track_key_state(logical, physical, state, repeat, modifiers)
+        else {
+            return ControlSignal::Continue;
+        };
+        let logical = released_logical.as_ref().unwrap_or(logical);
         // Release of a key whose press we consumed as a shortcut: swallow
         // it so kitty-protocol apps don't see an orphan release.
         let key_id = key_identity(logical, physical);
@@ -1475,6 +1581,26 @@ impl Toastty {
         if is_synthetic {
             return ControlSignal::Continue;
         }
+        self.encode_and_send_key(
+            logical, unmodified, physical, text, modifiers, state, repeat,
+        );
+        ControlSignal::Continue
+    }
+
+    /// Encode a key for the PTY (DECKPAM keypad, legacy or kitty
+    /// encoding) and write it, clearing the selection and snapping the
+    /// view on a press.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_and_send_key(
+        &mut self,
+        logical: &LogicalKey,
+        unmodified: &LogicalKey,
+        physical: &PhysicalKey,
+        text: Option<&str>,
+        modifiers: Modifiers,
+        state: KeyState,
+        repeat: bool,
+    ) {
         let kitty_flags = self.term.kitty_flags();
         let physical_code = match physical {
             PhysicalKey::Code(code) => code.as_str(),
@@ -1502,7 +1628,19 @@ impl Toastty {
             alt_escape: self.term.alt_sends_escape(),
         };
         if let Some(bytes) = keypad.or_else(|| {
-            encode_key_with_modes(logical, text, modifiers, kitty_flags, state, repeat, modes)
+            encode_key_with_modes(
+                logical,
+                text,
+                modifiers,
+                kitty_flags,
+                state,
+                repeat,
+                modes,
+                keyboard::KeyContext {
+                    physical: physical_code,
+                    unmodified: Some(unmodified),
+                },
+            )
         }) {
             self.write_pty(&bytes);
             // Typing into the PTY clears any visible selection — the
@@ -1519,7 +1657,6 @@ impl Toastty {
                 self.snap_view_after_input();
             }
         }
-        ControlSignal::Continue
     }
 
     /// Insert IME-committed text into the PTY. This is the IME analogue of
@@ -2671,6 +2808,7 @@ impl App for Toastty {
             }
             Event::Key {
                 logical,
+                unmodified,
                 physical,
                 text,
                 modifiers,
@@ -2679,6 +2817,7 @@ impl App for Toastty {
                 is_synthetic,
             } => self.handle_key(
                 &logical,
+                &unmodified,
                 &physical,
                 text.as_deref(),
                 modifiers,

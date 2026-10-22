@@ -634,6 +634,7 @@ fn translate_key(event: &KeyEvent, mods: ModifiersState, is_synthetic: bool) -> 
 
     Event::Key {
         logical: translate_logical_key(&event.logical_key),
+        unmodified: translate_logical_key(&event.key_without_modifiers()),
         physical: translate_physical_key(event.physical_key),
         text,
         modifiers: translate_modifiers_with_leds(mods, leds),
