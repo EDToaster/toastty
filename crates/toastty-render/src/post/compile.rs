@@ -4,13 +4,16 @@
 //! tested without a device. The GPU side ([`super::PostChain`]) takes the
 //! WGSL from here.
 //!
-//! Both languages get a prelude before the user's file, so a line in the
-//! wrapped source maps back to the user's file by subtracting the
-//! prelude's line count. GLSL also gets an epilogue after it (its
-//! `main()`, which must follow `mainImage`: naga wants callees declared
-//! before their callers, so a forward prototype in the prelude doesn't
-//! work once `mainImage` calls helpers). Errors in the prelude or the
-//! epilogue have no user line.
+//! GLSL gets a prelude before the user's file (`#version` and the
+//! declarations must come first), so a line in the wrapped source maps
+//! back to the user's file by subtracting the prelude's line count, and
+//! an epilogue after it (its `main()`, which must follow `mainImage`:
+//! naga wants callees declared before their callers, so a forward
+//! prototype in the prelude doesn't work once `mainImage` calls helpers).
+//! WGSL gets everything after the user's file: module-scope order doesn't
+//! matter there, and directives (`enable`, `requires`, `diagnostic`) must
+//! come before any declaration. Errors outside the user's file have no
+//! user line.
 
 use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -129,7 +132,7 @@ pub(crate) struct Wrapped {
 
 impl Wrapped {
     fn new(prelude: &str, user: &str, epilogue: &str) -> Self {
-        debug_assert!(prelude.ends_with('\n'));
+        debug_assert!(prelude.is_empty() || prelude.ends_with('\n'));
         let prelude_lines = count_lines(prelude);
         let mut text = String::with_capacity(prelude.len() + user.len() + epilogue.len() + 1);
         text.push_str(prelude);
@@ -201,9 +204,9 @@ const GLSL_EPILOGUE: &str = "void main() {\n\
                              \x20   toastty_frag_color = color;\n\
                              }\n";
 
-/// The WGSL prelude: the same block as `var<uniform> toastty`, the
-/// `iChannel0` texture and sampler, the cursor-style constants and the
-/// fragment entry point.
+/// The WGSL prelude (appended after the user's file): the same block as
+/// `var<uniform> toastty`, the `iChannel0` texture and sampler, the
+/// cursor-style constants and the fragment entry point.
 pub(crate) fn wgsl_prelude() -> String {
     let mut s = String::from("struct ToasttyUniforms {\n");
     for m in MEMBERS {
@@ -253,7 +256,7 @@ pub(crate) fn wrap_glsl(user: &str) -> Wrapped {
 
 /// Wrap a WGSL user file.
 pub(crate) fn wrap_wgsl(user: &str) -> Wrapped {
-    Wrapped::new(&wgsl_prelude(), user, "")
+    Wrapped::new("", user, &wgsl_prelude())
 }
 
 /// Compile one shader: parse, validate, analyse, and (for GLSL) emit
@@ -289,7 +292,7 @@ pub(crate) fn compile(src: &PostShaderSource) -> Result<CompiledShader, Vec<Shad
                         .iter()
                         .map(|e| {
                             let loc = wrapped.span_location(e.meta);
-                            err(loc, explain(&e.kind.to_string(), loc.is_some()))
+                            err(loc, explain(lang, &e.kind.to_string(), loc.is_some()))
                         })
                         .collect::<Vec<_>>()
                 })?
@@ -303,20 +306,17 @@ pub(crate) fn compile(src: &PostShaderSource) -> Result<CompiledShader, Vec<Shad
             {
                 message = format!("{message} ({label})");
             }
-            vec![err(loc, explain(&message, loc.is_some()))]
+            vec![err(loc, explain(lang, &message, loc.is_some()))]
         })?,
     };
     let info = Validator::new(ValidationFlags::all(), Capabilities::default())
         .validate(&module)
         .map_err(|e| {
-            // The narrowest span in the user's file is the most specific
-            // (the others are the enclosing function and the like).
-            let loc = e
-                .spans()
-                .filter(|(span, _)| wrapped.span_location(*span).is_some())
-                .min_by_key(|(span, _)| span.to_range().map_or(usize::MAX, |r| r.len()))
-                .and_then(|(span, _)| wrapped.span_location(*span));
-            vec![err(loc, explain(&error_chain(e.as_inner()), loc.is_some()))]
+            let loc = pick_location(&wrapped, e.spans().map(|(span, _)| span));
+            vec![err(
+                loc,
+                explain(lang, &error_chain(e.as_inner()), loc.is_some()),
+            )]
         })?;
     let entry_point = match lang {
         Language::Glsl => module
@@ -380,18 +380,49 @@ fn error_chain(e: &dyn std::error::Error) -> String {
     s
 }
 
-/// Add a hint to messages that commonly need one.
-fn explain(message: &str, in_user_file: bool) -> String {
-    let mut out = message.to_owned();
+/// What the error says when `mainImage` is missing or has the wrong
+/// signature.
+const GLSL_SIGNATURE: &str =
+    "the shader must define `void mainImage(out vec4 fragColor, in vec2 fragCoord)`";
+const WGSL_SIGNATURE: &str = "the shader must define `fn mainImage(fragCoord: vec2f) -> vec4f`";
+
+/// Rewrite messages that commonly need it. An error outside the user's
+/// file that involves `mainImage` (or the WGSL entry point calling it)
+/// means a missing `mainImage` or one with the wrong signature: say what
+/// it must look like.
+fn explain(lang: Language, message: &str, in_user_file: bool) -> String {
     if ["iChannel1", "iChannel2", "iChannel3"]
         .iter()
         .any(|c| message.contains(c))
     {
-        out.push_str(" (only iChannel0, the terminal image, is available)");
-    } else if !in_user_file && message.contains("mainImage") {
-        out.push_str(" (the shader must define mainImage)");
+        return format!("{message} (only iChannel0, the terminal image, is available)");
     }
-    out
+    if !in_user_file {
+        match lang {
+            Language::Glsl if message.contains("mainImage") => return GLSL_SIGNATURE.to_owned(),
+            Language::Wgsl if message.contains("mainImage") || message.contains(WGSL_ENTRY) => {
+                return WGSL_SIGNATURE.to_owned();
+            }
+            _ => {}
+        }
+    }
+    message.to_owned()
+}
+
+/// The location to report for an error with these spans: the narrowest
+/// span in the user's file (the others are the enclosing function and the
+/// like, or the prelude). `None` when no span is in the user's file.
+fn pick_location<'a>(
+    wrapped: &Wrapped,
+    spans: impl Iterator<Item = &'a Span>,
+) -> Option<(u32, u32)> {
+    spans
+        .filter_map(|span| {
+            let loc = wrapped.span_location(*span)?;
+            Some((span.to_range()?.len(), loc))
+        })
+        .min_by_key(|(len, _)| *len)
+        .map(|(_, loc)| loc)
 }
 
 #[cfg(test)]
@@ -510,8 +541,8 @@ mod tests {
         let line3 = w.text.lines().nth(w.prelude_lines as usize + 2).unwrap();
         assert!(line3.starts_with("void mainImage"), "{line3}");
         let w = wrap_wgsl(user);
-        let line1 = w.text.lines().nth(w.prelude_lines as usize).unwrap();
-        assert_eq!(line1, "// one");
+        assert_eq!(w.prelude_lines, 0);
+        assert!(w.text.starts_with(user));
     }
 
     #[test]
@@ -571,16 +602,70 @@ mod tests {
     }
 
     #[test]
-    fn missing_main_image_is_explained() {
-        let errs = compile_err("empty.wgsl", "fn other() {}\n");
-        assert_eq!(errs[0].line, None);
-        assert!(
-            errs[0].message.contains("must define mainImage"),
-            "{}",
-            errs[0]
+    fn missing_or_mistyped_main_image_is_explained() {
+        for (name, source) in [
+            ("missing.wgsl", "fn other() {}\n"),
+            (
+                "ret.wgsl",
+                "fn mainImage(p: vec2f) -> vec3f { return vec3f(1.0); }\n",
+            ),
+            (
+                "args.wgsl",
+                "fn mainImage() -> vec4f { return vec4f(1.0); }\n",
+            ),
+        ] {
+            let errs = compile_err(name, source);
+            assert_eq!(errs[0].line, None, "{name}");
+            assert_eq!(errs[0].message, WGSL_SIGNATURE, "{name}");
+        }
+        for (name, source) in [
+            ("missing.glsl", "void other() {}\n"),
+            (
+                "args.glsl",
+                "void mainImage(out vec4 c) { c = vec4(1.0); }\n",
+            ),
+            ("ret.glsl", "vec4 mainImage(vec2 p) { return vec4(1.0); }\n"),
+        ] {
+            let errs = compile_err(name, source);
+            assert_eq!(errs[0].line, None, "{name}");
+            assert_eq!(errs[0].message, GLSL_SIGNATURE, "{name}");
+        }
+    }
+
+    #[test]
+    fn wgsl_directives_compile() {
+        compile_ok("enable.wgsl", &format!("enable f16;\n{WGSL_PASS}"));
+        compile_ok(
+            "requires.wgsl",
+            &format!(
+                "requires pointer_composite_access;\ndiagnostic(off, derivative_uniformity);\n{WGSL_PASS}"
+            ),
         );
-        let errs = compile_err("empty.glsl", "void other() {}\n");
-        assert!(!errs.is_empty());
+        // Lines still map one to one.
+        let errs = compile_err(
+            "enable.wgsl",
+            "enable f16;\n\nfn mainImage(p: vec2f) -> vec4f {\n    return nope;\n}\n",
+        );
+        assert_eq!(errs[0].line, Some(4), "{}", errs[0]);
+    }
+
+    #[test]
+    fn location_prefers_the_narrowest_span_in_the_user_file() {
+        // User line 2 holds a function header and a narrower expression;
+        // the narrowest span of all is in the WGSL prelude (after the
+        // user's lines).
+        let user = "// x\nfn mainImage(p: vec2f) -> vec4f { return vec4f(1.0); }\n";
+        let w = wrap_wgsl(user);
+        let expr_at = user.find("vec4f(1.0)").unwrap();
+        let header = Span::from(5..user.len() - 1);
+        let expr = Span::from(expr_at..user.find("; }").unwrap());
+        let prelude = Span::from(user.len() + 3..user.len() + 4);
+        let col = u32::try_from(expr_at - 5).unwrap() + 1;
+        assert_eq!(
+            pick_location(&w, [header, prelude, expr].iter()),
+            Some((2, col))
+        );
+        assert_eq!(pick_location(&w, [prelude].iter()), None);
     }
 
     #[test]
