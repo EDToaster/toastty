@@ -6311,6 +6311,25 @@ mod tests {
     }
 
     #[test]
+    fn dcs_cut_by_esc_and_a_non_ascii_byte_is_dropped_whole() {
+        // Merge train (#52 x #54): the ESC ends the DCS without acting on
+        // it (WIRE-16), then ESC + a non-ASCII byte is dropped and the
+        // rest printed (WIRE-18), within one read and byte by byte.
+        let bytes = b"\x1bP$qm\x1b\xe2\x82\xacA";
+        let mut t = Term::new(2, 40, 0);
+        feed(&mut t, bytes);
+        assert!(t.drain_pty_replies().is_empty(), "no DECRQSS reply");
+        assert_eq!(row_text(&t, 0), "\u{FFFD}\u{FFFD}A");
+        let mut t = Term::new(2, 40, 0);
+        let mut p = Parser::new();
+        for b in bytes {
+            p.advance(&mut t, std::slice::from_ref(b));
+        }
+        assert!(t.drain_pty_replies().is_empty());
+        assert_eq!(row_text(&t, 0), "\u{FFFD}\u{FFFD}A");
+    }
+
+    #[test]
     fn erase_display_modes() {
         // mode 0 — cursor to end
         let mut t = Term::new(3, 5, 0);
