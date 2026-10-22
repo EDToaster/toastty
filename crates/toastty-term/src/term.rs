@@ -1770,10 +1770,9 @@ impl Term {
                 sel.contains(line_id, col) || wide_partner_selected(sel, row, line_id, col)
             };
             let len = row.cells.len();
-            if let (Some(lo), Some(hi)) = (
-                (0..len).find(|&i| selected(i)),
-                (0..len).rev().find(|&i| selected(i)),
-            ) {
+            if let (Some(lo), Some(hi)) =
+                ((0..len).find(|&i| selected(i)), (0..len).rev().find(|&i| selected(i)))
+            {
                 let mut col = lo;
                 while col <= hi {
                     if Some(col) == pad_col {
