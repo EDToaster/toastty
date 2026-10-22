@@ -108,8 +108,10 @@ pub fn process_name(pid: u32) -> Option<String> {
 fn raw_process_name(pid: u32) -> Option<String> {
     /// `TASK_COMM_LEN - 1`: the longest name `comm` can hold.
     const COMM_MAX: usize = 15;
-    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-    let comm = comm.trim_end_matches('\n').to_owned();
+    // Lossy: the kernel cuts `comm` at a byte boundary, which can split
+    // a multi-byte character.
+    let comm = std::fs::read(format!("/proc/{pid}/comm")).ok()?;
+    let comm = String::from_utf8_lossy(&comm).trim_end_matches('\n').to_owned();
     if comm.len() < COMM_MAX {
         return Some(comm);
     }
@@ -199,7 +201,8 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn process_name_for_nonexistent_pid_returns_none() {
-        assert!(process_name(0).is_none());
+        // Above any real pid_max (PID 0 is `kernel_task` on macOS).
+        assert!(process_name(i32::MAX as u32).is_none());
     }
 
     #[test]
