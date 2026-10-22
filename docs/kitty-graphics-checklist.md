@@ -1481,7 +1481,23 @@ Performance notes (Xvfb, software present; not conclusive):
 - `mpv --vo=kitty` at 1000×562, 30 fps: 26 fps delivered, with one ~0.5 s
   stall. RSS plateaus around 535 MB because the quota bounds it.
 - Idle CPU with `cursor.blink = true` was 65–98 % under Xvfb, and 0 % with
-  blink off. Re-check on real hardware.
+  blink off. Re-check on real hardware. (Explained and fixed: PERF-1.)
+
+- [x] **P1 — PERF-1. A blinking cursor keeps the event loop spinning.**
+  - Repro: `cursor.blink = true`, an idle shell; watch toastty's CPU.
+  - Actual: 46–50 % of a core on Xvfb (65–98 % in the earlier run), 0 %
+    with blink off. Anything else that schedules a redraw (smooth
+    scrolling, the FPS overlay, selection autoscroll) spins the same way
+    while it's pending.
+  - Cause: `ControlSignal::RedrawIn(d)` set `ControlFlow::WaitUntil` but
+    also requested a redraw immediately
+    (`crates/toastty-window/src/lib.rs` `apply_control`). The redraw
+    handler answers with the next deadline, so redraw followed redraw
+    until the deadline passed.
+  - Fixed in #50: `RedrawIn(d > 0)` only sleeps until the deadline and
+    `new_events(ResumeTimeReached)` requests the redraw; a `Continue`
+    from other events keeps a pending deadline. Idle CPU with a blinking
+    cursor is now ~0.3 %.
 
 ## 11. Verified working
 
