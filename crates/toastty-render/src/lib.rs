@@ -3036,9 +3036,10 @@ impl Renderer {
                 let ms = t.elapsed().as_secs_f64() * 1000.0;
                 tracing::info!(
                     target: "render_trace",
-                    "images n={} uploaded={} evicted={} resident={} ({} KiB) took={ms:.3}ms",
+                    "images n={} uploaded={} mipped={} evicted={} resident={} ({} KiB) took={ms:.3}ms",
                     tmp.len(),
                     stats.uploaded,
+                    stats.mipped,
                     stats.evicted,
                     self.image_tex_cache.len(),
                     self.image_tex_cache.total_bytes() / 1024,
@@ -3116,6 +3117,11 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("toastty-render encoder (term)"),
             });
+        // SIZE-12: mip chains for images first drawn downscaled this
+        // frame, ahead of the pass that samples them.
+        if let Some(img_pipe) = self.image_pipeline.as_mut() {
+            img_pipe.encode_pending_mips(&self.device, &mut encoder);
+        }
 
         // Content origin (physical px) added to every quad in the vertex
         // shader before the px->NDC map. `viewport_and_atlas.xy` MUST stay
