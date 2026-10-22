@@ -17,6 +17,7 @@ pub mod focus;
 pub mod font_zoom;
 pub mod geometry;
 pub mod image_cmd;
+pub mod ingest;
 pub mod keyboard;
 pub mod links;
 pub mod markdown;

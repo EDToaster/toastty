@@ -262,6 +262,7 @@ pub fn run<A: App>(options: WindowOptions, mut app: A) -> Result<(), WindowError
         app: &mut app,
         last_status: ControlSignal::Continue,
         redraw_at: None,
+        resume_pty: false,
     };
 
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -316,6 +317,8 @@ fn schedule(sig: ControlSignal, is_redraw: bool, redraw_at: Option<Instant>, now
                 redraw_at,
             }
         }
+        // Yield redraws now exactly like RedrawIn(0); the resumed
+        // PtyReady is the Runner's business (see `Runner::resume_pty`).
         // Duration::ZERO means "wake immediately" — under
         // ControlFlow::WaitUntil(now), winit's EventLoopWaker re-arms
         // the CFRunLoopTimer every iteration because Instant::now()
@@ -324,6 +327,11 @@ fn schedule(sig: ControlSignal, is_redraw: bool, redraw_at: Option<Instant>, now
         // CFRunLoopTimerSetNextFireDate. ControlFlow::Poll dedups
         // against a fixed past instant inside EventLoopWaker::start, so
         // the arm happens once and subsequent iterations short-circuit.
+        ControlSignal::Yield => Plan {
+            flow: Flow::Poll,
+            redraw_now: true,
+            redraw_at,
+        },
         ControlSignal::RedrawIn(d) if d.is_zero() => Plan {
             flow: Flow::Poll,
             redraw_now: true,
@@ -356,6 +364,11 @@ struct Runner<'a, A: App> {
     /// When the next scheduled redraw is due (from a
     /// `ControlSignal::RedrawIn`), if any.
     redraw_at: Option<Instant>,
+    /// The app answered `ControlSignal::Yield`: it stopped parsing PTY
+    /// output so a frame could be drawn. Until `about_to_wait` (which
+    /// every platform runs after the iteration's `RedrawRequested`)
+    /// delivers the resuming `Event::PtyReady`, reader wakes are dropped.
+    resume_pty: bool,
 }
 
 impl<A: App> Runner<'_, A> {
@@ -363,6 +376,9 @@ impl<A: App> Runner<'_, A> {
         let is_redraw = matches!(ev, Event::Redraw);
         let sig = self.app.event(ev);
         self.last_status = sig;
+        if sig == ControlSignal::Yield {
+            self.resume_pty = true;
+        }
         self.apply_control(sig, is_redraw, event_loop);
     }
 
@@ -555,6 +571,8 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<'_, A> {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, ev: UserEvent) {
         let mapped = match ev {
             UserEvent::Wake => Event::User,
+            // Covered by the resume in `about_to_wait`, after the frame.
+            UserEvent::PtyReady if self.resume_pty => return,
             UserEvent::PtyReady => Event::PtyReady,
         };
         self.dispatch(mapped, event_loop);
@@ -572,8 +590,18 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<'_, A> {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // No-op. We rely on `ControlFlow` set in `apply_control`.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Resume PTY parsing after a `Yield`. winit runs this after the
+        // iteration's user events and redraws on X11, Wayland and macOS
+        // alike, so the frame the app yielded for is out by now. Calling
+        // the app directly (rather than posting a wake) keeps it to one
+        // parse slice per iteration without a channel round trip; the
+        // `Poll` flow `Yield` set means the loop doesn't sleep before the
+        // next frame. Otherwise we rely on the `ControlFlow` set in
+        // `apply_control`.
+        if std::mem::take(&mut self.resume_pty) {
+            self.dispatch(Event::PtyReady, event_loop);
+        }
     }
 }
 
@@ -1042,6 +1070,20 @@ mod tests {
             schedule(ControlSignal::Exit, false, pending, now).flow,
             Flow::Exit
         );
+    }
+
+    #[test]
+    fn yield_redraws_at_once_and_keeps_the_deadline() {
+        let now = Instant::now();
+        let pending = Some(now + ms(300));
+        assert_eq!(
+            schedule(ControlSignal::Yield, false, pending, now),
+            schedule(ControlSignal::RedrawIn(ms(0)), false, pending, now),
+        );
+        let plan = schedule(ControlSignal::Yield, false, pending, now);
+        assert_eq!(plan.flow, Flow::Poll);
+        assert!(plan.redraw_now);
+        assert_eq!(plan.redraw_at, pending);
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! `Term`, and `Renderer`. A background mio thread reads bytes from
 //! the PTY master into a bounded buffer and wakes the loop with
 //! `Event::PtyReady`; the binary drains that buffer into the parser
-//! and requests a redraw.
+//! (paced by `toastty::ingest` during floods) and requests a redraw.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -42,6 +42,7 @@ use toastty::font_zoom::{FontZoom, ZoomAction, zoom_action};
 use toastty::geometry::{
     content_rect_from_padding, effective_font_size_px, grid_dims_from_pixels, scaled_pads,
 };
+use toastty::ingest::{self, Ingest};
 use toastty::keyboard::{self, encode_key_with_modes};
 use toastty::mouse::{
     MouseEventKind, classify_button_event, drag_autoscroll_dir, encode_mouse, pixel_to_cell,
@@ -283,6 +284,8 @@ struct Toastty {
     /// far, drained on `Event::PtyReady`. The thread exits on its own when
     /// the PTY closes or the proxy goes away.
     reader: Option<toastty_io::PtyReader>,
+    /// Paces `reader` draining against frames during floods.
+    ingest: Ingest,
     /// Background writer that drains queued bytes to the PTY master in
     /// order. Routing writes through here (instead of a direct
     /// `Pty::write`) guarantees the whole payload lands even when the
@@ -494,6 +497,7 @@ impl Toastty {
             term,
             pty: None,
             reader: None,
+            ingest: Ingest::default(),
             pty_writer: None,
             physical_size: initial_size,
             // Real value is read from the window in `init_impl`; 1.0 is a
@@ -946,22 +950,43 @@ impl Toastty {
         }
     }
 
-    /// Drain the PTY reader into the parser (`Event::PtyReady`). Bytes
-    /// the reader buffers past its cap wait in the kernel's buffer, which
-    /// blocks the child: memory stays flat however fast it writes.
+    /// Drain the PTY reader into the parser (`Event::PtyReady`).
+    ///
+    /// Parses in slices of at most [`ingest::SLICE`]. When output keeps
+    /// coming for longer than a frame interval, stops once a frame is due
+    /// and answers `Yield`, so the loop draws and then calls back here
+    /// (see `toastty::ingest`). Bytes the reader buffers meanwhile wait
+    /// in its bounded buffer, and past that in the kernel's, which blocks
+    /// the child: memory stays flat however fast it writes.
     fn handle_pty_ready(&mut self) -> ControlSignal {
+        let parse_start = Instant::now();
+        if self.ingest.should_wait_for_frame(parse_start) {
+            return ControlSignal::Yield;
+        }
         let Some(mut reader) = self.reader.take() else {
             return ControlSignal::Continue;
         };
         let mut parsed = false;
+        let mut yielded = false;
         loop {
-            let avail = reader.peek(usize::MAX);
+            let now = Instant::now();
+            let frame_due = self.ingest.should_yield(now, parse_start);
+            if frame_due && !self.term.pause_rendering() {
+                yielded = true;
+                break;
+            }
+            let avail = reader.peek(ingest::SLICE);
             if avail.is_empty() {
                 break;
             }
-            let now = Instant::now();
-            let n = avail.len();
-            self.handle_pty_bytes(avail);
+            // A frame is due but a synchronized update holds it: parse
+            // only to the end of that update, then check again.
+            let n = if frame_due {
+                ingest::slice_to_esu(avail)
+            } else {
+                avail.len()
+            };
+            self.handle_pty_bytes(&avail[..n]);
             self.stats.pty_batch(now, n, now.elapsed());
             reader.consume(n);
             parsed = true;
@@ -981,6 +1006,10 @@ impl Toastty {
         if self.term.link_hover().is_some() {
             self.refresh_link_hover();
         }
+        if yielded {
+            self.ingest.frame_requested(parse_start);
+            return ControlSignal::Yield;
+        }
         if self.term.pause_rendering() {
             // Mid synchronized update: `render_term` would just skip, so
             // instead of redrawing now, wake at the BSU watchdog deadline.
@@ -995,6 +1024,7 @@ impl Toastty {
         // wake immediately. On macOS, plain `request_redraw()` doesn't
         // wake from Wait reliably; RedrawIn sets ControlFlow::Poll,
         // which does.
+        self.ingest.frame_requested(parse_start);
         ControlSignal::RedrawIn(Duration::ZERO)
     }
 
@@ -2826,11 +2856,14 @@ impl App for Toastty {
                 self.term.sync_rich_blocks();
                 self.refresh_rich_chip();
                 let mut next_blink: Option<Duration> = None;
+                self.ingest.redraw_handled();
                 if let Some(r) = self.renderer.as_mut() {
                     let frame_start = Instant::now();
                     match r.render_term(&mut self.term) {
                         Ok(RenderOutcome::Rendered) => {
-                            self.stats.frame(frame_start, Instant::now());
+                            let frame_end = Instant::now();
+                            self.stats.frame(frame_start, frame_end);
+                            self.ingest.frame_drawn(frame_start, frame_end);
                             // Consume the per-cell damage signal so the
                             // next render only re-emits cells that
                             // changed. Clear the BSU timeout-flush

@@ -211,6 +211,9 @@ pub enum Event {
     /// buffered, or saw the master close. The binary drains its
     /// `toastty_io::PtyReader`, feeds the parser and requests a redraw;
     /// once the reader reports finished it reaps the child and exits.
+    ///
+    /// Also delivered after a [`ControlSignal::Yield`] frame, to resume
+    /// parsing where the binary left off.
     PtyReady,
     /// IME committed text — should be inserted into the editor (written to the PTY),
     /// the same as typed text. Arrives via the platform text-input protocol
@@ -238,4 +241,13 @@ pub enum ControlSignal {
     Exit,
     /// Schedule a redraw at most `Duration` from now.
     RedrawIn(Duration),
+    /// Redraw now, like `RedrawIn(Duration::ZERO)`, and deliver
+    /// [`Event::PtyReady`] again once that frame is out. Returned from
+    /// `PtyReady` when the app stopped parsing with bytes left so a frame
+    /// could be drawn (flood output). Reader wakes that arrive before the
+    /// frame are dropped: the resumed `PtyReady` drains everything
+    /// buffered anyway, and delivering them would parse again before the
+    /// frame (winit hands out every queued user event before it gets to
+    /// `RedrawRequested`).
+    Yield,
 }

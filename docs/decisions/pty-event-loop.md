@@ -249,3 +249,61 @@ That's the whole pattern. The rest of the variant-C file is PTY setup, CPU measu
 - **Streaming APC parser.** Variant C feeds vte 0.15 directly, which buffers entire APC payloads. Kitty graphics and RGP can carry MiB of data; the architecture doc already flags this as an open question. Decision belongs in its own RFC.
 - **Backpressure on render-thread overload.** If `parser.advance` ever becomes slow (it isn't today), we need to stop the read loop draining into vte and let the kernel pipe absorb. mio's level-triggered readiness means the poll will simply keep firing, which is fine — but if we adopt `Interest::READABLE` with edge-triggered mode we need an explicit re-arm. Document at integration time.
 - **Windows ConPTY** integration. Per architecture doc this is a v2 milestone — recommendation here does not block on it. mio's `NamedPipe` is the integration point when we get there.
+
+## Update 2026-10-22: bounded buffer, one wake in flight, paced ingest
+
+What shipped differed from the sketch above: the mio thread posted every
+4 KiB read as its own `UserEvent::PtyBytes(Vec<u8>)` through winit's
+unbounded proxy channel, and the main thread parsed each one in full. Under
+a flood (`cat` of a 64 MB file) that had three costs:
+
+- **No frames.** winit hands out every queued user event before it gets to
+  `RedrawRequested` (X11 and macOS drain the channel with `try_recv`), and
+  the reader refilled the queue faster than the parser emptied it, so not
+  one frame was drawn until the flood ended.
+- **Unbounded memory.** The reader ran ahead of the parser by the whole
+  file: peak RSS 400–650 MB, and a Ctrl-C only took effect after toastty
+  had parsed everything already queued.
+- **Per-event overhead.** ~16k events per 64 MB, each with a `Vec`
+  allocation and a run of per-batch work in `handle_pty_bytes`, including a
+  foreground-CWD probe (`tcgetpgrp` + `readlink /proc/<pid>/cwd`) that
+  cost ~8 % of flood CPU.
+
+The follow-up "Backpressure on render-thread overload" above is what this
+section does.
+
+**Reader → main thread** (`toastty-io`). The reader appends to a buffer
+shared with the main thread's `PtyReader` (a `Mutex<Vec<u8>>`; the main
+thread swaps the whole `Vec` out, so there is no copy and, in steady state,
+no allocation). It posts a payload-less `UserEvent::PtyReady` only when no
+wake is already in flight, so the queue never holds more than one. Once
+`BUFFER_CAP` (256 KiB) is waiting it stops reading until the main thread
+takes it; the kernel PTY buffer then fills and the child blocks in
+`write`. The close is a flag in the same state, so it is seen only after
+every byte read before it has been consumed. The reader collects up to
+64 KiB of (≤ 4 KiB, on Linux) reads before it takes the lock. mio is
+edge-triggered, so the reader still drains to `WouldBlock` before polling
+again; while it waits for space it isn't polling at all.
+
+**Main thread** (`crates/toastty/src/ingest.rs`, `handle_pty_ready` in
+`main.rs`). `PtyReady` parses in slices of at most 16 KiB. Output that is
+drained before a frame interval passes is drawn at once, as before
+(`RedrawIn(ZERO)`; small writes see no added latency). When output keeps
+coming, the handler stops once a frame is due (16.7 ms after the last
+frame started, and after parsing at least as long as that frame took to
+render) and answers the new `ControlSignal::Yield`. The `toastty-window`
+runner treats it as `RedrawIn(ZERO)`, drops reader wakes until
+`about_to_wait`, and there delivers `Event::PtyReady` again. Every
+platform winit supports runs `about_to_wait` after that iteration's
+redraws, so each loop iteration is one parse slice plus one frame. A
+second check at the top of the handler (a redraw it requested is still
+queued and a frame is due) covers output that arrives about as fast as it
+parses, where each pass drains the buffer and a fresh wake follows
+immediately.
+
+Mode 2026 is unchanged: the handler never yields while rendering is
+paused. Once a frame is due during a synchronized update it parses only up
+to the next ESU (`CSI ? 2026 l`), so the frame goes out between updates
+even when the app sends ESU and the next BSU back to back. A batch that
+ends mid-update asks for a wake at the BSU watchdog deadline instead of a
+redraw that `render_term` would skip.
