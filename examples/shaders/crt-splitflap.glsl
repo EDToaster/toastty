@@ -21,21 +21,21 @@
 const float TOASTTY_EVENT_DURATION = 1.6;
 
 // ---- CRT ----
-const float CURVATURE = 0.06;   // barrel distortion, 0 = flat
-const float SCANLINES = 0.22;   // scanline darkening, 0..1
-const float SCANLINE_PX = 3.0;  // scanline period in pixels
-const float MASK = 0.10;        // aperture-grille strength, 0..1
-const float FRINGE_PX = 0.6;    // red/blue offset at the edges, px
-const float VIGNETTE = 0.30;    // corner darkening, 0..1
-const float BRIGHTNESS = 1.12;  // makes up for scanline/mask loss
+const float CURVATURE   = 0.02;   // barrel distortion, 0 = flat
+const float SCANLINES   = 0.12;   // scanline darkening, 0..1
+const float SCANLINE_PX = 2.0;    // scanline period in pixels
+const float MASK        = 0.10;   // aperture-grille strength, 0..1
+const float FRINGE_PX   = 0.6;    // red/blue offset at the edges, px
+const float VIGNETTE    = 0.30;   // corner darkening, 0..1
+const float BRIGHTNESS  = 1.54;   // makes up for scanline/mask loss
 
 // ---- split-flap ----
-const float SWEEP_SECONDS = 1.2;  // time for the wave to cross the window
-const int FLIPS = 3;              // flips per tile: two random characters, then home
-const float FLIP_SECONDS = 0.1;   // time for one flip
-const float FLAP_SHADE = 0.55;    // darkest the flap gets edge-on
-const float SHADOW = 0.45;        // shadow the flap casts on the card behind it
-const float TILE_LIFT = 0.07;     // flipping tiles are drawn as lighter cards
+const float SWEEP_SECONDS = 2.0;  // time for the wave to cross the window
+const int FLIPS           = 2;    // flips per tile: two random characters, then home
+const float FLIP_SECONDS  = 0.2;  // time for one flip
+const float FLAP_SHADE    = 0.55; // darkest the flap gets edge-on
+const float SHADOW        = 0.45; // shadow the flap casts on the card behind it
+const float TILE_LIFT     = 0.07; // flipping tiles are drawn as lighter cards
 
 const float PI = 3.14159265;
 
