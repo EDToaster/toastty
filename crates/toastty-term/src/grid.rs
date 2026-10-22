@@ -25,7 +25,7 @@ use crate::rich::{RichBlockId, RichRow};
 /// cells: for `seq` / log-style output that's one cache line instead of
 /// forty (2026-10-22 perf note in `docs/decisions/scrollback.md`).
 /// Writers through [`Row::cells_mut`] conservatively set `used` to the
-/// full length; the hot paths ([`Row::put`], [`Row::write_run`],
+/// full length; the hot paths ([`Row::put`], `Row::write_ascii`,
 /// [`Row::erase`]) track it exactly.
 #[derive(Debug, Clone, Default)]
 pub struct Row {
@@ -946,6 +946,14 @@ mod tests {
         r.clear();
         assert!(r.cells().iter().all(|c| *c == Cell::BLANK));
         assert!(!r.soft_wrap);
+    }
+
+    /// A ring slot is a `Vec` header plus a few flags (it was ~350 B
+    /// with the inline `SmallVec<[Cell; 16]>`); 10k+ of them per grid.
+    #[test]
+    fn row_slot_stays_small() {
+        let s = std::mem::size_of::<Row>();
+        assert!(s <= 56, "Row grew to {s} bytes");
     }
 
     /// `Row::used` must stay an upper bound on the non-blank prefix
