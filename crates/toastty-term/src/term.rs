@@ -168,8 +168,14 @@ pub struct Term {
     alt: Grid,
     cursor: Cursor,
     /// Cursor snapshot captured on the most recent `1049` enter; restored
-    /// on `1049` exit.
+    /// on `1049` exit. 47 / 1047 neither save nor restore it.
     saved_cursor: Cursor,
+    /// True while on an alt screen entered with 1049, i.e. while
+    /// `saved_cursor` is the primary screen's cursor. After a 47 / 1047
+    /// entry it is just the last 1049 savepoint (kitty shares one cursor
+    /// between the screens there), so resize mustn't reflow it as the
+    /// primary cursor. Only meaningful while `alt_active`.
+    saved_cursor_is_primary: bool,
     /// DECSC (`ESC 7`) save slot. Separate from `saved_cursor` so a
     /// `DECSC ... enter-alt-screen ... exit-alt-screen ... DECRC`
     /// sequence doesn't have the alt-screen path clobber the user's
@@ -564,6 +570,7 @@ impl Term {
             alt,
             cursor: Cursor::default(),
             saved_cursor: Cursor::default(),
+            saved_cursor_is_primary: false,
             decsc_saved: None,
             alt_active: false,
             rows,
@@ -1536,6 +1543,35 @@ impl Term {
         false
     }
 
+    /// The primary screen's logical cursor, for reflowing the primary
+    /// grid: the live cursor on the primary screen or on a 47 / 1047
+    /// alt screen (one cursor shared by both, as in kitty), else the
+    /// snapshot taken on 1049 entry.
+    pub(super) fn primary_reflow_cursor(&self) -> (u16, u16) {
+        if self.alt_active && self.saved_cursor_is_primary {
+            (self.saved_cursor.row, self.saved_cursor.col)
+        } else {
+            (self.cursor.row, self.cursor.col)
+        }
+    }
+
+    /// Put the cursor [`Self::reflow_primary`] remapped back where
+    /// [`Self::primary_reflow_cursor`] took it from. On a 47 / 1047 alt
+    /// screen the live cursor addresses the alt grid, so the remapped
+    /// position is dropped (the caller clamps the live cursor), and the
+    /// 1049 savepoint is left as it was.
+    pub(super) fn store_primary_reflow_cursor(&mut self, (row, col): (u16, u16)) {
+        if !self.alt_active {
+            self.cursor.row = row;
+            self.cursor.col = col;
+        } else if self.saved_cursor_is_primary {
+            // Keep the saved primary cursor consistent with the reflowed
+            // primary grid for the 1049 exit.
+            self.saved_cursor.row = row;
+            self.saved_cursor.col = col;
+        }
+    }
+
     /// Line ids of the active grid's visible region, top to bottom.
     fn visible_line_ids(&self) -> std::ops::RangeInclusive<u64> {
         let g = self.active_grid();
@@ -1817,25 +1853,10 @@ impl Term {
         let rows = rows.max(1);
         let cols = cols.max(1);
         let primary_cap = rows as usize + self.scrollback as usize;
-        // The primary's logical cursor is the live cursor when the primary
-        // is active, else the snapshot taken on alt-screen (1049) entry.
-        let primary_cursor = if self.alt_active {
-            (self.saved_cursor.row, self.saved_cursor.col)
-        } else {
-            (self.cursor.row, self.cursor.col)
-        };
-        let (new_row, new_col) = self.reflow_primary(rows, cols, primary_cap, primary_cursor);
+        let cursor = self.primary_reflow_cursor();
+        let reflowed = self.reflow_primary(rows, cols, primary_cap, cursor);
         self.alt.resize(rows, cols, rows as usize);
-        if self.alt_active {
-            // The live cursor belongs to alt (clamped below); update the
-            // saved primary cursor so a later 1049 exit restores a position
-            // consistent with the reflowed primary grid.
-            self.saved_cursor.row = new_row;
-            self.saved_cursor.col = new_col;
-        } else {
-            self.cursor.row = new_row;
-            self.cursor.col = new_col;
-        }
+        self.store_primary_reflow_cursor(reflowed);
         self.rows = rows;
         self.cols = cols;
         // Resize collapses any prior DECSTBM region: xterm resets the
@@ -3803,6 +3824,7 @@ impl Term {
         // selection made on the alt screen is dropped on exit below.
         self.drop_selection();
         let clear = kind == AltSwitch::SaveCursorAndClear;
+        self.saved_cursor_is_primary = clear;
         if clear {
             self.saved_cursor = self.cursor;
             self.alt.clear_visible(Style::RESET);
@@ -10386,6 +10408,55 @@ mod minor_term_tests {
         // 1049 still saves and restores.
         feed(&mut t, b"\x1b[5;10H\x1b[?1049h\x1b[7;20H\x1b[?1049l");
         assert_eq!((t.cursor().row, t.cursor().col), (4, 9));
+    }
+
+    #[test]
+    fn mixed_alt_modes_match_kitty() {
+        // Checked live against kitty 0.49.2 with CPR.
+        // 1049 in, 47 out: no cursor restore.
+        let mut t = Term::new(10, 32, 0);
+        feed(&mut t, b"\x1b[5;10H\x1b[?1049h\x1b[7;20H\x1b[?47l");
+        assert!(!t.is_alt_active());
+        assert_eq!((t.cursor().row, t.cursor().col), (6, 19));
+        // 47 in, then 1049h is a no-op (already on alt: nothing cleared,
+        // cursor kept); 1049l restores the last 1049 save (5;10 above).
+        feed(&mut t, b"\x1b[3;3H\x1b[?47h\x1b[2;1Hkept");
+        feed(&mut t, b"\x1b[8;8H\x1b[?1049h");
+        assert!(t.is_alt_active());
+        assert_eq!(screen_row(&t, 1), "kept");
+        assert_eq!((t.cursor().row, t.cursor().col), (7, 7));
+        feed(&mut t, b"\x1b[?1049l");
+        assert_eq!((t.cursor().row, t.cursor().col), (4, 9));
+        // With no 1049 save ever made, 1049l after 47h goes home.
+        let mut t = Term::new(10, 32, 0);
+        feed(&mut t, b"\x1b[5;10H\x1b[?47h\x1b[7;20H\x1b[?1049l");
+        assert_eq!((t.cursor().row, t.cursor().col), (0, 0));
+    }
+
+    #[test]
+    fn resize_on_legacy_alt_screen_keeps_cursor_and_savepoint() {
+        // On a 47 / 1047 alt screen the live cursor is shared with the
+        // primary, and `saved_cursor` is only the last 1049 savepoint:
+        // a resize must neither reflow the savepoint as the primary
+        // cursor nor move the live cursor through the primary reflow.
+        let mut t = Term::new(6, 10, 100);
+        // A soft-wrapped line on the primary, then a 1049 save below it.
+        feed(&mut t, b"0123456789abcde\r\n\x1b[?1049h\x1b[?1049l");
+        let saved = (t.saved_cursor.row, t.saved_cursor.col);
+        assert_eq!(saved, (2, 0));
+        feed(&mut t, b"\x1b[?1047h\x1b[4;5H");
+        t.resize(6, 20);
+        assert_eq!((t.saved_cursor.row, t.saved_cursor.col), saved);
+        assert_eq!((t.cursor().row, t.cursor().col), (3, 4));
+        feed(&mut t, b"\x1b[?1047l");
+        assert_eq!((t.cursor().row, t.cursor().col), (3, 4));
+        // On a 1049 alt screen the saved primary cursor still follows the
+        // reflow: the wrapped line unwraps, so it moves up a row.
+        let mut t = Term::new(6, 10, 100);
+        feed(&mut t, b"0123456789abcde\r\n\x1b[?1049h\x1b[4;5H");
+        t.resize(6, 20);
+        assert_eq!((t.saved_cursor.row, t.saved_cursor.col), (1, 0));
+        assert_eq!((t.cursor().row, t.cursor().col), (3, 4));
     }
 
     #[test]
