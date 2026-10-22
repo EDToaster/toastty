@@ -6,6 +6,7 @@
 //! a time and the resident count is not limited by binding limits.
 
 use bytemuck::{Pod, Zeroable};
+use std::borrow::Cow;
 use std::num::NonZeroU64;
 use toastty_term::{ImageData, ImageRegistry};
 
@@ -44,6 +45,10 @@ pub struct ImagePipeline {
     slots: Vec<Option<TexSlot>>,
     /// Indices of `None` slots, reused by the next upload.
     free_indices: Vec<usize>,
+    /// `max_texture_dimension_2d` of the device. Larger kitty images are
+    /// downscaled to fit before upload (creating the texture would be a
+    /// wgpu validation panic).
+    max_texture_dim: u32,
 }
 
 /// One uploaded texture plus the bind group that samples it.
@@ -194,14 +199,16 @@ impl ImagePipeline {
             sampler,
             slots: Vec::new(),
             free_indices: Vec::new(),
+            max_texture_dim: device.limits().max_texture_dimension_2d,
         }
     }
 
     /// Drop cached textures the registry no longer backs: images that
-    /// were deleted, and images replaced in place (their content hash
-    /// changed). Uploads nothing; textures are uploaded on demand by
-    /// [`Self::resolve_kitty_textures`] when a placement is drawn.
-    /// Call when the term's image revision advances.
+    /// were deleted, and images re-transmitted since upload (their
+    /// registry generation moved on). Uploads nothing; textures are
+    /// uploaded on demand by [`Self::resolve_kitty_textures`], which also
+    /// checks the generation on every hit. Call when the term's image
+    /// revision advances.
     ///
     /// Returns true iff anything was dropped.
     pub fn sync_registry(
@@ -211,11 +218,7 @@ impl ImagePipeline {
     ) -> bool {
         let stale: Vec<u32> = cache
             .iter()
-            .filter(|(id, e)| {
-                registry
-                    .get(*id)
-                    .is_none_or(|d| hash_image(d) != e.content_hash)
-            })
+            .filter(|(id, e)| registry.generation(*id) != Some(e.generation))
             .map(|(id, _)| id)
             .collect();
         for id in &stale {
@@ -228,12 +231,16 @@ impl ImagePipeline {
 
     /// Bind kitty-image `instances` to GPU textures for this frame.
     ///
-    /// Each instance's `image_id` is looked up in `cache`; misses are
-    /// uploaded from `registry`. Instances whose image is gone from the
-    /// registry are dropped (order is kept). Afterwards textures not
-    /// drawn this frame are evicted, least recently drawn first, while
-    /// the cache is over its byte budget. Call once per frame, even
-    /// with no instances, so stale textures can still be evicted.
+    /// Each instance's `image_id` is looked up in `cache`. A miss, or a
+    /// hit whose registry generation has moved on (the id was
+    /// re-transmitted, whatever its size or pixels), uploads from
+    /// `registry`. Images larger than the device's texture limit are
+    /// downscaled to fit, keeping their aspect ratio. Instances whose
+    /// image is gone from the registry are dropped (order is kept).
+    /// Afterwards textures not drawn this frame are evicted, least
+    /// recently drawn first, while the cache is over its byte budget.
+    /// Call once per frame, even with no instances, so stale textures
+    /// can still be evicted.
     pub fn resolve_kitty_textures(
         &mut self,
         device: &wgpu::Device,
@@ -245,21 +252,39 @@ impl ImagePipeline {
         cache.begin_frame();
         let mut stats = ResolveStats::default();
         instances.retain_mut(|inst| {
-            let entry = if let Some(e) = cache.get_touch(inst.image_id) {
-                e
-            } else {
-                let Some(data) = registry.get(inst.image_id) else {
-                    return false;
-                };
-                let entry = ImageTexEntry {
-                    texture_index: self.allocate_texture(device, queue, data),
-                    width: data.width,
-                    height: data.height,
-                    content_hash: hash_image(data),
-                };
-                cache.insert(inst.image_id, entry);
-                stats.uploaded += 1;
-                entry
+            let (Some(generation), Some(data)) =
+                (registry.generation(inst.image_id), registry.get(inst.image_id))
+            else {
+                return false;
+            };
+            let entry = match plan(cache.get_touch(inst.image_id), generation) {
+                Plan::Use(e) => e,
+                Plan::Upload { replaces } => {
+                    if let Some(old) = replaces {
+                        self.release_texture(old);
+                    }
+                    let fitted = fit_to_max_dim(data, self.max_texture_dim);
+                    if let Cow::Owned(f) = &fitted {
+                        tracing::warn!(
+                            image_id = inst.image_id,
+                            "kitty image {}x{} exceeds the GPU texture limit {}; drawing it downscaled to {}x{}",
+                            data.width,
+                            data.height,
+                            self.max_texture_dim,
+                            f.width,
+                            f.height,
+                        );
+                    }
+                    let entry = ImageTexEntry {
+                        texture_index: self.allocate_texture(device, queue, &fitted),
+                        width: fitted.width,
+                        height: fitted.height,
+                        generation,
+                    };
+                    cache.insert(inst.image_id, entry);
+                    stats.uploaded += 1;
+                    entry
+                }
             };
             inst.texture_index = entry.texture_index as u32;
             true
@@ -473,30 +498,68 @@ impl ImagePipeline {
     }
 }
 
-/// Cheap content hash for an image — used to detect re-uploads.
-fn hash_image(data: &ImageData) -> u32 {
-    // FNV-1a over a fingerprint: dims + first/last few bytes + length.
-    // Full-content hashing would dominate the upload path; this is
-    // good enough to catch the "in-place replace" case for the
-    // texture cache.
-    let mut h: u32 = 0x811C_9DC5;
-    let mul = 0x0100_0193u32;
-    for b in data.width.to_le_bytes() {
-        h = (h ^ u32::from(b)).wrapping_mul(mul);
+/// What [`ImagePipeline::resolve_kitty_textures`] does for one instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Plan {
+    /// The resident texture holds the image's current generation.
+    Use(ImageTexEntry),
+    /// Upload the image, first freeing the stale texture slot, if any.
+    Upload { replaces: Option<usize> },
+}
+
+/// Decide between reusing `hit` and uploading, given the registry's
+/// current `generation` for the image.
+fn plan(hit: Option<ImageTexEntry>, generation: u64) -> Plan {
+    match hit {
+        Some(e) if e.generation == generation => Plan::Use(e),
+        stale => Plan::Upload {
+            replaces: stale.map(|e| e.texture_index),
+        },
     }
-    for b in data.height.to_le_bytes() {
-        h = (h ^ u32::from(b)).wrapping_mul(mul);
+}
+
+/// `data` itself if both sides fit in `max_dim`, else a copy shrunk by
+/// the smallest integer factor that fits, keeping the aspect ratio.
+/// Each output texel is the alpha-weighted average of its source block
+/// (partial blocks at the right and bottom edges average what exists).
+fn fit_to_max_dim(data: &ImageData, max_dim: u32) -> Cow<'_, ImageData> {
+    let max_dim = max_dim.max(1);
+    if data.width <= max_dim && data.height <= max_dim {
+        return Cow::Borrowed(data);
     }
-    for b in (data.pixels.len() as u32).to_le_bytes() {
-        h = (h ^ u32::from(b)).wrapping_mul(mul);
+    let factor = data.width.max(data.height).div_ceil(max_dim);
+    let (out_w, out_h) = (data.width.div_ceil(factor), data.height.div_ceil(factor));
+    let (src_w, src_h) = (data.width as usize, data.height as usize);
+    let factor = factor as usize;
+    let mut pixels = Vec::with_capacity(out_w as usize * out_h as usize * 4);
+    for block_y in 0..out_h as usize {
+        for block_x in 0..out_w as usize {
+            let (mut rgb, mut alpha, mut count) = ([0u64; 3], 0u64, 0u64);
+            for y in block_y * factor..((block_y + 1) * factor).min(src_h) {
+                for x in block_x * factor..((block_x + 1) * factor).min(src_w) {
+                    let at = (y * src_w + x) * 4;
+                    let Some(px) = data.pixels.get(at..at + 4) else {
+                        continue;
+                    };
+                    let px_alpha = u64::from(px[3]);
+                    for (sum, &chan) in rgb.iter_mut().zip(px) {
+                        *sum += u64::from(chan) * px_alpha;
+                    }
+                    alpha += px_alpha;
+                    count += 1;
+                }
+            }
+            for sum in rgb {
+                pixels.push(u8::try_from(sum.checked_div(alpha).unwrap_or(0)).unwrap_or(u8::MAX));
+            }
+            pixels.push(u8::try_from(alpha.checked_div(count).unwrap_or(0)).unwrap_or(u8::MAX));
+        }
     }
-    for &b in data.pixels.iter().take(32) {
-        h = (h ^ u32::from(b)).wrapping_mul(mul);
-    }
-    for &b in data.pixels.iter().rev().take(32) {
-        h = (h ^ u32::from(b)).wrapping_mul(mul);
-    }
-    h
+    Cow::Owned(ImageData {
+        width: out_w,
+        height: out_h,
+        pixels,
+    })
 }
 
 #[cfg(test)]
@@ -511,25 +574,61 @@ mod tests {
         }
     }
 
+    fn tex(idx: usize, generation: u64) -> ImageTexEntry {
+        ImageTexEntry {
+            texture_index: idx,
+            width: 4,
+            height: 4,
+            generation,
+        }
+    }
+
+    /// The upload decision keys on the registry generation, never on
+    /// content: a re-transmit with identical size and pixels still
+    /// replaces the texture (review of #24).
     #[test]
-    fn hash_image_is_stable_for_same_input() {
-        let a = img(2, 2, 5);
-        let b = img(2, 2, 5);
-        assert_eq!(hash_image(&a), hash_image(&b));
+    fn plan_reuses_only_the_current_generation() {
+        assert_eq!(plan(None, 1), Plan::Upload { replaces: None });
+        assert_eq!(plan(Some(tex(3, 1)), 1), Plan::Use(tex(3, 1)));
+        assert_eq!(plan(Some(tex(3, 1)), 2), Plan::Upload { replaces: Some(3) });
+        // Same-id same-size re-send through the real registry.
+        let mut r = ImageRegistry::new(1024);
+        r.insert(77, img(4, 4, 1)).unwrap();
+        let resident = tex(0, r.generation(77).unwrap());
+        r.insert(77, img(4, 4, 1)).unwrap();
+        assert_eq!(
+            plan(Some(resident), r.generation(77).unwrap()),
+            Plan::Upload { replaces: Some(0) }
+        );
     }
 
     #[test]
-    fn hash_image_differs_for_different_dims() {
-        let a = img(2, 2, 5);
-        let b = img(4, 4, 5);
-        assert_ne!(hash_image(&a), hash_image(&b));
+    fn fit_to_max_dim_keeps_small_images_and_aspect() {
+        let small = img(8, 4, 9);
+        assert!(matches!(fit_to_max_dim(&small, 8), Cow::Borrowed(_)));
+        // 20000x4 under a 2048 limit: factor 10 -> 2000x1.
+        let wide = img(20_000, 4, 200);
+        let f = fit_to_max_dim(&wide, 2048);
+        assert_eq!((f.width, f.height), (2000, 1));
+        assert_eq!(f.pixels.len(), 2000 * 4);
+        assert!(f.pixels.iter().all(|&b| b == 200));
+        // Odd sizes: 5x3 at limit 2 -> factor 3 -> 2x1.
+        let odd = img(5, 3, 7);
+        let f = fit_to_max_dim(&odd, 2);
+        assert_eq!((f.width, f.height), (2, 1));
     }
 
     #[test]
-    fn hash_image_differs_for_different_pixels() {
-        let a = img(2, 2, 0);
-        let b = img(2, 2, 1);
-        assert_ne!(hash_image(&a), hash_image(&b));
+    fn fit_to_max_dim_averages_alpha_weighted() {
+        // 2x1, one opaque white texel and one transparent red one,
+        // shrunk to 1x1: no red bleeds in; alpha halves.
+        let data = ImageData {
+            width: 2,
+            height: 1,
+            pixels: vec![255, 255, 255, 255, 255, 0, 0, 0],
+        };
+        let f = fit_to_max_dim(&data, 1);
+        assert_eq!(f.pixels, vec![255, 255, 255, 127]);
     }
 
     fn inst(image_id: u32) -> ImageInstance {
@@ -551,7 +650,7 @@ mod tests {
     #[test]
     fn resolve_uploads_every_placed_image_once() {
         let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
-            return; // No GPU available in CI sandbox — skip.
+            return; // No GPU: `try_device_and_queue` printed a skip note.
         };
         let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
         let mut cache = ImageTextureCache::default();
@@ -674,8 +773,219 @@ mod tests {
             pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
         assert_eq!(stats.uploaded, 1);
         assert_eq!(
-            cache.get(2).unwrap().content_hash,
-            hash_image(&img(4, 4, 99))
+            cache.get(2).unwrap().generation,
+            registry.generation(2).unwrap()
+        );
+    }
+
+    /// Render `instances` into a `w × h` sRGB target cleared to
+    /// transparent and read the pixels back (tightly packed RGBA8).
+    fn render_offscreen(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline: &mut ImagePipeline,
+        instances: &[ImageInstance],
+        w: u32,
+        h: u32,
+    ) -> Vec<u8> {
+        let extent = wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        };
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test target"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test depth"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test encoder"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("test pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pipeline.begin_frame();
+            #[allow(clippy::cast_precision_loss)]
+            pipeline.render(
+                device,
+                queue,
+                &mut pass,
+                instances,
+                (w as f32, h as f32),
+                [0.0, 0.0],
+            );
+        }
+        let row = (w * 4).div_ceil(256) * 256;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test readback"),
+            size: u64::from(row * h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(h),
+                },
+            },
+            extent,
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let data = buf.slice(..).get_mapped_range();
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            let start = (y * row) as usize;
+            out.extend_from_slice(&data[start..start + (w * 4) as usize]);
+        }
+        out
+    }
+
+    /// `w × h` opaque `centre` colour with a 1 px black border.
+    fn bordered(w: u32, h: u32, centre: [u8; 3]) -> ImageData {
+        let mut pixels = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let edge = x == 0 || y == 0 || x == w - 1 || y == h - 1;
+                let c = if edge { [0, 0, 0] } else { centre };
+                pixels.extend_from_slice(&[c[0], c[1], c[2], 255]);
+            }
+        }
+        ImageData {
+            width: w,
+            height: h,
+            pixels,
+        }
+    }
+
+    /// Review of #24: re-sending an id with the same size and identical
+    /// edges (the old fingerprint) must show the new pixels, both when
+    /// the registry sync runs in between and when it doesn't.
+    #[test]
+    fn same_size_resend_shows_new_pixels() {
+        let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
+            return;
+        };
+        let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let mut cache = ImageTextureCache::default();
+        let mut registry = ImageRegistry::new(1024 * 1024);
+        let centre = |px: &[u8]| -> [u8; 3] {
+            let i = (8 * 16 + 8) * 4;
+            [px[i], px[i + 1], px[i + 2]]
+        };
+        let draw = |pipeline: &mut ImagePipeline,
+                    cache: &mut ImageTextureCache,
+                    registry: &ImageRegistry| {
+            let mut frame = vec![ImageInstance {
+                size: [16.0, 16.0],
+                ..inst(77)
+            }];
+            let stats =
+                pipeline.resolve_kitty_textures(&device, &queue, registry, cache, &mut frame);
+            (
+                stats,
+                render_offscreen(&device, &queue, pipeline, &frame, 16, 16),
+            )
+        };
+
+        registry.insert(77, bordered(16, 16, [255, 0, 0])).unwrap();
+        let (stats, px) = draw(&mut pipeline, &mut cache, &registry);
+        assert_eq!(stats.uploaded, 1);
+        assert_eq!(centre(&px), [255, 0, 0]);
+
+        // Re-send without a sync in between (one PTY read, no render).
+        registry.insert(77, bordered(16, 16, [0, 255, 0])).unwrap();
+        let (stats, px) = draw(&mut pipeline, &mut cache, &registry);
+        assert_eq!(stats.uploaded, 1, "stale texture reused");
+        assert_eq!(centre(&px), [0, 255, 0]);
+        assert_eq!(pipeline.live_slots(), 1, "old texture freed");
+
+        // Re-send with the sync in between (normal revision path).
+        registry.insert(77, bordered(16, 16, [0, 0, 255])).unwrap();
+        assert!(pipeline.sync_registry(&registry, &mut cache));
+        let (stats, px) = draw(&mut pipeline, &mut cache, &registry);
+        assert_eq!(stats.uploaded, 1);
+        assert_eq!(centre(&px), [0, 0, 255]);
+
+        // No change: no upload.
+        let (stats, _) = draw(&mut pipeline, &mut cache, &registry);
+        assert_eq!(stats.uploaded, 0);
+    }
+
+    /// Review of #24: an image wider than `max_texture_dimension_2d`
+    /// used to be a wgpu validation panic. It now uploads downscaled
+    /// (aspect kept) and draws.
+    #[test]
+    fn image_over_texture_limit_is_downscaled_not_a_panic() {
+        let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
+            return;
+        };
+        let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let max = device.limits().max_texture_dimension_2d;
+        let mut cache = ImageTextureCache::default();
+        let mut registry = ImageRegistry::new(u64::MAX);
+        registry
+            .insert(9, bordered(max + 1, 4, [255, 0, 0]))
+            .unwrap();
+        let mut frame = vec![ImageInstance {
+            size: [8.0, 2.0],
+            ..inst(9)
+        }];
+        let stats =
+            pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
+        assert_eq!(stats.uploaded, 1);
+        let e = cache.get(9).unwrap();
+        assert!(e.width <= max && e.height <= max);
+        assert_eq!((e.width, e.height), ((max + 1).div_ceil(2), 2));
+        let px = render_offscreen(&device, &queue, &mut pipeline, &frame, 8, 2);
+        assert!(
+            px.chunks(4).any(|p| p[0] > 60 && p[1] < 30),
+            "drawn: {px:?}"
         );
     }
 }

@@ -311,6 +311,16 @@ UVs at draw time. Don't patch each item separately.
     is held to a 256 MiB byte budget, evicting the textures drawn least
     recently. Textures drawn this frame are never evicted, so nothing
     re-uploads per frame. Fixed in #24.
+  - Also fixed in #24 (found in review):
+    - Re-sending an id at the same size kept the old pixels when the
+      first and last 8 pixels matched, because the GPU copy was keyed on a
+      partial content fingerprint. It is now keyed on a per-insert
+      registry generation. This also covers delete-then-anonymous-send
+      reusing the lowest free id.
+    - An image wider or taller than the GPU's `max_texture_dimension_2d`
+      (e.g. a 20000×4 `a=T`) crashed toastty with a wgpu validation panic.
+      It is now box-downscaled on the CPU by the smallest integer factor
+      that fits, keeping the aspect ratio, and a warning is logged.
 - [ ] **P1 — SIZE-9. Images with z below INT32_MIN/2 are invisible.**
   - Repro: `K send a=T,i=1,z=-1073741825 --png img.png` over default and
     `\e[41m` cells.
