@@ -5422,6 +5422,19 @@ impl KittySink for Term {
         self.images.store.lowest_free_client_id()
     }
 
+    fn mark_transient(&mut self, id: u32) {
+        // By store key (#42); an anonymous image (id 0) is the one
+        // `register_image` just stored.
+        let key = if id == 0 {
+            self.last_registered_key
+        } else {
+            self.images.store.key_of(id)
+        };
+        if let Some(key) = key {
+            self.images.store.set_transient(key);
+        }
+    }
+
     fn image_dimensions(&self, id: u32) -> Option<(u32, u32)> {
         self.images.store.get(id).map(|img| (img.width, img.height))
     }
@@ -9331,6 +9344,29 @@ mod tests {
             String::from_utf8_lossy(&t.drain_pty_replies()),
             "\x1b_Gi=1,I=300;OK\x1b\\"
         );
+    }
+
+    /// §9 usage hints: under storage pressure an unplaced `N=1` image is
+    /// evicted before an older normal one.
+    #[test]
+    fn apc_kitty_transient_image_is_evicted_first() {
+        let mut t = Term::new(8, 20, 0);
+        // Room for two 1x1 images, each costing its 4 bytes plus #42's
+        // per-image overhead.
+        t.set_image_cap(2 * (4 + toastty_graphics::IMAGE_OVERHEAD_BYTES));
+        let px = String::from_utf8(b64_red_1x1()).unwrap();
+        let mut payload = Vec::new();
+        for header in [
+            "a=t,f=32,s=1,v=1,i=1,q=2",
+            "a=t,f=32,s=1,v=1,i=2,q=2,N=1",
+            "a=t,f=32,s=1,v=1,i=3,q=2",
+        ] {
+            payload.extend_from_slice(format!("\x1b_G{header};{px}\x1b\\").as_bytes());
+        }
+        feed(&mut t, &payload);
+        assert!(t.image_store().contains(1));
+        assert!(!t.image_store().contains(2), "transient evicted first");
+        assert!(t.image_store().contains(3));
     }
 
     /// PLC-1 / PLC-3 / DEL-1 round trip through `Term`.
