@@ -1,8 +1,9 @@
 //! Per-cell "extra" payloads that don't fit in [`Cell`](crate::Cell)'s
 //! single `char`: the trailing codepoints of a multi-codepoint grapheme
 //! cluster (combining marks, ZWJ emoji sequences, variation selectors,
-//! regional-indicator pairs under DECSET 2027) and the horizontal-tab
-//! marker that lets copy reproduce a literal `\t`.
+//! regional-indicator pairs under DECSET 2027), the horizontal-tab
+//! marker that lets copy reproduce a literal `\t`, and the diacritics +
+//! placement id of a kitty Unicode-placeholder cell.
 //!
 //! # Why an intern table
 //!
@@ -57,6 +58,46 @@ pub enum CellExtra {
     /// as long as those cells are still blank — matching kitty and
     /// Ghostty, which preserve tabs in copied text (xterm copies spaces).
     Tab(u16),
+    /// The per-cell data of a kitty Unicode-placeholder cell
+    /// (`Cell::ch == U+10EEEE`) that the cell's style doesn't already
+    /// hold. The image id's low bits are the cell's foreground colour.
+    /// A placeholder cell with no extra is a bare cell with placement
+    /// id 0.
+    Placeholder(PlaceholderExtra),
+}
+
+/// See [`CellExtra::Placeholder`]. The diacritic fields hold the
+/// diacritic's table index **plus one**, so `0` means "not given" and
+/// the value is inherited from the cell to the left at render time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct PlaceholderExtra {
+    /// Placement id, from the SGR 58 underline colour when the cell was
+    /// printed (`0` = any virtual placement of the image).
+    pub placement_id: u32,
+    /// First diacritic: the image row.
+    pub row: u16,
+    /// Second diacritic: the image column.
+    pub col: u16,
+    /// Third diacritic: bits 24..32 of the image id.
+    pub id_msb: u16,
+}
+
+impl PlaceholderExtra {
+    /// Record the next diacritic (table index `idx`) in stream order.
+    /// Returns `false` when all three slots are already taken.
+    pub fn push_diacritic(&mut self, idx: u16) -> bool {
+        let v = idx.saturating_add(1);
+        if self.row == 0 {
+            self.row = v;
+        } else if self.col == 0 {
+            self.col = v;
+        } else if self.id_msb == 0 {
+            self.id_msb = v;
+        } else {
+            return false;
+        }
+        true
+    }
 }
 
 /// Deduplicating intern table for [`CellExtra`] values.
