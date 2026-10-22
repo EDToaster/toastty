@@ -173,6 +173,31 @@ fn has_running_program_false_when_child_is_foreground_leader() {
 }
 
 #[test]
+fn running_program_name_reports_job_started_by_interactive_shell() {
+    // An interactive bash puts `sleep` in its own foreground pgrp, which
+    // is the case the close prompt names. No rc files and no history so
+    // the test leaves nothing behind.
+    let spec = PtySpec::program("/bin/bash")
+        .args(["--norc", "--noprofile", "-i"])
+        .env("HISTFILE", "/dev/null")
+        .env("PATH", "/usr/bin:/bin");
+    let pty = Pty::spawn(&spec).expect("spawn");
+    assert_eq!(pty.running_program_name(), None, "bare shell names nothing");
+    pty.write(b"sleep 60\n").expect("write");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut name = None;
+    while Instant::now() < deadline {
+        drain_now(&pty, 20);
+        name = pty.running_program_name();
+        if name.is_some() {
+            break;
+        }
+    }
+    assert_eq!(name.as_deref(), Some("sleep"));
+    assert!(pty.has_running_program());
+}
+
+#[test]
 fn drop_kills_running_child() {
     let spec = PtySpec::program("/bin/sleep").arg("60");
     let pty = Pty::spawn(&spec).expect("spawn");

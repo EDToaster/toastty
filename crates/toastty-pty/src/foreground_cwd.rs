@@ -1,4 +1,4 @@
-//! Foreground-process CWD lookup.
+//! Foreground-process lookups: CWD and name.
 //!
 //! Given the PTY master fd, find the foreground process group on the
 //! slave side (`tcgetpgrp`) and read its working directory from the
@@ -91,6 +91,75 @@ pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
     None
 }
 
+/// Short name of process `pid` (e.g. `"vim"`), for showing the user
+/// what is running. Control characters are dropped and an empty name
+/// is `None`.
+///
+/// - **Linux**: `/proc/<pid>/comm`. The kernel truncates it to 15
+///   bytes, so a name exactly that long is swapped for the basename of
+///   `argv[0]` when that extends it (`cargo-clippy-dr` → full name).
+/// - **macOS**: `proc_name`.
+#[must_use]
+pub fn process_name(pid: u32) -> Option<String> {
+    clean_name(&raw_process_name(pid)?)
+}
+
+#[cfg(target_os = "linux")]
+fn raw_process_name(pid: u32) -> Option<String> {
+    /// `TASK_COMM_LEN - 1`: the longest name `comm` can hold.
+    const COMM_MAX: usize = 15;
+    // Lossy: the kernel cuts `comm` at a byte boundary, which can split
+    // a multi-byte character.
+    let comm = std::fs::read(format!("/proc/{pid}/comm")).ok()?;
+    let comm = String::from_utf8_lossy(&comm).trim_end_matches('\n').to_owned();
+    if comm.len() < COMM_MAX {
+        return Some(comm);
+    }
+    let full = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .and_then(|cmd| {
+            let argv0 = cmd.split(|&b| b == 0).next()?;
+            let argv0 = String::from_utf8_lossy(argv0);
+            let base = argv0.rsplit('/').next()?.to_owned();
+            base.starts_with(&comm).then_some(base)
+        });
+    Some(full.unwrap_or(comm))
+}
+
+#[cfg(target_os = "macos")]
+fn raw_process_name(pid: u32) -> Option<String> {
+    // `2 * MAXCOMLEN + 1`, what `proc_name` fills at most.
+    let mut buf = [0u8; 33];
+    // SAFETY: `proc_name` writes at most `buf.len()` bytes into `buf`
+    // and returns the length written; a non-positive return is failure
+    // and we don't read the buffer.
+    let n = unsafe {
+        libc::proc_name(
+            pid as libc::c_int,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            buf.len() as u32,
+        )
+    };
+    if n <= 0 {
+        return None;
+    }
+    let n = usize::try_from(n).ok()?.min(buf.len());
+    Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn raw_process_name(_pid: u32) -> Option<String> {
+    None
+}
+
+/// Drop control characters (a process can name itself anything) and
+/// surrounding whitespace; `None` when nothing is left.
+fn clean_name(raw: &str) -> Option<String> {
+    let name: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 /// Convenience: combine [`foreground_pid`] and [`process_cwd`]. The
 /// hot path the binary calls before each PTY-byte batch.
 #[must_use]
@@ -117,6 +186,31 @@ mod tests {
         let got_canon = got.canonicalize().unwrap_or(got);
         let expected_canon = expected.canonicalize().unwrap_or(expected);
         assert_eq!(got_canon, expected_canon);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn process_name_for_self_is_the_test_binary() {
+        // The test harness binary is named after the crate plus a hash
+        // (`toastty_pty-0123abcd`); comm may truncate it, so compare
+        // the prefix.
+        let name = process_name(std::process::id()).expect("self should be readable");
+        assert!(name.starts_with("toastty_pty"), "got {name:?}");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn process_name_for_nonexistent_pid_returns_none() {
+        // Above any real pid_max (PID 0 is `kernel_task` on macOS).
+        assert!(process_name(i32::MAX as u32).is_none());
+    }
+
+    #[test]
+    fn clean_name_strips_controls_and_empties() {
+        assert_eq!(clean_name("vim\n").as_deref(), Some("vim"));
+        assert_eq!(clean_name("\u{1b}[31mevil").as_deref(), Some("[31mevil"));
+        assert_eq!(clean_name("  "), None);
+        assert_eq!(clean_name(""), None);
     }
 
     #[test]

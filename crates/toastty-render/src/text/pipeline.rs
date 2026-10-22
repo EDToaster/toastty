@@ -253,13 +253,24 @@ impl TextPipeline {
         bind_group: &'pass BindGroup,
         instance_count: usize,
     ) {
-        if instance_count == 0 {
+        self.render_glyph_range(pass, bind_group, 0..instance_count);
+    }
+
+    /// [`Self::render_glyph`] for the instances in `range` only (the
+    /// close dialog's text, drawn after the dialog panel).
+    pub fn render_glyph_range<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        bind_group: &'pass BindGroup,
+        range: std::ops::Range<usize>,
+    ) {
+        if range.is_empty() {
             return;
         }
         pass.set_pipeline(&self.glyph_pipeline);
         pass.set_bind_group(0, bind_group, &[]);
         pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-        pass.draw(0..4, 0..instance_count as u32);
+        pass.draw(0..4, range.start as u32..range.end as u32);
     }
 }
 
