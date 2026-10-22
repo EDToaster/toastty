@@ -1242,6 +1242,22 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
     `from_utf8_lossy`-style text. It holds an incomplete trailing sequence
     across reads, and turns one cut off by ESC into U+FFFD. Fixed in
     #41.
+  - Side effects:
+    - Output no longer depends on where a read splits an invalid
+      sequence. Before, vte's partial-UTF-8 path printed different things
+      for different splits.
+    - Until #32 lands, a DCS body runs through ground text, so the
+      sanitizer also rewrites it: a raw `0x9C` there becomes U+FFFD and no
+      longer ends the DCS (`ESC P z hi \x9c AFTER ESC \` prints nothing,
+      where it used to print `AFTER`). That matches kitty 0.49.2 and is
+      what #32 does explicitly. Part of WIRE-5 changes here. The APC
+      scanner still ends on `0x9C` until #32.
+  - Cost: text is checked once per read, with SIMD (`simdutf8`), up to the
+    last character boundary, and runs between escapes inside that span go
+    straight to vte. Parser instructions per byte against `main`: ASCII
+    +1.8%, CJK +5.1%, emoji +5.9%, sparse UTF-8 +5.7%, `ls --color` +2.2%,
+    vim-style redraw +3.3%. That is one SIMD validation pass, about
+    0.95 instructions per byte of non-ASCII text.
 
 ## 9. Not implemented
 
