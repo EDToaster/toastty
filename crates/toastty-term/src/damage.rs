@@ -53,9 +53,24 @@ impl RowDamage {
     /// Mark column `col` dirty. No-op when `all_cols` is already set.
     /// Sorted-insert keeps `cols` ordered and deduped so the renderer
     /// can iterate it directly.
+    #[inline]
     pub fn mark(&mut self, col: u16) {
         if self.all_cols {
             return;
+        }
+        // Printing marks columns left to right, so the common case is a
+        // plain append (or a repeat of the last column).
+        match self.cols.last() {
+            None => {
+                self.cols.push(col);
+                return;
+            }
+            Some(&last) if col > last => {
+                self.cols.push(col);
+                return;
+            }
+            Some(&last) if col == last => return,
+            Some(_) => {}
         }
         match self.cols.binary_search(&col) {
             Ok(_) => {} // already present
@@ -78,6 +93,11 @@ impl RowDamage {
         // the caller already meant "all of it".
         if start == 0 && end == cols_in_row {
             self.mark_all();
+            return;
+        }
+        if self.cols.last().is_none_or(|&last| start > last) {
+            // Past everything marked so far (a print run): append.
+            self.cols.extend(start..end);
             return;
         }
         for c in start..end {
@@ -142,6 +162,16 @@ impl Damage {
     /// renderer's `needs_full_clear` is keyed off `all`, so this is the
     /// path BSU-watchdog / resize / theme-swap take.
     pub fn mark_all(&mut self) {
+        // `all` already implies every row is `all_cols`: rows are only
+        // un-marked by `clear`, which drops `all` too. Every full-screen
+        // scroll lands here, so skip re-walking the rows.
+        if self.all {
+            return;
+        }
+        self.mark_all_rows();
+    }
+
+    fn mark_all_rows(&mut self) {
         self.all = true;
         for r in &mut self.rows {
             r.mark_all();
@@ -153,7 +183,8 @@ impl Damage {
     /// resize, so a partial clean state would be a lie).
     pub fn resize(&mut self, new_rows: u16) {
         self.rows.resize_with(new_rows as usize, RowDamage::default);
-        self.mark_all();
+        // Not `mark_all`: the new rows aren't marked even if `all` is.
+        self.mark_all_rows();
     }
 
     /// Iterate `(row_index, &RowDamage)` for all rows whose damage is
@@ -303,6 +334,47 @@ mod tests {
         for r in &d.rows {
             assert!(r.all_cols);
         }
+    }
+
+    /// The append fast paths in `mark` / `mark_range` must keep `cols`
+    /// exactly the sorted, deduped set whatever order columns arrive in.
+    #[test]
+    fn row_damage_any_mark_order_stays_sorted_unique() {
+        let mut want = std::collections::BTreeSet::new();
+        let mut r = RowDamage::default();
+        // A deterministic scramble: runs, repeats, back-steps, ranges.
+        let mut x: u32 = 7;
+        for _ in 0..500 {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let col = u16::try_from((x >> 16) % 60).unwrap();
+            if x & 1 == 0 {
+                r.mark(col);
+                want.insert(col);
+            } else {
+                let end = col + u16::try_from((x >> 8) % 5).unwrap();
+                r.mark_range(col, end, 80);
+                want.extend(col..end);
+            }
+            assert!(r.cols.windows(2).all(|w| w[0] < w[1]));
+        }
+        assert_eq!(
+            r.cols.iter().copied().collect::<Vec<_>>(),
+            want.into_iter().collect::<Vec<_>>()
+        );
+    }
+
+    /// `mark_all` skips the row walk when `all` is set; `resize` must
+    /// still mark the rows it adds.
+    #[test]
+    fn damage_resize_while_all_marks_new_rows() {
+        let mut d = Damage::new(2);
+        assert!(d.all);
+        d.resize(5);
+        assert!(d.rows.iter().all(|r| r.all_cols));
+        d.clear();
+        d.mark_all();
+        d.mark_all();
+        assert!(d.all && d.rows.iter().all(|r| r.all_cols));
     }
 
     #[test]
