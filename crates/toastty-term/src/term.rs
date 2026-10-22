@@ -32,6 +32,8 @@ use toastty_graphics::{ImageData, ImageGrid, ImageRegistry, Placement};
 use toastty_parser::{Params, Perform};
 pub use toastty_protocols::clipboard::{ClipboardTarget, ClipboardTargets};
 
+#[cfg(test)]
+mod relative_tests;
 mod rich_term;
 mod vt;
 
@@ -1772,9 +1774,10 @@ impl Term {
                 sel.contains(line_id, col) || wide_partner_selected(sel, row, line_id, col)
             };
             let len = row.cells.len();
-            if let (Some(lo), Some(hi)) =
-                ((0..len).find(|&i| selected(i)), (0..len).rev().find(|&i| selected(i)))
-            {
+            if let (Some(lo), Some(hi)) = (
+                (0..len).find(|&i| selected(i)),
+                (0..len).rev().find(|&i| selected(i)),
+            ) {
                 let mut col = lo;
                 while col <= hi {
                     if Some(col) == pad_col {
@@ -2749,7 +2752,7 @@ impl Term {
             placement.from_placeholder = true;
             placement.placement_id = placement_id;
             placement.line = top_line + i64::from(cell.row);
-            placement.col = cell.col;
+            placement.col = i32::from(cell.col);
             placement.src_rect = toastty_graphics::SrcRect {
                 x: sx,
                 y: sy,
@@ -4627,6 +4630,24 @@ impl Term {
         }
     }
 
+    /// REL-2 (kitty 0.49.2): a relative child deleted because its parent
+    /// was deleted takes its image with it once the image has no
+    /// placement left, even for a lowercase delete. (A child deleted
+    /// directly keeps its image, as in kitty.) `dropped` is what the
+    /// grid's removal returned, cascaded children included.
+    fn free_cascaded_child_images(&mut self, dropped: &[Placement]) {
+        let mut seen: Vec<u32> = Vec::new();
+        for p in dropped {
+            if !ImageGrid::removed_with_parent(p, dropped) || seen.contains(&p.image_id) {
+                continue;
+            }
+            seen.push(p.image_id);
+            if !self.image_grid.iter().any(|q| q.image_id == p.image_id) {
+                self.remove_image_bytes(p.image_id);
+            }
+        }
+    }
+
     /// Register a decoded sixel image and place it at the cursor, then
     /// advance the cursor per the active sixel cursor mode (DECSET 8452).
     ///
@@ -4783,27 +4804,28 @@ impl KittySink for Term {
         // `C=1` image at the bottom is clipped rather than scrolling the
         // screen (SCR-10).
         placement.line = self.image_top_line() + i64::from(self.cursor.row);
-        placement.col = self.cursor.col.min(self.cols.saturating_sub(1));
+        placement.col = i32::from(self.cursor.col.min(self.cols.saturating_sub(1)));
         placement.clip_rows = 0..placement.rows;
         // M5: re-emitting the same `(image_id, placement_id)` must
         // REPLACE the prior placement, not stack on top of it. Per spec:
         // "If you send two placements with the same image id and
         // placement id the second one will replace the first." Only
         // applies when BOTH ids are non-zero (a named placement);
-        // unnamed (`p=0`) placements always accumulate.
-        if placement.image_id != 0 && placement.placement_id != 0 {
-            let img = placement.image_id;
-            let pid = placement.placement_id;
-            for old in self
+        // unnamed (`p=0`) placements always accumulate. `upsert`
+        // replaces in place, so the placement's relative children stay
+        // attached and follow it to its new position (REL-3).
+        if placement.image_id != 0
+            && placement.placement_id != 0
+            && let Some(old) = self
                 .image_grid
-                .remove_where(|p| p.image_id == img && p.placement_id == pid)
-            {
-                mark_placement_dirty(self, &old);
-            }
+                .find(placement.image_id, placement.placement_id)
+                .cloned()
+        {
+            mark_placement_dirty(self, &old);
         }
         // Mark dirty BEFORE consuming `placement` into the grid.
         mark_placement_dirty(self, &placement);
-        self.image_grid.add(placement);
+        self.image_grid.upsert(placement);
         self.image_revision = self.image_revision.wrapping_add(1);
     }
 
@@ -4820,22 +4842,23 @@ impl KittySink for Term {
             "kitty: place_relative",
         );
         // M5 replace rule: a named (image_id, placement_id) re-emission
-        // replaces the prior placement of the same pair.
-        if placement.image_id != 0 && placement.placement_id != 0 {
-            let img = placement.image_id;
-            let pid = placement.placement_id;
-            for old in self
-                .image_grid
-                .remove_where(|p| p.image_id == img && p.placement_id == pid)
-            {
-                mark_placement_dirty(self, &old);
-            }
-        }
-        // `add_relative` validates the parent ref and rebases the child's
-        // cell ranges onto the parent origin + (H, V). On error nothing is
-        // inserted.
+        // replaces the prior placement of the same pair. `add_relative`
+        // validates the parent reference *first* and only then replaces
+        // in place, so a rejected re-placement keeps the old placement
+        // and its children (REL-1). It rebases the child onto the parent
+        // origin + (H, V).
+        let old = (placement.image_id != 0 && placement.placement_id != 0)
+            .then(|| {
+                self.image_grid
+                    .find(placement.image_id, placement.placement_id)
+                    .cloned()
+            })
+            .flatten();
         match self.image_grid.add_relative(placement) {
             Ok(handle) => {
+                if let Some(old) = old {
+                    mark_placement_dirty(self, &old);
+                }
                 // The placement was rebased inside `add_relative`; re-read
                 // it to mark the resolved cells dirty.
                 let resolved = self
@@ -5022,6 +5045,7 @@ impl KittySink for Term {
         if needs_survivor_sweep {
             self.free_orphaned_image_bytes(&dropped_placements);
         }
+        self.free_cascaded_child_images(&dropped_placements);
         tracing::info!(
             target: "kitty",
             spec = %spec_char,

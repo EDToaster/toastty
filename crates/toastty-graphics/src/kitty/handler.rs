@@ -596,6 +596,17 @@ impl KittyHandler {
         // subsequent U+10EEEE placeholder cells (handled elsewhere). So
         // for `U=1` we skip both the visible placement and the cursor
         // advance, but still reply OK.
+        // REL-4: `a=T` with `P=` is a relative placement, exactly like
+        // `a=p` (kitty 0.49.2). It never moves the cursor, and a rejected
+        // parent reference is replied to with its error, but the image
+        // stays registered.
+        if matches!(header.action, Action::TransmitAndPlace)
+            && !header.unicode_placeholder
+            && header.parent_image != 0
+        {
+            place_relative_from_header(&header, final_id, img_w, img_h, sink);
+            return;
+        }
         if matches!(header.action, Action::TransmitAndPlace) && !header.unicode_placeholder {
             let (cell_pw, cell_ph) = sink.cell_pixel_size();
             let placement =
@@ -625,6 +636,19 @@ impl KittyHandler {
             reply_error_if_verbose(&header, sink, ErrorCode::Einval, "place requires i=");
             return;
         }
+        // REL-7: a virtual placement can't be relative (spec). kitty
+        // rejects `a=p,U=1,P=…` with EINVAL. (For `a=T,U=1,P=…` kitty
+        // replies OK and makes the virtual placement, so that path ignores
+        // `P`/`Q`.)
+        if header.unicode_placeholder && header.parent_image != 0 {
+            reply_error_if_verbose(
+                &header,
+                sink,
+                ErrorCode::Einval,
+                "virtual placement cannot refer to a parent",
+            );
+            return;
+        }
         // B12: `U=1` is a virtual placement — register-only, no visible
         // placement at the cursor and no cursor motion. The image was
         // already transmitted; the placeholder pipeline (handled
@@ -634,45 +658,13 @@ impl KittyHandler {
             reply_ok_if_verbose_with_id(&header, sink, header.image_id);
             return;
         }
-        // M13: relative placement. Taken when BOTH `P=` (parent image)
-        // and `Q=` (parent placement) are set. The child is positioned at
-        // the parent placement's origin plus `(H, V)` cells and the
-        // cursor NEVER moves (regardless of `C=`). If only one of `P`/`Q`
-        // is set the reference is incomplete → EINVAL.
-        if header.parent_image != 0 || header.parent_placement != 0 {
-            if header.parent_image == 0 || header.parent_placement == 0 {
-                reply_error_if_verbose(
-                    &header,
-                    sink,
-                    ErrorCode::Einval,
-                    "relative placement requires both P= and Q=",
-                );
-                return;
-            }
-            let (cell_pw, cell_ph) = sink.cell_pixel_size();
+        // M13: relative placement, taken whenever `P=` (parent image) is
+        // set. kitty 0.49.2 accepts `P` without `Q` (any placement of the
+        // parent image) and ignores `Q` without `P` (an ordinary placement
+        // at the cursor). Relative placements never move the cursor.
+        if header.parent_image != 0 {
             let (img_w, img_h) = sink.image_dimensions(header.image_id).unwrap_or((0, 0));
-            let mut placement = default_placement_from_header(
-                &header,
-                header.image_id,
-                img_w,
-                img_h,
-                cell_pw,
-                cell_ph,
-            );
-            placement.parent = Some((header.parent_image, header.parent_placement));
-            placement.rel_offset = (header.h_offset, header.v_offset);
-            match sink.place_relative(placement) {
-                Ok(()) => reply_ok_if_verbose_with_id(&header, sink, header.image_id),
-                Err(e) => {
-                    let code = match e {
-                        RelativeError::NoParent => ErrorCode::Enoparent,
-                        RelativeError::Cycle => ErrorCode::Ecycle,
-                        RelativeError::TooDeep => ErrorCode::Etoodeep,
-                    };
-                    reply_error_if_verbose(&header, sink, code, "relative placement");
-                }
-            }
-            // Relative placements never move the cursor.
+            place_relative_from_header(&header, header.image_id, img_w, img_h, sink);
             return;
         }
         // Standalone `a=p`: look up the already-transmitted image's pixel
@@ -899,6 +891,40 @@ fn default_placement_from_header(
     // for `a=p` with `P=`/`Q=` set (M13).
     p.pix_offset = (header.cell_x, header.cell_y);
     p
+}
+
+/// Create the relative placement (`P=`/`Q=`/`H=`/`V=`) a header asks for
+/// and reply: OK, or the error code kitty 0.49.2 uses for the rejection
+/// (REL-7). Shared by `a=p` and `a=T` (REL-4). Never moves the cursor.
+fn place_relative_from_header<S: KittySink>(
+    header: &Header,
+    image_id: u32,
+    img_w: u32,
+    img_h: u32,
+    sink: &mut S,
+) {
+    let cell_px = sink.cell_pixel_size();
+    let mut placement =
+        default_placement_from_header(header, image_id, img_w, img_h, cell_px.0, cell_px.1);
+    placement.parent = Some((header.parent_image, header.parent_placement));
+    placement.rel_offset = (header.h_offset, header.v_offset);
+    match sink.place_relative(placement) {
+        Ok(()) => reply_ok_if_verbose_with_id(header, sink, image_id),
+        Err(e) => {
+            let (code, msg) = match e {
+                RelativeError::NoParent => {
+                    (ErrorCode::Enoparent, "parent placement does not exist")
+                }
+                RelativeError::Cycle => (ErrorCode::Ecycle, "parent reference creates a cycle"),
+                RelativeError::TooDeep => (ErrorCode::Etoodeep, "parent chain too deep"),
+                RelativeError::SelfParent => (
+                    ErrorCode::Einval,
+                    "placement refers to itself as its own parent",
+                ),
+            };
+            reply_error_if_verbose(header, sink, code, msg);
+        }
+    }
 }
 
 /// Emit an EINVAL reply for a header that failed to parse (B9).
@@ -2070,6 +2096,7 @@ mod major_relative_handler_tests {
         grid: ImageGrid,
         registered: Vec<u32>,
         replies: Vec<Vec<u8>>,
+        cursor_advances: usize,
     }
 
     impl KittySink for GridSink {
@@ -2085,6 +2112,9 @@ mod major_relative_handler_tests {
         }
         fn place_relative(&mut self, placement: Placement) -> Result<(), RelativeError> {
             self.grid.add_relative(placement).map(|_| ())
+        }
+        fn advance_cursor_after_placement(&mut self, _rows: u16, _cols: u16, _start_col: u16) {
+            self.cursor_advances += 1;
         }
         fn delete_image(&mut self, _delete: DeleteSpec, _header: &Header) {}
         fn queue_reply(&mut self, bytes: &[u8]) {
@@ -2193,18 +2223,85 @@ mod major_relative_handler_tests {
     }
 
     #[test]
-    fn relative_placement_partial_ref_replies_einval() {
-        // Only P= set, no Q= → incomplete reference → EINVAL.
+    fn relative_placement_partial_refs_match_kitty() {
+        // REL-7, kitty 0.49.2: `P` without `Q` is relative to any
+        // placement of the parent image; `Q` without `P` is an ordinary
+        // placement. Both reply OK.
         let mut h = KittyHandler::new();
         let mut sink = GridSink::default();
         seed_parent(&mut sink);
         sink.registered.push(2);
         h.process(b"Ga=p,i=2,p=20,P=1,H=1,V=1", b"", &mut sink)
             .unwrap();
-        assert!(sink.grid.find(2, 20).is_none());
+        let child = sink.grid.find(2, 20).expect("relative to image 1");
+        assert_eq!(child.parent, Some((1, 0)));
+        assert_eq!((child.line, child.col), (6, 4));
+        h.process(b"Ga=p,i=2,p=21,Q=10,H=7,V=7", b"", &mut sink)
+            .unwrap();
+        assert_eq!(sink.grid.find(2, 21).map(|p| p.parent), Some(None));
+        assert!(
+            !sink.replies_joined().contains("EINVAL"),
+            "got {:?}",
+            sink.replies_joined()
+        );
+    }
+
+    #[test]
+    fn relative_errors_match_kitty() {
+        // REL-7: self-reference of an existing placement → EINVAL; of a
+        // new one → ENOPARENT; `a=p,U=1` with a parent → EINVAL.
+        let mut h = KittyHandler::new();
+        let mut sink = GridSink::default();
+        seed_parent(&mut sink);
+        h.process(b"Ga=p,i=1,p=10,P=1,Q=10", b"", &mut sink)
+            .unwrap();
         assert!(
             sink.replies_joined().contains("EINVAL"),
-            "got {:?}",
+            "{}",
+            sink.replies_joined()
+        );
+        assert!(sink.grid.find(1, 10).is_some(), "REL-1: still there");
+        sink.replies.clear();
+        sink.registered.push(2);
+        h.process(b"Ga=p,i=2,p=7,P=2,Q=7", b"", &mut sink).unwrap();
+        assert!(
+            sink.replies_joined().contains("ENOPARENT"),
+            "{}",
+            sink.replies_joined()
+        );
+        sink.replies.clear();
+        h.process(b"Ga=p,i=2,p=8,U=1,P=1,Q=10", b"", &mut sink)
+            .unwrap();
+        assert!(
+            sink.replies_joined().contains("EINVAL"),
+            "{}",
+            sink.replies_joined()
+        );
+    }
+
+    #[test]
+    fn transmit_and_place_honours_parent() {
+        // REL-4: `a=T` with P/Q/H/V is relative and doesn't move the
+        // cursor; negative offsets aren't clamped (REL-6).
+        let mut h = KittyHandler::new();
+        let mut sink = GridSink::default();
+        seed_parent(&mut sink);
+        h.process(
+            b"Ga=T,f=32,s=1,v=1,i=5,p=1,P=1,Q=10,H=-4,V=-2,c=3,r=2",
+            b"/wAA/w==",
+            &mut sink,
+        )
+        .unwrap();
+        let child = sink.grid.find(5, 1).expect("relative child");
+        assert_eq!((child.line, child.col), (3, -1));
+        assert_eq!(child.parent, Some((1, 10)));
+        assert_eq!(
+            sink.cursor_advances, 0,
+            "relative placements never move the cursor"
+        );
+        assert!(
+            sink.replies_joined().contains(";OK"),
+            "{}",
             sink.replies_joined()
         );
     }
