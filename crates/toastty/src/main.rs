@@ -1027,12 +1027,14 @@ impl Toastty {
                 ControlSignal::RedrawIn(left)
             }
             ingest::Outcome::Redraw => {
-                // RedrawIn(ZERO) — not Continue — to force the event loop
-                // to wake immediately. On macOS, plain `request_redraw()`
-                // doesn't wake from Wait reliably; RedrawIn sets
-                // ControlFlow::Poll, which does.
+                // RedrawIn — not Continue — to force the event loop to
+                // wake. On macOS, plain `request_redraw()` doesn't wake
+                // from Wait reliably; RedrawIn(ZERO) sets ControlFlow::Poll
+                // and a later deadline WaitUntil, which both do. The delay
+                // is zero unless a frame was drawn under one frame
+                // interval ago (see `Ingest::redraw_delay`).
                 self.ingest.frame_requested(parse_start);
-                ControlSignal::RedrawIn(Duration::ZERO)
+                ControlSignal::RedrawIn(self.ingest.redraw_delay(Instant::now()))
             }
         }
     }

@@ -90,6 +90,18 @@ impl Ingest {
         self.frame_requested.get_or_insert(now);
     }
 
+    /// How long a drained pass waits before its redraw: until a frame is
+    /// due again. Zero after a quiet spell, so an echo or a prompt draws at
+    /// once; while output keeps arriving (a flood the parser now outruns,
+    /// so every pass drains) it caps the redraws at [`FRAME_INTERVAL`]
+    /// instead of drawing once per pass, which reached 360 FPS.
+    #[must_use]
+    pub fn redraw_delay(&self, now: Instant) -> Duration {
+        self.last_frame.map_or(Duration::ZERO, |t| {
+            (t + FRAME_INTERVAL).saturating_duration_since(now)
+        })
+    }
+
     fn frame_due(&self, now: Instant) -> bool {
         self.last_frame
             .is_none_or(|t| now.saturating_duration_since(t) >= FRAME_INTERVAL)
@@ -244,6 +256,17 @@ mod tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    #[test]
+    fn a_drained_pass_redraws_at_once_only_when_a_frame_is_due() {
+        let mut ing = Ingest::default();
+        let t0 = Instant::now();
+        assert_eq!(ing.redraw_delay(t0), Duration::ZERO);
+        ing.frame_drawn(t0, t0 + ms(1));
+        assert_eq!(ing.redraw_delay(t0 + ms(4)) + ms(4), FRAME_INTERVAL);
+        assert_eq!(ing.redraw_delay(t0 + FRAME_INTERVAL), Duration::ZERO);
+        assert_eq!(ing.redraw_delay(t0 + ms(100)), Duration::ZERO);
     }
 
     #[test]
