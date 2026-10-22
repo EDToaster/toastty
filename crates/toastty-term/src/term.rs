@@ -4498,6 +4498,45 @@ impl Term {
         });
     }
 
+    /// `a=d,d=f` / `d=F` — delete animation frames (DEL-2). Targets the
+    /// image given by `i=`, or the newest with number `I=`. With
+    /// neither, or for an unknown image, it's a silent no-op (kitty).
+    /// Returns the placements it removed.
+    ///
+    /// toastty doesn't store animation frames yet, so every image has
+    /// exactly one frame. For such an image kitty 0.49.2 treats `d=F`
+    /// as "delete and free the image": every placement (`p=` doesn't
+    /// scope it) and the stored data. `d=f` is a no-op. (Checked live;
+    /// the spec only says "delete animation frames".)
+    ///
+    /// Hook for animation support (stack E): once images carry extra
+    /// frames, delete those here (the frames kitty selects) and return
+    /// early; only an image left with no extra frames falls through to
+    /// the single-frame rule below.
+    fn delete_image_frames(
+        &mut self,
+        header: &toastty_graphics::kitty::header::Header,
+        uppercase: bool,
+    ) -> Vec<Placement> {
+        let target = if header.image_id != 0 {
+            Some(header.image_id).filter(|&id| self.image_registry.contains(id))
+        } else if header.image_number != 0 {
+            self.image_number_to_id.get(&header.image_number).copied()
+        } else {
+            None
+        };
+        let Some(img) = target else {
+            return Vec::new();
+        };
+        // Single-frame rule.
+        if !uppercase {
+            return Vec::new();
+        }
+        let dropped = self.image_grid.remove_image(img);
+        self.remove_image_bytes(img);
+        dropped
+    }
+
     /// Free image bytes for every image that just lost its last
     /// placement: for each distinct image id among `dropped`, if the
     /// grid no longer holds ANY placement for that id, remove its bytes
@@ -4996,6 +5035,12 @@ impl KittySink for Term {
             // `z` / `Z` — placements with z-index == `z=`.
             b'z' | b'Z' => {
                 dropped_placements.extend(self.image_grid.remove_where(|p| p.z == sel_z));
+            }
+            // `f` / `F` — delete animation frames (DEL-2); see
+            // [`Term::delete_image_frames`].
+            b'f' | b'F' => {
+                dropped_placements.extend(self.delete_image_frames(header, drop_bytes));
+                needs_survivor_sweep = false;
             }
             _ => {}
         }
@@ -10054,6 +10099,74 @@ mod major_delete_tests {
         assert!(!has_placement_for(&t, 2));
         assert!(!t.image_registry().contains(2), "N frees newest bytes");
         assert!(t.image_registry().contains(1), "older image untouched");
+    }
+
+    // ---- DEL-2: d=f / d=F (animation frames) ----
+    // Single-frame images, matching kitty 0.49.2 (checked live): `F`
+    // deletes and frees the whole image (all placements, `p=` ignored),
+    // `f` does nothing. (Delete replies are DEL-1, fixed separately.)
+
+    #[test]
+    fn del2_uppercase_f_deletes_and_frees_the_image() {
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_at(&mut t, 0, 0, 1, 0, 0);
+        place_again_at(&mut t, 0, 3, 1, 2);
+        transmit_place_at(&mut t, 2, 0, 2, 0, 0);
+        assert_eq!(t.image_grid().len(), 3);
+        feed(&mut t, b"\x1b_Ga=d,d=F,i=1\x1b\\");
+        assert!(!has_placement_for(&t, 1), "both placements of image 1 gone");
+        assert!(!t.image_registry().contains(1), "F frees the data");
+        assert!(has_placement_for(&t, 2), "other images untouched");
+        assert!(t.image_registry().contains(2));
+    }
+
+    #[test]
+    fn del2_lowercase_f_is_a_noop() {
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_at(&mut t, 0, 0, 1, 0, 0);
+        feed(&mut t, b"\x1b_Ga=d,d=f,i=1\x1b\\");
+        assert!(has_placement_for(&t, 1));
+        assert!(t.image_registry().contains(1));
+    }
+
+    #[test]
+    fn del2_uppercase_f_ignores_placement_id_and_frees_unplaced_images() {
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_at(&mut t, 0, 0, 3, 0, 0);
+        place_again_at(&mut t, 0, 3, 3, 2);
+        feed(&mut t, b"\x1b_Ga=d,d=F,i=3,p=2\x1b\\");
+        assert!(!has_placement_for(&t, 3), "p= doesn't scope d=F");
+        assert!(!t.image_registry().contains(3));
+        // An image with no placements is freed too.
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_at(&mut t, 0, 0, 4, 0, 0);
+        feed(&mut t, b"\x1b_Ga=d,d=i,i=4\x1b\\");
+        assert!(t.image_registry().contains(4));
+        feed(&mut t, b"\x1b_Ga=d,d=F,i=4\x1b\\");
+        assert!(!t.image_registry().contains(4));
+    }
+
+    #[test]
+    fn del2_uppercase_f_by_number_targets_the_newest() {
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_numbered(&mut t, 0, 0, 7); // id 1 (older)
+        transmit_place_numbered(&mut t, 2, 0, 7); // id 2 (newest)
+        feed(&mut t, b"\x1b_Ga=d,d=F,I=7\x1b\\");
+        assert!(!t.image_registry().contains(2), "newest with I=7 freed");
+        assert!(!has_placement_for(&t, 2));
+        assert!(t.image_registry().contains(1), "older one kept");
+        assert!(has_placement_for(&t, 1));
+    }
+
+    #[test]
+    fn del2_uppercase_f_without_target_or_unknown_id_is_a_noop() {
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_at(&mut t, 0, 0, 1, 0, 0);
+        feed(&mut t, b"\x1b_Ga=d,d=F\x1b\\");
+        feed(&mut t, b"\x1b_Ga=d,d=F,i=99\x1b\\");
+        feed(&mut t, b"\x1b_Ga=d,d=F,I=5\x1b\\");
+        assert!(has_placement_for(&t, 1));
+        assert!(t.image_registry().contains(1));
     }
 
     // ---- M12: d=c/C, q/Q, x/X, y/Y, z/Z ----
