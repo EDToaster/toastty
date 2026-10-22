@@ -111,9 +111,16 @@ The table now recycles ids, and placeholders get a quota:
   reclaims again. Those cells stay `U+10EEEE` text but draw nothing,
   much like images evicted by kitty's storage quota. New images, the
   visible screen and the alt grid always keep theirs.
-- **Throttle.** If a pass frees less than 1/16 of the table, what's
-  there is live, and the next 4,096 refused interns skip the scan. A
-  full table therefore doesn't cost a scan per printed character.
+- **Throttle.** A pass is low-yield when it frees less than 1/16 of the
+  table, or less than one id per 64 cells scanned. Most of what's there
+  is then live, so the next refused interns skip the scan:
+  - 4,096 after the first low-yield pass;
+  - doubled after each further low-yield pass in a row, up to 2²⁰;
+  - reset by a pass that pays off.
+
+  A churning stream therefore can't force a full scan every few
+  thousand extras, and a full table doesn't cost a scan per printed
+  character.
 
 All print-path callers (graphemes, tab markers, placeholders) write the
 returned id straight into the grid. The rich-block layout still interns

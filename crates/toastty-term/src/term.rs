@@ -38,6 +38,12 @@ mod vt;
 
 pub use placeholder::PlaceholderRun;
 
+/// Refused interns waited out after a low-yield extras sweep, doubled per
+/// consecutive low-yield sweep up to [`EXTRAS_GC_BACKOFF_MAX`]. See
+/// [`Term::intern_extra`].
+const EXTRAS_GC_BACKOFF_BASE: u32 = 4096;
+const EXTRAS_GC_BACKOFF_MAX: u32 = 1 << 20;
+
 /// Mouse reporting protocol selected via DECSET 9/1000/1002/1003.
 ///
 /// Apps opt in via the matching DECSET; the binary uses
@@ -277,6 +283,8 @@ pub struct Term {
     /// after a scan that freed almost nothing (see
     /// [`Term::intern_extra`]).
     extras_gc_cooldown: u32,
+    /// Low-yield sweeps in a row; doubles the next back-off.
+    extras_gc_streak: u32,
     /// FIFO of OSC 52 clipboard requests waiting on the binary to
     /// service through `arboard`. Drained by [`Term::drain_clipboard_requests`].
     clipboard_requests: Vec<ClipboardRequest>,
@@ -566,6 +574,7 @@ impl Term {
             current_hyperlink: None,
             extras: ExtraTable::default(),
             extras_gc_cooldown: 0,
+            extras_gc_streak: 0,
             clipboard_requests: Vec::new(),
             security: SecurityFlags::default(),
             apc_buffer: Vec::new(),
@@ -830,11 +839,20 @@ impl Term {
                 freed +=
                     self.drop_old_placeholder_extras(crate::extra::MAX_PLACEHOLDER_ENTRIES / 2);
             }
-            // A scan costs one pass over every grid row. If it freed
-            // little, what's there is genuinely live; don't rescan on
-            // every following print.
-            if freed < crate::extra::MAX_ENTRIES / 16 {
-                self.extras_gc_cooldown = 4096;
+            // A scan costs one pass over every grid cell. A sweep that
+            // freed little for its cost (under 1/16 of the table, or under
+            // one id per 64 cells scanned) means what's there is mostly
+            // live: back off before the next one, doubling the back-off on
+            // each low-yield sweep in a row (capped), so a churning stream
+            // can't make every few thousand extras pay for a full scan.
+            let scanned = (self.primary.cap() + self.alt.cap()) * usize::from(self.cols);
+            if freed < crate::extra::MAX_ENTRIES / 16 || freed.saturating_mul(64) < scanned {
+                self.extras_gc_cooldown = EXTRAS_GC_BACKOFF_BASE
+                    .saturating_mul(1 << self.extras_gc_streak)
+                    .min(EXTRAS_GC_BACKOFF_MAX);
+                self.extras_gc_streak = (self.extras_gc_streak + 1).min(16);
+            } else {
+                self.extras_gc_streak = 0;
             }
         }
         self.extras.intern(extra)
@@ -3849,6 +3867,7 @@ impl Term {
         // any more — drop the table.
         self.extras = ExtraTable::default();
         self.extras_gc_cooldown = 0;
+        self.extras_gc_streak = 0;
         // Scroll region back to the full screen.
         self.scroll_top = 0;
         self.scroll_bot = self.rows.saturating_sub(1);
