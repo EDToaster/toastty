@@ -304,12 +304,14 @@ pub struct Term {
     /// screen's grid here and install a fresh one as `image_grid`.
     /// `None` while on the primary screen (nothing stashed).
     stashed_image_grid: Option<ImageGrid>,
-    /// Image *number* (`I=`) → the ids registered with it, oldest first.
-    /// The kitty spec lets a client refer to "the most recent image with
-    /// this number" (`a=p,I=`, `d=n`/`d=N`, animation). Updated on every
-    /// registration that carried a non-zero `I=`; pruned when an id leaves
-    /// the registry (delete / eviction), so the next-newest image with
-    /// that number takes over, as in kitty.
+    /// Image *number* (`I=`) → ids of the live images with that number,
+    /// oldest first. The kitty spec lets a client refer to "the newest
+    /// image with this number" (`d=n`/`d=N`, `d=f`/`d=F`); keeping every
+    /// id means that once the newest is freed, the next-newest is still
+    /// reachable, as in kitty. Appended on each numbered registration (an
+    /// image re-sent by `i=` keeps its number and place); pruned when an
+    /// id leaves the registry (delete / eviction). Read it through
+    /// [`Term::newest_image_for_number`].
     image_number_to_id: std::collections::HashMap<u32, Vec<u32>>,
     /// Monotonic counter bumped whenever the registry or grid mutates.
     /// The renderer compares against its cached value to decide when
@@ -4499,19 +4501,18 @@ impl Term {
         self.forget_image_number(id);
     }
 
-    /// Drop `id` from the image-number map.
-    fn forget_image_number(&mut self, id: u32) {
-        self.image_number_to_id.retain(|_, ids| {
-            ids.retain(|x| *x != id);
-            !ids.is_empty()
-        });
+    /// The newest live image registered with number `number` (`I=`).
+    fn newest_image_for_number(&self, number: u32) -> Option<u32> {
+        self.image_number_to_id.get(&number)?.last().copied()
     }
 
-    /// The newest stored image registered with number `number`.
-    fn newest_image_with_number(&self, number: u32) -> Option<u32> {
-        self.image_number_to_id
-            .get(&number)
-            .and_then(|ids| ids.last().copied())
+    /// Drop `id` from the number → ids map (it left the registry or
+    /// was re-registered).
+    fn forget_image_number(&mut self, id: u32) {
+        self.image_number_to_id.retain(|_, ids| {
+            ids.retain(|&x| x != id);
+            !ids.is_empty()
+        });
     }
 
     /// Free image bytes for every image that just lost its last
@@ -4645,15 +4646,15 @@ impl KittySink for Term {
                     }
                     self.forget_image_number(*evicted);
                 }
-                // Record this id as the most-recent for its image number
-                // (M11: `d=n`/`d=N` resolution).
-                // A re-sent id loses its old number.
-                self.forget_image_number(inserted.id);
+                // Record this id as the newest for its image number (M11:
+                // `d=n`/`d=N` resolution). Re-sending an existing image by
+                // `i=` keeps its number and its age, as in kitty (`i=` and
+                // `I=` can't be combined, so it can't gain a new one).
                 if image_number != 0 {
-                    self.image_number_to_id
-                        .entry(image_number)
-                        .or_default()
-                        .push(inserted.id);
+                    let ids = self.image_number_to_id.entry(image_number).or_default();
+                    if !ids.contains(&inserted.id) {
+                        ids.push(inserted.id);
+                    }
                 }
                 self.image_revision = self.image_revision.wrapping_add(1);
                 Some(inserted.id)
@@ -4884,7 +4885,7 @@ impl KittySink for Term {
             // when no placement of that image survives.
             b'n' | b'N' => {
                 if header.image_number != 0 {
-                    if let Some(img) = self.newest_image_with_number(header.image_number) {
+                    if let Some(img) = self.newest_image_for_number(header.image_number) {
                         dropped_placements.extend(self.image_grid.remove_image(img));
                         if drop_bytes && !self.image_grid.iter().any(|p| p.image_id == img) {
                             self.remove_image_bytes(img);
@@ -5042,7 +5043,7 @@ impl KittySink for Term {
     }
 
     fn image_id_for_number(&self, number: u32) -> Option<u32> {
-        self.newest_image_with_number(number)
+        self.newest_image_for_number(number)
             .filter(|id| self.image_registry.contains(*id))
     }
 
@@ -8372,6 +8373,25 @@ mod tests {
         assert!(t.image_registry().contains(1));
     }
 
+    /// Review of #37: re-sending an image by `i=` keeps its number and its
+    /// age (kitty). `I=300` twice (ids 1, 2), re-send id 1, free the
+    /// newest with `d=N`: `a=p,I=300` still finds id 1.
+    #[test]
+    fn apc_kitty_resent_image_keeps_its_number() {
+        let mut t = Term::new(8, 20, 0);
+        let px = String::from_utf8(b64_red_1x1()).unwrap();
+        let mut payload = Vec::new();
+        for header in ["a=t,f=32,s=1,v=1,I=300,q=2", "a=t,f=32,s=1,v=1,I=300,q=2", "a=t,f=32,s=1,v=1,i=1,q=2"] {
+            payload.extend_from_slice(format!("\x1b_G{header};{px}\x1b\\").as_bytes());
+        }
+        payload.extend_from_slice(b"\x1b_Ga=d,d=N,I=300\x1b\\\x1b_Ga=p,I=300,C=1\x1b\\");
+        feed(&mut t, &payload);
+        assert_eq!(
+            String::from_utf8_lossy(&t.drain_pty_replies()),
+            "\x1b_Gi=1,I=300;OK\x1b\\"
+        );
+    }
+
     /// PLC-1 / PLC-3 / DEL-1 round trip through `Term`.
     #[test]
     fn apc_kitty_place_and_delete_replies_like_kitty() {
@@ -9860,7 +9880,7 @@ mod major_delete_tests {
     // ---- M11: d=n / d=N by image NUMBER ----
 
     #[test]
-    fn m11_delete_n_targets_newest_image_with_number() {
+    fn m11_delete_n_targets_newest_image_for_number() {
         // Two images share image-number I=7. Per the B8 rule a transmit
         // can't carry both `i=` and `I=`, so the terminal assigns ids:
         // auto-assign yields id 1 (older) then id 2 (newer).

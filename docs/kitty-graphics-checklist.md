@@ -727,8 +727,10 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
     C1 ST shouldn't end an APC.
 - [x] **P2 — WIRE-6. Malformed headers get an EINVAL reply; kitty stays
   silent.**
-  - Cases: `s=abc`, `s=`, `q=3`, `m=2`, `a=X`, `t=x`, `o=y`, `x=-5`,
-    `z=2147483648`.
+  - Cases: `s=abc`, `s=`, `a=X`, `t=x`, `o=y`, `x=-5`. (Re-measured for
+    #37: `q=3` and `m=2` are not malformed in kitty — `q=` and `m=` are
+    numbers, `q=3` stores the image silently and `m=2` means `m=1` — and
+    `z=2147483648` is accepted.)
   - The comment at `emit_bad_header_einval` (`handler.rs:922`) says kitty
     replies EINVAL here. kitty 0.49.2 doesn't.
   - Pick one and document it. Replying is defensible, but it is more

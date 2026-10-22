@@ -2301,8 +2301,7 @@ mod blocker_graphics_tests {
         for header in [
             &b"Ga=t,i=700,f=32,s=abc,v=1"[..],
             b"Ga=t,i=701,f=32,s=,v=1",
-            b"Ga=t,i=702,f=32,s=1,v=1,q=3",
-            b"Ga=t,i=703,f=32,s=1,v=1,m=2",
+            b"Ga=t,i=702,f=32,s=1,v=1,q=-1",
             b"Ga=X,i=704",
             b"Ga=X,I=7",
             b"Ga=t,i=705,t=x,f=32,s=1,v=1",
@@ -2329,6 +2328,30 @@ mod blocker_graphics_tests {
             assert!(sink.registered.is_empty());
             assert_eq!(h.pending_uploads(), 0);
         }
+    }
+
+    /// Review of #37: `q=3` stores the image silently; `m=2` is `m=1`
+    /// (kitty 0.49.2).
+    #[test]
+    fn wire6_q_and_m_are_numbers() {
+        let mut h = KittyHandler::new();
+        let mut sink = RecordingSink::new();
+        h.process(
+            b"Ga=t,i=702,f=32,s=1,v=1,q=3",
+            b64_red_pixel().as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(sink.replies.is_empty(), "{}", sink.joined_replies());
+        assert_eq!(sink.registered.len(), 1);
+        let px = b64_red_pixel();
+        let (a, b) = px.split_at(4);
+        h.process(b"Ga=t,i=703,f=32,s=1,v=1,m=2", a.as_bytes(), &mut sink)
+            .unwrap();
+        assert_eq!(h.pending_uploads(), 1, "m=2 starts a chunked upload");
+        h.process(b"Gm=0", b.as_bytes(), &mut sink).unwrap();
+        assert_eq!(sink.joined_replies(), "\x1b_Gi=703;OK\x1b\\");
+        assert_eq!(sink.registered.len(), 2);
     }
 
     /// kitty accepts an out-of-range `z=` that still fits 32 bits, and an
