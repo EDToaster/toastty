@@ -1384,6 +1384,34 @@ mod tests {
         }
     }
 
+    /// A DEL inside an open escape / CSI at the end of an all-ASCII read
+    /// keeps the sequence open (vte ignores DEL there), so a non-ASCII
+    /// byte starting the next read still aborts it (WIRE-17), exactly as
+    /// when the bytes arrive in one read. (The old all-ASCII shortcut
+    /// stopped tracking the sequence at the DEL, so vte stayed in it and
+    /// swallowed the next read's text.)
+    #[test]
+    fn del_in_open_sequence_then_non_ascii_read_aborts_like_one_read() {
+        for (a, b) in [
+            (&b"\x1b[1\x7f"[..], &b"\xc3\xa9X"[..]),
+            (b"\x1b(\x7f", b"\x9ca"),
+            (b"\x1b-\x7f", b"\x8f\xbd"),
+        ] {
+            let whole = parse(&[a, b].concat());
+            let mut p = Parser::new();
+            let mut split = Recorder::default();
+            p.advance(&mut split, a);
+            p.advance(&mut split, b);
+            assert_eq!(split, whole, "{a:?} | {b:?}");
+            assert!(split.csi.is_empty() && split.esc.is_empty(), "{split:?}");
+        }
+        let mut p = Parser::new();
+        let mut r = Recorder::default();
+        p.advance(&mut r, b"\x1b[1\x7f");
+        p.advance(&mut r, b"\xc3\xa9X");
+        assert_eq!(r.text, "\u{fffd}X");
+    }
+
     #[test]
     fn plain_text_becomes_print_events() {
         let r = parse(b"hello");

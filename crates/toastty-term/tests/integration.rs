@@ -712,3 +712,36 @@ mod selection {
         assert!(t.selection().is_none());
     }
 }
+
+/// WIRE-17 across a read boundary: a DEL inside an open sequence at the
+/// end of one read, then a non-ASCII byte, aborts the sequence just as
+/// when it all arrives at once (it used to depend on where the read
+/// split: the split form printed nothing).
+#[test]
+fn del_in_open_sequence_split_from_non_ascii_matches_one_read() {
+    for (a, b) in [
+        (&b"\x1b[1\x7f"[..], &b"\xc3\xa9X"[..]),
+        (b"\x1b(\x7f", b"\x9ca"),
+        (b"\x1b-\x7f", b"\x8f\xbd"),
+    ] {
+        let whole = run(3, 10, &[a, b].concat());
+        let mut split = Term::new(3, 10, 32);
+        let mut p = Parser::new();
+        p.advance(&mut split, a);
+        p.advance(&mut split, b);
+        for r in 0..3 {
+            assert_eq!(
+                row_text(&split, r),
+                row_text(&whole, r),
+                "{a:?} | {b:?} row {r}"
+            );
+        }
+        assert_eq!(split.cursor(), whole.cursor(), "{a:?} | {b:?}");
+    }
+    let mut t = Term::new(3, 10, 32);
+    let mut p = Parser::new();
+    p.advance(&mut t, b"\x1b[1\x7f");
+    p.advance(&mut t, b"\xc3\xa9X");
+    assert_eq!(row_text(&t, 0), "\u{fffd}X");
+    assert_eq!((t.cursor().row, t.cursor().col), (0, 2));
+}
