@@ -62,3 +62,7 @@ word_chars = "_-./~:?&=%+#@"
 
 [text]
 blink = true
+
+[shader]
+paths     = ["~/.config/toastty/crt.glsl", "bloom.wgsl"]
+animation = "auto"
