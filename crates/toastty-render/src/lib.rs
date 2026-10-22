@@ -186,6 +186,35 @@ fn build_term_dirty_instances_into(
 /// the damage space when not fractionally scrolled). During a
 /// fractional scroll the frame is a full redraw anyway, so just mark
 /// everything.
+/// Clip rect for image instances, `[x0, y0, x1, y1]` relative to the
+/// content origin, matching what the text pass covers so images and text
+/// are cut at the same edges. At the live bottom that is the grid itself
+/// (`cols × rows` cells, not the sub-cell sliver below the last row).
+/// While scrolled back or mid smooth-scroll the text pass also draws the
+/// partial row hanging above the top (into the top padding) and the rows
+/// below the grid that fill the content area, so images get the same span.
+#[allow(clippy::cast_precision_loss)]
+fn image_clip(term: &Term, cell: (f32, f32), content_h: f32) -> [f32; 4] {
+    let (rows, cols) = term.size();
+    let grid_w = f32::from(cols) * cell.0;
+    let view_pixel = term.view_offset_pixel();
+    if term.view_offset_lines() == 0 && view_pixel <= 0.0 {
+        return [0.0, 0.0, grid_w, f32::from(rows) * cell.1];
+    }
+    let y_translate = if view_pixel > 0.0 {
+        view_pixel - cell.1
+    } else {
+        0.0
+    };
+    let drawn = crate::text::instance::rows_to_render(rows, view_pixel, cell.1, content_h);
+    [
+        0.0,
+        y_translate.min(0.0),
+        grid_w,
+        y_translate + f32::from(drawn) * cell.1,
+    ]
+}
+
 fn mark_blinking_cells_dirty(term: &mut Term, row_blink: &[bool]) {
     if term.view_offset_pixel() > 0.0 {
         term.mark_all_dirty();
@@ -2954,7 +2983,7 @@ impl Renderer {
                 let view = ImageView {
                     top_line: term.image_top_line(),
                     scroll_px,
-                    clip: [0.0, 0.0, content_dims.0, content_dims.1],
+                    clip: image_clip(term, cell_size, content_dims.1),
                 };
                 build_image_instances(
                     &mut tmp,

@@ -199,6 +199,11 @@ pub enum RelativeError {
 pub struct ImageGrid {
     placements: Vec<(PlacementHandle, Placement)>,
     next_handle: u32,
+    /// Cached `(min shown end, max shown start)` line over all
+    /// placements, so [`Self::retain_lines`] (run on every full-screen
+    /// LF) is O(1) when nothing can be evicted. `None` = stale; every
+    /// mutation clears it and the next `retain_lines` recomputes it.
+    bounds: Option<(i64, i64)>,
 }
 
 impl ImageGrid {
@@ -213,6 +218,7 @@ impl ImageGrid {
         let handle = PlacementHandle(self.next_handle);
         self.next_handle = self.next_handle.wrapping_add(1);
         self.placements.push((handle, p));
+        self.bounds = None;
         handle
     }
 
@@ -285,6 +291,7 @@ impl ImageGrid {
         if !has_relative {
             return;
         }
+        self.bounds = None;
         for _ in 0..MAX_RELATIVE_DEPTH {
             let mut changed = false;
             // Snapshot parent origins by (image_id, placement_id) before
@@ -320,21 +327,28 @@ impl ImageGrid {
     /// present.
     pub fn remove(&mut self, handle: PlacementHandle) -> Option<Placement> {
         let pos = self.placements.iter().position(|(h, _)| *h == handle)?;
+        self.bounds = None;
         Some(self.placements.swap_remove(pos).1)
     }
 
     /// Remove every placement matching `pred`. Returns the removed
-    /// placements in their original order.
+    /// placements in their original order; the survivors keep theirs.
+    /// Single pass, O(n) however many are removed.
     pub fn remove_where(&mut self, mut pred: impl FnMut(&Placement) -> bool) -> Vec<Placement> {
+        if !self.placements.iter().any(|(_, p)| pred(p)) {
+            return Vec::new();
+        }
         let mut removed = Vec::new();
-        let mut i = 0;
-        while i < self.placements.len() {
-            if pred(&self.placements[i].1) {
-                removed.push(self.placements.remove(i).1);
+        let mut kept = Vec::with_capacity(self.placements.len());
+        for (h, p) in self.placements.drain(..) {
+            if pred(&p) {
+                removed.push(p);
             } else {
-                i += 1;
+                kept.push((h, p));
             }
         }
+        self.placements = kept;
+        self.bounds = None;
         removed
     }
 
@@ -352,6 +366,7 @@ impl ImageGrid {
 
     /// Drop every placement. Returns the dropped placements.
     pub fn clear(&mut self) -> Vec<Placement> {
+        self.bounds = None;
         let out: Vec<Placement> = self.placements.drain(..).map(|(_, p)| p).collect();
         out
     }
@@ -386,28 +401,34 @@ impl ImageGrid {
         if delta == 0 {
             return;
         }
+        self.bounds = None;
         for (_, p) in &mut self.placements {
             p.line += delta;
         }
     }
 
-    /// Move every placement whose shown part starts at or below screen
-    /// row `from_row` by `delta` lines, untrimmed. Used for a full-screen
-    /// scroll down (SD / RI at the top), which moves the on-screen text
-    /// down while scrollback and the line ids stay put: images on screen
-    /// move with their text, and one pushed partly off the bottom keeps
-    /// its whole box, so a later scroll up brings it all back (kitty
-    /// does the same). Placements that start in scrollback stay with the
-    /// scrollback text.
+    /// Move every placement whose shown part reaches screen row
+    /// `from_row` or below (`end > from_row`) by `delta` lines, untrimmed,
+    /// then re-resolve relative children. Used for a full-screen scroll
+    /// down (SD / RI at the top), which moves the on-screen text down
+    /// while scrollback and the line ids stay put. Images on screen move
+    /// with their text, including one that straddles the top edge (its
+    /// hidden top rows come back on screen, as in kitty). One pushed
+    /// partly off the bottom keeps its whole box, so a later scroll up
+    /// brings it all back. Placements entirely in scrollback stay with
+    /// the scrollback text (kitty shifts those too; keeping them on
+    /// their history text is a deliberate divergence).
     pub fn shift_rows_from(&mut self, top_line: i64, from_row: i64, delta: i64) {
         if delta == 0 {
             return;
         }
+        self.bounds = None;
         for (_, p) in &mut self.placements {
-            if p.screen_rows(top_line).start >= from_row {
+            if p.screen_rows(top_line).end > from_row {
                 p.line += delta;
             }
         }
+        self.resolve_relative_positions();
     }
 
     /// Scroll the placements inside a screen-row band whose text moves
@@ -434,6 +455,7 @@ impl ImageGrid {
         }
         let (rt, rb) = (i64::from(region.start), i64::from(region.end));
         let delta = i64::from(delta);
+        self.bounds = None;
         let mut removed = Vec::new();
         let mut i = 0;
         while i < self.placements.len() {
@@ -447,6 +469,8 @@ impl ImageGrid {
             let start = (shown.start + delta).max(rt);
             let end = (shown.end + delta).min(rb);
             if start >= end {
+                // Rare (a whole image scrolled out of its region), so the
+                // O(n) shift of `remove` is fine here.
                 removed.push(self.placements.remove(i).1);
                 continue;
             }
@@ -466,8 +490,28 @@ impl ImageGrid {
     /// line ids `first..=last`: those scrolled out of the history
     /// (`first` = oldest retained line) or pushed below the screen
     /// (`last` = the live bottom line). Returns the dropped placements.
+    ///
+    /// O(1) when nothing can be evicted (the common case on every LF):
+    /// it checks cached line bounds before scanning.
     pub fn retain_lines(&mut self, first: i64, last: i64) -> Vec<Placement> {
         if self.placements.is_empty() {
+            return Vec::new();
+        }
+        let (min_end, max_start) = *self.bounds.get_or_insert_with(|| {
+            self.placements
+                .iter()
+                .fold((i64::MAX, i64::MIN), |(e, s), (_, p)| {
+                    let shown = p.shown_lines();
+                    // An empty shown band must always be swept.
+                    let end = if shown.is_empty() {
+                        i64::MIN
+                    } else {
+                        shown.end
+                    };
+                    (e.min(end), s.max(shown.start))
+                })
+        });
+        if min_end > first && max_start <= last {
             return Vec::new();
         }
         self.remove_where(|p| {
@@ -874,6 +918,54 @@ mod tests {
         let child = g.find(2, 20).unwrap();
         assert_eq!(child.line, 11);
         assert_eq!(child.screen_rows(25), -14..-13);
+    }
+
+    #[test]
+    fn shift_rows_from_moves_top_straddler_and_resolves_children() {
+        // SD with fixed line ids (#23): a parent straddling the top edge
+        // (screen rows -2..4) moves with its text, and its child keeps
+        // its offset. A placement entirely in scrollback stays.
+        let mut g = ImageGrid::new();
+        let mut parent = p(1, 98..104, 0..20, 0);
+        parent.placement_id = 1;
+        g.add(parent);
+        g.add_relative(rel(2, 2, (1, 1), (0, 4))).unwrap();
+        g.add(p(3, 90..95, 0..4, 0)); // rows -10..-5: history
+        g.shift_rows_from(100, 0, 2);
+        let parent = g.find(1, 1).unwrap();
+        assert_eq!(parent.screen_rows(100), 0..6);
+        assert_eq!(g.find(2, 2).unwrap().line - parent.line, 4);
+        assert_eq!(g.find(3, 0).unwrap().screen_rows(100), -10..-5);
+    }
+
+    #[test]
+    fn remove_where_keeps_survivor_order() {
+        let mut g = ImageGrid::new();
+        for id in 1..=6 {
+            g.add(p(id, 0..1, 0..1, 0));
+        }
+        let gone = g.remove_where(|p| p.image_id % 2 == 0);
+        let ids: Vec<u32> = gone.iter().map(|p| p.image_id).collect();
+        assert_eq!(ids, vec![2, 4, 6]);
+        let kept: Vec<u32> = g.iter().map(|p| p.image_id).collect();
+        assert_eq!(kept, vec![1, 3, 5]);
+        assert!(g.remove_where(|_| false).is_empty());
+    }
+
+    #[test]
+    fn retain_lines_bounds_cache_tracks_mutations() {
+        let mut g = ImageGrid::new();
+        g.add(p(1, 10..12, 0..1, 0));
+        assert!(g.retain_lines(5, 100).is_empty()); // caches (12, 10)
+        g.shift_lines(-8); // now 2..4: the cache must not hide it
+        assert_eq!(g.retain_lines(5, 100).len(), 1);
+        g.add(p(2, 10..12, 0..1, 0));
+        assert!(g.retain_lines(5, 100).is_empty());
+        g.add(p(3, 1..3, 0..1, 0)); // a new, older placement
+        assert_eq!(g.retain_lines(5, 100).len(), 1);
+        // Below the live bottom.
+        assert_eq!(g.retain_lines(0, 9).len(), 1);
+        assert!(g.is_empty());
     }
 
     #[test]
