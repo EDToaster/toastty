@@ -344,7 +344,7 @@ UVs at draw time. Don't patch each item separately.
       (e.g. a 20000×4 `a=T`) crashed toastty with a wgpu validation panic.
       It is now box-downscaled on the CPU by the smallest integer factor
       that fits, keeping the aspect ratio, and a warning is logged.
-- [ ] **P1 — SIZE-9. Images with z below INT32_MIN/2 are invisible.**
+- [x] **P1 — SIZE-9. Images with z below INT32_MIN/2 are invisible.**
   - Repro: `K send a=T,i=1,z=-1073741825 --png img.png` over default and
     `\e[41m` cells.
   - Expected (spec): drawn "under cells with non-default background colors".
@@ -352,6 +352,10 @@ UVs at draw time. Don't patch each item separately.
   - Actual: nothing is visible.
   - Cause: `lib.rs:3089-3114` draws this layer first, then the bg pass paints
     every cell opaque, including default-bg cells.
+  - Fix: while such a placement is on screen, the frame is a full clear and
+    default-bg cell quads are dropped. "Default" is decided by value, as in
+    kitty, so an explicit SGR color equal to the default bg also shows the
+    image. Selection covers it, as in kitty. Fixed in #26.
 - [ ] **P2 — SIZE-10. `X=`/`Y=` pixel offsets aren't clamped to the cell, and
   aren't fitted into `c`/`r`.**
   - Repro: `X=25,Y=40` with 10×19 cells, and `X=5,c=6`.
