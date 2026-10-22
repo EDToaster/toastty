@@ -631,10 +631,18 @@ remaining gaps:
   - Cause: `handle_delete` (`handler.rs:704-707`).
   - Fixed in #37. `a=d` never replies. Both `i=` and `I=` is still
     EINVAL, as in kitty.
-- [ ] **P2 — DEL-2. `d=F` is a no-op.**
+- [x] **P2 — DEL-2. `d=F` is a no-op.**
   - Expected: kitty deletes and frees a single-frame image. `d=f` is a no-op
     in both.
   - Cause: `delete_image` has no `f`/`F` arm.
+  - Checked against kitty 0.49.2:
+    - `d=F,i=N` deletes every placement of the image (`p=` doesn't scope it)
+      and frees its data, even when it has no placements.
+    - `d=F,I=N` does the same to the newest image with that number.
+    - `d=F` with no `i`/`I`, or with an unknown id, does nothing. So does
+      `d=f`.
+  - Fix: the new `Term::delete_image_frames` does this. Stack E's
+    animation-frame work hooks in there. Fixed in #35.
 - [ ] **P2 — DEL-3. A delete during a chunked upload doesn't abort it.**
   - Expected (spec): the upload is aborted. kitty replies ENOENT to the
     remaining chunks.
