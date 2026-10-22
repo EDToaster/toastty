@@ -365,13 +365,23 @@ UVs at draw time. Don't patch each item separately.
     the grid stays visible.
   - Cause: `pipeline.rs:161-163` uses linear filtering with no mipmaps.
   - Consider mipmaps, or a box prefilter on upload.
-  - Fix: a texture gets a GPU-built, alpha-weighted mip chain the first
-    time it is drawn downscaled, and the sampler is trilinear. Images drawn
-    at 1:1 or larger stay single-level and render pixel-identically to
-    before. Fixed in #34.
-  - Divergence: at `c=30` the true grid pitch is about 1.8 px, so toastty
-    now draws an even tint. kitty's visible grid there is itself aliasing:
-    it shows every 5th line at a 9 px pitch.
+  - Fix: a texture drawn downscaled gets the mip levels that draw samples
+    (`floor(log2(ratio) - 0.5) + 2`, added to in place if it's later drawn
+    smaller). Sampling is trilinear with a -0.5 LOD bias.
+    - The filter is alpha-weighted and runs in linear light, with a 3-tap
+      footprint for odd sizes.
+    - Textures up to 256² build their levels on the CPU; larger ones use
+      GPU passes in the frame's encoder.
+    - Mip work is capped per frame (16 GPU passes, 256K CPU texels, 4 ms).
+      The rest finishes on following frames, and meanwhile those images
+      draw from level 0.
+    - Images drawn at 1:1 or larger stay single-level and render
+      pixel-identically to before.
+    - Fixed in #34.
+  - Divergence (acknowledged by the PM, kept deliberately): at `c=30` the
+    true grid pitch is about 1.8 px, so toastty now draws an even tint.
+    kitty's visible grid there is itself aliasing: it shows every 5th line
+    at a 9 px pitch.
 - [ ] **P2 — SIZE-13. `TIOCGWINSZ` pixel size includes the leftover sub-cell
   strip.**
   - Measured: toastty reports 1000×600 for 100×31 cells (19.35 px rows),

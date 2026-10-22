@@ -5,24 +5,31 @@
 //! instances that share a texture, so only one texture is ever bound at
 //! a time and the resident count is not limited by binding limits.
 //!
-//! Downscaling (SIZE-12): a kitty image's texture gets a full mip chain
-//! the first frame it is drawn smaller than its source rect, and the
-//! sampler is trilinear. The chain is generated on the GPU ([`MipGen`])
-//! inside the frame's own command encoder
-//! ([`ImagePipeline::encode_pending_mips`]), so it costs no extra queue
-//! submit. Images only ever drawn at 1:1 or larger stay single-level:
-//! they cost no extra memory or upload time (mpv-style per-frame
-//! re-sends at native size pay nothing), and their sampling is
-//! unchanged. With one level, or at 1:1 where the LOD is 0, the
-//! trilinear sampler reads level 0 exactly as the old bilinear one did.
+//! Downscaling (SIZE-12): a kitty image drawn smaller than its source
+//! rect gets the mip levels that draw samples (see [`super::mip`]) and
+//! the sampler is trilinear with a small negative LOD bias. Small
+//! textures build their levels on the CPU; larger ones on the GPU,
+//! encoded into the frame's own command encoder
+//! ([`ImagePipeline::encode_pending_mips`]). Mip work is capped per frame
+//! ([`MipLimits`]); an image over the cap draws from the levels it
+//! already has (level 0 at worst) and is finished on later frames, which
+//! [`ResolveStats::deferred`] asks the renderer to schedule. A level is
+//! only bound for sampling once it has been filled, so an image never
+//! samples an empty level.
+//!
+//! Images only ever drawn at 1:1 or larger stay single-level: they cost
+//! no extra memory or upload time (mpv-style per-frame re-sends at native
+//! size pay nothing), and their sampling is unchanged: at 1:1 or when
+//! upscaling the LOD is <= 0, so level 0 is read exactly as before.
 
 use bytemuck::{Pod, Zeroable};
 use std::borrow::Cow;
 use std::num::NonZeroU64;
 use toastty_term::{ImageData, ImageRegistry};
 
-use super::atlas::{ImageTexEntry, ImageTextureCache, full_mip_count};
+use super::atlas::{ImageTexEntry, ImageTextureCache};
 use super::instance::{ImageInstance, UNRESOLVED_TEXTURE};
+use super::mip::{MipGen, cpu_levels, draw_ratio, level_texels, needed_levels};
 
 /// Uniform buffer matching the WGSL `Globals` struct.
 #[repr(C)]
@@ -61,145 +68,78 @@ pub struct ImagePipeline {
     /// wgpu validation panic).
     max_texture_dim: u32,
     mip_gen: MipGen,
-    /// Textures whose levels `1..n` still need generating, encoded by
-    /// the next [`ImagePipeline::encode_pending_mips`]. Level 0 is
-    /// already queued with `queue.write_texture`, which lands first.
-    pending_mips: Vec<(wgpu::Texture, u32)>,
+    /// GPU mip work queued by [`Self::resolve_kitty_textures`] and
+    /// encoded by the next [`Self::encode_pending_mips`]. Entries are
+    /// dropped when their slot is released or replaced, so skipped
+    /// frames can't pile up work for (or keep alive) dead textures.
+    pending_mips: Vec<PendingMip>,
+    limits: MipLimits,
+    /// Mip work still allowed this frame (reset by each resolve).
+    budget: MipBudget,
+}
+
+/// Per-frame caps on mip generation, so one frame that first draws many
+/// downscaled images (a thumbnail grid) can't stall.
+#[derive(Debug, Clone, Copy)]
+pub struct MipLimits {
+    /// GPU mip passes per frame (one per level built).
+    pub gpu_passes_per_frame: u32,
+    /// Texels of CPU-built levels per frame.
+    pub cpu_texels_per_frame: u64,
+    /// Wall-clock cap on CPU level building per frame (at least one
+    /// image always progresses), so a slow or loaded machine can't stall
+    /// a frame either.
+    pub cpu_time_per_frame: std::time::Duration,
+    /// Textures with at most this many texels build their levels on the
+    /// CPU (no render passes); larger ones use the GPU.
+    pub cpu_max_texels: u64,
+}
+
+impl Default for MipLimits {
+    fn default() -> Self {
+        Self {
+            gpu_passes_per_frame: 16,
+            cpu_texels_per_frame: 1 << 18,
+            cpu_time_per_frame: std::time::Duration::from_millis(4),
+            cpu_max_texels: 256 * 256,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MipBudget {
+    gpu_passes: u32,
+    cpu_texels: u64,
+    /// When this frame's resolve started, for `cpu_time_per_frame`.
+    started: std::time::Instant,
+    /// CPU level builds done this frame.
+    cpu_jobs: u32,
+}
+
+/// GPU mip levels `from..to` to build for slot `index`.
+#[derive(Debug)]
+struct PendingMip {
+    index: usize,
+    texture: wgpu::Texture,
+    from: u32,
+    to: u32,
 }
 
 /// The texture format of every image texture (straight-alpha sRGB).
 const IMAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-/// GPU mip-chain generator: one alpha-weighted 2×2 box pass per level
-/// (`shaders/mip.wgsl`).
-#[derive(Debug)]
-struct MipGen {
-    pipeline: wgpu::RenderPipeline,
-    bind_layout: wgpu::BindGroupLayout,
-}
-
-impl MipGen {
-    fn new(device: &wgpu::Device) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("toastty-image mip shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/mip.wgsl").into()),
-        });
-        let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("toastty-image mip bind group layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            }],
-        });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("toastty-image mip pipeline layout"),
-            bind_group_layouts: &[Some(&bind_layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("toastty-image mip pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: IMAGE_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-        Self {
-            pipeline,
-            bind_layout,
-        }
-    }
-
-    /// Encode passes filling levels `1..levels` of `texture` from level 0.
-    fn encode(
-        &self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        texture: &wgpu::Texture,
-        levels: u32,
-    ) {
-        let level_view = |level: u32| {
-            texture.create_view(&wgpu::TextureViewDescriptor {
-                label: Some("toastty-image mip level"),
-                base_mip_level: level,
-                mip_level_count: Some(1),
-                ..Default::default()
-            })
-        };
-        for level in 1..levels {
-            let src = level_view(level - 1);
-            let dst = level_view(level);
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("toastty-image mip bg"),
-                layout: &self.bind_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&src),
-                }],
-            });
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("toastty-image mip pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &dst,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
-    }
-}
-
-/// True when `inst` draws its source rect of a `width × height` texture
-/// smaller than 1:1 on either axis, so sampling it needs mips.
-#[allow(clippy::cast_precision_loss)] // image dims fit comfortably in 23-bit mantissa.
-fn is_downscaled(inst: &ImageInstance, width: u32, height: u32) -> bool {
-    // A hair of slack so float noise at exactly 1:1 doesn't count.
-    const SLACK: f32 = 1.0 - 1e-4;
-    let src_w = (inst.uv_max[0] - inst.uv_min[0]).abs() * width as f32;
-    let src_h = (inst.uv_max[1] - inst.uv_min[1]).abs() * height as f32;
-    inst.size[0] < src_w * SLACK || inst.size[1] < src_h * SLACK
-}
-
 /// One uploaded texture plus the bind group that samples it.
 #[derive(Debug)]
 struct TexSlot {
-    // Held so the texture lives as long as its bind group.
-    _texture: wgpu::Texture,
+    texture: wgpu::Texture,
+    /// Samples levels `0..levels_ready` only.
     bind_group: wgpu::BindGroup,
+    /// Levels the texture was created with.
+    levels_alloc: u32,
+    /// Levels filled and bound for sampling.
+    levels_ready: u32,
+    /// Levels filled or queued on the GPU (`>= levels_ready`).
+    levels_queued: u32,
 }
 
 /// What [`ImagePipeline::resolve_kitty_textures`] did this frame.
@@ -207,9 +147,13 @@ struct TexSlot {
 pub struct ResolveStats {
     /// Textures uploaded (cache misses).
     pub uploaded: usize,
-    /// Textures built with a mip chain because they are drawn
-    /// downscaled: fresh uploads, or resident ones upgraded in place.
+    /// Textures whose mip levels were built (CPU) or queued (GPU) this
+    /// frame.
     pub mipped: usize,
+    /// Drawn-downscaled textures still waiting for mip levels because
+    /// this frame's [`MipLimits`] ran out. They draw from the levels
+    /// they have; the caller should schedule another frame.
+    pub deferred: usize,
     /// Textures dropped to get back under the byte budget.
     pub evicted: usize,
 }
@@ -349,21 +293,41 @@ impl ImagePipeline {
             slots: Vec::new(),
             free_indices: Vec::new(),
             max_texture_dim: device.limits().max_texture_dimension_2d,
-            mip_gen: MipGen::new(device),
+            mip_gen: MipGen::new(device, IMAGE_FORMAT),
             pending_mips: Vec::new(),
+            limits: MipLimits::default(),
+            budget: MipBudget {
+                gpu_passes: 0,
+                cpu_texels: 0,
+                started: std::time::Instant::now(),
+                cpu_jobs: 0,
+            },
         }
     }
 
-    /// Encode the mip-chain passes queued by this frame's uploads into
-    /// `encoder`. Call before the render pass that draws images, in the
-    /// frame's encoder, so the chain costs no extra queue submit.
+    /// Override the per-frame mip work caps.
+    pub fn set_mip_limits(&mut self, limits: MipLimits) {
+        self.limits = limits;
+    }
+
+    /// Encode the GPU mip passes queued by this frame's resolve into
+    /// `encoder`, then bind the filled levels for sampling. Call before
+    /// the render pass that draws images, in the frame's encoder, so the
+    /// chain costs no extra queue submit. Until this runs, those images
+    /// keep sampling only their already-filled levels.
     pub fn encode_pending_mips(
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
     ) {
-        for (texture, levels) in self.pending_mips.drain(..) {
-            self.mip_gen.encode(device, encoder, &texture, levels);
+        for job in std::mem::take(&mut self.pending_mips) {
+            self.mip_gen
+                .encode(device, encoder, &job.texture, job.from, job.to);
+            let bind_group = self.make_bind_group(device, &job.texture, job.to);
+            if let Some(Some(slot)) = self.slots.get_mut(job.index) {
+                slot.levels_ready = job.to;
+                slot.bind_group = bind_group;
+            }
         }
     }
 
@@ -398,10 +362,9 @@ impl ImagePipeline {
     /// Each instance's `image_id` is looked up in `cache`. A miss, or a
     /// hit whose registry generation has moved on (the id was
     /// re-transmitted, whatever its size or pixels), uploads from
-    /// `registry`. An image drawn downscaled gets a mip chain: uploaded
-    /// with one, or, if resident without, rebuilt in its slot (same
-    /// `texture_index`); the chain itself is encoded by
-    /// [`Self::encode_pending_mips`]. Images larger than the device's texture limit are
+    /// `registry`. An image drawn downscaled gets the mip levels that
+    /// draw samples, within this frame's [`MipLimits`] (see the module
+    /// docs). Images larger than the device's texture limit are
     /// downscaled to fit, keeping their aspect ratio. Instances whose
     /// image is gone from the registry are dropped (order is kept).
     /// Afterwards textures not drawn this frame are evicted, least
@@ -417,6 +380,12 @@ impl ImagePipeline {
         instances: &mut Vec<ImageInstance>,
     ) -> ResolveStats {
         cache.begin_frame();
+        self.budget = MipBudget {
+            gpu_passes: self.limits.gpu_passes_per_frame,
+            cpu_texels: self.limits.cpu_texels_per_frame,
+            started: std::time::Instant::now(),
+            cpu_jobs: 0,
+        };
         let mut stats = ResolveStats::default();
         instances.retain_mut(|inst| {
             let (Some(generation), Some(data)) =
@@ -424,25 +393,7 @@ impl ImagePipeline {
             else {
                 return false;
             };
-            let entry = match plan(cache.get_touch(inst.image_id), generation) {
-                Plan::Use(e)
-                    if e.mip_levels == 1
-                        && full_mip_count(e.width, e.height) > 1
-                        && is_downscaled(inst, e.width, e.height) =>
-                {
-                    // Drawn downscaled for the first time: rebuild with mips.
-                    let levels = full_mip_count(e.width, e.height);
-                    let fitted = fit_to_max_dim(data, self.max_texture_dim);
-                    let slot = self.make_slot(device, queue, &fitted, levels);
-                    self.slots[e.texture_index] = Some(slot);
-                    let e = ImageTexEntry {
-                        mip_levels: levels,
-                        ..e
-                    };
-                    cache.insert(inst.image_id, e);
-                    stats.mipped += 1;
-                    e
-                }
+            let mut entry = match plan(cache.get_touch(inst.image_id), generation) {
                 Plan::Use(e) => e,
                 Plan::Upload { replaces } => {
                     if let Some(old) = replaces {
@@ -460,11 +411,11 @@ impl ImagePipeline {
                             f.height,
                         );
                     }
-                    let levels = if is_downscaled(inst, fitted.width, fitted.height) {
-                        full_mip_count(fitted.width, fitted.height)
-                    } else {
-                        1
-                    };
+                    let levels = needed_levels(
+                        draw_ratio(inst, fitted.width, fitted.height),
+                        fitted.width,
+                        fitted.height,
+                    );
                     let slot = self.make_slot(device, queue, &fitted, levels);
                     let entry = ImageTexEntry {
                         texture_index: self.store_slot(slot),
@@ -475,10 +426,30 @@ impl ImagePipeline {
                     };
                     cache.insert(inst.image_id, entry);
                     stats.uploaded += 1;
-                    stats.mipped += usize::from(levels > 1);
                     entry
                 }
             };
+            let needed = needed_levels(
+                draw_ratio(inst, entry.width, entry.height),
+                entry.width,
+                entry.height,
+            );
+            if needed > entry.mip_levels {
+                // Drawn smaller than any earlier draw: more levels.
+                // Rebuild in place (same `texture_index`).
+                let fitted = fit_to_max_dim(data, self.max_texture_dim);
+                let slot = self.make_slot(device, queue, &fitted, needed);
+                self.replace_slot(entry.texture_index, slot);
+                entry.mip_levels = needed;
+                cache.insert(inst.image_id, entry);
+            }
+            if needed > 1 {
+                match self.fill_mips(device, queue, entry.texture_index, data) {
+                    Fill::Done => {}
+                    Fill::Started => stats.mipped += 1,
+                    Fill::Deferred => stats.deferred += 1,
+                }
+            }
             inst.texture_index = entry.texture_index as u32;
             true
         });
@@ -553,6 +524,10 @@ impl ImagePipeline {
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, buf.slice(..));
 
+        debug_assert!(
+            self.pending_mips.is_empty(),
+            "encode_pending_mips must run (in the frame encoder) before image passes"
+        );
         // One draw per run of same-texture instances, rebinding the
         // texture between runs. Runs keep the caller's (z) order.
         let mut start = 0usize;
@@ -612,9 +587,9 @@ impl ImagePipeline {
         )
     }
 
-    /// Create a texture with `mip_levels` levels, upload `pixels` into
-    /// level 0, queue the rest for [`Self::encode_pending_mips`], and
-    /// build its bind group.
+    /// Create a texture with `mip_levels` levels and upload `pixels` into
+    /// level 0. Only level 0 is filled and bound; [`Self::fill_mips`]
+    /// does the rest.
     fn make_slot_rgba(
         &mut self,
         device: &wgpu::Device,
@@ -624,7 +599,9 @@ impl ImagePipeline {
         pixels: &[u8],
         mip_levels: u32,
     ) -> TexSlot {
-        let mut usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+        let mut usage = wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC;
         if mip_levels > 1 {
             usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
         }
@@ -643,31 +620,31 @@ impl ImagePipeline {
             view_formats: &[],
         });
         if width > 0 && height > 0 && pixels.len() >= (width as usize * height as usize * 4) {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                pixels,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(width * 4),
-                    rows_per_image: Some(height),
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
+            write_level(queue, &texture, 0, width, height, pixels);
         }
-        if mip_levels > 1 {
-            self.pending_mips.push((texture.clone(), mip_levels));
+        let bind_group = self.make_bind_group(device, &texture, 1);
+        TexSlot {
+            texture,
+            bind_group,
+            levels_alloc: mip_levels.max(1),
+            levels_ready: 1,
+            levels_queued: 1,
         }
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    }
+
+    /// Bind group sampling levels `0..levels` of `texture`.
+    fn make_bind_group(
+        &self,
+        device: &wgpu::Device,
+        texture: &wgpu::Texture,
+        levels: u32,
+    ) -> wgpu::BindGroup {
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            base_mip_level: 0,
+            mip_level_count: Some(levels.max(1)),
+            ..Default::default()
+        });
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("toastty-image bg"),
             layout: &self.bind_layout,
             entries: &[
@@ -684,10 +661,84 @@ impl ImagePipeline {
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
             ],
-        });
-        TexSlot {
-            _texture: texture,
-            bind_group,
+        })
+    }
+
+    /// Fill slot `index`'s unbuilt mip levels if this frame's budget
+    /// allows: on the CPU (built from `data`, uploaded and bound now)
+    /// for small textures, else queued for [`Self::encode_pending_mips`].
+    fn fill_mips(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        index: usize,
+        data: &ImageData,
+    ) -> Fill {
+        let Some(Some(slot)) = self.slots.get(index) else {
+            return Fill::Done;
+        };
+        let (from, to) = (slot.levels_queued, slot.levels_alloc);
+        if from >= to {
+            return Fill::Done;
+        }
+        let size = slot.texture.size();
+        let (w, h) = (size.width, size.height);
+        if u64::from(w) * u64::from(h) <= self.limits.cpu_max_texels {
+            let cost = level_texels(w, h, from, to);
+            let out_of_time = self.budget.cpu_jobs > 0
+                && self.budget.started.elapsed() >= self.limits.cpu_time_per_frame;
+            if cost > self.budget.cpu_texels || out_of_time {
+                return Fill::Deferred;
+            }
+            self.budget.cpu_texels -= cost;
+            self.budget.cpu_jobs += 1;
+            // Level 0 as uploaded: a very thin image can be both small
+            // and over the device limit, so fit it the same way.
+            let texture = slot.texture.clone();
+            let base = fit_to_max_dim(data, self.max_texture_dim);
+            debug_assert_eq!((base.width, base.height), (w, h));
+            let levels = cpu_levels(&base.pixels, w, h, to);
+            for (level, bytes) in (from..to).zip(levels.iter().skip(from as usize - 1)) {
+                write_level(
+                    queue,
+                    &texture,
+                    level,
+                    (w >> level).max(1),
+                    (h >> level).max(1),
+                    bytes,
+                );
+            }
+            let bind_group = self.make_bind_group(device, &texture, to);
+            if let Some(Some(slot)) = self.slots.get_mut(index) {
+                slot.levels_ready = to;
+                slot.levels_queued = to;
+                slot.bind_group = bind_group;
+            }
+        } else {
+            let passes = to - from;
+            if passes > self.budget.gpu_passes {
+                return Fill::Deferred;
+            }
+            self.budget.gpu_passes -= passes;
+            self.pending_mips.push(PendingMip {
+                index,
+                texture: slot.texture.clone(),
+                from,
+                to,
+            });
+            if let Some(Some(slot)) = self.slots.get_mut(index) {
+                slot.levels_queued = to;
+            }
+        }
+        Fill::Started
+    }
+
+    /// Swap in a new texture for slot `index`, dropping work queued for
+    /// the old one.
+    fn replace_slot(&mut self, index: usize, slot: TexSlot) {
+        self.pending_mips.retain(|p| p.index != index);
+        if let Some(s) = self.slots.get_mut(index) {
+            *s = Some(slot);
         }
     }
 
@@ -711,6 +762,7 @@ impl ImagePipeline {
         // Dropping the slot drops the texture and bind group, so evicted
         // images really give their GPU memory back. The `take` guard
         // keeps a double free from handing one index out twice.
+        self.pending_mips.retain(|p| p.index != index);
         if let Some(slot) = self.slots.get_mut(index)
             && slot.take().is_some()
         {
@@ -723,6 +775,47 @@ impl ImagePipeline {
     fn live_slots(&self) -> usize {
         self.slots.iter().filter(|s| s.is_some()).count()
     }
+}
+
+/// Outcome of [`ImagePipeline::fill_mips`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fill {
+    /// Nothing to do: every level is built or already queued.
+    Done,
+    /// Levels built (CPU) or queued (GPU) this frame.
+    Started,
+    /// Over this frame's budget; try again next frame.
+    Deferred,
+}
+
+/// Upload one mip level's tightly packed RGBA8 bytes.
+fn write_level(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    level: u32,
+    width: u32,
+    height: u32,
+    bytes: &[u8],
+) {
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: level,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 /// What [`ImagePipeline::resolve_kitty_textures`] does for one instance.
@@ -1016,6 +1109,19 @@ mod tests {
         w: u32,
         h: u32,
     ) -> Vec<u8> {
+        render_offscreen_with(device, queue, pipeline, instances, w, h, true)
+    }
+
+    /// [`render_offscreen`], optionally skipping `encode_pending_mips`.
+    fn render_offscreen_with(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline: &mut ImagePipeline,
+        instances: &[ImageInstance],
+        w: u32,
+        h: u32,
+        encode: bool,
+    ) -> Vec<u8> {
         let extent = wgpu::Extent3d {
             width: w,
             height: h,
@@ -1046,7 +1152,9 @@ mod tests {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("test encoder"),
         });
-        pipeline.encode_pending_mips(device, &mut encoder);
+        if encode {
+            pipeline.encode_pending_mips(device, &mut encoder);
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("test pass"),
@@ -1226,72 +1334,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn is_downscaled_compares_box_to_source_rect() {
-        assert!(!is_downscaled(&inst_sized(1, 4.0, 4.0), 4, 4), "1:1");
-        assert!(!is_downscaled(&inst_sized(1, 8.0, 8.0), 4, 4), "upscale");
-        assert!(is_downscaled(&inst_sized(1, 2.0, 4.0), 4, 4), "x only");
-        assert!(is_downscaled(&inst_sized(1, 4.0, 3.0), 4, 4), "y only");
-        // A half-image source rect drawn at its own size is 1:1.
-        let half = ImageInstance {
-            uv_max: [0.5, 1.0],
-            ..inst_sized(1, 2.0, 4.0)
-        };
-        assert!(!is_downscaled(&half, 4, 4));
-    }
-
-    /// SIZE-12: mips are built only once an image is drawn downscaled,
-    /// in place (same texture index), and counted in the byte budget.
-    #[test]
-    fn resolve_builds_mips_only_when_downscaled() {
-        let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
-            return;
-        };
-        let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let mut cache = ImageTextureCache::default();
-        let mut registry = ImageRegistry::new(1024 * 1024);
-        registry.insert(1, img(16, 8, 1)).unwrap();
-
-        // 1:1 and upscaled draws: single level, no mip work.
-        for size in [(16.0, 8.0), (32.0, 16.0)] {
-            let mut frame = vec![inst_sized(1, size.0, size.1)];
-            let stats =
-                pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
-            assert_eq!(stats.mipped, 0);
-        }
-        let flat = cache.get(1).unwrap();
-        assert_eq!(flat.mip_levels, 1);
-        assert_eq!(cache.total_bytes(), 16 * 8 * 4);
-
-        // First downscaled draw: rebuilt with the full chain in place.
-        let mut frame = vec![inst_sized(1, 4.0, 2.0)];
-        let stats =
-            pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
-        assert_eq!((stats.uploaded, stats.mipped), (0, 1));
-        let mipped = cache.get(1).unwrap();
-        assert_eq!(mipped.mip_levels, 5); // 16x8 8x4 4x2 2x1 1x1
-        assert_eq!(mipped.texture_index, flat.texture_index);
-        assert_eq!(frame[0].texture_index, flat.texture_index as u32);
-        assert_eq!(cache.total_bytes(), (128 + 32 + 8 + 2 + 1) * 4);
-        assert_eq!(pipeline.live_slots(), 1);
-
-        // Later frames, downscaled or not, do no more mip work.
-        for size in [(4.0, 2.0), (16.0, 8.0)] {
-            let mut frame = vec![inst_sized(1, size.0, size.1)];
-            let stats =
-                pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
-            assert_eq!(stats, ResolveStats::default());
-        }
-
-        // A replaced image drawn downscaled uploads straight with mips.
-        registry.insert(1, img(16, 8, 77)).unwrap();
-        pipeline.sync_registry(&registry, &mut cache);
-        let mut frame = vec![inst_sized(1, 4.0, 2.0)];
-        let stats =
-            pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
-        assert_eq!((stats.uploaded, stats.mipped), (1, 1));
-    }
-
     /// Opaque `w × h` image with distinct per-pixel bytes.
     fn gradient(w: u32, h: u32) -> ImageData {
         let mut pixels = Vec::with_capacity((w * h * 4) as usize);
@@ -1312,83 +1354,378 @@ mod tests {
         }
     }
 
+    /// Read mip `level` of `texture` back (tightly packed RGBA8).
+    fn read_level(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+        level: u32,
+    ) -> Vec<u8> {
+        let size = texture.size();
+        let (w, h) = ((size.width >> level).max(1), (size.height >> level).max(1));
+        let row = (w * 4).div_ceil(256) * 256;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test level readback"),
+            size: u64::from(row * h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test level readback"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: level,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+        buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        let data = buf.slice(..).get_mapped_range();
+        let mut out = Vec::new();
+        for y in 0..h {
+            let start = (y * row) as usize;
+            out.extend_from_slice(&data[start..start + (w * 4) as usize]);
+        }
+        out
+    }
+
+    fn slot(pipeline: &ImagePipeline, index: usize) -> &TexSlot {
+        pipeline.slots[index].as_ref().expect("live slot")
+    }
+
+    /// Limits that force the GPU path.
+    fn gpu_only() -> MipLimits {
+        MipLimits {
+            cpu_max_texels: 0,
+            ..MipLimits::default()
+        }
+    }
+
+    /// Review of #34: only the levels the draw samples are built, on
+    /// the first downscaled draw, in place (same texture index), counted
+    /// in the byte budget; a smaller draw later adds levels; then no more
+    /// work.
+    #[test]
+    fn resolve_builds_only_the_levels_the_draw_needs() {
+        let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
+            return;
+        };
+        let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let mut cache = ImageTextureCache::default();
+        let mut registry = ImageRegistry::new(1024 * 1024);
+        registry.insert(1, img(16, 8, 1)).unwrap();
+        let frame_at = |pipeline: &mut ImagePipeline, cache: &mut ImageTextureCache, w, h| {
+            let mut frame = vec![inst_sized(1, w, h)];
+            let stats =
+                pipeline.resolve_kitty_textures(&device, &queue, &registry, cache, &mut frame);
+            (stats, frame[0].texture_index)
+        };
+
+        // 1:1 and upscaled: single level, no mip work.
+        for (w, h) in [(16.0, 8.0), (32.0, 16.0)] {
+            let (stats, _) = frame_at(&mut pipeline, &mut cache, w, h);
+            assert_eq!((stats.mipped, stats.deferred), (0, 0));
+        }
+        let flat = cache.get(1).unwrap();
+        assert_eq!(flat.mip_levels, 1);
+
+        // ¼ scale: LOD 2 - 0.5 -> 3 levels, built now (CPU path).
+        let (stats, idx) = frame_at(&mut pipeline, &mut cache, 4.0, 2.0);
+        assert_eq!((stats.uploaded, stats.mipped), (0, 1));
+        assert_eq!(idx, flat.texture_index as u32);
+        assert_eq!(cache.get(1).unwrap().mip_levels, 3);
+        assert_eq!(cache.total_bytes(), (128 + 32 + 8) * 4);
+        assert_eq!(slot(&pipeline, flat.texture_index).levels_ready, 3);
+
+        // 1/16 scale: the full 5-level chain, again in place.
+        let (stats, idx) = frame_at(&mut pipeline, &mut cache, 1.0, 1.0);
+        assert_eq!(stats.mipped, 1);
+        assert_eq!(idx, flat.texture_index as u32);
+        assert_eq!(cache.get(1).unwrap().mip_levels, 5);
+        assert_eq!(pipeline.live_slots(), 1);
+
+        // Later frames, at any scale: no more work.
+        for (w, h) in [(1.0, 1.0), (4.0, 2.0), (16.0, 8.0)] {
+            let (stats, _) = frame_at(&mut pipeline, &mut cache, w, h);
+            assert_eq!(stats, ResolveStats::default());
+        }
+    }
+
+    /// Review of #34: mip work is capped per frame. Images over the cap
+    /// report `deferred`, draw from level 0, and finish on later frames,
+    /// on both the CPU and the GPU path.
+    #[test]
+    fn mip_work_is_capped_per_frame_and_finishes_later() {
+        let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
+            return;
+        };
+        for (limits, side) in [
+            // CPU: 32x32 at 8x8 -> levels 1, 2 = 256 + 64 texels each.
+            (
+                MipLimits {
+                    cpu_texels_per_frame: 1000,
+                    cpu_time_per_frame: std::time::Duration::MAX,
+                    ..MipLimits::default()
+                },
+                32u32,
+            ),
+            // GPU: 64x64 at 16x16 -> 2 passes each.
+            (
+                MipLimits {
+                    gpu_passes_per_frame: 4,
+                    ..gpu_only()
+                },
+                64,
+            ),
+        ] {
+            let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+            pipeline.set_mip_limits(limits);
+            let mut cache = ImageTextureCache::default();
+            let mut registry = ImageRegistry::new(16 * 1024 * 1024);
+            for id in 1u32..=10 {
+                registry.insert(id, gradient(side, side)).unwrap();
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let box_px = side as f32 / 4.0;
+            let mut done = 0;
+            let mut frames = 0;
+            loop {
+                let mut frame: Vec<ImageInstance> = (1u32..=10)
+                    .map(|id| inst_sized(id, box_px, box_px))
+                    .collect();
+                let stats = pipeline
+                    .resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
+                assert!(stats.mipped <= 3, "cap exceeded: {stats:?}");
+                done += stats.mipped;
+                frames += 1;
+                // Deferred ones still draw (from the levels they have).
+                assert_eq!(frame.len(), 10);
+                let mut enc =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                pipeline.encode_pending_mips(&device, &mut enc);
+                queue.submit(std::iter::once(enc.finish()));
+                if stats.deferred == 0 {
+                    break;
+                }
+                assert!(frames < 10, "mip work never finished");
+            }
+            assert_eq!(done, 10);
+            assert!(frames >= 4, "work should spread over frames ({frames})");
+            for id in 1u32..=10 {
+                let e = cache.get(id).unwrap();
+                assert_eq!(slot(&pipeline, e.texture_index).levels_ready, 3);
+            }
+        }
+    }
+
+    /// Review of #34: GPU-built levels are bound only once
+    /// `encode_pending_mips` has encoded them (before, an image sampled
+    /// zero-filled levels if the call was missing), and rendering with
+    /// unencoded work trips a debug assertion.
+    #[test]
+    fn gpu_levels_bind_only_after_encode_pending_mips() {
+        let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
+            return;
+        };
+        let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        pipeline.set_mip_limits(gpu_only());
+        let mut cache = ImageTextureCache::default();
+        let mut registry = ImageRegistry::new(1024 * 1024);
+        registry.insert(1, gradient(64, 64)).unwrap();
+        let mut frame = vec![inst_sized(1, 16.0, 16.0)];
+        pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
+        let idx = cache.get(1).unwrap().texture_index;
+        assert_eq!(pipeline.pending_mips.len(), 1);
+        assert_eq!(
+            (
+                slot(&pipeline, idx).levels_ready,
+                slot(&pipeline, idx).levels_queued
+            ),
+            (1, 3)
+        );
+
+        if cfg!(debug_assertions) {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                render_offscreen_with(&device, &queue, &mut pipeline, &frame, 16, 16, false)
+            }));
+            assert!(r.is_err(), "render with unencoded mip work must assert");
+        }
+
+        let px = render_offscreen(&device, &queue, &mut pipeline, &frame, 16, 16);
+        assert!(pipeline.pending_mips.is_empty());
+        assert_eq!(slot(&pipeline, idx).levels_ready, 3);
+        assert!(px.chunks(4).all(|p| p[3] == 255), "image drawn everywhere");
+    }
+
+    /// Review of #34: queued GPU work for a slot is dropped when the slot
+    /// is released, so skipped frames can't keep dead textures alive.
+    #[test]
+    fn pending_mips_are_dropped_with_their_slot() {
+        let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
+            return;
+        };
+        let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        pipeline.set_mip_limits(gpu_only());
+        let mut cache = ImageTextureCache::default();
+        let mut registry = ImageRegistry::new(1024 * 1024);
+        registry.insert(1, gradient(64, 64)).unwrap();
+        // A re-send at a downscale on every "skipped" frame (resolve,
+        // no encode): only the current texture's work stays queued.
+        for _ in 0..5 {
+            registry.insert(1, gradient(64, 64)).unwrap();
+            pipeline.sync_registry(&registry, &mut cache);
+            let mut frame = vec![inst_sized(1, 16.0, 16.0)];
+            pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
+            assert_eq!(pipeline.pending_mips.len(), 1);
+        }
+        registry.remove(1);
+        pipeline.sync_registry(&registry, &mut cache);
+        assert!(pipeline.pending_mips.is_empty());
+    }
+
+    /// The GPU pass and the CPU filter build the same levels, including
+    /// odd sizes (3-tap) and transparent texels (alpha-weighted).
+    #[test]
+    fn gpu_and_cpu_mips_agree() {
+        let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
+            return;
+        };
+        let mut src = gradient(37, 21);
+        // Some fully transparent texels with junk RGB.
+        for i in (0..src.pixels.len()).step_by(4 * 7) {
+            src.pixels[i + 3] = 0;
+            src.pixels[i + 1] = 255;
+        }
+        let cpu = crate::image::mip::cpu_levels(&src.pixels, 37, 21, 6);
+
+        let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        pipeline.set_mip_limits(gpu_only());
+        let mut cache = ImageTextureCache::default();
+        let mut registry = ImageRegistry::new(1024 * 1024);
+        registry.insert(1, src).unwrap();
+        let mut frame = vec![inst_sized(1, 1.0, 1.0)];
+        pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
+        let mut enc =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        pipeline.encode_pending_mips(&device, &mut enc);
+        queue.submit(std::iter::once(enc.finish()));
+        let e = cache.get(1).unwrap();
+        assert_eq!(e.mip_levels, 6);
+        let texture = slot(&pipeline, e.texture_index).texture.clone();
+        for level in 1..6u32 {
+            let gpu = read_level(&device, &queue, &texture, level);
+            let want = &cpu[level as usize - 1];
+            assert_eq!(gpu.len(), want.len(), "level {level}");
+            for (k, (g, c)) in gpu.iter().zip(want).enumerate() {
+                assert!(
+                    (i32::from(*g) - i32::from(*c)).abs() <= 2,
+                    "level {level} byte {k}: gpu {g} cpu {c}"
+                );
+            }
+        }
+    }
+
     /// A 1:1 draw reproduces the source bytes exactly, both before and
-    /// after the texture has gained a mip chain (stack A draws native
-    /// size images 1:1 and relies on this).
+    /// after the texture has gained mip levels (stack A draws native-size
+    /// images 1:1 and relies on this; the LOD bias changes nothing here).
     #[test]
     fn one_to_one_draw_is_pixel_exact_with_and_without_mips() {
         let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
             return;
         };
-        let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let mut cache = ImageTextureCache::default();
-        let mut registry = ImageRegistry::new(1024 * 1024);
-        let src = gradient(16, 8);
-        registry.insert(1, src.clone()).unwrap();
+        for limits in [MipLimits::default(), gpu_only()] {
+            let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+            pipeline.set_mip_limits(limits);
+            let mut cache = ImageTextureCache::default();
+            let mut registry = ImageRegistry::new(1024 * 1024);
+            let src = gradient(16, 8);
+            registry.insert(1, src.clone()).unwrap();
 
-        let mut frame = vec![inst_sized(1, 16.0, 8.0)];
-        pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
-        let got = render_offscreen(&device, &queue, &mut pipeline, &frame, 16, 8);
-        assert_eq!(got, src.pixels, "1:1 without mips");
+            let mut frame = vec![inst_sized(1, 16.0, 8.0)];
+            pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
+            let got = render_offscreen(&device, &queue, &mut pipeline, &frame, 16, 8);
+            assert_eq!(got, src.pixels, "1:1 without mips");
 
-        // Force the mip chain, then draw 1:1 again.
-        let mut down = vec![inst_sized(1, 4.0, 2.0)];
-        pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut down);
-        assert!(cache.get(1).unwrap().mip_levels > 1);
-        let mut frame = vec![inst_sized(1, 16.0, 8.0)];
-        pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
-        let got = render_offscreen(&device, &queue, &mut pipeline, &frame, 16, 8);
-        assert_eq!(got, src.pixels, "1:1 with mips");
+            let mut down = vec![inst_sized(1, 4.0, 2.0)];
+            pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut down);
+            assert!(cache.get(1).unwrap().mip_levels > 1);
+            let mut frame = vec![inst_sized(1, 16.0, 8.0)];
+            pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
+            let got = render_offscreen(&device, &queue, &mut pipeline, &frame, 16, 8);
+            assert_eq!(got, src.pixels, "1:1 with mips");
+        }
     }
 
     /// SIZE-12: 1 px white lines every 8 px, drawn at 1/8 scale. With
     /// mips every output column averages one line (uniform grey); plain
-    /// bilinear sampling would hit a line in some columns and miss it
-    /// in the rest.
+    /// bilinear sampling hits no line at all. Both mip paths.
     #[test]
     fn downscaled_thin_lines_stay_visible() {
         let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
             return;
         };
-        let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let mut cache = ImageTextureCache::default();
-        let mut registry = ImageRegistry::new(1024 * 1024);
-        let (w, h) = (128u32, 8u32);
-        let mut pixels = Vec::new();
-        for _ in 0..h {
-            for x in 0..w {
-                let v = if x % 8 == 0 { 255 } else { 0 };
-                pixels.extend_from_slice(&[v, v, v, 255]);
+        for limits in [MipLimits::default(), gpu_only()] {
+            let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+            pipeline.set_mip_limits(limits);
+            let mut cache = ImageTextureCache::default();
+            let mut registry = ImageRegistry::new(1024 * 1024);
+            let (w, h) = (128u32, 8u32);
+            let mut pixels = Vec::new();
+            for _ in 0..h {
+                for x in 0..w {
+                    let v = if x % 8 == 0 { 255 } else { 0 };
+                    pixels.extend_from_slice(&[v, v, v, 255]);
+                }
             }
+            registry
+                .insert(
+                    1,
+                    ImageData {
+                        width: w,
+                        height: h,
+                        pixels,
+                    },
+                )
+                .unwrap();
+            let mut frame = vec![inst_sized(1, 16.0, 1.0)];
+            pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
+            let got = render_offscreen(&device, &queue, &mut pipeline, &frame, 16, 1);
+            let reds: Vec<u8> = got.chunks(4).map(|p| p[0]).collect();
+            let (lo, hi) = (*reds.iter().min().unwrap(), *reds.iter().max().unwrap());
+            // 1/8 linear coverage is sRGB ~99; allow filter slop.
+            assert!(lo >= 70, "a column lost its line: {reds:?}");
+            assert!(hi - lo <= 12, "columns should be near-uniform: {reds:?}");
         }
-        registry
-            .insert(
-                1,
-                ImageData {
-                    width: w,
-                    height: h,
-                    pixels,
-                },
-            )
-            .unwrap();
-        let mut frame = vec![inst_sized(1, 16.0, 1.0)];
-        pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
-        let got = render_offscreen(&device, &queue, &mut pipeline, &frame, 16, 1);
-        let reds: Vec<u8> = got.chunks(4).map(|p| p[0]).collect();
-        let (lo, hi) = (*reds.iter().min().unwrap(), *reds.iter().max().unwrap());
-        // 1/8 linear coverage is sRGB ~99; allow filter slop.
-        assert!(lo >= 70, "a column lost its line: {reds:?}");
-        assert!(hi - lo <= 12, "columns should be near-uniform: {reds:?}");
     }
 
-    /// The mip box filter is alpha-weighted: a transparent texel's RGB
+    /// The GPU mip level is alpha-weighted: a transparent texel's RGB
     /// doesn't bleed into the average.
     #[test]
-    fn mip_average_ignores_rgb_of_transparent_texels() {
+    fn gpu_mip_ignores_rgb_of_transparent_texels() {
         let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
             return;
         };
         let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        pipeline.set_mip_limits(gpu_only());
         let mut cache = ImageTextureCache::default();
         let mut registry = ImageRegistry::new(1024 * 1024);
         // 2x2: one opaque red texel, three fully transparent green ones.
@@ -1406,14 +1743,27 @@ mod tests {
                 },
             )
             .unwrap();
-        // Drawn at 1x1: samples level 1 (the 1x1 mip).
-        let mut frame = vec![inst_sized(1, 1.0, 1.0)];
+        let mut frame = vec![inst_sized(1, 0.5, 0.5)];
         pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
-        assert_eq!(cache.get(1).unwrap().mip_levels, 2);
-        let got = render_offscreen(&device, &queue, &mut pipeline, &frame, 1, 1);
-        // Alpha-blended over transparent black: red at 1/4 coverage,
-        // no green at all.
-        assert_eq!(got[1], 0, "green bled from transparent texels: {got:?}");
-        assert!(got[0] > 100, "red lost: {got:?}");
+        let mut enc =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        pipeline.encode_pending_mips(&device, &mut enc);
+        queue.submit(std::iter::once(enc.finish()));
+        let e = cache.get(1).unwrap();
+        assert_eq!(e.mip_levels, 2);
+        let level1 = read_level(
+            &device,
+            &queue,
+            &slot(&pipeline, e.texture_index).texture,
+            1,
+        );
+        assert_eq!(
+            level1[1], 0,
+            "green bled from transparent texels: {level1:?}"
+        );
+        assert!(
+            level1[0] >= 254 && (63..=65).contains(&level1[3]),
+            "{level1:?}"
+        );
     }
 }
