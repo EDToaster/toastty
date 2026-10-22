@@ -930,35 +930,32 @@ mod tests {
 
     #[test]
     fn pm_and_sos_end_on_bel_st_can_sub_and_esc() {
+        // `(tail, execs, csi count)`: what follows `hello`, then the
+        // expected executed controls and CSIs. The text after is always
+        // `x`, whole and split at every byte.
+        let cases: [(&[u8], &[u8], usize); 5] = [
+            (b"\x07x", b"", 0),     // BEL ends it, isn't rung
+            (b"\x1b\\x", b"", 0),   // ST
+            (b"\x18x", b"\x18", 0), // CAN: executed, as in vte
+            (b"\x1ax", b"\x1a", 0), // SUB
+            (b"\x1b[31mx", b"", 1), // ESC + other starts a new escape
+        ];
         for intro in [&b"\x1b^"[..], b"\x1bX"] {
-            let with = |tail: &[u8]| {
-                let mut v = intro.to_vec();
-                v.extend_from_slice(b"hello");
-                v.extend_from_slice(tail);
-                parse(&v)
-            };
-            let r = with(b"\x07x");
-            assert_eq!(r.text, "x", "{intro:x?} BEL");
-            assert!(r.execs.is_empty(), "{intro:x?}: BEL ends it, isn't rung");
-            let r = with(b"\x1b\\x");
-            assert_eq!(r.text, "x", "{intro:x?} ST");
-            for cancel in [0x18u8, 0x1A] {
-                let r = with(&[cancel, b'x']);
-                assert_eq!(r.text, "x", "{intro:x?} {cancel:#x}");
-                assert_eq!(r.execs, vec![cancel], "{intro:x?} {cancel:#x}");
+            for (tail, execs, csi) in cases {
+                let mut input = intro.to_vec();
+                input.extend_from_slice(b"hello");
+                input.extend_from_slice(tail);
+                for cut in 0..input.len() {
+                    let mut p = Parser::new();
+                    let mut r = Recorder::default();
+                    p.advance(&mut r, &input[..cut]);
+                    p.advance(&mut r, &input[cut..]);
+                    let what = format!("{intro:x?} {tail:x?} cut {cut}");
+                    assert_eq!(r.text, "x", "{what}");
+                    assert_eq!(r.execs, execs, "{what}");
+                    assert_eq!(r.csi.len(), csi, "{what}");
+                }
             }
-            // ESC + anything else ends the string and starts a new
-            // escape, as in vte.
-            let r = with(b"\x1b[31mx");
-            assert_eq!(r.csi.len(), 1, "{intro:x?}");
-            assert_eq!(r.text, "x", "{intro:x?}");
-            // Body bytes never print, across chunks.
-            let mut p = Parser::new();
-            let mut r = Recorder::default();
-            p.advance(&mut r, intro);
-            p.advance(&mut r, b"abc");
-            p.advance(&mut r, b"def\x07ok");
-            assert_eq!(r.text, "ok", "{intro:x?} chunks");
         }
         // A PM cuts off a CSI in progress, as the ESC did before.
         let r = parse(b"\x1b[1\x1b^zz\x07x");

@@ -711,6 +711,10 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
     PM and SOS bodies are swallowed by the scanner up to BEL, ESC, CAN or
     SUB. tmux passthrough is unaffected: a BEL inside the wrapped payload
     is still data. Fixed in #36.
+  - Deliberate difference, kept on purpose: inside a DCS, PM or SOS,
+    kitty 0.49.2 treats CAN, SUB and an ESC not followed by `\` as data
+    and keeps going to ST or BEL (checked live). toastty ends the string
+    on them, as xterm and vte do.
 - [ ] **P2 — WIRE-6. Malformed headers get an EINVAL reply; kitty stays
   silent.**
   - Cases: `s=abc`, `s=`, `q=3`, `m=2`, `a=X`, `t=x`, `o=y`, `x=-5`,
