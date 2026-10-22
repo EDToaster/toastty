@@ -33,14 +33,32 @@ pub struct ImageTexEntry {
     /// (`ImageRegistry::generation`). A mismatch means the id was
     /// re-transmitted since, whatever its size or pixels.
     pub generation: u64,
+    /// Mip levels in the texture: 1 until the image is first drawn
+    /// downscaled, then the full chain (SIZE-12).
+    pub mip_levels: u32,
 }
 
 impl ImageTexEntry {
-    /// GPU bytes held by this entry's texture (RGBA8, no mips).
+    /// GPU bytes held by this entry's texture (RGBA8), counting every
+    /// mip level (a full chain adds about a third).
     #[must_use]
     pub fn byte_size(&self) -> u64 {
-        u64::from(self.width.max(1)) * u64::from(self.height.max(1)) * 4
+        let (mut w, mut h) = (u64::from(self.width.max(1)), u64::from(self.height.max(1)));
+        let mut total = 0;
+        for _ in 0..self.mip_levels.max(1) {
+            total += w * h * 4;
+            w = (w / 2).max(1);
+            h = (h / 2).max(1);
+        }
+        total
     }
+}
+
+/// Mip levels in a full chain for a `width × height` texture (down to
+/// 1×1, sizes rounding down as wgpu does).
+#[must_use]
+pub fn full_mip_count(width: u32, height: u32) -> u32 {
+    32 - width.max(height).max(1).leading_zeros()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -215,7 +233,44 @@ mod tests {
             width: bytes / 4,
             height: 1,
             generation: 0,
+            mip_levels: 1,
         }
+    }
+
+    #[test]
+    fn full_mip_count_rounds_down_like_wgpu() {
+        assert_eq!(full_mip_count(1, 1), 1);
+        assert_eq!(full_mip_count(0, 0), 1);
+        assert_eq!(full_mip_count(2, 1), 2);
+        assert_eq!(full_mip_count(1500, 900), 11);
+        assert_eq!(full_mip_count(1024, 1024), 11);
+        assert_eq!(full_mip_count(1023, 3), 10);
+    }
+
+    #[test]
+    fn byte_size_counts_mip_levels() {
+        let mut e = ImageTexEntry {
+            texture_index: 0,
+            width: 8,
+            height: 4,
+            generation: 0,
+            mip_levels: 1,
+        };
+        assert_eq!(e.byte_size(), 8 * 4 * 4);
+        // 8x4 + 4x2 + 2x1 + 1x1 texels.
+        e.mip_levels = full_mip_count(8, 4);
+        assert_eq!(e.mip_levels, 4);
+        assert_eq!(e.byte_size(), (32 + 8 + 2 + 1) * 4);
+        // A full chain on a large image adds about a third.
+        let big = ImageTexEntry {
+            width: 1500,
+            height: 900,
+            mip_levels: full_mip_count(1500, 900),
+            ..e
+        };
+        let base = 1500 * 900 * 4;
+        assert!(big.byte_size() > base * 4 / 3 - base / 100);
+        assert!(big.byte_size() < base * 4 / 3 + base / 100);
     }
 
     #[test]
