@@ -841,6 +841,22 @@ Seen during app testing, not a graphics bug:
     - RIS and DECSTR (`CSI ! p`, which `tput init` sends) clear both
       stacks.
     - Fixed in #33.
+- [x] **P1 — QRY-1. yazi prints "Terminal response timeout" at startup;
+  toastty reportedly answers only DA1 of its four queries.** Not reproducible
+  on `main`; see the evidence below. Closed in #48.
+  - yazi sends one batch: `ESC 7`, `CSI > q` (XTVERSION), `CSI 16 t`,
+    `OSC 11 ; ? BEL`, `CSI 0 c` (DA1), `ESC 8`.
+  - toastty answers all four, in order, within a few milliseconds:
+    `DCS >| … ST`, `CSI 6;19;10 t`, `OSC 11;rgb:1212/1212/1414 ST` and
+    `CSI ? 62;4;22 c`. This holds in a shell, as `toastty -- yazi`, and
+    inside tmux 3.8. In every case yazi's debug log shows the replies
+    arriving in under 100 ms, and it starts without a timeout.
+  - The replies match kitty 0.49.2 (checked live). OSC 10 / 11 / 12 / 4
+    colour replies use `rgb:RRRR/GGGG/BBBB` and end with ST even when the
+    query ended with BEL; kitty does the same.
+  - The one change made: XTVERSION now names toastty's own version,
+    `toastty 1.0.0 (kitty 0.42.0)`. The `kitty` brand is kept because
+    yazi and other apps substring-match it to enable kitty graphics.
 
 Performance notes (Xvfb, software present; not conclusive):
 

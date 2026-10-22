@@ -133,7 +133,7 @@ parsed and dropped (screenshot check: `printf '\e[2mdim \e[9mstrike \e[4:3mcurly
 ## 5. Identity
 
 - [ ] **P2 — toastty advertises itself as kitty.**
-  - The child environment sets `KITTY_WINDOW_ID=1` (to steer yazi), and XTVERSION answers `toastty (kitty 0.42.0)`.
+  - The child environment sets `KITTY_WINDOW_ID=1` (to steer yazi), and XTVERSION answers `toastty <version> (kitty 0.42.0)`.
   - Apps may then use kitty-only features toastty doesn't implement: text sizing (OSC 66), OSC 99 notifications, the kitty clipboard protocol (OSC 5522), and remote control.
   - Revisit once the target apps probe for capabilities instead.
 
