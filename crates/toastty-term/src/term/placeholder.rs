@@ -202,9 +202,6 @@ impl Term {
     /// Returns `false` (print `c` normally) when that cell isn't a
     /// placeholder or `c` isn't one of kitty's diacritics.
     pub(super) fn attach_placeholder_diacritic(&mut self, c: char) -> bool {
-        let Some(idx) = toastty_graphics::diacritic_to_index(c) else {
-            return false;
-        };
         let row = self.cursor.row;
         // With a deferred wrap the cursor sits on the cell just written.
         let cur = if self.wrap_pending() {
@@ -221,6 +218,11 @@ impl Term {
         if cell.ch != crate::PLACEHOLDER || cell.is_continuation {
             return false;
         }
+        // Checked after the cell: the diacritic table is a linear scan,
+        // and every non-ASCII character printed comes through here.
+        let Some(idx) = toastty_graphics::diacritic_to_index(c) else {
+            return false;
+        };
         let mut ph = match cell.extra.and_then(|id| self.extras.get(id)) {
             Some(CellExtra::Placeholder(p)) => *p,
             _ => PlaceholderExtra::default(),

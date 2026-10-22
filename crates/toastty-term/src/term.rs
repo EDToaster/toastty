@@ -2453,10 +2453,7 @@ impl Term {
         // Kitty Unicode placeholders: a diacritic after a placeholder
         // cell is that cell's row / column / id-MSB (see `placeholder`).
         // The placeholder itself prints as an ordinary 1-cell char below.
-        if !c.is_ascii()
-            && toastty_graphics::is_diacritic(c)
-            && self.attach_placeholder_diacritic(c)
-        {
+        if !c.is_ascii() && self.attach_placeholder_diacritic(c) {
             return;
         }
         let cell_w = Self::char_cell_width(c);
@@ -2760,9 +2757,9 @@ impl Term {
             return false;
         }
         let tail = self.extras.grapheme_tail(prev.extra);
-        let mut cluster = String::with_capacity(prev.ch.len_utf8() + tail.len() + c.len_utf8());
-        cluster.push(prev.ch);
-        cluster.push_str(tail);
+        // Decide before building any strings: most non-ASCII text (CJK,
+        // Greek, …) is wide or narrow but never joins, and allocating the
+        // cluster for every such character was most of its print cost.
         let joins = cell_w == 0 || {
             let after_zwj = tail.ends_with('\u{200D}');
             // UAX #29 lets a modifier extend *any* base (`a🏽` is one
@@ -2776,7 +2773,10 @@ impl Term {
                     .is_some_and(|c| c.is_continuation);
             let emoji_modifier = emoji_base && ('\u{1F3FB}'..='\u{1F3FF}').contains(&c);
             (self.grapheme_cluster_mode || after_zwj || emoji_modifier) && {
-                let mut probe = cluster.clone();
+                let mut probe =
+                    String::with_capacity(prev.ch.len_utf8() + tail.len() + c.len_utf8());
+                probe.push(prev.ch);
+                probe.push_str(tail);
                 probe.push(c);
                 probe.graphemes(true).nth(1).is_none()
             }
@@ -2793,7 +2793,9 @@ impl Term {
         let mut new_tail = String::with_capacity(tail.len() + c.len_utf8());
         new_tail.push_str(tail);
         new_tail.push(c);
-        cluster.push(c);
+        let mut cluster = String::with_capacity(prev.ch.len_utf8() + new_tail.len());
+        cluster.push(prev.ch);
+        cluster.push_str(&new_tail);
         let Some(id) = self.intern_extra(CellExtra::Grapheme(new_tail.into())) else {
             // Table full: fall back to the old behaviour for zero-width
             // codepoints (dropped); a joining wide codepoint prints as
