@@ -140,10 +140,13 @@ Each store holds:
   ED, re-transmission, eviction, a cap change) ends in
   `Term::drop_placements`, which calls `ScreenImages::release`. The
   stashed screen's removals (reflow, cap change) call `release` directly.
-  That is where a removal's consequences go: freeing anonymous and
-  (for uppercase deletes) orphaned bytes today, REL-2's child cascade
-  (#40) and #28's virtual-placement cleanup next, so they reach every
-  path, re-transmission and eviction included.
+  That is where a removal's consequences go, decided by the `Free` rule
+  the path passes: anonymous images always, orphaned images for
+  uppercase deletes (`orphans`), and the images of relative children
+  that went with their parent (`children`: the id-like deletes,
+  re-transmission, quota eviction and cap changes; REL-2). #28's
+  virtual-placement cleanup goes there next, so it reaches every path
+  too.
 - **#24 (texture cache, generation counter).** Key the GPU textures on
   `Placement::key`. Keys are already unique per transmission across both
   screens, so the registry's per-insert generation becomes redundant.
