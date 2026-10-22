@@ -36,6 +36,12 @@ enum ApcState {
     /// BEL ends the DCS like ST does (kitty; vte would keep it as
     /// data), so it's handed to vte as `ESC \\` (WIRE-13).
     Dcs,
+    /// Inside a DCS and the last byte was ESC (not yet given to vte).
+    /// `\\` makes it ST. Anything else aborts the DCS: vte would
+    /// unhook it as if it had ended normally, so the handler is told
+    /// to drop it first, and the ESC then starts a new escape
+    /// (WIRE-16).
+    DcsAfterEsc,
     /// Inside a PM (`ESC ^`) or SOS (`ESC X`) string. vte would ignore
     /// the body and end it only on ESC / CAN / SUB; kitty also ends it on
     /// BEL (WIRE-13). So the scanner swallows the body itself, and vte
@@ -180,6 +186,25 @@ impl Scanner {
                     self.apc = ApcState::Dcs;
                 }
                 ApcState::Dcs => bytes = self.advance_dcs(perform, bytes),
+                ApcState::DcsAfterEsc => {
+                    let byte = bytes[0];
+                    bytes = &bytes[1..];
+                    if byte == b'\\' {
+                        self.vte
+                            .advance(&mut VteAdapter { inner: perform }, b"\x1b\\");
+                        self.apc = ApcState::Ground;
+                    } else {
+                        // Not ST. End the DCS without acting on it
+                        // (vte unhooks on the ESC; CAN then returns it
+                        // to ground, swallowed by the null performer)
+                        // and reprocess the ESC as a fresh escape.
+                        perform.dcs_cancel();
+                        self.vte
+                            .advance(&mut VteAdapter { inner: perform }, &[0x1B]);
+                        self.vte.advance(&mut NullPerform, &[0x18]);
+                        self.after_esc(perform, byte, detect_tmux);
+                    }
+                }
                 ApcState::SosPm => bytes = self.advance_sos_pm(perform, bytes),
                 ApcState::Apc => {
                     // Terminators: ESC (ST is `ESC \\`) or BEL, not 0x9C.
@@ -304,9 +329,8 @@ impl Scanner {
         match bytes[pos] {
             // Data, not ST: drop it.
             0x9C => {}
-            // Possibly ST; the ESC peek replays it to vte, which ends
-            // the DCS on any ESC.
-            0x1B => self.apc = ApcState::AfterEsc,
+            // Possibly ST: decided on the next byte.
+            0x1B => self.apc = ApcState::DcsAfterEsc,
             // BEL ends the DCS exactly like ST.
             0x07 => {
                 self.vte
@@ -929,6 +953,84 @@ mod tests {
             let mut r = Rec::default();
             Parser::new().advance(&mut r, &input);
             assert_eq!(r.0, ["hook", "unhook"], "{end:x?}");
+        }
+    }
+
+    /// WIRE-16: an ESC that doesn't start ST ends the DCS without it
+    /// being acted on, and then starts its own escape.
+    #[test]
+    fn dcs_cut_off_by_esc_is_cancelled() {
+        #[derive(Default)]
+        struct Rec(Vec<String>);
+        impl Perform for Rec {
+            fn hook(&mut self, _: &Params, _: &[u8], _: bool, action: char) {
+                self.0.push(format!("hook {action}"));
+            }
+            fn dcs_cancel(&mut self) {
+                self.0.push("cancel".into());
+            }
+            fn unhook(&mut self) {
+                self.0.push("unhook".into());
+            }
+            fn csi_dispatch(&mut self, _: &Params, _: &[u8], _: bool, action: char) {
+                self.0.push(format!("csi {action}"));
+            }
+            fn esc_dispatch(&mut self, _: &[u8], _: bool, byte: u8) {
+                self.0.push(format!("esc {}", byte as char));
+            }
+            fn apc_start(&mut self) {
+                self.0.push("apc".into());
+            }
+            fn apc_end(&mut self) {
+                self.0.push("apc end".into());
+            }
+            fn print(&mut self, c: char) {
+                self.0.push(format!("print {c}"));
+            }
+        }
+        let cases: &[(&[u8], &[&str])] = &[
+            // ST: no cancel. (vte also reports the ST's `ESC \\`.)
+            (
+                b"\x1bP$qm\x1b\\x",
+                &["hook q", "unhook", "esc \\", "print x"],
+            ),
+            // A CSI after the ESC still runs.
+            (
+                b"\x1bP$qm\x1b[cx",
+                &["hook q", "cancel", "unhook", "csi c", "print x"],
+            ),
+            // ESC + an ordinary final byte.
+            (
+                b"\x1bP$qm\x1b7x",
+                &["hook q", "cancel", "unhook", "esc 7", "print x"],
+            ),
+            // A new DCS, ended by ST.
+            (
+                b"\x1bP$qm\x1bP$qr\x1b\\",
+                &["hook q", "cancel", "unhook", "hook q", "unhook", "esc \\"],
+            ),
+            // An APC (kitty graphics) right after.
+            (
+                b"\x1bP$qm\x1b_Ga=q\x1b\\x",
+                &["hook q", "cancel", "unhook", "apc", "apc end", "print x"],
+            ),
+            // ESC ESC: the first ESC cuts the DCS off.
+            (
+                b"\x1bP$qm\x1b\x1b[cx",
+                &["hook q", "cancel", "unhook", "csi c", "print x"],
+            ),
+            // Before the final byte: cancel without a hook.
+            (b"\x1bP$\x1b[cx", &["cancel", "csi c", "print x"]),
+        ];
+        for (input, want) in cases {
+            // Same events for every split point.
+            for split in 0..=input.len() {
+                let mut r = Rec::default();
+                let mut p = Parser::new();
+                p.advance(&mut r, &input[..split]);
+                p.advance(&mut r, &input[split..]);
+                assert_eq!(r.0, *want, "{input:x?} split at {split}");
+            }
         }
     }
 
