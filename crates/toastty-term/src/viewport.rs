@@ -144,13 +144,20 @@ impl Viewport {
     }
 
     /// Clamp current + target to `max_lines`. Called by the host when
-    /// the scrollback budget shrinks (resize, alt-screen toggle, etc.).
+    /// the scrollback budget shrinks (resize, alt-screen toggle, ED 3).
+    /// At `max_lines` a sub-row pixel offset would reach past the oldest
+    /// row, so it's dropped too: with `max_lines == 0` a view scrolled
+    /// back by pixels only (a touchpad nudge) snaps to the live bottom.
     pub fn clamp_to(&mut self, max_lines: u32) {
-        if self.target_lines > max_lines {
+        if self.target_lines > max_lines
+            || (self.target_lines == max_lines && self.target_pixel > 0.0)
+        {
             self.target_lines = max_lines;
             self.target_pixel = 0.0;
         }
-        if self.current_lines > max_lines {
+        if self.current_lines > max_lines
+            || (self.current_lines == max_lines && self.current_pixel > 0.0)
+        {
             self.current_lines = max_lines;
             self.current_pixel = 0.0;
         }
@@ -384,6 +391,24 @@ mod tests {
         v.on_grid_scroll_up(10);
         assert_eq!(v.target_lines, 10);
         assert_eq!(v.current_lines, 10);
+    }
+
+    #[test]
+    fn clamp_to_drops_a_pixel_offset_at_the_maximum() {
+        let mut v = Viewport::new();
+        v.target_pixel = 7.0;
+        v.current_pixel = 3.0;
+        v.clamp_to(0);
+        assert_eq!((v.target_lines, v.current_lines), (0, 0));
+        assert!(v.target_pixel.abs() < f32::EPSILON);
+        assert!(v.current_pixel.abs() < f32::EPSILON);
+        // Below the maximum a pixel offset is fine and kept.
+        let mut v = Viewport::new();
+        v.target_lines = 2;
+        v.target_pixel = 5.0;
+        v.clamp_to(4);
+        assert_eq!(v.target_lines, 2);
+        assert!((v.target_pixel - 5.0).abs() < f32::EPSILON);
     }
 
     #[test]
