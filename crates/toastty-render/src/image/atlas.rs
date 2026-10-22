@@ -19,6 +19,8 @@
 
 use std::collections::HashMap;
 
+use toastty_term::ImageKey;
+
 /// Bookkeeping for one image's GPU texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageTexEntry {
@@ -56,7 +58,7 @@ struct Slot {
 /// don't need a GPU).
 #[derive(Debug)]
 pub struct ImageTextureCache {
-    entries: HashMap<u32, Slot>,
+    entries: HashMap<ImageKey, Slot>,
     /// Sum of [`ImageTexEntry::byte_size`] over `entries`.
     total_bytes: u64,
     /// Soft cap on `total_bytes`. Only textures not drawn this frame
@@ -119,18 +121,18 @@ impl ImageTextureCache {
     }
 
     /// Iterate `(image_id, entry)` in arbitrary order.
-    pub fn iter(&self) -> impl Iterator<Item = (u32, ImageTexEntry)> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = (ImageKey, ImageTexEntry)> + '_ {
         self.entries.iter().map(|(k, v)| (*k, v.entry))
     }
 
     /// Lookup without marking the entry used.
     #[must_use]
-    pub fn get(&self, id: u32) -> Option<ImageTexEntry> {
+    pub fn get(&self, id: ImageKey) -> Option<ImageTexEntry> {
         self.entries.get(&id).map(|s| s.entry)
     }
 
     /// Lookup and mark the entry used this frame.
-    pub fn get_touch(&mut self, id: u32) -> Option<ImageTexEntry> {
+    pub fn get_touch(&mut self, id: ImageKey) -> Option<ImageTexEntry> {
         let frame = self.frame;
         let slot = self.entries.get_mut(&id)?;
         slot.last_used = frame;
@@ -141,7 +143,7 @@ impl ImageTextureCache {
     /// Returns the replaced entry, if any: the caller frees its texture.
     /// Never evicts; call [`Self::evict_over_budget`] once the frame's
     /// working set is resident.
-    pub fn insert(&mut self, id: u32, entry: ImageTexEntry) -> Option<ImageTexEntry> {
+    pub fn insert(&mut self, id: ImageKey, entry: ImageTexEntry) -> Option<ImageTexEntry> {
         let prior = self.entries.insert(
             id,
             Slot {
@@ -157,7 +159,7 @@ impl ImageTextureCache {
     }
 
     /// Remove `id` if present. Returns its prior entry.
-    pub fn remove(&mut self, id: u32) -> Option<ImageTexEntry> {
+    pub fn remove(&mut self, id: ImageKey) -> Option<ImageTexEntry> {
         let s = self.entries.remove(&id)?;
         self.total_bytes -= s.entry.byte_size();
         Some(s.entry)
@@ -166,12 +168,12 @@ impl ImageTextureCache {
     /// While over budget, drop the least recently drawn entries that
     /// were not used this frame. Returns the evicted `(id, entry)`s: the
     /// caller frees their textures.
-    pub fn evict_over_budget(&mut self) -> Vec<(u32, ImageTexEntry)> {
+    pub fn evict_over_budget(&mut self) -> Vec<(ImageKey, ImageTexEntry)> {
         if self.total_bytes <= self.budget_bytes {
             return Vec::new();
         }
         let frame = self.frame;
-        let mut candidates: Vec<(u64, u32)> = self
+        let mut candidates: Vec<(u64, ImageKey)> = self
             .entries
             .iter()
             .filter(|(_, s)| s.last_used != frame)
@@ -192,7 +194,7 @@ impl ImageTextureCache {
     }
 
     /// Drop every entry. Returns the dropped entries.
-    pub fn clear(&mut self) -> Vec<(u32, ImageTexEntry)> {
+    pub fn clear(&mut self) -> Vec<(ImageKey, ImageTexEntry)> {
         self.total_bytes = 0;
         self.entries.drain().map(|(id, s)| (id, s.entry)).collect()
     }
@@ -201,6 +203,10 @@ impl ImageTextureCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn k(n: u32) -> ImageKey {
+        ImageKey(n)
+    }
 
     /// An entry of exactly `bytes` bytes (`bytes / 4` × 1 pixels).
     fn entry(idx: usize, bytes: u32) -> ImageTexEntry {
@@ -227,7 +233,7 @@ mod tests {
         // 500 entries, far past any entry-count limit and the byte
         // budget: all stay resident until an explicit eviction.
         for id in 0..500u32 {
-            assert!(c.insert(id, entry(id as usize, 40)).is_none());
+            assert!(c.insert(k(id), entry(id as usize, 40)).is_none());
         }
         assert_eq!(c.len(), 500);
         assert_eq!(c.total_bytes(), 500 * 40);
@@ -236,22 +242,22 @@ mod tests {
     #[test]
     fn replace_returns_prior_and_adjusts_bytes() {
         let mut c = ImageTextureCache::new(1000);
-        c.insert(1, entry(0, 40));
-        let prior = c.insert(1, entry(9, 80)).unwrap();
+        c.insert(k(1), entry(0, 40));
+        let prior = c.insert(k(1), entry(9, 80)).unwrap();
         assert_eq!(prior.texture_index, 0);
         assert_eq!(c.len(), 1);
         assert_eq!(c.total_bytes(), 80);
-        assert_eq!(c.get(1).unwrap().texture_index, 9);
+        assert_eq!(c.get(k(1)).unwrap().texture_index, 9);
     }
 
     #[test]
     fn remove_and_clear_release_bytes() {
         let mut c = ImageTextureCache::new(1000);
-        c.insert(1, entry(0, 40));
-        c.insert(2, entry(1, 40));
-        assert_eq!(c.remove(1).unwrap().texture_index, 0);
+        c.insert(k(1), entry(0, 40));
+        c.insert(k(2), entry(1, 40));
+        assert_eq!(c.remove(k(1)).unwrap().texture_index, 0);
         assert_eq!(c.total_bytes(), 40);
-        assert!(c.remove(1).is_none());
+        assert!(c.remove(k(1)).is_none());
         assert_eq!(c.clear().len(), 1);
         assert!(c.is_empty());
         assert_eq!(c.total_bytes(), 0);
@@ -260,9 +266,9 @@ mod tests {
     #[test]
     fn under_budget_evicts_nothing() {
         let mut c = ImageTextureCache::new(100);
-        c.insert(1, entry(0, 40));
+        c.insert(k(1), entry(0, 40));
         c.begin_frame();
-        c.insert(2, entry(1, 40));
+        c.insert(k(2), entry(1, 40));
         assert!(c.evict_over_budget().is_empty());
         assert_eq!(c.len(), 2);
     }
@@ -272,17 +278,17 @@ mod tests {
         let mut c = ImageTextureCache::new(100);
         // Frame 1: insert 1, 2. Frame 2: draw 1 only. Frame 3: insert 3.
         c.begin_frame();
-        c.insert(1, entry(0, 40));
-        c.insert(2, entry(1, 40));
+        c.insert(k(1), entry(0, 40));
+        c.insert(k(2), entry(1, 40));
         c.begin_frame();
-        assert!(c.get_touch(1).is_some());
+        assert!(c.get_touch(k(1)).is_some());
         c.begin_frame();
-        c.insert(3, entry(2, 40));
-        let evicted: Vec<u32> = c.evict_over_budget().iter().map(|e| e.0).collect();
+        c.insert(k(3), entry(2, 40));
+        let evicted: Vec<u32> = c.evict_over_budget().iter().map(|e| e.0.0).collect();
         // 2 was drawn longest ago; evicting it brings 120 -> 80 bytes.
         assert_eq!(evicted, vec![2]);
-        assert!(c.get(1).is_some());
-        assert!(c.get(3).is_some());
+        assert!(c.get(k(1)).is_some());
+        assert!(c.get(k(3)).is_some());
         assert_eq!(c.total_bytes(), 80);
     }
 
@@ -293,35 +299,35 @@ mod tests {
         let mut c = ImageTextureCache::new(100);
         c.begin_frame();
         for id in 0..10u32 {
-            c.insert(id, entry(id as usize, 40));
+            c.insert(k(id), entry(id as usize, 40));
         }
         assert!(c.evict_over_budget().is_empty());
         assert_eq!(c.len(), 10);
         // Next frame draws the same ten: all hits, nothing evicted.
         c.begin_frame();
         for id in 0..10u32 {
-            assert!(c.get_touch(id).is_some());
+            assert!(c.get_touch(k(id)).is_some());
         }
         assert!(c.evict_over_budget().is_empty());
         // A frame that draws only two lets the other eight go.
         c.begin_frame();
-        c.get_touch(3);
-        c.get_touch(7);
+        c.get_touch(k(3));
+        c.get_touch(k(7));
         let evicted = c.evict_over_budget();
         assert_eq!(c.total_bytes(), 80);
         assert_eq!(evicted.len(), 8);
-        assert!(c.get(3).is_some() && c.get(7).is_some());
+        assert!(c.get(k(3)).is_some() && c.get(k(7)).is_some());
     }
 
     #[test]
     fn get_does_not_count_as_a_draw() {
         let mut c = ImageTextureCache::new(40);
         c.begin_frame();
-        c.insert(1, entry(0, 40));
+        c.insert(k(1), entry(0, 40));
         c.begin_frame();
-        c.insert(2, entry(1, 40));
-        let _ = c.get(1);
-        let evicted: Vec<u32> = c.evict_over_budget().iter().map(|e| e.0).collect();
+        c.insert(k(2), entry(1, 40));
+        let _ = c.get(k(1));
+        let evicted: Vec<u32> = c.evict_over_budget().iter().map(|e| e.0.0).collect();
         assert_eq!(evicted, vec![1]);
     }
 }

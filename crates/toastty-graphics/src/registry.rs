@@ -35,16 +35,54 @@ impl ImageData {
     }
 }
 
-/// LRU-bounded cache of decoded images keyed by Kitty image id.
+/// Key of stored image bytes in an [`crate::ImageStore`]: unique per
+/// transmission across both screens, and never the client's `i=` id. A
+/// newtype so a client id can't be used to look bytes up by mistake
+/// (that would compile and silently draw another image). `ImageKey(0)`
+/// ([`ImageKey::NONE`]) is never handed out and finds nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct ImageKey(pub u32);
+
+impl ImageKey {
+    /// The key no image is stored under.
+    pub const NONE: Self = Self(0);
+}
+
+impl From<u32> for ImageKey {
+    fn from(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+impl From<ImageKey> for u32 {
+    fn from(k: ImageKey) -> Self {
+        k.0
+    }
+}
+
+/// What an [`ImageRegistry`] can be keyed by: a plain `u32` id (tests,
+/// standalone use) or an [`ImageKey`] (a screen's `ImageStore`).
+pub trait RegistryKey:
+    Copy + Eq + std::hash::Hash + std::fmt::Debug + From<u32> + Into<u32>
+{
+}
+
+impl<K: Copy + Eq + std::hash::Hash + std::fmt::Debug + From<u32> + Into<u32>> RegistryKey for K {}
+
+/// LRU-bounded cache of decoded images.
 #[derive(Debug)]
-pub struct ImageRegistry {
-    entries: HashMap<u32, ImageData>,
+pub struct ImageRegistry<K: RegistryKey = u32> {
+    entries: HashMap<K, ImageData>,
     /// Eviction order. Most recently used at the back.
-    lru: VecDeque<u32>,
-    /// Sum of `byte_size()` across `entries`.
+    lru: VecDeque<K>,
+    /// Sum of each entry's cost (`byte_size() + overhead`).
     total_bytes: u64,
     /// Soft cap. Insertions evict until `total_bytes + new <= cap_bytes`.
     cap_bytes: u64,
+    /// Bytes charged per image on top of its pixels, so millions of tiny
+    /// images can't fit a quota that only counts pixels (each entry costs
+    /// real memory in the maps and the LRU). `0` unless set.
+    overhead: u64,
     /// Monotonic content version. Bumps on every successful insert /
     /// remove. The renderer compares this to its cached value to decide
     /// when to re-sync GPU textures.
@@ -53,24 +91,39 @@ pub struct ImageRegistry {
     /// in-place replace under the same id) from `next_generation`. The
     /// renderer keys its GPU textures on it, so any re-transmit is seen
     /// as new content regardless of size or pixels.
-    generations: HashMap<u32, u64>,
+    generations: HashMap<K, u64>,
     /// Next generation to hand out. Starts at 1, never reused.
     next_generation: u64,
 }
 
-impl ImageRegistry {
+impl<K: RegistryKey> ImageRegistry<K> {
     /// Empty registry with `cap_bytes` byte budget.
     #[must_use]
     pub fn new(cap_bytes: u64) -> Self {
+        Self::with_overhead(cap_bytes, 0)
+    }
+
+    /// Empty registry charging `overhead` bytes per image on top of its
+    /// pixels against `cap_bytes`.
+    #[must_use]
+    pub fn with_overhead(cap_bytes: u64, overhead: u64) -> Self {
         Self {
             entries: HashMap::new(),
             lru: VecDeque::new(),
             total_bytes: 0,
             cap_bytes,
+            overhead,
             revision: 0,
             generations: HashMap::new(),
             next_generation: 1,
         }
+    }
+
+    /// What `data` costs against the cap: its pixel bytes plus the
+    /// per-image overhead.
+    #[must_use]
+    pub fn cost(&self, data: &ImageData) -> u64 {
+        data.byte_size() + self.overhead
     }
 
     /// Current byte cap.
@@ -79,7 +132,7 @@ impl ImageRegistry {
         self.cap_bytes
     }
 
-    /// Total bytes resident.
+    /// Total bytes charged (pixels plus per-image overhead).
     #[must_use]
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
@@ -112,13 +165,13 @@ impl ImageRegistry {
 
     /// True iff `id` is resident.
     #[must_use]
-    pub fn contains(&self, id: u32) -> bool {
+    pub fn contains(&self, id: K) -> bool {
         self.entries.contains_key(&id)
     }
 
     /// Borrow an image by id. Does NOT touch the LRU.
     #[must_use]
-    pub fn get(&self, id: u32) -> Option<&ImageData> {
+    pub fn get(&self, id: K) -> Option<&ImageData> {
         self.entries.get(&id)
     }
 
@@ -126,12 +179,12 @@ impl ImageRegistry {
     /// insert, so a re-transmit under the same id (same size, same
     /// pixels or not) always yields a new value. `None` if not resident.
     #[must_use]
-    pub fn generation(&self, id: u32) -> Option<u64> {
+    pub fn generation(&self, id: K) -> Option<u64> {
         self.generations.get(&id).copied()
     }
 
     /// Borrow an image by id and mark it MRU.
-    pub fn touch(&mut self, id: u32) -> Option<&ImageData> {
+    pub fn touch(&mut self, id: K) -> Option<&ImageData> {
         if !self.entries.contains_key(&id) {
             return None;
         }
@@ -140,21 +193,21 @@ impl ImageRegistry {
     }
 
     /// Iterate (id, image) in MRU order (oldest first).
-    pub fn iter(&self) -> impl Iterator<Item = (u32, &ImageData)> {
+    pub fn iter(&self) -> impl Iterator<Item = (K, &ImageData)> {
         self.lru
             .iter()
             .copied()
             .filter_map(|id| self.entries.get(&id).map(|d| (id, d)))
     }
 
-    /// Insert `data` under `id`. If `id == 0` the registry assigns the
+    /// Insert `data` under `id`. If `id` is 0 the registry assigns the
     /// lowest unused id (starting at 1). If the data is larger than the
     /// cap, returns `Err(InsertError::TooLarge)`. Otherwise evicts LRU
     /// entries until the new image fits.
     ///
     /// An insert under an existing id replaces the prior entry without
     /// disturbing other ids' LRU order.
-    pub fn insert(&mut self, id: u32, data: ImageData) -> Result<Inserted, InsertError> {
+    pub fn insert(&mut self, id: K, data: ImageData) -> Result<Inserted<K>, InsertError> {
         self.insert_with_pinned(id, data, &HashSet::new())
     }
 
@@ -166,23 +219,27 @@ impl ImageRegistry {
     /// order (oldest first).
     pub fn insert_with_pinned(
         &mut self,
-        id: u32,
+        id: K,
         data: ImageData,
-        pinned: &HashSet<u32>,
-    ) -> Result<Inserted, InsertError> {
-        let need = data.byte_size();
+        pinned: &HashSet<K>,
+    ) -> Result<Inserted<K>, InsertError> {
+        let need = self.cost(&data);
         if need > self.cap_bytes {
             return Err(InsertError::TooLarge {
                 need,
                 cap: self.cap_bytes,
             });
         }
-        let final_id = if id == 0 { self.next_free_id() } else { id };
+        let final_id = if id.into() == 0 {
+            self.next_free_id()
+        } else {
+            id
+        };
 
         // Replace path: free the old bytes first so eviction calculus
         // uses post-replace totals.
         if let Some(old) = self.entries.remove(&final_id) {
-            self.total_bytes -= old.byte_size();
+            self.total_bytes -= self.cost(&old);
             // Drop the stale LRU entry; we'll push the fresh one below.
             self.lru.retain(|x| *x != final_id);
         }
@@ -200,19 +257,21 @@ impl ImageRegistry {
             let victim = self
                 .lru
                 .iter()
-                .copied()
-                .find(|x| !pinned.contains(x))
+                .position(|x| !pinned.contains(x))
                 // Fall back to the strict LRU front if everything left is
                 // pinned (we must still free space to honor the cap).
-                .or_else(|| self.lru.front().copied());
-            let Some(victim) = victim else {
+                .or_else(|| (!self.lru.is_empty()).then_some(0));
+            let Some(at) = victim else {
                 // Empty LRU; the cap check above guarantees the insert
                 // fits, so this is purely defensive.
                 break;
             };
-            self.lru.retain(|x| *x != victim);
+            // O(1) for the usual case, the front.
+            let Some(victim) = self.lru.remove(at) else {
+                break;
+            };
             if let Some(victim_data) = self.entries.remove(&victim) {
-                self.total_bytes -= victim_data.byte_size();
+                self.total_bytes -= self.cost(&victim_data);
                 self.generations.remove(&victim);
                 evicted.push(victim);
             }
@@ -231,9 +290,9 @@ impl ImageRegistry {
     }
 
     /// Remove `id`. Returns the freed image if it was present.
-    pub fn remove(&mut self, id: u32) -> Option<ImageData> {
+    pub fn remove(&mut self, id: K) -> Option<ImageData> {
         let data = self.entries.remove(&id)?;
-        self.total_bytes -= data.byte_size();
+        self.total_bytes -= self.cost(&data);
         self.generations.remove(&id);
         self.lru.retain(|x| *x != id);
         self.revision = self.revision.wrapping_add(1);
@@ -241,13 +300,13 @@ impl ImageRegistry {
     }
 
     /// Iterate every resident id.
-    pub fn ids(&self) -> impl Iterator<Item = u32> + '_ {
+    pub fn ids(&self) -> impl Iterator<Item = K> + '_ {
         self.entries.keys().copied()
     }
 
     /// Resize the byte cap. If `new_cap < total_bytes`, evicts LRU
     /// entries until the budget is satisfied. Returns the evicted ids.
-    pub fn set_cap(&mut self, new_cap: u64) -> Vec<u32> {
+    pub fn set_cap(&mut self, new_cap: u64) -> Vec<K> {
         self.cap_bytes = new_cap;
         let mut evicted = Vec::new();
         while self.total_bytes > self.cap_bytes {
@@ -255,7 +314,7 @@ impl ImageRegistry {
                 break;
             };
             if let Some(data) = self.entries.remove(&victim) {
-                self.total_bytes -= data.byte_size();
+                self.total_bytes -= self.cost(&data);
                 self.generations.remove(&victim);
                 evicted.push(victim);
                 self.revision = self.revision.wrapping_add(1);
@@ -264,7 +323,7 @@ impl ImageRegistry {
         evicted
     }
 
-    fn bump_to_back(&mut self, id: u32) {
+    fn bump_to_back(&mut self, id: K) {
         self.lru.retain(|x| *x != id);
         self.lru.push_back(id);
     }
@@ -273,11 +332,11 @@ impl ImageRegistry {
     /// 1-based id not currently resident. Worst case is O(n) but `n` is
     /// small.
     #[must_use]
-    pub fn next_free_id(&self) -> u32 {
+    pub fn next_free_id(&self) -> K {
         let mut candidate = 1u32;
         loop {
-            if !self.entries.contains_key(&candidate) {
-                return candidate;
+            if !self.entries.contains_key(&K::from(candidate)) {
+                return K::from(candidate);
             }
             candidate += 1;
         }
@@ -286,12 +345,12 @@ impl ImageRegistry {
 
 /// Outcome of a successful [`ImageRegistry::insert`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Inserted {
+pub struct Inserted<K = u32> {
     /// Final id under which the image is stored. Same as the `id`
     /// passed in if it was non-zero; freshly assigned otherwise.
-    pub id: u32,
+    pub id: K,
     /// Ids evicted to make room (oldest first).
-    pub evicted: Vec<u32>,
+    pub evicted: Vec<K>,
 }
 
 /// Errors from `ImageRegistry::insert`.
@@ -317,7 +376,7 @@ mod tests {
 
     #[test]
     fn empty_registry() {
-        let r = ImageRegistry::new(1024);
+        let r = ImageRegistry::<u32>::new(1024);
         assert_eq!(r.len(), 0);
         assert!(r.is_empty());
         assert_eq!(r.total_bytes(), 0);
@@ -326,7 +385,7 @@ mod tests {
 
     #[test]
     fn insert_assigns_id_when_zero() {
-        let mut r = ImageRegistry::new(64 * 1024);
+        let mut r = ImageRegistry::<u32>::new(64 * 1024);
         let res = r.insert(0, img(2, 2, 0)).unwrap();
         assert_eq!(res.id, 1);
         assert!(res.evicted.is_empty());
@@ -336,7 +395,7 @@ mod tests {
 
     #[test]
     fn insert_uses_explicit_id() {
-        let mut r = ImageRegistry::new(64 * 1024);
+        let mut r = ImageRegistry::<u32>::new(64 * 1024);
         let res = r.insert(42, img(2, 2, 0)).unwrap();
         assert_eq!(res.id, 42);
         assert!(r.contains(42));
@@ -344,7 +403,7 @@ mod tests {
 
     #[test]
     fn insert_replaces_existing_id() {
-        let mut r = ImageRegistry::new(64 * 1024);
+        let mut r = ImageRegistry::<u32>::new(64 * 1024);
         r.insert(1, img(2, 2, 1)).unwrap();
         let before_bytes = r.total_bytes();
         r.insert(1, img(4, 4, 2)).unwrap();
@@ -358,7 +417,7 @@ mod tests {
     #[test]
     fn too_large_returns_err() {
         // 2x2 RGBA = 16 bytes; equals the cap so it fits.
-        let mut r = ImageRegistry::new(16);
+        let mut r = ImageRegistry::<u32>::new(16);
         assert!(r.insert(1, img(2, 2, 0)).is_ok());
         // Truly oversized: 4x4 = 64 bytes > cap.
         let err = r.insert(2, img(4, 4, 0)).unwrap_err();
@@ -374,7 +433,7 @@ mod tests {
     fn lru_evicts_oldest() {
         // Cap: 3 entries × 16 bytes = 48; we'll add a 4th to trigger
         // eviction.
-        let mut r = ImageRegistry::new(48);
+        let mut r = ImageRegistry::<u32>::new(48);
         r.insert(1, img(2, 2, 0)).unwrap();
         r.insert(2, img(2, 2, 0)).unwrap();
         r.insert(3, img(2, 2, 0)).unwrap();
@@ -390,7 +449,7 @@ mod tests {
 
     #[test]
     fn touch_promotes_to_mru() {
-        let mut r = ImageRegistry::new(48);
+        let mut r = ImageRegistry::<u32>::new(48);
         r.insert(1, img(2, 2, 0)).unwrap();
         r.insert(2, img(2, 2, 0)).unwrap();
         r.insert(3, img(2, 2, 0)).unwrap();
@@ -404,7 +463,7 @@ mod tests {
 
     #[test]
     fn remove_drops_from_lru_and_decreases_total() {
-        let mut r = ImageRegistry::new(64);
+        let mut r = ImageRegistry::<u32>::new(64);
         r.insert(1, img(2, 2, 0)).unwrap();
         r.insert(2, img(2, 2, 0)).unwrap();
         assert_eq!(r.total_bytes(), 32);
@@ -416,7 +475,7 @@ mod tests {
 
     #[test]
     fn revision_increments_on_mutation() {
-        let mut r = ImageRegistry::new(1024);
+        let mut r = ImageRegistry::<u32>::new(1024);
         let r0 = r.revision();
         r.insert(1, img(1, 1, 0)).unwrap();
         let r1 = r.revision();
@@ -428,7 +487,7 @@ mod tests {
 
     #[test]
     fn auto_assign_fills_holes_lowest_first() {
-        let mut r = ImageRegistry::new(1024);
+        let mut r = ImageRegistry::<u32>::new(1024);
         r.insert(1, img(1, 1, 0)).unwrap();
         r.insert(3, img(1, 1, 0)).unwrap();
         let res = r.insert(0, img(1, 1, 0)).unwrap();
@@ -437,7 +496,7 @@ mod tests {
 
     #[test]
     fn budget_remaining_tracks_inserts() {
-        let mut r = ImageRegistry::new(100);
+        let mut r = ImageRegistry::<u32>::new(100);
         assert_eq!(r.budget_remaining(), 100);
         r.insert(1, img(2, 2, 0)).unwrap(); // 16 bytes
         assert_eq!(r.budget_remaining(), 84);
@@ -445,7 +504,7 @@ mod tests {
 
     #[test]
     fn set_cap_evicts_to_fit() {
-        let mut r = ImageRegistry::new(64);
+        let mut r = ImageRegistry::<u32>::new(64);
         r.insert(1, img(2, 2, 0)).unwrap();
         r.insert(2, img(2, 2, 0)).unwrap();
         r.insert(3, img(2, 2, 0)).unwrap();
@@ -458,7 +517,7 @@ mod tests {
 
     #[test]
     fn ids_iteration_covers_all() {
-        let mut r = ImageRegistry::new(1024);
+        let mut r = ImageRegistry::<u32>::new(1024);
         r.insert(1, img(1, 1, 0)).unwrap();
         r.insert(7, img(1, 1, 0)).unwrap();
         let mut ids: Vec<u32> = r.ids().collect();
@@ -473,7 +532,7 @@ mod tests {
         // Cap holds two 16-byte images. id=1 is the LRU front but PINNED
         // (has a live placement); id=2 is unpinned. Inserting a third
         // must evict the unpinned id=2, not the pinned-but-older id=1.
-        let mut r = ImageRegistry::new(32);
+        let mut r = ImageRegistry::<u32>::new(32);
         r.insert(1, img(2, 2, 0)).unwrap();
         r.insert(2, img(2, 2, 0)).unwrap();
         let mut pinned = HashSet::new();
@@ -489,7 +548,7 @@ mod tests {
     fn eviction_falls_back_to_pinned_when_no_unpinned_candidate() {
         // Both resident images are pinned and we must still free space.
         // Eviction falls back to the strict LRU front (id=1).
-        let mut r = ImageRegistry::new(32);
+        let mut r = ImageRegistry::<u32>::new(32);
         r.insert(1, img(2, 2, 0)).unwrap();
         r.insert(2, img(2, 2, 0)).unwrap();
         let mut pinned = HashSet::new();
@@ -511,7 +570,7 @@ mod tests {
         // Three images, cap holds three (48 bytes). Pin the oldest (1).
         // Insert a 4th: should evict the oldest UNPINNED (2), keeping the
         // pinned-oldest (1) and newer (3).
-        let mut r = ImageRegistry::new(48);
+        let mut r = ImageRegistry::<u32>::new(48);
         r.insert(1, img(2, 2, 0)).unwrap();
         r.insert(2, img(2, 2, 0)).unwrap();
         r.insert(3, img(2, 2, 0)).unwrap();
@@ -529,7 +588,7 @@ mod tests {
     fn insert_with_empty_pinned_matches_plain_insert() {
         // Sanity: insert_with_pinned with no pins behaves like insert
         // (strict LRU).
-        let mut r = ImageRegistry::new(48);
+        let mut r = ImageRegistry::<u32>::new(48);
         r.insert(1, img(2, 2, 0)).unwrap();
         r.insert(2, img(2, 2, 0)).unwrap();
         r.insert(3, img(2, 2, 0)).unwrap();
@@ -544,7 +603,7 @@ mod tests {
         // Cap: 32 bytes. One 16-byte entry. Replacing it should NOT
         // evict it (which would leave total_bytes 0 then add 16) — the
         // entry should just be swapped in place.
-        let mut r = ImageRegistry::new(32);
+        let mut r = ImageRegistry::<u32>::new(32);
         r.insert(1, img(2, 2, 1)).unwrap();
         let res = r.insert(1, img(2, 2, 9)).unwrap();
         assert!(res.evicted.is_empty());
@@ -559,7 +618,7 @@ mod tests {
             height: 2,
             pixels: vec![fill; 16],
         };
-        let mut r = ImageRegistry::new(1024);
+        let mut r = ImageRegistry::<u32>::new(1024);
         assert_eq!(r.generation(7), None);
         r.insert(7, img(1)).unwrap();
         let g1 = r.generation(7).unwrap();
@@ -583,7 +642,7 @@ mod tests {
             height: 1,
             pixels: vec![0; 4],
         };
-        let mut r = ImageRegistry::new(1024);
+        let mut r = ImageRegistry::<u32>::new(1024);
         let id = r.insert(0, img.clone()).unwrap().id;
         let g1 = r.generation(id).unwrap();
         r.remove(id);
@@ -599,7 +658,7 @@ mod tests {
             height: 2,
             pixels: vec![0; 16],
         };
-        let mut r = ImageRegistry::new(32);
+        let mut r = ImageRegistry::<u32>::new(32);
         r.insert(1, img.clone()).unwrap();
         r.insert(2, img.clone()).unwrap();
         let ins = r.insert(3, img).unwrap();

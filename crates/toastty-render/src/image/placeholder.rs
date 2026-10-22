@@ -66,7 +66,12 @@ pub fn build_placeholder_instances(
             let Some(vp) = term.resolve_placeholder(run) else {
                 continue;
             };
-            let Some(image) = registry.get(run.image_id) else {
+            // Placeholder cells name the client id; the bytes and the
+            // texture are keyed by the store key (#42).
+            let Some(image_key) = term.image_store().key_of(run.image_id) else {
+                continue;
+            };
+            let Some(image) = registry.get(image_key) else {
                 continue;
             };
             pieces.clear();
@@ -95,7 +100,7 @@ pub fn build_placeholder_instances(
                     texture_index: UNRESOLVED_TEXTURE,
                     z: vp.z,
                     image_id: run.image_id,
-                    _pad: [0; 1],
+                    key: image_key.0,
                 };
                 let key = MergeKey::of(&inst);
                 if let Some(&i) = open.get(&key)
@@ -343,7 +348,7 @@ mod tests {
             texture_index: 0,
             z: 5,
             image_id: 1,
-            _pad: [0],
+            key: 1,
         };
         let mut out = vec![other];
         build_placeholder_instances(&mut out, &t, CELL, LAYOUT, None);

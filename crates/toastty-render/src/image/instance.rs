@@ -10,7 +10,7 @@
 //! [`super::pipeline::ImagePipeline::render`].
 
 use bytemuck::{Pod, Zeroable};
-use toastty_term::{ImageGrid, ImageRegistry};
+use toastty_term::{ImageGrid, ImageKey, ImageRegistry};
 
 /// `ImageInstance::texture_index` before the pipeline binds the
 /// instance's image to a texture. Never drawn.
@@ -33,15 +33,15 @@ pub struct ImageInstance {
     pub texture_index: u32,
     /// Z order. The host splits below/above text using sign.
     pub z: i32,
-    /// Source image id. Not consumed by the shader; carried here so the
-    /// CPU-side sort can tie-break equal-z placements by ascending id
-    /// (kitty spec). Occupies the first std430 pad slot.
-    #[allow(clippy::pub_underscore_fields)]
+    /// Source image (client) id. Not consumed by the shader; carried here
+    /// so the CPU-side sort can tie-break equal-z placements by ascending
+    /// id (kitty spec). Occupies the first std430 pad slot.
     pub image_id: u32,
-    /// Padding for std430 alignment. Not consumed by callers; the
-    /// underscore prefix tells Rust it's intentional.
-    #[allow(clippy::pub_underscore_fields)]
-    pub _pad: [u32; 1],
+    /// Store key of the image's bytes (`ImageKey.0`, #42), which
+    /// `ImagePipeline::resolve_kitty_textures` binds the texture by (#24).
+    /// Not consumed by the shader; occupies the second std430 pad slot.
+    /// `0` (`ImageKey::NONE`) for instances that bring their own texture.
+    pub key: u32,
 }
 
 /// Which compositing layer a placement belongs to, per the kitty spec's
@@ -163,7 +163,7 @@ impl ImageView {
 pub fn build_image_instances(
     out: &mut Vec<ImageInstance>,
     grid: &ImageGrid,
-    registry: &ImageRegistry,
+    registry: &ImageRegistry<ImageKey>,
     cell_size: (f32, f32),
     view: &ImageView,
 ) {
@@ -242,7 +242,7 @@ pub fn build_image_instances(
             texture_index: UNRESOLVED_TEXTURE,
             z: placement.z,
             image_id: placement.image_id,
-            _pad: [0; 1],
+            key: placement.key.0,
         });
     }
     // m3: sort by (z, image_id) so equal-z placements tie-break by
@@ -280,7 +280,7 @@ pub fn split_layers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use toastty_term::{ImageGrid, ImageRegistry, Placement, SrcRect};
+    use toastty_term::{ImageGrid, ImageKey, ImageRegistry, Placement, SrcRect};
 
     fn red_pixel(width: u32, height: u32) -> toastty_term::ImageData {
         let n = (width * height) as usize;
@@ -301,6 +301,7 @@ mod tests {
             u16::try_from(rows.end - rows.start).unwrap(),
             cols.end - cols.start,
         );
+        p.key = ImageKey(id);
         p.line = rows.start;
         p.col = cols.start;
         p.z = z;
@@ -313,9 +314,9 @@ mod tests {
     }
 
     /// Registry holding one `w`x`h` image under id 1.
-    fn one_image(w: u32, h: u32) -> ImageRegistry {
-        let mut reg = ImageRegistry::new(1 << 20);
-        reg.insert(1, red_pixel(w, h)).unwrap();
+    fn one_image(w: u32, h: u32) -> ImageRegistry<ImageKey> {
+        let mut reg = ImageRegistry::<ImageKey>::new(1 << 20);
+        reg.insert(ImageKey(1), red_pixel(w, h)).unwrap();
         reg
     }
 
@@ -534,7 +535,7 @@ mod tests {
     #[test]
     fn empty_grid_emits_no_instances() {
         let grid = ImageGrid::new();
-        let reg = ImageRegistry::new(1024);
+        let reg = ImageRegistry::<ImageKey>::new(1024);
         let mut out = Vec::new();
         build_image_instances(&mut out, &grid, &reg, (10.0, 20.0), &view());
         assert!(out.is_empty());
@@ -544,7 +545,7 @@ mod tests {
     fn placement_without_registry_image_is_skipped() {
         let mut grid = ImageGrid::new();
         grid.add(place(1, 0..2, 0..4, 0));
-        let reg = ImageRegistry::new(4096);
+        let reg = ImageRegistry::<ImageKey>::new(4096);
         let mut out = Vec::new();
         build_image_instances(&mut out, &grid, &reg, (10.0, 20.0), &view());
         assert!(out.is_empty());
@@ -554,8 +555,8 @@ mod tests {
     fn single_placement_emits_one_instance() {
         let mut grid = ImageGrid::new();
         grid.add(place(1, 0..2, 0..4, 0));
-        let mut reg = ImageRegistry::new(4096);
-        reg.insert(1, red_pixel(2, 2)).unwrap();
+        let mut reg = ImageRegistry::<ImageKey>::new(4096);
+        reg.insert(ImageKey(1), red_pixel(2, 2)).unwrap();
         let mut out = Vec::new();
         build_image_instances(&mut out, &grid, &reg, (10.0, 20.0), &view());
         assert_eq!(out.len(), 1);
@@ -575,8 +576,8 @@ mod tests {
         grid.add(place(1, 0..1, 0..1, 10));
         grid.add(place(1, 0..1, 1..2, -5));
         grid.add(place(1, 0..1, 2..3, 0));
-        let mut reg = ImageRegistry::new(4096);
-        reg.insert(1, red_pixel(1, 1)).unwrap();
+        let mut reg = ImageRegistry::<ImageKey>::new(4096);
+        reg.insert(ImageKey(1), red_pixel(1, 1)).unwrap();
         let mut out = Vec::new();
         build_image_instances(&mut out, &grid, &reg, (10.0, 10.0), &view());
         let zs: Vec<i32> = out.iter().map(|i| i.z).collect();
@@ -591,8 +592,8 @@ mod tests {
         grid.add(place(1, 0..1, 2..3, 0));
         grid.add(place(1, 0..1, 3..4, 5));
         grid.add(place(1, 0..1, 4..5, i32::MIN));
-        let mut reg = ImageRegistry::new(4096);
-        reg.insert(1, red_pixel(1, 1)).unwrap();
+        let mut reg = ImageRegistry::<ImageKey>::new(4096);
+        reg.insert(ImageKey(1), red_pixel(1, 1)).unwrap();
         let mut out = Vec::new();
         build_image_instances(&mut out, &grid, &reg, (10.0, 10.0), &view());
         let (below_bg, below_text, above) = split_layers(&out);
@@ -623,8 +624,8 @@ mod tests {
             h: 2,
         };
         grid.add(p);
-        let mut reg = ImageRegistry::new(4096);
-        reg.insert(1, red_pixel(4, 4)).unwrap();
+        let mut reg = ImageRegistry::<ImageKey>::new(4096);
+        reg.insert(ImageKey(1), red_pixel(4, 4)).unwrap();
         let mut out = Vec::new();
         build_image_instances(&mut out, &grid, &reg, (10.0, 10.0), &view());
         assert_eq!(out[0].uv_min, [0.25, 0.25]);
@@ -635,7 +636,7 @@ mod tests {
 #[cfg(test)]
 mod minor_render_tests {
     use super::*;
-    use toastty_term::{ImageGrid, ImageRegistry, Placement};
+    use toastty_term::{ImageGrid, ImageKey, ImageRegistry, Placement};
 
     fn view() -> ImageView {
         ImageView::live(0, (10_000.0, 10_000.0))
@@ -656,6 +657,7 @@ mod minor_render_tests {
 
     fn place(id: u32, z: i32) -> Placement {
         let mut p = Placement::new(id, 1, 1);
+        p.key = ImageKey(id);
         p.z = z;
         p
     }
@@ -670,9 +672,9 @@ mod minor_render_tests {
         grid.add(place(30, 7));
         grid.add(place(10, 7));
         grid.add(place(20, 7));
-        let mut reg = ImageRegistry::new(8192);
+        let mut reg = ImageRegistry::<ImageKey>::new(8192);
         for id in [10u32, 20, 30] {
-            reg.insert(id, red_pixel(1, 1)).unwrap();
+            reg.insert(ImageKey(id), red_pixel(1, 1)).unwrap();
         }
         let mut out = Vec::new();
         build_image_instances(&mut out, &grid, &reg, (10.0, 10.0), &view());
