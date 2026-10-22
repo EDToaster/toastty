@@ -67,9 +67,9 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // LOD bias -0.5 (`LOD_BIAS` in src/image/mip.rs) offsets
-    // trilinear's softness on thin features. At 1:1 or when upscaling
-    // the LOD is <= 0 already, so level 0 is read exactly as before.
-    let sample = textureSampleBias(image_tex, image_sampler, in.uv, -0.5);
+    // Plain trilinear (`LOD_BIAS` = 0 in src/image/mip.rs: a negative
+    // bias re-introduces aliasing at moderate downscales). At 1:1 or when
+    // upscaling the LOD is <= 0, so level 0 is read exactly as before.
+    let sample = textureSample(image_tex, image_sampler, in.uv);
     return sample;
 }
