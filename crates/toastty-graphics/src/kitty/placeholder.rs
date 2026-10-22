@@ -17,6 +17,8 @@
 //! <https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders>.
 //! The diacritic list comes from kitty's published table.
 
+use std::collections::HashMap;
+
 /// The base placeholder codepoint.
 pub const PLACEHOLDER: char = '\u{10EEEE}';
 
@@ -82,36 +84,80 @@ pub struct VirtualPlacement {
 /// oldest entry is dropped.
 pub const MAX_VIRTUAL_PLACEMENTS: usize = 4096;
 
-/// The virtual placements of one screen, in creation order.
+/// The virtual placements of one screen.
 ///
 /// Placeholder cells look their placement up here at render time, so
 /// the table only has to be right when a frame is built: placeholders
-/// printed before the image (or its virtual placement) arrives show up
+/// printed before the image (or its virtual placement) arrive show up
 /// as soon as it does.
+///
+/// Lookups run once per placeholder run per frame, so they are indexed
+/// rather than scanned: per image, the placements in creation order
+/// (`p=0` takes the first), plus a map for named `(image, p)` pairs. A
+/// stream that piles thousands of placements onto one image therefore
+/// can't make each frame cost thousands of comparisons per run.
 #[derive(Debug, Clone, Default)]
 pub struct VirtualPlacements {
-    entries: Vec<VirtualPlacement>,
+    /// Per image, `(seq, placement)` sorted by `seq` (creation order).
+    by_image: HashMap<u32, Vec<(u64, VirtualPlacement)>>,
+    /// `(image, placement id != 0)` → `seq` of that entry.
+    named: HashMap<(u32, u32), u64>,
+    len: usize,
+    next_seq: u64,
 }
 
 impl VirtualPlacements {
     /// Add `vp`. A non-zero placement id replaces the existing
-    /// placement with the same `(image, placement)` in place, as for
-    /// ordinary placements. Anonymous placements (`p=0`) always add a
-    /// new entry, matching kitty.
+    /// placement with the same `(image, placement)` in place, keeping its
+    /// age, as for ordinary placements. Anonymous placements (`p=0`)
+    /// always add a new entry, matching kitty.
     pub fn insert(&mut self, vp: VirtualPlacement) {
         if vp.placement_id != 0
-            && let Some(e) = self
-                .entries
-                .iter_mut()
-                .find(|e| e.image_id == vp.image_id && e.placement_id == vp.placement_id)
+            && let Some(&seq) = self.named.get(&(vp.image_id, vp.placement_id))
+            && let Some(slot) = self.slot_mut(vp.image_id, seq)
         {
-            *e = vp;
+            *slot = vp;
             return;
         }
-        if self.entries.len() >= MAX_VIRTUAL_PLACEMENTS {
-            self.entries.remove(0);
+        if self.len >= MAX_VIRTUAL_PLACEMENTS {
+            self.remove_oldest();
         }
-        self.entries.push(vp);
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.by_image
+            .entry(vp.image_id)
+            .or_default()
+            .push((seq, vp));
+        if vp.placement_id != 0 {
+            self.named.insert((vp.image_id, vp.placement_id), seq);
+        }
+        self.len += 1;
+    }
+
+    fn slot_mut(&mut self, image_id: u32, seq: u64) -> Option<&mut VirtualPlacement> {
+        let list = self.by_image.get_mut(&image_id)?;
+        let i = list.binary_search_by_key(&seq, |e| e.0).ok()?;
+        Some(&mut list[i].1)
+    }
+
+    /// Drop the oldest placement overall (the cap). Rare: one pass over
+    /// the images, not the placements.
+    fn remove_oldest(&mut self) {
+        let Some((&image_id, _)) = self
+            .by_image
+            .iter()
+            .min_by_key(|(_, list)| list.first().map_or(u64::MAX, |e| e.0))
+        else {
+            return;
+        };
+        let mut first = true;
+        self.remove_where(|v| {
+            let hit = first && v.image_id == image_id;
+            if hit {
+                first = false;
+            }
+            hit
+        });
     }
 
     /// The virtual placement a placeholder cell refers to. A non-zero
@@ -120,47 +166,77 @@ impl VirtualPlacements {
     /// takes the oldest).
     #[must_use]
     pub fn find(&self, image_id: u32, placement_id: u32) -> Option<&VirtualPlacement> {
-        self.entries.iter().find(|e| {
-            e.image_id == image_id && (placement_id == 0 || e.placement_id == placement_id)
-        })
+        let list = self.by_image.get(&image_id)?;
+        if placement_id == 0 {
+            return list.first().map(|e| &e.1);
+        }
+        let seq = *self.named.get(&(image_id, placement_id))?;
+        let i = list.binary_search_by_key(&seq, |e| e.0).ok()?;
+        Some(&list[i].1)
     }
 
     /// True when any virtual placement refers to `image_id`.
     #[must_use]
     pub fn contains_image(&self, image_id: u32) -> bool {
-        self.entries.iter().any(|e| e.image_id == image_id)
+        self.by_image.contains_key(&image_id)
     }
 
-    /// Remove every entry matching `pred`. Returns `true` when anything
-    /// was removed.
+    /// Remove every entry matching `pred` (visited per image in creation
+    /// order). Returns `true` when anything was removed.
     pub fn remove_where(&mut self, mut pred: impl FnMut(&VirtualPlacement) -> bool) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(|e| !pred(e));
-        self.entries.len() != before
+        let before = self.len;
+        let named = &mut self.named;
+        let len = &mut self.len;
+        self.by_image.retain(|_, list| {
+            list.retain(|(_, v)| {
+                let drop = pred(v);
+                if drop {
+                    *len -= 1;
+                    if v.placement_id != 0 {
+                        named.remove(&(v.image_id, v.placement_id));
+                    }
+                }
+                !drop
+            });
+            !list.is_empty()
+        });
+        self.len != before
     }
 
     /// Remove every virtual placement of `image_id`.
     pub fn remove_image(&mut self, image_id: u32) -> bool {
-        self.remove_where(|e| e.image_id == image_id)
+        let Some(list) = self.by_image.remove(&image_id) else {
+            return false;
+        };
+        self.len -= list.len();
+        for (_, v) in &list {
+            if v.placement_id != 0 {
+                self.named.remove(&(v.image_id, v.placement_id));
+            }
+        }
+        true
     }
 
-    /// Iterate in creation order.
+    /// Iterate every placement (grouped by image, unspecified order
+    /// between images).
     pub fn iter(&self) -> impl Iterator<Item = &VirtualPlacement> {
-        self.entries.iter()
+        self.by_image.values().flat_map(|l| l.iter().map(|e| &e.1))
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.len
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len == 0
     }
 
     pub fn clear(&mut self) {
-        self.entries.clear();
+        self.by_image.clear();
+        self.named.clear();
+        self.len = 0;
     }
 }
 
@@ -371,6 +447,36 @@ mod tests {
         t.insert(vp(1, 2, 3, 3));
         assert_eq!(t.len(), 1);
         assert_eq!(t.find(1, 2).map(|v| v.cols), Some(3));
+    }
+
+    #[test]
+    fn virtual_index_stays_consistent() {
+        // The hostile shape from the #28 review: thousands of placements
+        // of one image. Lookups go through the index, and it must agree
+        // with the table after replaces and removals.
+        let mut t = VirtualPlacements::default();
+        t.insert(vp(1, 0, 1, 1));
+        for p in 1..4000 {
+            t.insert(vp(1, p, p, 1));
+        }
+        assert_eq!(t.len(), 4000);
+        assert!(t.find(1, 70_000).is_none(), "unknown pid");
+        assert_eq!(t.find(1, 2500).map(|v| v.cols), Some(2500));
+        // Replacing a named placement keeps its age: pid 0 still finds
+        // the very first (anonymous) one.
+        t.insert(vp(1, 2500, 9, 9));
+        assert_eq!(t.find(1, 2500).map(|v| v.cols), Some(9));
+        assert_eq!(t.find(1, 0).map(|v| v.cols), Some(1));
+        // Removing entries removes their index too.
+        assert!(t.remove_where(|v| v.placement_id % 2 == 0));
+        assert!(t.find(1, 2500).is_none());
+        assert_eq!(t.find(1, 2501).map(|v| v.cols), Some(2501));
+        // The anonymous one is gone; pid 0 now picks the oldest left.
+        assert_eq!(t.find(1, 0).map(|v| v.placement_id), Some(1));
+        assert_eq!(t.len(), 2000);
+        t.insert(vp(1, 2500, 3, 3));
+        assert_eq!(t.find(1, 2500).map(|v| v.cols), Some(3));
+        assert_eq!(t.len(), 2001);
     }
 
     #[test]
