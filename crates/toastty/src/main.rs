@@ -961,18 +961,26 @@ impl Toastty {
     fn handle_pty_ready(&mut self) -> ControlSignal {
         let parse_start = Instant::now();
         if self.ingest.should_wait_for_frame(parse_start) {
+            // Nothing taken from the reader, so its wake stays armed and
+            // it won't post again; the runner's `about_to_wait` resume
+            // that `Yield` schedules is what brings us back.
             return ControlSignal::Yield;
         }
+        // No reader (spawn failed): there is nothing to wake us anyway.
         let Some(mut reader) = self.reader.take() else {
             return ControlSignal::Continue;
         };
-        let mut parsed = false;
-        let mut yielded = false;
+        let mut any_parsed = false;
+        let mut stopped = None;
         loop {
-            let now = Instant::now();
-            let frame_due = self.ingest.should_yield(now, parse_start);
-            if frame_due && !self.term.pause_rendering() {
-                yielded = true;
+            let step = self.ingest.step(
+                Instant::now(),
+                parse_start,
+                any_parsed,
+                self.term.pause_rendering(),
+            );
+            if let ingest::Step::Stop(why) = step {
+                stopped = Some(why);
                 break;
             }
             let avail = reader.peek(ingest::SLICE);
@@ -981,51 +989,51 @@ impl Toastty {
             }
             // A frame is due but a synchronized update holds it: parse
             // only to the end of that update, then check again.
-            let n = if frame_due {
+            let n = if step == ingest::Step::ParseToEsu {
                 ingest::slice_to_esu(avail)
             } else {
                 avail.len()
             };
+            // After `peek`, so a buffer swap doesn't count as parsing.
+            let at = Instant::now();
             self.handle_pty_bytes(&avail[..n]);
-            self.stats.pty_batch(now, n, now.elapsed());
+            self.stats.pty_batch(at, n, at.elapsed());
             reader.consume(n);
-            parsed = true;
+            any_parsed = true;
         }
         let finished = reader.is_finished();
         self.reader = Some(reader);
-        if finished {
-            // Every byte read before the close is parsed by now.
-            return self.handle_pty_closed();
-        }
-        if !parsed {
-            // A wake for bytes an earlier pass already took.
-            return ControlSignal::Continue;
-        }
-        // New output may have rewritten or moved the hovered link;
-        // re-resolve it (clears when it's gone).
-        if self.term.link_hover().is_some() {
+        let outcome = ingest::outcome(finished, any_parsed, stopped, self.term.pause_rendering());
+        if any_parsed && outcome != ingest::Outcome::Closed && self.term.link_hover().is_some() {
+            // New output may have rewritten or moved the hovered link;
+            // re-resolve it (clears when it's gone).
             self.refresh_link_hover();
         }
-        if yielded {
-            self.ingest.frame_requested(parse_start);
-            return ControlSignal::Yield;
+        match outcome {
+            // Every byte read before the close is any_parsed by now.
+            ingest::Outcome::Closed => self.handle_pty_closed(),
+            ingest::Outcome::Idle => ControlSignal::Continue,
+            ingest::Outcome::Yield => {
+                self.ingest.frame_requested(parse_start);
+                ControlSignal::Yield
+            }
+            ingest::Outcome::AwaitEsu => {
+                // `handle_pty_bytes` fires the watchdog when more bytes
+                // arrive after it; this covers BSU-then-silence.
+                let left = self.term.sync_output_started_at().map_or(BSU_TIMEOUT, |t| {
+                    (t + BSU_TIMEOUT).saturating_duration_since(Instant::now())
+                });
+                ControlSignal::RedrawIn(left)
+            }
+            ingest::Outcome::Redraw => {
+                // RedrawIn(ZERO) — not Continue — to force the event loop
+                // to wake immediately. On macOS, plain `request_redraw()`
+                // doesn't wake from Wait reliably; RedrawIn sets
+                // ControlFlow::Poll, which does.
+                self.ingest.frame_requested(parse_start);
+                ControlSignal::RedrawIn(Duration::ZERO)
+            }
         }
-        if self.term.pause_rendering() {
-            // Mid synchronized update: `render_term` would just skip, so
-            // instead of redrawing now, wake at the BSU watchdog deadline.
-            // `handle_pty_bytes` fires the watchdog when more bytes
-            // arrive after it; this covers BSU-then-silence.
-            let left = self.term.sync_output_started_at().map_or(BSU_TIMEOUT, |t| {
-                (t + BSU_TIMEOUT).saturating_duration_since(Instant::now())
-            });
-            return ControlSignal::RedrawIn(left);
-        }
-        // RedrawIn(ZERO) — not Continue — to force the event loop to
-        // wake immediately. On macOS, plain `request_redraw()` doesn't
-        // wake from Wait reliably; RedrawIn sets ControlFlow::Poll,
-        // which does.
-        self.ingest.frame_requested(parse_start);
-        ControlSignal::RedrawIn(Duration::ZERO)
     }
 
     /// The PTY closed and its last bytes are parsed: reap and exit.

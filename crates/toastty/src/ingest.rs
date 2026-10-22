@@ -101,11 +101,37 @@ impl Ingest {
             && self.frame_due(now)
     }
 
-    /// Between slices: stop parsing (begun at `parse_start`) to draw a
-    /// frame. The caller also holds off while mode 2026 pauses rendering,
-    /// since that frame would be skipped.
+    /// What the `PtyReady` loop does next, at `now`, in a pass that began
+    /// at `parse_start` and has (`any_parsed`) or hasn't parsed a slice yet,
+    /// while mode 2026 does (`sync_paused`) or doesn't pause rendering.
+    ///
+    /// Never stops before the first slice. Besides guaranteeing progress
+    /// when the thread was descheduled between the pass starting and this
+    /// check, that first slice is what takes the reader's buffer and
+    /// re-arms its wake; see [`outcome`] for the other half.
     #[must_use]
-    pub fn should_yield(&self, now: Instant, parse_start: Instant) -> bool {
+    pub fn step(
+        &self,
+        now: Instant,
+        parse_start: Instant,
+        any_parsed: bool,
+        sync_paused: bool,
+    ) -> Step {
+        let frame_due = self.should_yield(now, parse_start);
+        if !frame_due {
+            Step::Parse
+        } else if any_parsed && !sync_paused {
+            Step::Stop(Stop::Yield)
+        } else {
+            // Due, but a synchronized update holds the frame back (or
+            // nothing is parsed yet): parse to the end of the update.
+            Step::ParseToEsu
+        }
+    }
+
+    /// Whether a frame is due and the pass begun at `parse_start` has
+    /// parsed long enough to let it through.
+    fn should_yield(&self, now: Instant, parse_start: Instant) -> bool {
         let min_parse = (self.last_render * 2).clamp(MIN_PARSE, MAX_MIN_PARSE);
         self.frame_due(now) && now.saturating_duration_since(parse_start) >= min_parse
     }
@@ -121,6 +147,59 @@ impl Ingest {
         };
         let split = std::mem::replace(&mut self.trailing_esc, last == 0x1B) && bytes[0] == b'_';
         split || memmem::find(bytes, b"\x1b_").is_some()
+    }
+}
+
+/// The next move of the `PtyReady` parse loop ([`Ingest::step`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Parse the next slice, up to [`SLICE`] bytes.
+    Parse,
+    /// Parse the next slice only up to the end of its first ESU
+    /// ([`slice_to_esu`]).
+    ParseToEsu,
+    /// Leave the loop with bytes still buffered.
+    Stop(Stop),
+}
+
+/// Why the parse loop left with bytes still buffered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// To draw a frame: answer `ControlSignal::Yield`.
+    Yield,
+}
+
+/// What a finished `PtyReady` pass answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The PTY closed and every byte is parsed: reap and exit.
+    Closed,
+    /// Nothing new to parse (a wake for bytes an earlier pass took).
+    Idle,
+    /// Redraw, then resume parsing (`ControlSignal::Yield`).
+    Yield,
+    /// Drained mid synchronized update: wake at the BSU watchdog deadline
+    /// rather than redraw a frame `render_term` would skip.
+    AwaitEsu,
+    /// Drained: redraw now.
+    Redraw,
+}
+
+/// The answer to a `PtyReady` pass that ended with `stop` (or by draining
+/// the reader when `None`).
+///
+/// A stop must always be answered with one that schedules a resume, even
+/// if nothing was parsed: the stop left bytes in the reader, whose wake
+/// stays armed until they are taken, so no further `PtyReady` would
+/// arrive and output would freeze.
+#[must_use]
+pub fn outcome(finished: bool, any_parsed: bool, stop: Option<Stop>, sync_paused: bool) -> Outcome {
+    match stop {
+        _ if finished => Outcome::Closed,
+        Some(Stop::Yield) => Outcome::Yield,
+        None if !any_parsed => Outcome::Idle,
+        None if sync_paused => Outcome::AwaitEsu,
+        None => Outcome::Redraw,
     }
 }
 
@@ -207,6 +286,44 @@ mod tests {
         ing.frame_requested(t0);
         ing.frame_requested(t0 + ms(50));
         assert!(!ing.should_wait_for_frame(t0 + MAX_FRAME_WAIT));
+    }
+
+    #[test]
+    fn a_frame_due_on_entry_still_parses_a_slice_first() {
+        // Regression: the thread was descheduled between the pass
+        // starting and the first check, so a frame was already due. The
+        // loop stopped without peeking, the pass answered "idle", and the
+        // reader, whose wake was still armed, never woke us again.
+        let ing = Ingest::default();
+        let parse_start = Instant::now();
+        let late = parse_start + ms(40);
+        assert_eq!(ing.step(late, parse_start, false, false), Step::ParseToEsu);
+        assert_eq!(
+            ing.step(late, parse_start, true, false),
+            Step::Stop(Stop::Yield)
+        );
+        // And a stop is never answered as idle, parsed or not.
+        assert_eq!(
+            outcome(false, false, Some(Stop::Yield), false),
+            Outcome::Yield
+        );
+    }
+
+    #[test]
+    fn step_parses_to_the_esu_while_the_frame_is_held() {
+        let ing = Ingest::default();
+        let t0 = Instant::now();
+        assert_eq!(ing.step(t0, t0, true, true), Step::Parse);
+        assert_eq!(ing.step(t0 + ms(5), t0, true, true), Step::ParseToEsu);
+    }
+
+    #[test]
+    fn outcome_after_draining() {
+        assert_eq!(outcome(true, true, None, false), Outcome::Closed);
+        assert_eq!(outcome(true, false, None, true), Outcome::Closed);
+        assert_eq!(outcome(false, false, None, false), Outcome::Idle);
+        assert_eq!(outcome(false, true, None, true), Outcome::AwaitEsu);
+        assert_eq!(outcome(false, true, None, false), Outcome::Redraw);
     }
 
     #[test]
