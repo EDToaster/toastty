@@ -11,6 +11,17 @@ use vte::Params;
 /// in [`BufferingApcHandler`].
 pub trait Perform {
     fn print(&mut self, _c: char) {}
+
+    /// A run of printable ASCII (`0x20..=0x7E`) in ground state: the
+    /// same as one [`Self::print`] per byte, which is what the default
+    /// does. Handlers that can write a run in one go (the terminal grid)
+    /// override it; ground text reaches them in runs whenever the parser
+    /// can skip vte's per-byte state machine.
+    fn print_ascii(&mut self, run: &[u8]) {
+        for &b in run {
+            self.print(char::from(b));
+        }
+    }
     fn execute(&mut self, _byte: u8) {}
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     fn put(&mut self, _byte: u8) {}
@@ -106,6 +117,9 @@ pub trait BufferedApc: Perform {
 impl<H: BufferedApc> Perform for BufferingApcHandler<H> {
     fn print(&mut self, c: char) {
         self.inner.print(c);
+    }
+    fn print_ascii(&mut self, run: &[u8]) {
+        self.inner.print_ascii(run);
     }
     fn execute(&mut self, byte: u8) {
         self.inner.execute(byte);
