@@ -56,11 +56,47 @@ use crate::text::glyph_rasterizer::{DEFAULT_LINE_HEIGHT_RATIO, GlyphRasterizer, 
 use crate::text::instance::{CellInstance, CellRenderOpts, Theme};
 use crate::text::pipeline::{GlobalsUbo, TextPipeline};
 
-/// True when any placement sits in the kitty `z < INT32_MIN/2` band,
-/// which draws under non-default cell backgrounds (SIZE-9).
-fn has_below_cell_bg_placements(grid: &toastty_term::ImageGrid) -> bool {
-    grid.iter()
-        .any(|p| classify_layer(p.z) == Layer::BelowCellBg)
+/// True when a placement that actually draws sits in the kitty
+/// `z < INT32_MIN/2` band, which draws under non-default cell
+/// backgrounds (SIZE-9). Uses the same skips as `build_image_instances`
+/// (image missing from the registry, empty span), so a leftover
+/// placement doesn't force full redraws for nothing.
+fn has_below_cell_bg_placements(
+    grid: &toastty_term::ImageGrid,
+    registry: &toastty_term::ImageRegistry,
+) -> bool {
+    grid.iter().any(|p| {
+        classify_layer(p.z) == Layer::BelowCellBg
+            && registry.contains(p.image_id)
+            && !p.col_range.is_empty()
+            && !p.row_range.is_empty()
+    })
+}
+
+/// Whether this frame must be a full redraw for the below-cell-bg band:
+/// while such a placement is on screen, and for the one frame after it
+/// goes (to repaint the cells it showed through). Updates `drawn_last`.
+fn below_bg_forces_full_redraw(active: bool, drawn_last: &mut bool) -> bool {
+    let force = active || *drawn_last;
+    *drawn_last = active;
+    force
+}
+
+/// Post-process the full-build cell instances: drop the trailing cursor
+/// instance when the cursor is hidden, and, while a below-cell-bg image
+/// is on screen, the default-bg quads it must show through.
+fn finish_full_build(
+    instances: &mut Vec<CellInstance>,
+    cursor_visible: bool,
+    below_bg_active: bool,
+    default_bg: [f32; 4],
+) {
+    if !cursor_visible {
+        instances.pop();
+    }
+    if below_bg_active {
+        drop_default_bg_quads(instances, default_bg);
+    }
 }
 
 /// Drop the cell-background quads painted in the default background
@@ -2294,12 +2330,12 @@ impl Renderer {
         // default-bg cells. A partial (LoadOp::Load) frame would leave
         // stale pixels in the skipped cells, so repaint everything while
         // such a placement is (or just was) on screen.
-        let below_bg_active = has_below_cell_bg_placements(term.image_grid());
-        if below_bg_active || self.below_bg_drawn_last {
+        let below_bg_active =
+            has_below_cell_bg_placements(term.image_grid(), term.image_registry());
+        if below_bg_forces_full_redraw(below_bg_active, &mut self.below_bg_drawn_last) {
             self.needs_full_clear = true;
             term.mark_all_dirty();
         }
-        self.below_bg_drawn_last = below_bg_active;
 
         // The chip is translucent: compositing it over a LoadOp::Load
         // partial frame would stack on last frame's chip. While it is
@@ -2630,12 +2666,7 @@ impl Renderer {
                 content_dims.1,
                 &cell_opts,
             );
-            if !cursor_visible {
-                instances.pop();
-            }
-            if below_bg_active {
-                drop_default_bg_quads(&mut instances, theme.bg);
-            }
+            finish_full_build(&mut instances, cursor_visible, below_bg_active, theme.bg);
         } else {
             build_term_dirty_instances_into(
                 &mut instances,
@@ -3956,14 +3987,106 @@ mod below_cell_bg_tests {
             parent: None,
             rel_offset: (0, 0),
         };
+        let mut reg = toastty_term::ImageRegistry::new(1024);
+        reg.insert(
+            1,
+            toastty_term::ImageData {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 4],
+            },
+        )
+        .unwrap();
         let mut grid = ImageGrid::new();
-        assert!(!has_below_cell_bg_placements(&grid));
+        assert!(!has_below_cell_bg_placements(&grid, &reg));
         grid.add(place(0));
         grid.add(place(-1));
         grid.add(place(i32::MIN / 2));
-        assert!(!has_below_cell_bg_placements(&grid));
+        assert!(!has_below_cell_bg_placements(&grid, &reg));
         grid.add(place(i32::MIN / 2 - 1));
-        assert!(has_below_cell_bg_placements(&grid));
+        assert!(has_below_cell_bg_placements(&grid, &reg));
+    }
+
+    /// Placements that never draw (image gone, empty span) don't force
+    /// the below-bg full-redraw mode.
+    #[test]
+    fn below_cell_bg_detection_ignores_placements_that_never_draw() {
+        use toastty_term::{ImageData, ImageGrid, ImageRegistry, Placement, SrcRect};
+        let place = |id: u32, rows: std::ops::Range<u16>, cols: std::ops::Range<u16>| Placement {
+            image_id: id,
+            placement_id: 0,
+            row_range: rows,
+            col_range: cols,
+            src_rect: SrcRect::FULL,
+            z: i32::MIN,
+            pix_offset: (0, 0),
+            parent: None,
+            rel_offset: (0, 0),
+        };
+        let mut reg = ImageRegistry::new(1024);
+        reg.insert(
+            1,
+            ImageData {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 4],
+            },
+        )
+        .unwrap();
+        let mut grid = ImageGrid::new();
+        grid.add(place(2, 0..1, 0..1)); // image 2 not in the registry
+        grid.add(place(1, 0..0, 0..1)); // no rows
+        grid.add(place(1, 0..1, 3..3)); // no cols
+        assert!(!has_below_cell_bg_placements(&grid, &reg));
+        grid.add(place(1, 0..1, 0..1));
+        assert!(has_below_cell_bg_placements(&grid, &reg));
+    }
+
+    /// The forced full redraw holds while the band is active and for one
+    /// frame after, then stops.
+    #[test]
+    fn below_bg_full_redraw_lasts_one_frame_past_the_image() {
+        let mut drawn_last = false;
+        assert!(!below_bg_forces_full_redraw(false, &mut drawn_last));
+        assert!(below_bg_forces_full_redraw(true, &mut drawn_last));
+        assert!(below_bg_forces_full_redraw(true, &mut drawn_last));
+        assert!(
+            below_bg_forces_full_redraw(false, &mut drawn_last),
+            "cleanup frame"
+        );
+        assert!(!below_bg_forces_full_redraw(false, &mut drawn_last));
+    }
+
+    /// `finish_full_build` (what `render_term` calls on the full path):
+    /// default-bg quads go only with the flag on; the hidden cursor is
+    /// popped either way.
+    #[test]
+    fn finish_full_build_drops_default_bg_only_when_below_bg_active() {
+        use crate::text::instance::{FLAG_CURSOR, FLAG_NO_GLYPH, Theme, build_instances};
+        let theme = Theme::default_dark();
+        let mut term = Term::new(1, 6, 0);
+        let mut parser = toastty_parser::Parser::new();
+        parser.advance(&mut term, b"ab\x1b[41mcd\x1b[0m");
+        let built = build_instances(&term, (10.0, 20.0), &theme, None, |_, _, _, _| None);
+        let bg_quads = |v: &[CellInstance]| v.iter().filter(|i| i.flags == FLAG_NO_GLYPH).count();
+        let has_cursor = |v: &[CellInstance]| v.iter().any(|i| i.flags & FLAG_CURSOR != 0);
+        assert_eq!(bg_quads(&built), 4);
+
+        let mut v = built.clone();
+        finish_full_build(&mut v, true, false, theme.bg);
+        assert_eq!((bg_quads(&v), has_cursor(&v)), (4, true));
+
+        let mut v = built.clone();
+        finish_full_build(&mut v, true, true, theme.bg);
+        assert_eq!((bg_quads(&v), has_cursor(&v)), (2, true), "only red stays");
+
+        let mut v = built.clone();
+        finish_full_build(&mut v, false, false, theme.bg);
+        assert_eq!((bg_quads(&v), has_cursor(&v)), (4, false));
+
+        let mut v = built;
+        finish_full_build(&mut v, false, true, theme.bg);
+        assert_eq!((bg_quads(&v), has_cursor(&v)), (2, false));
     }
 
     /// SIZE-9: default-bg cell quads are dropped (the image shows

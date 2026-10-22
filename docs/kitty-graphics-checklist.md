@@ -333,6 +333,17 @@ UVs at draw time. Don't patch each item separately.
     default-bg cell quads are dropped. "Default" is decided by value, as in
     kitty, so an explicit SGR color equal to the default bg also shows the
     image. Selection covers it, as in kitty. Fixed in #26.
+  - Divergences from kitty 0.49.2, both kept deliberately:
+    - DECSCNM (`CSI ? 5 h`): kitty hides the `z < INT32_MIN/2` image
+      entirely (it also turns every cell's bg into the default). toastty
+      keeps showing it under cells whose bg equals the effective (swapped)
+      default bg. That is the sensible reading of the spec, and toastty's
+      DECSCNM already differs from kitty's for SGR backgrounds.
+    - With a transparent theme bg (alpha < 1), toastty's "default" check
+      compares the alpha too. kitty compares only the 24-bit RGB. So an
+      explicit `\e[48;2;r;g;bm` equal to the default RGB covers the image
+      in toastty (the cell is painted opaque), but in kitty it lets the
+      image through and is drawn translucent.
 - [ ] **P2 — SIZE-10. `X=`/`Y=` pixel offsets aren't clamped to the cell, and
   aren't fitted into `c`/`r`.**
   - Repro: `X=25,Y=40` with 10×19 cells, and `X=5,c=6`.
