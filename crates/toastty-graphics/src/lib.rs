@@ -8,6 +8,7 @@ pub mod kitty;
 pub mod registry;
 pub mod rgp;
 pub mod sixel;
+pub mod store;
 
 pub use image_grid::{ImageGrid, Placement, PlacementHandle, SrcRect};
 pub use kitty::{
@@ -33,3 +34,4 @@ pub use rgp::{
     reply::{frame_apc as frame_rgp_apc, support_reply as rgp_support_reply},
     scene::{RgpAsset, RgpPlacement, RgpScene},
 };
+pub use store::{ImageStore, Stored};

@@ -323,6 +323,15 @@ impl Term {
         }
     }
 
+    /// Drop the virtual placements whose image left this screen's store
+    /// (quota eviction).
+    pub(super) fn prune_virtual_placements(&mut self) {
+        let store = &self.image_store;
+        if self.virtual_placements.remove_where(|v| !store.contains(v.image_id)) {
+            self.image_revision = self.image_revision.wrapping_add(1);
+        }
+    }
+
     /// The active screen's virtual (`U=1`) placements.
     #[must_use]
     pub fn virtual_placements(&self) -> &VirtualPlacements {
