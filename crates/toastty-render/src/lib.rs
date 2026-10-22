@@ -2560,6 +2560,9 @@ impl Renderer {
             self.set_post_resources(true);
         }
         chain.bind_source(&self.device, &self.scratch_texture);
+        if chain.inputs().reads(post::date_mask()) {
+            self.post_state.prepare_date();
+        }
         self.post = Some(chain);
         // The new chain's uniform buffer has no palette yet.
         self.post_palette_key = None;
