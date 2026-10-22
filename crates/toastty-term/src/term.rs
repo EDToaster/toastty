@@ -11197,7 +11197,7 @@ mod major_medium_term_tests {
             format!("\x1b_Ga=T,f=32,s=2,v=2,i=315,t=s,S=16,q=2;{image_body}\x1b\\").as_bytes(),
         );
         assert!(t.drain_pty_replies().is_empty());
-        assert!(t.image_registry().contains(315));
+        assert!(t.image_store().contains(315));
         assert_eq!(t.image_grid().len(), 1, "a=T must place the image");
         assert!(!image.0.exists(), "t=s must unlink the object");
     }
