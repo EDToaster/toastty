@@ -600,8 +600,8 @@ impl KittyHandler {
             let (cell_pw, cell_ph) = sink.cell_pixel_size();
             let placement =
                 default_placement_from_header(&header, final_id, img_w, img_h, cell_pw, cell_ph);
-            let rows_span = placement.row_range.end - placement.row_range.start;
-            let cols_span = placement.col_range.end - placement.col_range.start;
+            let rows_span = placement.rows;
+            let cols_span = placement.cols;
             // M1: capture the cursor's start_col BEFORE place_image
             // consumes the placement. The cursor lands at
             // (start_col + cols, start_row + rows - 1).
@@ -684,8 +684,8 @@ impl KittyHandler {
         let (img_w, img_h) = sink.image_dimensions(header.image_id).unwrap_or((0, 0));
         let placement =
             default_placement_from_header(&header, header.image_id, img_w, img_h, cell_pw, cell_ph);
-        let rows_span = placement.row_range.end - placement.row_range.start;
-        let cols_span = placement.col_range.end - placement.col_range.start;
+        let rows_span = placement.rows;
+        let cols_span = placement.cols;
         // M2: capture the start column BEFORE place_image consumes the
         // placement, so the cursor lands one column past the image's
         // right edge (start_col + cols).
@@ -884,27 +884,21 @@ fn default_placement_from_header(
         // Neither set: natural cell count.
         _ => (derived_cols.max(1) as u16, derived_rows.max(1) as u16),
     };
-    Placement {
-        image_id: id,
-        placement_id: header.placement_id,
-        // The host rebases these ranges against the current cursor (see
-        // `Term::place_image`); we carry only the SPAN here, anchored at
-        // the origin. M3: `X=`/`Y=` are NOT cell offsets — they are
-        // intra-cell pixel offsets, threaded via `pix_offset` below, so
-        // they must NOT shift the cell range.
-        row_range: 0..rows,
-        col_range: 0..cols,
-        src_rect: src,
-        z: header.z,
-        // M3: `X=` / `Y=` are sub-cell pixel offsets within the first
-        // cell, applied at render time. They do not move the placement's
-        // cells. (Header field names kept as `cell_x`/`cell_y` for now.)
-        pix_offset: (header.cell_x, header.cell_y),
-        // Non-relative by default; the relative branch in `handle_place`
-        // overrides these for `a=p` with `P=`/`Q=` set (M13).
-        parent: None,
-        rel_offset: (0, 0),
-    }
+    // The host anchors the box at the cursor (see `Term::place_image`);
+    // we carry only the SPAN here, anchored at line 0 / column 0. M3:
+    // `X=`/`Y=` are NOT cell offsets — they are intra-cell pixel offsets,
+    // threaded via `pix_offset` below, so they must NOT shift the box.
+    let mut p = Placement::new(id, rows, cols);
+    p.placement_id = header.placement_id;
+    p.src_rect = src;
+    p.z = header.z;
+    // M3: `X=` / `Y=` are sub-cell pixel offsets within the first cell,
+    // applied at render time. They do not move the placement's cells.
+    // (Header field names kept as `cell_x`/`cell_y` for now.) The
+    // relative branch in `handle_place` sets `parent` / `rel_offset`
+    // for `a=p` with `P=`/`Q=` set (M13).
+    p.pix_offset = (header.cell_x, header.cell_y);
+    p
 }
 
 /// Emit an EINVAL reply for a header that failed to parse (B9).
@@ -1804,10 +1798,9 @@ mod major_place_handler_tests {
             ..Header::default()
         };
         let p = default_placement_from_header(&header, 1, 200, 100, 10, 20);
-        assert_eq!(p.col_range, 0..10);
+        assert_eq!(p.cols, 10);
         assert_eq!(
-            p.row_range,
-            0..3,
+            p.rows, 3,
             "rows derived from aspect, not natural cell count"
         );
     }
@@ -1824,10 +1817,9 @@ mod major_place_handler_tests {
             ..Header::default()
         };
         let p = default_placement_from_header(&header, 1, 200, 100, 10, 20);
-        assert_eq!(p.row_range, 0..4);
+        assert_eq!(p.rows, 4);
         assert_eq!(
-            p.col_range,
-            0..16,
+            p.cols, 16,
             "cols derived from aspect, not natural cell count"
         );
     }
@@ -1837,8 +1829,7 @@ mod major_place_handler_tests {
         // 200x100 image, 10x20 cell: natural = (20 cols, 5 rows).
         let header = Header::default();
         let p = default_placement_from_header(&header, 1, 200, 100, 10, 20);
-        assert_eq!(p.col_range, 0..20);
-        assert_eq!(p.row_range, 0..5);
+        assert_eq!((p.cols, p.rows), (20, 5));
     }
 
     #[test]
@@ -1849,8 +1840,7 @@ mod major_place_handler_tests {
             ..Header::default()
         };
         let p = default_placement_from_header(&header, 1, 200, 100, 10, 20);
-        assert_eq!(p.col_range, 0..7);
-        assert_eq!(p.row_range, 0..9);
+        assert_eq!((p.cols, p.rows), (7, 9));
     }
 
     // ---- M3: X=/Y= map to pix_offset, leave cell ranges alone ----
@@ -1866,11 +1856,13 @@ mod major_place_handler_tests {
         let p = default_placement_from_header(&header, 1, 16, 16, 8, 8);
         assert_eq!(p.pix_offset, (3, 4));
         assert_eq!(
-            p.col_range, base.col_range,
+            (p.col, p.cols),
+            (base.col, base.cols),
             "X must not shift the cell range"
         );
         assert_eq!(
-            p.row_range, base.row_range,
+            (p.line, p.rows),
+            (base.line, base.rows),
             "Y must not shift the cell range"
         );
     }
@@ -2113,17 +2105,11 @@ mod major_relative_handler_tests {
     /// Seed a parent placement (image 1, placement 10) at the origin.
     fn seed_parent(sink: &mut GridSink) {
         sink.registered.push(1);
-        sink.grid.add(Placement {
-            image_id: 1,
-            placement_id: 10,
-            row_range: 5..7,
-            col_range: 3..6,
-            src_rect: SrcRect::FULL,
-            z: 0,
-            pix_offset: (0, 0),
-            parent: None,
-            rel_offset: (0, 0),
-        });
+        let mut parent = Placement::new(1, 2, 3);
+        parent.placement_id = 10;
+        parent.line = 5;
+        parent.col = 3;
+        sink.grid.add(parent);
     }
 
     #[test]
@@ -2136,8 +2122,8 @@ mod major_relative_handler_tests {
         h.process(b"Ga=p,i=2,p=20,P=1,Q=10,H=2,V=1", b"", &mut sink)
             .unwrap();
         let child = sink.grid.find(2, 20).expect("child placement created");
-        assert_eq!(child.row_range.start, 6); // parent row 5 + V=1
-        assert_eq!(child.col_range.start, 5); // parent col 3 + H=2
+        assert_eq!(child.line, 6); // parent row 5 + V=1
+        assert_eq!(child.col, 5); // parent col 3 + H=2
         assert!(sink.replies_joined().contains("OK"));
     }
 
@@ -2163,17 +2149,10 @@ mod major_relative_handler_tests {
         // Seed (1,10) whose parent is (2,20).
         sink.registered.push(1);
         sink.registered.push(2);
-        sink.grid.add(Placement {
-            image_id: 1,
-            placement_id: 10,
-            row_range: 0..1,
-            col_range: 0..1,
-            src_rect: SrcRect::FULL,
-            z: 0,
-            pix_offset: (0, 0),
-            parent: Some((2, 20)),
-            rel_offset: (0, 0),
-        });
+        let mut looped = Placement::new(1, 1, 1);
+        looped.placement_id = 10;
+        looped.parent = Some((2, 20));
+        sink.grid.add(looped);
         // Now add (2,20) parented to (1,10) — closes the loop.
         h.process(b"Ga=p,i=2,p=20,P=1,Q=10,H=1,V=1", b"", &mut sink)
             .unwrap();
@@ -2192,17 +2171,9 @@ mod major_relative_handler_tests {
         let mut sink = GridSink::default();
         sink.registered.push(1);
         // Root (1,1), no parent.
-        sink.grid.add(Placement {
-            image_id: 1,
-            placement_id: 1,
-            row_range: 0..1,
-            col_range: 0..1,
-            src_rect: SrcRect::FULL,
-            z: 0,
-            pix_offset: (0, 0),
-            parent: None,
-            rel_offset: (0, 0),
-        });
+        let mut root = Placement::new(1, 1, 1);
+        root.placement_id = 1;
+        sink.grid.add(root);
         // Build the deepest allowed chain (place=(MAX+1) has MAX ancestors).
         for i in 2..=MAX_RELATIVE_DEPTH as u32 + 1 {
             let hdr = format!("Ga=p,i=1,p={i},P=1,Q={},H=1,V=0", i - 1);

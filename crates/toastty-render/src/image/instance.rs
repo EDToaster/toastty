@@ -107,13 +107,48 @@ impl ImageInstance {
     }
 }
 
+/// Where the active screen sits in the window this frame, for placing
+/// line-anchored image placements (see
+/// `docs/decisions/image-placement-model.md`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImageView {
+    /// Line id of the live screen's row 0 (`Term::image_top_line`). A
+    /// placement's screen row is `placement.line - top_line`.
+    pub top_line: i64,
+    /// Extra downward shift in pixels from looking at scrollback:
+    /// `view_offset_lines * cell_h + view_offset_pixel`, exactly the
+    /// translation text and rich blocks get. `0.0` at the live bottom.
+    pub scroll_px: f32,
+    /// Visible area `[x0, y0, x1, y1]` in pixels, relative to the content
+    /// origin. Images are cropped to it.
+    pub clip: [f32; 4],
+}
+
+impl ImageView {
+    /// A view at the live bottom (no scrollback offset) with screen row 0
+    /// on line `top_line`, clipped to `size` (`(w, h)` pixels).
+    #[must_use]
+    pub fn live(top_line: i64, size: (f32, f32)) -> Self {
+        Self {
+            top_line,
+            scroll_px: 0.0,
+            clip: [0.0, 0.0, size.0, size.1],
+        }
+    }
+}
+
 /// Build per-instance draw data from `grid` + `registry` + `cache`.
 ///
 /// The output is sorted by `(z, insertion-order)` already — same-z
 /// placements draw in insertion order. The caller splits below/above
 /// text via the sign of `z`.
 ///
-/// `cell_size` is `(w, h)` in pixels.
+/// `cell_size` is `(w, h)` in pixels. Each placement's full destination
+/// rect is computed from its (never trimmed) cell box, shifted by the
+/// view's scroll offset, then intersected with the view's clip rect and
+/// the placement's margin clip; the UVs are cropped by the same
+/// fractions, so a partly hidden image is cropped, never squashed. This
+/// is O(placements): no per-cell work.
 #[allow(clippy::cast_precision_loss)] // image dims fit comfortably in 23-bit mantissa.
 pub fn build_image_instances(
     out: &mut Vec<ImageInstance>,
@@ -121,37 +156,53 @@ pub fn build_image_instances(
     registry: &ImageRegistry,
     cache: &ImageTextureCache,
     cell_size: (f32, f32),
+    view: &ImageView,
 ) {
     // Two-pass: collect with stable insertion order, then sort by z
     // ascending. Same-z placements keep insertion order via a stable
     // sort.
     let len_before = out.len();
+    let (cw, ch) = cell_size;
     for placement in grid.iter() {
+        if placement.cols == 0 || placement.rows == 0 || placement.clip_rows.is_empty() {
+            continue;
+        }
+        // Top-left of the reserved cell box. Rows are relative to the
+        // live screen (negative = in scrollback).
+        let row = (placement.line - view.top_line) as f32;
+        let box_x = f32::from(placement.col) * cw;
+        let box_y = row * ch + view.scroll_px;
+        // Destination rect: the box, shifted by the M3 `X=`/`Y=`
+        // intra-cell pixel offsets, stretched over the whole box.
+        let dst_x = box_x + placement.pix_offset.0 as f32;
+        let dst_y = box_y + placement.pix_offset.1 as f32;
+        let dst_w = f32::from(placement.cols) * cw;
+        let dst_h = f32::from(placement.rows) * ch;
+        // Crop: the view, narrowed by any margin clip. An unclipped edge
+        // doesn't constrain (the `Y=` shift may push the image past the
+        // box's last row, as before).
+        let mut clip = view.clip;
+        if placement.clip_rows.start > 0 {
+            clip[1] = clip[1].max(box_y + f32::from(placement.clip_rows.start) * ch);
+        }
+        if placement.clip_rows.end < placement.rows {
+            clip[3] = clip[3].min(box_y + f32::from(placement.clip_rows.end) * ch);
+        }
+        let x0 = dst_x.max(clip[0]);
+        let y0 = dst_y.max(clip[1]);
+        let x1 = (dst_x + dst_w).min(clip[2]);
+        let y1 = (dst_y + dst_h).min(clip[3]);
+        // Cull before touching the registry / texture cache: only what
+        // is visible this frame is emitted.
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
         let Some(image) = registry.get(placement.image_id) else {
             continue;
         };
         let Some(entry) = cache.get(placement.image_id) else {
             continue;
         };
-        let cols = placement
-            .col_range
-            .end
-            .saturating_sub(placement.col_range.start);
-        let rows = placement
-            .row_range
-            .end
-            .saturating_sub(placement.row_range.start);
-        if cols == 0 || rows == 0 {
-            continue;
-        }
-        // M3: `X=`/`Y=` are intra-cell pixel offsets within the first
-        // cell. Add them on top of the cell-aligned position.
-        let pos_x =
-            f32::from(placement.col_range.start) * cell_size.0 + placement.pix_offset.0 as f32;
-        let pos_y =
-            f32::from(placement.row_range.start) * cell_size.1 + placement.pix_offset.1 as f32;
-        let size_x = f32::from(cols) * cell_size.0;
-        let size_y = f32::from(rows) * cell_size.1;
         let (uv_min, uv_max) = if placement.src_rect.is_full() {
             ([0.0, 0.0], [1.0, 1.0])
         } else {
@@ -163,11 +214,21 @@ pub fn build_image_instances(
             let y1 = (placement.src_rect.y + placement.src_rect.h) as f32 / ih;
             ([x0, y0], [x1, y1])
         };
+        // Map the cropped rect back through the dst -> uv linear map.
+        let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let uv0 = [
+            lerp(uv_min[0], uv_max[0], (x0 - dst_x) / dst_w),
+            lerp(uv_min[1], uv_max[1], (y0 - dst_y) / dst_h),
+        ];
+        let uv1 = [
+            lerp(uv_min[0], uv_max[0], (x1 - dst_x) / dst_w),
+            lerp(uv_min[1], uv_max[1], (y1 - dst_y) / dst_h),
+        ];
         out.push(ImageInstance {
-            pos: [pos_x, pos_y],
-            size: [size_x, size_y],
-            uv_min,
-            uv_max,
+            pos: [x0, y0],
+            size: [x1 - x0, y1 - y0],
+            uv_min: uv0,
+            uv_max: uv1,
             texture_index: entry.texture_index as u32,
             z: placement.z,
             image_id: placement.image_id,
@@ -224,18 +285,156 @@ mod tests {
         }
     }
 
-    fn place(id: u32, rows: std::ops::Range<u16>, cols: std::ops::Range<u16>, z: i32) -> Placement {
-        Placement {
-            image_id: id,
-            placement_id: 0,
-            row_range: rows,
-            col_range: cols,
-            src_rect: SrcRect::FULL,
-            z,
-            pix_offset: (0, 0),
-            parent: None,
-            rel_offset: (0, 0),
-        }
+    fn place(id: u32, rows: std::ops::Range<i64>, cols: std::ops::Range<u16>, z: i32) -> Placement {
+        let mut p = Placement::new(
+            id,
+            u16::try_from(rows.end - rows.start).unwrap(),
+            cols.end - cols.start,
+        );
+        p.line = rows.start;
+        p.col = cols.start;
+        p.z = z;
+        p
+    }
+
+    /// A live view with screen row 0 on line 0 and a large clip.
+    fn view() -> ImageView {
+        ImageView::live(0, (10_000.0, 10_000.0))
+    }
+
+    /// Registry + cache holding one `w`x`h` image under id 1.
+    fn one_image(w: u32, h: u32) -> (ImageRegistry, ImageTextureCache) {
+        let mut reg = ImageRegistry::new(1 << 20);
+        reg.insert(1, red_pixel(w, h)).unwrap();
+        let mut cache = ImageTextureCache::new(4);
+        cache.insert(
+            1,
+            crate::image::atlas::ImageTexEntry {
+                texture_index: 0,
+                width: w,
+                height: h,
+                content_hash: 0,
+            },
+        );
+        (reg, cache)
+    }
+
+    fn build(
+        grid: &ImageGrid,
+        w: u32,
+        h: u32,
+        cell: (f32, f32),
+        v: &ImageView,
+    ) -> Vec<ImageInstance> {
+        let (reg, cache) = one_image(w, h);
+        let mut out = Vec::new();
+        build_image_instances(&mut out, grid, &reg, &cache, cell, v);
+        out
+    }
+
+    /// Float-tolerant `assert_eq!` for a 2-vector.
+    #[track_caller]
+    fn assert_near(got: [f32; 2], want: [f32; 2], msg: &str) {
+        let close = (got[0] - want[0]).abs() < 1e-5 && (got[1] - want[1]).abs() < 1e-5;
+        assert!(close, "{msg}: got {got:?}, want {want:?}");
+    }
+
+    #[test]
+    fn partly_scrolled_off_top_is_cropped_not_squashed() {
+        // SCR-1: a 10-row box whose top 3 rows are above the screen.
+        let mut grid = ImageGrid::new();
+        grid.add(place(1, 0..10, 0..20, 0));
+        let v = ImageView::live(3, (400.0, 400.0));
+        let out = build(&grid, 200, 100, (10.0, 20.0), &v);
+        assert_eq!(out.len(), 1);
+        let i = out[0];
+        assert_near(i.pos, [0.0, 0.0], "");
+        assert_near(i.size, [200.0, 140.0], "7 rows on screen at full scale");
+        assert_near(i.uv_min, [0.0, 0.3], "");
+        assert_near(i.uv_max, [1.0, 1.0], "");
+    }
+
+    #[test]
+    fn hanging_off_bottom_and_right_is_cropped() {
+        let mut grid = ImageGrid::new();
+        grid.add(place(1, 8..12, 6..10, 0));
+        let v = ImageView::live(0, (80.0, 200.0)); // 8 cols, 10 rows
+        let out = build(&grid, 4, 4, (10.0, 20.0), &v);
+        let i = out[0];
+        assert_near(i.pos, [60.0, 160.0], "");
+        assert_near(i.size, [20.0, 40.0], "");
+        assert_near(i.uv_min, [0.0, 0.0], "");
+        assert_near(i.uv_max, [0.5, 0.5], "");
+    }
+
+    #[test]
+    fn scrollback_offset_moves_image_with_text() {
+        // SCR-2 / SCR-4: viewing 3 lines + 7 px back shifts the image down
+        // by exactly what text gets.
+        let mut grid = ImageGrid::new();
+        grid.add(place(1, -2..0, 0..4, 0)); // in scrollback
+        let mut v = ImageView::live(0, (400.0, 400.0));
+        assert!(
+            build(&grid, 4, 4, (10.0, 20.0), &v).is_empty(),
+            "off-screen"
+        );
+        v.scroll_px = 3.0 * 20.0 + 7.0;
+        let out = build(&grid, 4, 4, (10.0, 20.0), &v);
+        let i = out[0];
+        assert_near(i.pos, [0.0, 27.0], "row -2 at (-2 + 3) * 20 + 7");
+        assert_near(i.size, [40.0, 40.0], "whole");
+        assert_near(i.uv_min, [0.0, 0.0], "");
+        assert_near(i.uv_max, [1.0, 1.0], "");
+    }
+
+    #[test]
+    fn sub_row_offset_crops_by_pixels() {
+        // Mid smooth-scroll: a box whose top is 5 px above the window.
+        let mut grid = ImageGrid::new();
+        grid.add(place(1, -1..1, 0..2, 0));
+        let mut v = ImageView::live(0, (400.0, 400.0));
+        v.scroll_px = 15.0;
+        let out = build(&grid, 20, 40, (10.0, 20.0), &v);
+        let i = out[0];
+        assert_near(i.pos, [0.0, 0.0], "");
+        assert_near(i.size, [20.0, 35.0], "");
+        assert_near(i.uv_min, [0.0, 5.0 / 40.0], "");
+        assert_near(i.uv_max, [1.0, 1.0], "");
+    }
+
+    #[test]
+    fn margin_clip_crops_rows() {
+        // DECSTBM cut the first row of a 4-row box.
+        let mut grid = ImageGrid::new();
+        let mut p = place(1, 2..6, 0..4, 0);
+        p.clip_rows = 1..4;
+        grid.add(p);
+        let out = build(&grid, 4, 8, (10.0, 20.0), &view());
+        let i = out[0];
+        assert_near(i.pos, [0.0, 60.0], "");
+        assert_near(i.size, [40.0, 60.0], "");
+        assert_near(i.uv_min, [0.0, 0.25], "");
+        assert_near(i.uv_max, [1.0, 1.0], "");
+    }
+
+    #[test]
+    fn crop_composes_with_src_rect() {
+        // A sub-rect x=0..4, y=4..8 of an 8x8 image, half scrolled off.
+        let mut grid = ImageGrid::new();
+        let mut p = place(1, 0..2, 0..2, 0);
+        p.src_rect = SrcRect {
+            x: 0,
+            y: 4,
+            w: 4,
+            h: 4,
+        };
+        grid.add(p);
+        let v = ImageView::live(1, (400.0, 400.0));
+        let out = build(&grid, 8, 8, (10.0, 20.0), &v);
+        let i = out[0];
+        assert_near(i.size, [20.0, 20.0], "");
+        assert_near(i.uv_min, [0.0, 0.75], "");
+        assert_near(i.uv_max, [0.5, 1.0], "");
     }
 
     #[test]
@@ -244,7 +443,7 @@ mod tests {
         let reg = ImageRegistry::new(1024);
         let cache = ImageTextureCache::new(4);
         let mut out = Vec::new();
-        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 20.0));
+        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 20.0), &view());
         assert!(out.is_empty());
     }
 
@@ -256,7 +455,7 @@ mod tests {
         reg.insert(1, red_pixel(2, 2)).unwrap();
         let cache = ImageTextureCache::new(4); // no insert.
         let mut out = Vec::new();
-        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 20.0));
+        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 20.0), &view());
         assert!(out.is_empty());
     }
 
@@ -277,7 +476,7 @@ mod tests {
             },
         );
         let mut out = Vec::new();
-        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 20.0));
+        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 20.0), &view());
         assert_eq!(out.len(), 1);
         let i = out[0];
         assert_eq!(i.pos, [0.0, 0.0]);
@@ -307,7 +506,7 @@ mod tests {
             },
         );
         let mut out = Vec::new();
-        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 10.0));
+        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 10.0), &view());
         let zs: Vec<i32> = out.iter().map(|i| i.z).collect();
         assert_eq!(zs, vec![-5, 0, 10]);
     }
@@ -333,7 +532,7 @@ mod tests {
             },
         );
         let mut out = Vec::new();
-        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 10.0));
+        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 10.0), &view());
         let (below_bg, below_text, above) = split_layers(&out);
         assert_eq!(below_bg.len(), 1);
         assert_eq!(below_text.len(), 2);
@@ -354,22 +553,14 @@ mod tests {
     #[test]
     fn sub_rect_normalizes_to_image_dims() {
         let mut grid = ImageGrid::new();
-        grid.add(Placement {
-            image_id: 1,
-            placement_id: 0,
-            row_range: 0..2,
-            col_range: 0..4,
-            src_rect: SrcRect {
-                x: 1,
-                y: 1,
-                w: 2,
-                h: 2,
-            },
-            z: 0,
-            pix_offset: (0, 0),
-            parent: None,
-            rel_offset: (0, 0),
-        });
+        let mut p = place(1, 0..2, 0..4, 0);
+        p.src_rect = SrcRect {
+            x: 1,
+            y: 1,
+            w: 2,
+            h: 2,
+        };
+        grid.add(p);
         let mut reg = ImageRegistry::new(4096);
         reg.insert(1, red_pixel(4, 4)).unwrap();
         let mut cache = ImageTextureCache::new(4);
@@ -383,7 +574,7 @@ mod tests {
             },
         );
         let mut out = Vec::new();
-        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 10.0));
+        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 10.0), &view());
         assert_eq!(out[0].uv_min, [0.25, 0.25]);
         assert_eq!(out[0].uv_max, [0.75, 0.75]);
     }
@@ -392,7 +583,11 @@ mod tests {
 #[cfg(test)]
 mod minor_render_tests {
     use super::*;
-    use toastty_term::{ImageGrid, ImageRegistry, Placement, SrcRect};
+    use toastty_term::{ImageGrid, ImageRegistry, Placement};
+
+    fn view() -> ImageView {
+        ImageView::live(0, (10_000.0, 10_000.0))
+    }
 
     fn red_pixel(width: u32, height: u32) -> toastty_term::ImageData {
         let n = (width * height) as usize;
@@ -408,17 +603,9 @@ mod minor_render_tests {
     }
 
     fn place(id: u32, z: i32) -> Placement {
-        Placement {
-            image_id: id,
-            placement_id: 0,
-            row_range: 0..1,
-            col_range: 0..1,
-            src_rect: SrcRect::FULL,
-            z,
-            pix_offset: (0, 0),
-            parent: None,
-            rel_offset: (0, 0),
-        }
+        let mut p = Placement::new(id, 1, 1);
+        p.z = z;
+        p
     }
 
     // m3: equal z, differing image ids must sort by ascending image id,
@@ -446,7 +633,7 @@ mod minor_render_tests {
             );
         }
         let mut out = Vec::new();
-        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 10.0));
+        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 10.0), &view());
         let ids: Vec<u32> = out.iter().map(|i| i.image_id).collect();
         assert_eq!(ids, vec![10, 20, 30]);
     }

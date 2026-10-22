@@ -47,7 +47,7 @@ use wgpu::{
 use crate::chip::ChipFade;
 use crate::chip::pipeline::{ChipPipeline, ChipUniform};
 use crate::image::atlas::ImageTextureCache;
-use crate::image::instance::{ImageInstance, build_image_instances, split_layers};
+use crate::image::instance::{ImageInstance, ImageView, build_image_instances, split_layers};
 use crate::image::pipeline::ImagePipeline;
 use crate::rgp::{GpuAssetCache, Rgp3dPipeline};
 use crate::text::glyph_rasterizer::{DEFAULT_LINE_HEIGHT_RATIO, GlyphRasterizer, LineGlyphs};
@@ -2866,6 +2866,18 @@ impl Renderer {
         self.image_instances_below.clear();
         self.image_instances_above.clear();
         if !term.image_grid().is_empty() {
+            // Placements are anchored to line ids: place them against the
+            // live screen's top line and shift them by the same scrollback
+            // offset text gets (`(L + view_lines) * cell_h + view_pixel`
+            // for logical row L), then crop to the content area.
+            #[allow(clippy::cast_precision_loss)]
+            let scroll_px =
+                term.view_offset_lines() as f32 * cell_size.1 + term.view_offset_pixel();
+            let view = ImageView {
+                top_line: term.image_top_line(),
+                scroll_px,
+                clip: [0.0, 0.0, content_dims.0, content_dims.1],
+            };
             let mut tmp: Vec<ImageInstance> = Vec::new();
             build_image_instances(
                 &mut tmp,
@@ -2873,6 +2885,7 @@ impl Renderer {
                 term.image_registry(),
                 &self.image_tex_cache,
                 cell_size,
+                &view,
             );
             let (below_bg, below, above) = split_layers(&tmp);
             self.image_instances_below_bg.extend_from_slice(below_bg);

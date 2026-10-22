@@ -677,6 +677,59 @@ impl Term {
         &self.image_grid
     }
 
+    /// Line id of the active screen's row 0: the origin image placements
+    /// are anchored against. A placement's screen row is
+    /// `placement.line - image_top_line()`; negative rows are in
+    /// scrollback. See `docs/decisions/image-placement-model.md`.
+    #[must_use]
+    pub fn image_top_line(&self) -> i64 {
+        top_line_of(self.active_grid())
+    }
+
+    /// Test helper: screen rows of `p`'s shown part on the active screen
+    /// (negative = scrollback).
+    #[cfg(test)]
+    pub(crate) fn prows(&self, p: &Placement) -> std::ops::Range<i64> {
+        p.screen_rows(self.image_top_line())
+    }
+
+    /// Live-screen rows covered by `p`'s shown part (empty when it is
+    /// entirely in scrollback or below the screen).
+    fn screen_rows_clamped(&self, p: &Placement) -> std::ops::Range<u16> {
+        let r = p.screen_rows(self.image_top_line());
+        let rows = i64::from(self.rows);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (start, end) = (r.start.clamp(0, rows) as u16, r.end.clamp(0, rows) as u16);
+        start..end.max(start)
+    }
+
+    /// Drop placements that left the active grid's retained lines:
+    /// scrolled out of the history, or pushed entirely below the live
+    /// bottom. Called after every full-screen scroll.
+    fn evict_offscreen_images(&mut self) {
+        if self.image_grid.is_empty() {
+            return;
+        }
+        let g = self.active_grid();
+        let (first, last) = (line_i64(g.oldest_retained_id()), line_i64(g.bottom_id()));
+        if !self.image_grid.retain_lines(first, last).is_empty() {
+            self.image_revision = self.image_revision.wrapping_add(1);
+        }
+    }
+
+    /// Full-screen scroll up by one on the active grid: the top row goes
+    /// into scrollback (primary only) and placements ride along with
+    /// their line ids, so they need no update beyond eviction.
+    fn full_scroll_up(&mut self) {
+        self.active_grid_mut().scroll_up();
+        if !self.alt_active {
+            self.viewport
+                .on_grid_scroll_up(self.primary.history_lines());
+        }
+        self.mark_all_dirty();
+        self.evict_offscreen_images();
+    }
+
     /// Monotonic image-content revision. Bumps when the registry or
     /// placement grid changes. Renderer compares to its cached value
     /// to decide when to re-sync GPU textures.
@@ -1821,6 +1874,11 @@ impl Term {
         } else {
             (self.cursor.row, self.cursor.col)
         };
+        // Image placements are anchored to line ids, which the reflow
+        // renumbers. Note each screen's top line so the placements can be
+        // put back at the same screen rows (they don't follow reflowed
+        // text yet; see SCR-7).
+        let (primary_top, alt_top) = (top_line_of(&self.primary), top_line_of(&self.alt));
         let (new_row, new_col) = self.reflow_primary(rows, cols, primary_cap, primary_cursor);
         self.alt.resize(rows, cols, rows as usize);
         if self.alt_active {
@@ -1858,11 +1916,22 @@ impl Term {
         // potentially drops history); clear so we don't paint stale
         // highlights at the wrong (line_id, col).
         self.drop_selection();
-        // Image placements anchored past the new geometry become
-        // phantoms (kitty clips placements on resize). Trim each to the
-        // new rows/cols and drop any that no longer have any visible
-        // cells. `pix_offset` is preserved by `clip_to`.
-        if self.image_grid.clip_to(rows, cols) {
+        // Keep each screen's placements at the same screen rows, and drop
+        // those that now start past the new edge. The boxes themselves
+        // are never trimmed: the renderer crops what hangs off-screen.
+        let (primary_images, alt_images) = if self.alt_active {
+            (self.stashed_image_grid.as_mut(), Some(&mut self.image_grid))
+        } else {
+            (Some(&mut self.image_grid), None)
+        };
+        let mut changed = false;
+        if let Some(g) = primary_images {
+            changed |= reanchor_images(g, primary_top, &self.primary, cols);
+        }
+        if let Some(g) = alt_images {
+            changed |= reanchor_images(g, alt_top, &self.alt, cols);
+        }
+        if changed {
             self.image_revision = self.image_revision.wrapping_add(1);
         }
         self.gc_rich_blocks();
@@ -1978,18 +2047,9 @@ impl Term {
             return;
         }
         if top == 0 && bot == self.rows.saturating_sub(1) {
-            self.active_grid_mut().scroll_up();
-            if !self.alt_active {
-                self.viewport
-                    .on_grid_scroll_up(self.primary.history_lines());
-            }
-            self.mark_all_dirty();
-            let dropped = self.image_grid.shift_rows_up(1, 0);
-            // M13: relative-placement children follow their parent.
-            self.image_grid.resolve_relative_positions();
-            if !dropped.is_empty() {
-                self.image_revision = self.image_revision.wrapping_add(1);
-            }
+            // Placements ride along with their line ids (into scrollback
+            // on the primary screen), so nothing moves but the eviction.
+            self.full_scroll_up();
             return;
         }
         if top >= bot {
@@ -2023,9 +2083,10 @@ impl Term {
         // active, only images entirely within it are scrolled, and they
         // are clipped at the region boundaries. `bot` is an inclusive
         // margin, so the exclusive bottom bound is `bot + 1`.
+        let top_line = self.image_top_line();
         let dropped = self
             .image_grid
-            .shift_rows_up_within(1, top, bot.saturating_add(1));
+            .scroll_region(top_line, top..bot.saturating_add(1), -1);
         self.image_grid.resolve_relative_positions();
         if !dropped.is_empty() {
             self.image_revision = self.image_revision.wrapping_add(1);
@@ -2045,16 +2106,22 @@ impl Term {
             return;
         }
         if top == 0 && bot == self.rows.saturating_sub(1) {
+            let before = self.image_top_line();
             self.active_grid_mut().scroll_down();
             if !self.alt_active {
                 self.viewport.clamp_to(self.primary.history_lines());
             }
             self.mark_all_dirty();
-            let dropped = self.image_grid.shift_rows_down(1, 0, self.rows);
-            self.image_grid.resolve_relative_positions();
-            if !dropped.is_empty() {
-                self.image_revision = self.image_revision.wrapping_add(1);
+            // The on-screen text moved down one row with its line ids
+            // fixed (history untouched), so move the on-screen images
+            // down with it. Like kitty, a box pushed partly below the
+            // bottom is not trimmed: a later scroll up brings the whole
+            // image back. (If the grid renumbers rows to follow the text
+            // instead, the top line moved and the anchors already track.)
+            if self.image_top_line() == before {
+                self.image_grid.shift_rows_from(before, 0, 1);
             }
+            self.evict_offscreen_images();
             return;
         }
         if top >= bot {
@@ -2084,11 +2151,13 @@ impl Term {
         for r in top..=bot {
             self.mark_row(r);
         }
-        // Scroll images within the region, clipping at its boundaries.
-        // `bot` is inclusive → exclusive bottom bound is `bot + 1`.
+        // Scroll images entirely within the region, clipping at its
+        // boundaries. `bot` is inclusive → exclusive bottom bound is
+        // `bot + 1`.
+        let top_line = self.image_top_line();
         let dropped = self
             .image_grid
-            .shift_rows_down_within(1, top, bot.saturating_add(1));
+            .scroll_region(top_line, top..bot.saturating_add(1), 1);
         self.image_grid.resolve_relative_positions();
         if !dropped.is_empty() {
             self.image_revision = self.image_revision.wrapping_add(1);
@@ -2576,6 +2645,7 @@ impl Term {
         let cell_pw = u32::from(cell_pw).max(1);
         let cell_ph = u32::from(cell_ph).max(1);
         let placement_id = run.placement_id;
+        let top_line = self.image_top_line();
         let mut placements = Vec::new();
         // Resolved (row, col, id_msb) of the previous cell, for
         // left-neighbor inheritance.
@@ -2621,22 +2691,17 @@ impl Term {
             let sy = sy_full.min(img_h.saturating_sub(1));
             let sw = cell_pw.min(img_w.saturating_sub(sx));
             let sh = cell_ph.min(img_h.saturating_sub(sy));
-            placements.push(Placement {
-                image_id: id,
-                placement_id,
-                row_range: cell.row..cell.row.saturating_add(1),
-                col_range: cell.col..cell.col.saturating_add(1),
-                src_rect: toastty_graphics::SrcRect {
-                    x: sx,
-                    y: sy,
-                    w: sw,
-                    h: sh,
-                },
-                z: 0,
-                pix_offset: (0, 0),
-                parent: None,
-                rel_offset: (0, 0),
-            });
+            let mut placement = Placement::new(id, 1, 1);
+            placement.placement_id = placement_id;
+            placement.line = top_line + i64::from(cell.row);
+            placement.col = cell.col;
+            placement.src_rect = toastty_graphics::SrcRect {
+                x: sx,
+                y: sy,
+                w: sw,
+                h: sh,
+            };
+            placements.push(placement);
         }
         if placements.is_empty() {
             return;
@@ -3145,8 +3210,16 @@ impl Term {
                 // Per the kitty graphics protocol: "The clear screen
                 // escape code (usually ESC[2J) should also clear all
                 // images." This applies to 2J and 3J only — partial
-                // erases (0J/1J) must not affect graphics.
-                let dropped = self.image_grid.clear();
+                // erases (0J/1J) must not affect graphics. Like kitty,
+                // 2J spares images entirely in scrollback (they belong
+                // to text it doesn't erase); 3J clears them all.
+                let dropped = if mode == 3 {
+                    self.image_grid.clear()
+                } else {
+                    let top_line = self.image_top_line();
+                    self.image_grid
+                        .remove_where(|p| p.screen_rows(top_line).end > 0)
+                };
                 if !dropped.is_empty() {
                     self.image_revision = self.image_revision.wrapping_add(1);
                 }
@@ -3348,18 +3421,20 @@ impl Term {
         for r in cur_row..region_end {
             self.mark_row(r);
         }
-        // Mirror the text shift on the image layer: placements in
-        // [cur_row, region_end) slide down by `n`, those pushed past the
-        // bottom margin are dropped (kitty shifts images on IL). Any
-        // placement whose start is in that band moves, so bump the
-        // revision when one exists (shift_rows_down_within mutates ranges
-        // in place; its return only lists dropped placements).
+        // Mirror the text shift on the image layer: placements entirely
+        // in [cur_row, region_end) slide down by `n`, clipped at the
+        // bottom margin (kitty shifts images on IL). Any placement whose
+        // start is in that band may move, so bump the revision when one
+        // exists (`scroll_region` mutates in place; its return only lists
+        // dropped placements).
+        let top_line = self.image_top_line();
+        let band = i64::from(cur_row)..i64::from(region_end);
         let affected = self
             .image_grid
             .iter()
-            .any(|p| p.row_range.start >= cur_row && p.row_range.start < region_end);
+            .any(|p| band.contains(&p.screen_rows(top_line).start));
         self.image_grid
-            .shift_rows_down_within(n, cur_row, region_end);
+            .scroll_region(top_line, cur_row..region_end, i32::from(n));
         self.image_grid.resolve_relative_positions();
         if affected {
             self.image_revision = self.image_revision.wrapping_add(1);
@@ -3427,14 +3502,17 @@ impl Term {
         for r in cur_row..region_end {
             self.mark_row(r);
         }
-        // Mirror the text shift on the image layer: placements in
-        // [cur_row, region_end) slide up by `n`, those scrolled entirely
-        // above the cursor row are dropped (kitty shifts images on DL).
+        // Mirror the text shift on the image layer: placements entirely
+        // in [cur_row, region_end) slide up by `n`, clipped at the cursor
+        // row (kitty shifts images on DL).
+        let top_line = self.image_top_line();
+        let band = i64::from(cur_row)..i64::from(region_end);
         let affected = self
             .image_grid
             .iter()
-            .any(|p| p.row_range.start >= cur_row && p.row_range.start < region_end);
-        self.image_grid.shift_rows_up_within(n, cur_row, region_end);
+            .any(|p| band.contains(&p.screen_rows(top_line).start));
+        self.image_grid
+            .scroll_region(top_line, cur_row..region_end, -i32::from(n));
         self.image_grid.resolve_relative_positions();
         if affected {
             self.image_revision = self.image_revision.wrapping_add(1);
@@ -4532,56 +4610,34 @@ impl Term {
         let cols = img_w.div_ceil(u32::from(cell_w.max(1))).max(1) as u16;
         let rows = img_h.div_ceil(u32::from(cell_h.max(1))).max(1) as u16;
 
-        // `place_image` rebases the span against the cursor and scrolls
-        // the screen up if the image doesn't fit below it, computing its
-        // own `start_row` internally. Mirror that math so we know where
-        // the image lands for the cursor advance below.
+        // `place_image` anchors the box at the cursor without scrolling.
+        // The cursor advance below scrolls the screen as far as it has to
+        // go, and the image rides up with its text.
         let cur_row = self.cursor.row;
         let start_col = self.cursor_col();
-        let scroll_n = cur_row.saturating_add(rows).saturating_sub(self.rows);
-        let start_row = cur_row.saturating_sub(scroll_n);
 
-        self.place_image(Placement {
-            image_id: id,
-            placement_id: 0,
-            row_range: 0..rows,
-            col_range: 0..cols,
-            src_rect: toastty_graphics::SrcRect::FULL,
-            z: 0,
-            pix_offset: (0, 0),
-            parent: None,
-            rel_offset: (0, 0),
-        });
+        self.place_image(Placement::new(id, rows, cols));
 
-        let image_bottom = start_row.saturating_add(rows).saturating_sub(1);
-        if self.sixel_cursor_right {
-            // DECSET 8452: cursor lands on the image's last row, one
-            // column past its right edge (kitty-style).
-            self.cursor.row = image_bottom.min(self.rows.saturating_sub(1));
+        let image_bottom = cur_row.saturating_add(rows).saturating_sub(1);
+        // DECSET 8452: cursor lands on the image's last row, one column
+        // past its right edge (kitty-style). Default sixel scrolling: the
+        // cursor moves to the left margin of the line BELOW the image.
+        let want = if self.sixel_cursor_right {
             self.cursor.col = start_col
                 .saturating_add(cols)
                 .min(self.cols.saturating_sub(1));
+            image_bottom
         } else {
-            // Default sixel scrolling: cursor moves to the left margin of
-            // the line BELOW the image. If that line is past the bottom,
-            // scroll one row (the image scrolls up with the content, as a
-            // real terminal does) and sit on the new last row.
             self.cursor.col = 0;
-            let want = image_bottom.saturating_add(1);
-            if want >= self.rows {
-                self.active_grid_mut().scroll_up();
-                if !self.alt_active {
-                    self.viewport
-                        .on_grid_scroll_up(self.primary.history_lines());
-                }
-                self.image_grid.shift_rows_up(1, 0);
-                self.image_grid.resolve_relative_positions();
-                self.mark_all_dirty();
-                self.cursor.row = self.rows.saturating_sub(1);
-            } else {
-                self.cursor.row = want;
-            }
+            image_bottom.saturating_add(1)
+        };
+        // If that line is past the bottom, scroll until it is the last
+        // row, as a real terminal does while it paints the image.
+        let last = self.rows.saturating_sub(1);
+        for _ in last..want {
+            self.full_scroll_up();
         }
+        self.cursor.row = want.min(last);
     }
 }
 
@@ -4658,8 +4714,8 @@ impl KittySink for Term {
             target: "kitty",
             image_id = placement.image_id,
             placement_id = placement.placement_id,
-            row_range = ?placement.row_range,
-            col_range = ?placement.col_range,
+            rows = placement.rows,
+            cols = placement.cols,
             cursor_row = self.cursor.row,
             cursor_col = self.cursor.col,
             image_known,
@@ -4685,43 +4741,17 @@ impl KittySink for Term {
         // header's cell_x/cell_y. For M11a we treat all placements as
         // relative-to-cursor, which matches the way `tput` / `kitty
         // +kitten icat` actually drive the protocol.
-        let cur_row = self.cursor.row;
-        let cur_col = self.cursor.col.min(self.cols.saturating_sub(1));
-        let row_span = placement.row_range.end - placement.row_range.start;
-        let col_span = placement.col_range.end - placement.col_range.start;
-
-        // Make room. Per the kitty spec: "If the image is larger than
-        // the available space, the rest of the image will scroll the
-        // screen up." Without this the placement clamps to whatever
-        // rows are left below the cursor — which is often 0 or 1 by
-        // the time multiple images have been placed, so the image
-        // collapses to a single-row band at the bottom.
-        let scroll_n = cur_row.saturating_add(row_span).saturating_sub(self.rows);
-        if scroll_n > 0 {
-            for _ in 0..scroll_n {
-                self.active_grid_mut().scroll_up();
-                if !self.alt_active {
-                    self.viewport
-                        .on_grid_scroll_up(self.primary.history_lines());
-                }
-                self.image_grid.shift_rows_up(1, 0);
-            }
-            // M13: keep relative children anchored to their parents after
-            // the scroll that made room for this placement.
-            self.image_grid.resolve_relative_positions();
-            self.mark_all_dirty();
-        }
-        let start_row = cur_row.saturating_sub(scroll_n);
-
-        placement.row_range = start_row..start_row.saturating_add(row_span);
-        placement.col_range = cur_col..cur_col.saturating_add(col_span);
-        // Defensive clamp (shouldn't trigger after the scroll fix).
-        if placement.row_range.end > self.rows {
-            placement.row_range.end = self.rows;
-        }
-        if placement.col_range.end > self.cols {
-            placement.col_range.end = self.cols;
-        }
+        //
+        // The box is anchored at the cursor's line and kept whole. It may
+        // hang off the bottom (or right) edge: the renderer crops it. We
+        // never scroll here. Like kitty, the screen scrolls only when the
+        // cursor then moves past the bottom margin
+        // (`advance_cursor_after_placement`), which `C=1` skips, so a
+        // `C=1` image at the bottom is clipped rather than scrolling the
+        // screen (SCR-10).
+        placement.line = self.image_top_line() + i64::from(self.cursor.row);
+        placement.col = self.cursor.col.min(self.cols.saturating_sub(1));
+        placement.clip_rows = 0..placement.rows;
         // M5: re-emitting the same `(image_id, placement_id)` must
         // REPLACE the prior placement, not stack on top of it. Per spec:
         // "If you send two placements with the same image id and
@@ -4816,6 +4846,9 @@ impl KittySink for Term {
         let sel_col = header.src_x.saturating_sub(1) as u16;
         let sel_row = header.src_y.saturating_sub(1) as u16;
         let sel_z = header.z;
+        // Cell selectors address screen cells; placements are anchored to
+        // line ids, so translate through the screen's top line.
+        let top_line = self.image_top_line();
         // For uppercase selectors that don't free bytes inline, this
         // flag drives a post-removal survivor sweep (free bytes for
         // images left with no placement). Set false by arms that do
@@ -4828,11 +4861,11 @@ impl KittySink for Term {
             // Uppercase `A` frees bytes for images left without any
             // surviving placement (survivor sweep below).
             b'a' | b'A' => {
-                let rows = self.rows;
-                dropped_placements.extend(
-                    self.image_grid
-                        .remove_where(|p| p.row_range.start < rows && p.row_range.end > 0),
-                );
+                let rows = i64::from(self.rows);
+                dropped_placements.extend(self.image_grid.remove_where(|p| {
+                    let r = p.screen_rows(top_line);
+                    r.start < rows && r.end > 0
+                }));
             }
             // `i` / `I` — by image id (provided via `i=`). When `p=` is
             // also given (non-zero), scope to that single placement;
@@ -4875,12 +4908,13 @@ impl KittySink for Term {
             // `p` / `P` — by CELL coordinates. The cell is specified via
             // the lowercase `x=` / `y=` keys (parsed into `src_x` /
             // `src_y`), 1-based per the spec ("x=1,y=1 is the top left
-            // cell"). Internal `col_range` / `row_range` are 0-based, so
+            // cell"). Internal screen rows / columns are 0-based, so
             // convert by subtracting 1. (B6)
             b'p' | b'P' => {
-                dropped_placements.extend(self.image_grid.remove_where(|p| {
-                    p.col_range.contains(&sel_col) && p.row_range.contains(&sel_row)
-                }));
+                dropped_placements.extend(
+                    self.image_grid
+                        .remove_where(|p| p.covers(top_line, sel_row, sel_col)),
+                );
                 // Uppercase `P` frees bytes for any image that lost its
                 // last placement. (B6, same rule as B5) — handled by the
                 // shared survivor sweep below.
@@ -4915,23 +4949,24 @@ impl KittySink for Term {
             b'c' | b'C' => {
                 let row = self.cursor.row;
                 let col = self.cursor.col.min(self.cols.saturating_sub(1));
-                dropped_placements
-                    .extend(self.image_grid.remove_where(|p| {
-                        p.row_range.contains(&row) && p.col_range.contains(&col)
-                    }));
+                dropped_placements.extend(
+                    self.image_grid
+                        .remove_where(|p| p.covers(top_line, row, col)),
+                );
             }
             // `q` / `Q` — placements intersecting cell (sel_col, sel_row)
             // AND having z-index == `z=`.
             b'q' | b'Q' => {
-                dropped_placements.extend(self.image_grid.remove_where(|p| {
-                    p.row_range.contains(&sel_row) && p.col_range.contains(&sel_col) && p.z == sel_z
-                }));
+                dropped_placements.extend(
+                    self.image_grid
+                        .remove_where(|p| p.covers(top_line, sel_row, sel_col) && p.z == sel_z),
+                );
             }
             // `x` / `X` — placements intersecting COLUMN sel_col.
             b'x' | b'X' => {
                 dropped_placements.extend(
                     self.image_grid
-                        .remove_where(|p| p.col_range.contains(&sel_col)),
+                        .remove_where(|p| p.col_range().contains(&sel_col)),
                 );
             }
             // `y` / `Y` — placements intersecting ROW sel_row. The real
@@ -4939,7 +4974,7 @@ impl KittySink for Term {
             b'y' | b'Y' => {
                 dropped_placements.extend(
                     self.image_grid
-                        .remove_where(|p| p.row_range.contains(&sel_row)),
+                        .remove_where(|p| p.on_row(top_line, sel_row)),
                 );
             }
             // `z` / `Z` — placements with z-index == `z=`.
@@ -4989,22 +5024,26 @@ impl KittySink for Term {
         //   row = start_row + (rows - 1)
         //   col = start_col + cols
         //
-        // `place_image` already scrolled the screen when the image
-        // didn't fit below the cursor, so we don't issue additional
-        // linefeeds here — each linefeed at the bottom calls
-        // `image_grid.shift_rows_up`, which would shift the image we
-        // just placed UP by one cell per linefeed. With `row_span`
-        // linefeeds the image would shrink to a one-row band at the top
-        // (the M11a "1 cell tall" regression).
-        //
         // M1: row advances by `rows - 1` (not `rows`); col advances by
         // `cols` from `start_col` (the placement's starting column).
-        let target_row = self
-            .cursor
-            .row
-            .saturating_add(rows.saturating_sub(1))
-            .min(self.rows.saturating_sub(1));
-        self.cursor.row = target_row;
+        //
+        // When that row is past the bottom margin, kitty scrolls the
+        // region up by the overshoot and leaves the cursor on the margin.
+        // This is the only place an image scrolls the screen, so `C=1`
+        // (which skips this call) never scrolls (SCR-10). The image is
+        // anchored to its line, so it rides up with the text instead of
+        // being squashed. A cursor below the region just clamps.
+        let target_row = self.cursor.row.saturating_add(rows.saturating_sub(1));
+        let bot = self.scroll_bot.min(self.rows.saturating_sub(1));
+        let in_region = (self.scroll_top..=bot).contains(&self.cursor.row);
+        if in_region && target_row > bot {
+            for _ in bot..target_row {
+                self.region_scroll_up();
+            }
+            self.cursor.row = bot;
+        } else {
+            self.cursor.row = target_row.min(self.rows.saturating_sub(1));
+        }
         self.cursor.col = start_col
             .saturating_add(cols)
             .min(self.cols.saturating_sub(1));
@@ -5221,14 +5260,47 @@ fn placeholder_image_id_from_sgr(fg: Color, underline_color: Option<Color>) -> O
     Some((fg_bits, placement_id))
 }
 
+/// Mark the on-screen cells under `p`'s shown part dirty.
 fn mark_placement_dirty(t: &mut Term, p: &Placement) {
-    let rows = t.rows;
-    let cols = t.cols;
-    let r_end = p.row_range.end.min(rows);
-    let c_end = p.col_range.end.min(cols);
-    for r in p.row_range.start..r_end {
-        t.mark_cells(r, p.col_range.start, c_end);
+    let rows = t.screen_rows_clamped(p);
+    let cols = p.col_range();
+    let c_end = cols.end.min(t.cols);
+    for r in rows {
+        t.mark_cells(r, cols.start, c_end);
     }
+}
+
+/// Line id of `g`'s screen row 0, as the signed id placements use.
+fn top_line_of(g: &Grid) -> i64 {
+    line_i64(g.bottom_id()) - i64::from(g.visible_rows().saturating_sub(1))
+}
+
+/// A `Grid` line id as the signed id placements use. Ids start near 0
+/// and grow by one per scrolled line, so they never reach `i64::MAX`.
+#[allow(clippy::cast_possible_wrap)]
+fn line_i64(id: u64) -> i64 {
+    id as i64
+}
+
+/// After a resize renumbered `grid`'s lines, put `images` back at the
+/// screen rows they had (`old_top` was the line id of screen row 0
+/// before), then drop placements that now start past the bottom or
+/// right edge, or that left the retained history. The boxes themselves
+/// are kept whole. Returns `true` if anything changed.
+fn reanchor_images(images: &mut ImageGrid, old_top: i64, grid: &Grid, cols: u16) -> bool {
+    if images.is_empty() {
+        return false;
+    }
+    let new_top = top_line_of(grid);
+    images.shift_lines(new_top - old_top);
+    let rows = i64::from(grid.visible_rows());
+    let mut changed = new_top != old_top;
+    changed |= !images
+        .remove_where(|p| p.screen_rows(new_top).start >= rows || p.col >= cols)
+        .is_empty();
+    let first = line_i64(grid.oldest_retained_id());
+    changed |= !images.retain_lines(first, i64::MAX).is_empty();
+    changed
 }
 
 /// True when the *other* half of the width-2 cluster at `col` is in
@@ -8288,15 +8360,15 @@ mod tests {
         payload.extend_from_slice(b"\x1b\\");
         feed(&mut t, &payload);
         let p = t.image_grid().iter().next().expect("placement registered");
-        let span = p.row_range.end - p.row_range.start;
+        let span = t.prows(p).end - t.prows(p).start;
         assert_eq!(
             span, 5,
             "placement should be 5 rows tall after scroll; got {p:?}"
         );
         // The placement should extend to the bottom of the grid.
-        assert_eq!(p.row_range.end, 10);
+        assert_eq!(t.prows(p).end, 10);
         // Top of the image sits at row 5 (10 - 5).
-        assert_eq!(p.row_range.start, 5);
+        assert_eq!(t.prows(p).start, 5);
     }
 
     #[test]
@@ -8309,7 +8381,7 @@ mod tests {
         payload.extend_from_slice(b"\x1b\\");
         feed(&mut t, &payload);
         // The placement was at row 0..1.
-        let p_before = t.image_grid().iter().next().unwrap().row_range.clone();
+        let p_before = t.prows(t.image_grid().iter().next().unwrap());
         assert_eq!(p_before, 0..1);
         // Force a few newlines so the grid scrolls (only 2 rows total).
         feed(&mut t, b"\n\n\n");
@@ -9033,12 +9105,12 @@ mod blocker_screenops_tests {
         // Place a 2-row image at region-interior row 5 (1-based row 6).
         feed(&mut t, b"\x1b[6;1H");
         place_image_at_cursor(&mut t, 1, 2, 2);
-        let before = t.image_grid().iter().next().unwrap().row_range.clone();
+        let before = t.prows(t.image_grid().iter().next().unwrap());
         assert_eq!(before, 5..7, "image placed at rows 5..7");
         // Drive the cursor to the bottom margin and emit 2 line feeds so
         // the region scrolls up twice.
         feed(&mut t, b"\x1b[9;1H\n\n");
-        let after = t.image_grid().iter().next().unwrap().row_range.clone();
+        let after = t.prows(t.image_grid().iter().next().unwrap());
         assert_eq!(after, 3..5, "image shifted up by 2 within the region");
     }
 
@@ -9052,12 +9124,12 @@ mod blocker_screenops_tests {
         feed(&mut t, b"\x1b[3;8r"); // top=2, bot=7.
         feed(&mut t, b"\x1b[4;1H"); // row 3 (interior).
         place_image_at_cursor(&mut t, 1, 2, 3); // rows 3..6.
-        assert_eq!(t.image_grid().iter().next().unwrap().row_range, 3..6);
+        assert_eq!(t.prows(t.image_grid().iter().next().unwrap()), 3..6);
         // Scroll up by 2: 3..6 → 1..4, but region top is 2, so clipped
         // to 2..4.
         feed(&mut t, b"\x1b[8;1H\n\n");
         assert_eq!(
-            t.image_grid().iter().next().unwrap().row_range,
+            t.prows(t.image_grid().iter().next().unwrap()),
             2..4,
             "top edge clipped to region top margin"
         );
@@ -9070,12 +9142,12 @@ mod blocker_screenops_tests {
         // Place image at rows 8..9 first (below the region we set next).
         feed(&mut t, b"\x1b[9;1H");
         place_image_at_cursor(&mut t, 1, 2, 1); // rows 8..9.
-        assert_eq!(t.image_grid().iter().next().unwrap().row_range, 8..9);
+        assert_eq!(t.prows(t.image_grid().iter().next().unwrap()), 8..9);
         // Region rows 1..=5 (1-based 2;6), entirely above the image.
         feed(&mut t, b"\x1b[2;6r");
         feed(&mut t, b"\x1b[6;1H\n\n");
         assert_eq!(
-            t.image_grid().iter().next().unwrap().row_range,
+            t.prows(t.image_grid().iter().next().unwrap()),
             8..9,
             "image below region is untouched"
         );
@@ -9089,12 +9161,12 @@ mod blocker_screenops_tests {
         feed(&mut t, b"\x1b[3;9r"); // top=2, bot=8.
         feed(&mut t, b"\x1b[4;1H"); // row 3 interior.
         place_image_at_cursor(&mut t, 1, 2, 2); // rows 3..5.
-        assert_eq!(t.image_grid().iter().next().unwrap().row_range, 3..5);
+        assert_eq!(t.prows(t.image_grid().iter().next().unwrap()), 3..5);
         // Move to top margin and Reverse Index (ESC M) twice to scroll
         // the region down by 2.
         feed(&mut t, b"\x1b[3;1H\x1bM\x1bM");
         assert_eq!(
-            t.image_grid().iter().next().unwrap().row_range,
+            t.prows(t.image_grid().iter().next().unwrap()),
             5..7,
             "image shifted down by 2 within the region"
         );
@@ -9302,7 +9374,7 @@ mod blocker_placeholder_tests {
 
         assert_eq!(t.image_grid().len(), 2);
         let mut ps: Vec<&Placement> = t.image_grid().iter().collect();
-        ps.sort_by_key(|p| p.col_range.start);
+        ps.sort_by_key(|p| p.col_range().start);
         let (first, second) = (ps[0], ps[1]);
         // Both reference the same image and placement id.
         assert_eq!(first.image_id, 5);
@@ -9340,7 +9412,7 @@ mod blocker_placeholder_tests {
 
         assert_eq!(t.image_grid().len(), 2);
         let mut ps: Vec<&Placement> = t.image_grid().iter().collect();
-        ps.sort_by_key(|p| p.col_range.start);
+        ps.sort_by_key(|p| p.col_range().start);
         let (cell_pw, cell_ph) = t.cell_pixel_size();
         // Second cell: row=3 from its own diacritic, col=2 inherited+1.
         assert_eq!(ps[1].src_rect.y, 3 * u32::from(cell_ph));
@@ -9417,8 +9489,8 @@ mod major_place_tests {
         feed(&mut t, b"\x1b_Ga=p,i=1,p=1,c=10\x1b\\");
 
         let p = t.image_grid().iter().next().expect("placement created");
-        let cols = p.col_range.end - p.col_range.start;
-        let rows = p.row_range.end - p.row_range.start;
+        let cols = p.col_range().end - p.col_range().start;
+        let rows = p.rows;
         let expected_rows = (((10u32 * cpw * 100) + (200 * cph) - 1) / (200 * cph)).max(1) as u16;
         assert_eq!(cols, 10, "c=10 honored");
         assert_eq!(
@@ -9523,11 +9595,13 @@ mod major_place_tests {
         );
         // Cell ranges are UNCHANGED relative to the X=Y=0 case.
         assert_eq!(
-            p.col_range, base.col_range,
+            p.col_range(),
+            base.col_range(),
             "X must not move the starting cell"
         );
         assert_eq!(
-            p.row_range, base.row_range,
+            t.prows(&p),
+            t.prows(&base),
             "Y must not move the starting cell"
         );
     }
@@ -9542,8 +9616,8 @@ mod major_place_tests {
         transmit_and_place(&mut t, 1, 2, 2, ",p=1");
         assert_eq!(t.image_grid().len(), 1);
         let first = t.image_grid().iter().next().unwrap().clone();
-        assert_eq!(first.col_range.start, 3);
-        assert_eq!(first.row_range.start, 2);
+        assert_eq!(first.col_range().start, 3);
+        assert_eq!(t.prows(&first).start, 2);
 
         // Re-place i=1,p=1 at a DIFFERENT cell (row 6, col 9).
         feed(&mut t, b"\x1b[7;10H");
@@ -9554,8 +9628,8 @@ mod major_place_tests {
         let p = t.image_grid().iter().next().unwrap().clone();
         assert_eq!(p.image_id, 1);
         assert_eq!(p.placement_id, 1);
-        assert_eq!(p.col_range.start, 9, "new column");
-        assert_eq!(p.row_range.start, 6, "new row");
+        assert_eq!(p.col_range().start, 9, "new column");
+        assert_eq!(t.prows(&p).start, 6, "new row");
     }
 
     #[test]
@@ -9866,8 +9940,8 @@ mod major_screen_tests {
         feed(t, &payload);
     }
 
-    fn first_row_range(t: &Term) -> std::ops::Range<u16> {
-        t.image_grid().iter().next().unwrap().row_range.clone()
+    fn first_row_range(t: &Term) -> std::ops::Range<i64> {
+        t.prows(t.image_grid().iter().next().unwrap())
     }
 
     // ---- M7: RIS ---------------------------------------------------
@@ -9993,7 +10067,7 @@ mod major_screen_tests {
         t.resize(5, 8); // start 17 >= 5 → dropped
 
         assert!(
-            t.image_grid().iter().all(|p| p.row_range.start < 5),
+            t.image_grid().iter().all(|p| t.prows(p).start < 5),
             "no placement may start past the new bottom"
         );
         assert!(t.image_grid().is_empty(), "out-of-bounds placement dropped");
@@ -10001,7 +10075,7 @@ mod major_screen_tests {
     }
 
     #[test]
-    fn resize_clips_straddling_placement_preserving_pix_offset() {
+    fn resize_keeps_straddling_placement_whole() {
         let mut t = Term::new(20, 8, 0);
         feed(&mut t, b"\x1b[4;1H");
         // Place via a=T with a Y pixel offset so we can assert it survives.
@@ -10013,11 +10087,29 @@ mod major_screen_tests {
         assert_eq!(first_row_range(&t), 3..7);
         let pix_before = t.image_grid().iter().next().unwrap().pix_offset;
 
-        t.resize(5, 8); // start 3 < 5 stays; end clipped to 5
+        t.resize(5, 8); // start 3 < 5 stays; the box hangs off the bottom
 
-        assert_eq!(first_row_range(&t), 3..5, "straddling placement clipped");
+        // The box is not trimmed (the renderer crops what hangs off the
+        // screen), so growing the window back shows the whole image.
+        assert_eq!(first_row_range(&t), 3..7, "box kept whole");
         let pix_after = t.image_grid().iter().next().unwrap().pix_offset;
-        assert_eq!(pix_before, pix_after, "clip_to must preserve pix_offset");
+        assert_eq!(pix_before, pix_after, "resize must preserve pix_offset");
+        t.resize(20, 8);
+        assert_eq!(first_row_range(&t), 3..7, "whole again after growing back");
+        let p = t.image_grid().iter().next().unwrap();
+        assert_eq!((p.rows, p.clip_rows.clone()), (4, 0..4));
+    }
+
+    #[test]
+    fn resize_keeps_wide_placement_whole() {
+        let mut t = Term::new(10, 20, 0);
+        let mut payload = b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=15,r=2,C=1;".to_vec();
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        t.resize(10, 8);
+        let p = t.image_grid().iter().next().unwrap();
+        assert_eq!(p.col_range(), 0..15, "narrowing never trims the box");
     }
 
     // ---- M15: IL / DL shift images ---------------------------------
@@ -10155,7 +10247,7 @@ mod major_relative_tests {
         feed(&mut t, b"\x1b[6;4H"); // row 5, col 3 (1-based -> 0-based)
         place_parent(&mut t, 1, 10, 3, 2);
         let parent = t.image_grid().find(1, 10).expect("parent placement");
-        let (prow, pcol) = (parent.row_range.start, parent.col_range.start);
+        let (prow, pcol) = (t.prows(parent).start, parent.col_range().start);
         assert_eq!((prow, pcol), (5, 3), "parent at cursor origin");
 
         // Record cursor, then place the child relative: H=2 cols, V=1 row.
@@ -10164,8 +10256,8 @@ mod major_relative_tests {
         let cur_after = t.cursor();
 
         let child = t.image_grid().find(2, 20).expect("child placement created");
-        assert_eq!(child.row_range.start, prow + 1, "child row = parent + V");
-        assert_eq!(child.col_range.start, pcol + 2, "child col = parent + H");
+        assert_eq!(t.prows(child).start, prow + 1, "child row = parent + V");
+        assert_eq!(child.col_range().start, pcol + 2, "child col = parent + H");
         assert_eq!(child.parent, Some((1, 10)));
         assert_eq!(child.rel_offset, (2, 1));
         assert_eq!(
@@ -10199,10 +10291,10 @@ mod major_relative_tests {
         place_parent(&mut t, 1, 10, 2, 2);
         feed(&mut t, b"\x1b_Ga=p,i=2,p=20,P=1,Q=10,H=1,V=1\x1b\\");
         let parent0 = t.image_grid().find(1, 10).unwrap();
-        let (prow0, pcol0) = (parent0.row_range.start, parent0.col_range.start);
+        let (prow0, pcol0) = (t.prows(parent0).start, parent0.col_range().start);
         let child0 = t.image_grid().find(2, 20).unwrap();
-        assert_eq!(child0.row_range.start, prow0 + 1);
-        assert_eq!(child0.col_range.start, pcol0 + 1);
+        assert_eq!(t.prows(child0).start, prow0 + 1);
+        assert_eq!(child0.col_range().start, pcol0 + 1);
 
         // Scroll the whole screen up by 1 (full-screen region scroll via
         // reverse-index is awkward; use IND/linefeed-style index by
@@ -10210,15 +10302,11 @@ mod major_relative_tests {
         feed(&mut t, b"\x1b[10;1H\n"); // cursor to last row, LF scrolls.
 
         let parent1 = t.image_grid().find(1, 10).expect("parent still present");
-        let (prow1, pcol1) = (parent1.row_range.start, parent1.col_range.start);
+        let (prow1, pcol1) = (t.prows(parent1).start, parent1.col_range().start);
         assert_eq!(prow1, prow0 - 1, "parent scrolled up by 1");
         let child1 = t.image_grid().find(2, 20).expect("child still present");
-        assert_eq!(
-            child1.row_range.start,
-            prow1 + 1,
-            "child followed parent up"
-        );
-        assert_eq!(child1.col_range.start, pcol1 + 1);
+        assert_eq!(t.prows(child1).start, prow1 + 1, "child followed parent up");
+        assert_eq!(child1.col_range().start, pcol1 + 1);
     }
 }
 
@@ -10368,5 +10456,306 @@ mod minor_term_tests {
         let mut t = Term::new(24, 80, 0);
         t.set_image_cap(64 * 1024 * 1024);
         assert_eq!(t.image_registry().cap_bytes(), 64 * 1024 * 1024);
+    }
+}
+
+/// Line-anchored placement model (SCR-1..5, SCR-10): placements ride
+/// with their text into scrollback, keep their whole box, and only
+/// DECSTBM margin scrolls move or clip them individually. See
+/// `docs/decisions/image-placement-model.md`.
+#[cfg(test)]
+mod placement_model_tests {
+    use super::*;
+    use toastty_parser::Parser;
+
+    fn feed(t: &mut Term, bytes: &[u8]) {
+        let mut p = Parser::new();
+        p.advance(t, bytes);
+    }
+
+    fn row_text(t: &Term, r: u16) -> String {
+        let s: String = t.row(r).cells.iter().map(|c| c.ch).collect();
+        s.trim_end().to_string()
+    }
+
+    /// Transmit-and-place a 1x1 image (id `id`) over `cols`x`rows` cells
+    /// at the cursor, with extra header `keys` (e.g. `",C=1"`).
+    fn place(t: &mut Term, id: u32, cols: u16, rows: u16, keys: &str) {
+        use base64::Engine;
+        let mut payload =
+            format!("\x1b_Ga=T,f=32,s=1,v=1,i={id},c={cols},r={rows}{keys};").into_bytes();
+        payload.extend_from_slice(
+            base64::engine::general_purpose::STANDARD
+                .encode([255u8, 0, 0, 255])
+                .as_bytes(),
+        );
+        payload.extend_from_slice(b"\x1b\\");
+        feed(t, &payload);
+    }
+
+    fn only(t: &Term) -> &Placement {
+        let mut it = t.image_grid().iter();
+        let p = it.next().expect("one placement");
+        assert!(it.next().is_none(), "exactly one placement");
+        p
+    }
+
+    fn lines(n: usize) -> Vec<u8> {
+        (0..n)
+            .flat_map(|i| format!("\r\nl{i}").into_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn scr1_scrolling_moves_the_box_without_trimming_it() {
+        // Repro from SCR-1: c=20,r=10, then enough output to push the
+        // top 3 rows off the screen.
+        let mut t = Term::new(20, 40, 100);
+        place(&mut t, 1, 20, 10, "");
+        let line = only(&t).line;
+        assert_eq!(t.prows(only(&t)), 0..10);
+        feed(&mut t, &lines(13));
+        let p = only(&t);
+        assert_eq!(p.line, line, "the anchor never changes on a full scroll");
+        assert_eq!(t.prows(p), -3..7, "three rows above the top edge");
+        assert_eq!((p.rows, p.cols, p.clip_rows.clone()), (10, 20, 0..10));
+    }
+
+    #[test]
+    fn scr1_su_and_tall_images_keep_whole_box() {
+        let mut t = Term::new(10, 40, 100);
+        feed(&mut t, b"\x1b[5;1H");
+        place(&mut t, 1, 4, 3, ",C=1");
+        feed(&mut t, b"\x1b[6S"); // SU 6: rows 4..7 -> -2..1
+        assert_eq!(t.prows(only(&t)), -2..1);
+        assert_eq!(only(&t).clip_rows, 0..3);
+
+        // An image taller than the screen scrolls it by the overshoot and
+        // keeps all its rows (the top ones in scrollback).
+        let mut t = Term::new(10, 40, 100);
+        place(&mut t, 1, 4, 15, "");
+        assert_eq!(t.prows(only(&t)), -5..10);
+        assert_eq!(only(&t).rows, 15);
+        assert_eq!(t.cursor().row, 9);
+        assert_eq!(t.history_lines(), 5);
+    }
+
+    #[test]
+    fn scr2_image_lives_in_scrollback_until_evicted() {
+        let mut t = Term::new(5, 20, 10);
+        place(&mut t, 1, 4, 2, "");
+        // Fully off the top, but still in history: kept.
+        feed(&mut t, &lines(8));
+        assert_eq!(t.prows(only(&t)), -5..-3);
+        // Its last row falls out of the 10-line history once it scrolls
+        // past row -10.
+        feed(&mut t, &lines(6));
+        assert_eq!(t.prows(only(&t)), -11..-9, "oldest retained row is -10");
+        let rev = t.image_revision();
+        feed(&mut t, &lines(1));
+        assert!(t.image_grid().is_empty(), "evicted with its text");
+        assert_ne!(t.image_revision(), rev);
+
+        // No scrollback at all: gone as soon as it leaves the screen.
+        let mut t = Term::new(5, 20, 0);
+        place(&mut t, 1, 4, 2, "");
+        feed(&mut t, &lines(4));
+        assert_eq!(t.prows(only(&t)), -1..1);
+        feed(&mut t, &lines(1));
+        assert!(t.image_grid().is_empty());
+    }
+
+    #[test]
+    fn scr3_output_while_scrolled_back_keeps_image_with_text() {
+        let mut t = Term::new(10, 20, 100);
+        feed(&mut t, &lines(20));
+        place(&mut t, 1, 4, 2, ",C=1");
+        t.scroll_view_by(3, 0.0, 19.0);
+        t.force_snap_view();
+        let (row0, view0) = (t.prows(only(&t)).start, t.view_offset_lines());
+        feed(&mut t, &lines(6));
+        let (row1, view1) = (t.prows(only(&t)).start, t.view_offset_lines());
+        // The live screen moved 6 lines; the viewport followed so the
+        // text holds still, and the image's on-view row is unchanged.
+        assert_eq!(row1, row0 - 6);
+        assert_eq!(view1, view0 + 6);
+        assert_eq!(row1 + i64::from(view1), row0 + i64::from(view0));
+    }
+
+    #[test]
+    fn scr5_decstbm_leaves_straddling_image_alone() {
+        // SCR-5 repro: image on rows 3..8 (1-based), margins 2..7.
+        let mut t = Term::new(20, 40, 0);
+        feed(&mut t, b"\x1b[3;1H");
+        place(&mut t, 1, 4, 6, ",C=1");
+        assert_eq!(t.prows(only(&t)), 2..8);
+        feed(&mut t, b"\x1b[2;7r\x1b[7;1H\n\n\x1b[r");
+        assert_eq!(t.prows(only(&t)), 2..8, "not entirely inside: not moved");
+        assert_eq!(only(&t).clip_rows, 0..6, "and not clipped");
+    }
+
+    #[test]
+    fn scr5_decstbm_clip_is_kept_after_margins_reset() {
+        let mut t = Term::new(20, 40, 0);
+        feed(&mut t, b"\x1b[4;1H");
+        place(&mut t, 1, 4, 3, ",C=1"); // rows 3..6
+        feed(&mut t, b"\x1b[3;10r\x1b[10;1H\n\n\x1b[r"); // region 2..10, up 2
+        let p = only(&t);
+        assert_eq!(t.prows(p), 2..4, "top row cut at the margin");
+        assert_eq!((p.rows, p.clip_rows.clone()), (3, 1..3));
+        // A later full-screen scroll keeps the cut.
+        feed(&mut t, b"\x1b[20;1H\n");
+        assert_eq!(t.prows(only(&t)), 1..3);
+    }
+
+    #[test]
+    fn scr10_c1_at_bottom_never_scrolls() {
+        let mut t = Term::new(10, 20, 100);
+        feed(&mut t, b"top\x1b[10;1H");
+        place(&mut t, 1, 4, 5, ",C=1");
+        assert_eq!(t.history_lines(), 0, "no scroll");
+        assert_eq!(row_text(&t, 0), "top");
+        assert_eq!(t.prows(only(&t)), 9..14, "box hangs off the bottom");
+        assert_eq!(t.cursor().row, 9);
+        // Later output reveals the rest of the box: it was never trimmed.
+        feed(&mut t, &lines(4));
+        assert_eq!(t.prows(only(&t)), 5..10);
+    }
+
+    #[test]
+    fn scr10_c1_on_alt_screen_never_scrolls() {
+        let mut t = Term::new(10, 20, 100);
+        feed(&mut t, b"\x1b[?1049htop\x1b[10;1H");
+        place(&mut t, 1, 4, 5, ",C=1");
+        assert_eq!(row_text(&t, 0), "top", "full-screen TUI keeps its top line");
+        assert_eq!(t.prows(only(&t)), 9..14);
+    }
+
+    #[test]
+    fn c0_past_bottom_scrolls_by_overshoot_like_kitty() {
+        // kitty 0.49.2 (checked on kitty-ref): without C=1 the cursor
+        // moves to the image's last row, and the screen scrolls by the
+        // overshoot, on the alt screen too.
+        for alt in [false, true] {
+            let mut t = Term::new(10, 20, 100);
+            if alt {
+                feed(&mut t, b"\x1b[?1049h");
+            }
+            feed(&mut t, b"top\x1b[9;1H");
+            place(&mut t, 1, 4, 5, "");
+            assert_eq!(t.prows(only(&t)), 5..10, "alt={alt}");
+            assert_eq!(t.cursor().row, 9);
+            assert_eq!(row_text(&t, 0), "", "scrolled 3 lines (alt={alt})");
+        }
+    }
+
+    #[test]
+    fn c0_with_margins_scrolls_only_the_region() {
+        let mut t = Term::new(10, 20, 100);
+        feed(&mut t, b"top\x1b[2;6r\x1b[5;1H"); // region rows 1..=5, cursor row 4
+        place(&mut t, 1, 4, 3, "");
+        assert_eq!(t.cursor().row, 5);
+        assert_eq!(row_text(&t, 0), "top", "row above the region untouched");
+        assert_eq!(t.history_lines(), 0);
+        // Rows 4..7 straddle the bottom margin (5), so the image stays
+        // put while the region scrolls (SCR-5 rule).
+        assert_eq!(t.prows(only(&t)), 4..7);
+    }
+
+    #[test]
+    fn sd_pushes_box_off_bottom_and_su_brings_it_back() {
+        // kitty-ref: SD pushes an image partly below the screen; SU brings
+        // the whole image back.
+        let mut t = Term::new(10, 20, 0);
+        feed(&mut t, b"\x1b[7;1H");
+        place(&mut t, 1, 4, 3, ",C=1"); // rows 6..9
+        feed(&mut t, b"\x1b[3T");
+        assert_eq!(t.prows(only(&t)), 9..12);
+        assert_eq!(only(&t).clip_rows, 0..3, "not trimmed");
+        feed(&mut t, b"\x1b[3S");
+        assert_eq!(t.prows(only(&t)), 6..9);
+        // Pushed entirely below: dropped with its text.
+        feed(&mut t, b"\x1b[4T");
+        assert!(t.image_grid().is_empty());
+    }
+
+    #[test]
+    fn ed2_spares_images_in_scrollback_ed3_clears_all() {
+        // kitty-ref: after `ESC[2J` an image entirely in scrollback is
+        // still there when you scroll back; one on screen is gone.
+        let mut t = Term::new(5, 20, 100);
+        place(&mut t, 1, 4, 2, "");
+        feed(&mut t, &lines(8)); // image 1 fully in scrollback
+        place(&mut t, 2, 4, 2, ",C=1"); // image 2 on screen
+        feed(&mut t, b"\x1b[2J");
+        let ids: Vec<u32> = t.image_grid().iter().map(|p| p.image_id).collect();
+        assert_eq!(ids, vec![1]);
+        feed(&mut t, b"\x1b[3J");
+        assert!(t.image_grid().is_empty());
+    }
+
+    #[test]
+    fn delete_by_cell_uses_current_screen_rows() {
+        let mut t = Term::new(10, 20, 100);
+        feed(&mut t, b"\x1b[5;1H");
+        place(&mut t, 1, 4, 2, ",C=1"); // rows 4..6
+        feed(&mut t, b"\x1b[10;1H\n\n"); // now rows 2..4
+        feed(&mut t, b"\x1b_Ga=d,d=p,x=1,y=6\x1b\\"); // old row 5: miss
+        assert_eq!(t.image_grid().len(), 1);
+        feed(&mut t, b"\x1b_Ga=d,d=p,x=1,y=3\x1b\\"); // row 2: hit
+        assert!(t.image_grid().is_empty());
+    }
+
+    #[test]
+    fn delete_all_visible_spares_scrollback() {
+        let mut t = Term::new(5, 20, 100);
+        place(&mut t, 1, 4, 2, "");
+        feed(&mut t, &lines(8));
+        place(&mut t, 2, 4, 2, ",C=1");
+        feed(&mut t, b"\x1b_Ga=d,d=a\x1b\\");
+        let ids: Vec<u32> = t.image_grid().iter().map(|p| p.image_id).collect();
+        assert_eq!(ids, vec![1], "d=a deletes only placements on screen");
+    }
+
+    #[test]
+    fn alt_screen_round_trip_keeps_primary_anchor() {
+        let mut t = Term::new(10, 20, 100);
+        feed(&mut t, &lines(15));
+        place(&mut t, 1, 4, 2, ",C=1");
+        let before = t.prows(only(&t));
+        feed(&mut t, b"\x1b[?1049h");
+        feed(&mut t, &lines(30)); // scroll the alt screen a lot
+        assert!(t.image_grid().is_empty());
+        feed(&mut t, b"\x1b[?1049l");
+        assert_eq!(t.prows(only(&t)), before);
+    }
+
+    #[test]
+    fn resize_on_alt_reanchors_stashed_primary_images() {
+        let mut t = Term::new(10, 20, 100);
+        feed(&mut t, b"\x1b[3;1H");
+        place(&mut t, 1, 4, 2, ",C=1");
+        feed(&mut t, b"\x1b[?1049h");
+        t.resize(12, 20);
+        feed(&mut t, b"\x1b[?1049l");
+        assert_eq!(t.prows(only(&t)), 2..4, "same screen row as before");
+    }
+
+    #[test]
+    fn placeholder_placements_are_line_anchored() {
+        // Minimal: a virtual placement plus one placeholder cell; the
+        // resulting per-cell placement sits on the cursor's line.
+        let mut t = Term::new(10, 20, 100);
+        feed(&mut t, &lines(12));
+        place(&mut t, 7, 1, 1, ",U=1,q=2");
+        feed(
+            &mut t,
+            b"\x1b[38;5;7m\xf4\x8e\xbb\xae\xcc\x85\xcc\x85\x1b[0m x",
+        );
+        let p = t.image_grid().iter().next().expect("placeholder placement");
+        assert_eq!(t.prows(p), 9..10);
+        feed(&mut t, &lines(3));
+        let p = t.image_grid().iter().next().expect("still there");
+        assert_eq!(t.prows(p), 6..7, "moved up with its text");
     }
 }
