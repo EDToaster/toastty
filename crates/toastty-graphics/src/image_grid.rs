@@ -84,11 +84,6 @@ pub struct Placement {
     /// (kitty's `H=`/`V=`). Only meaningful when [`Self::parent`] is
     /// `Some`. Signed. Defaults to `(0, 0)`.
     pub rel_offset: (i32, i32),
-    /// Content offset of [`Self::line`] within its logical (soft-wrapped)
-    /// line, as of the last reflow, so repeated width changes keep the
-    /// placement on the same text instead of drifting to the line start.
-    /// `None` until a reflow sets it. Only resize code reads or writes it.
-    pub wrap_offset: Option<u32>,
 }
 
 impl Placement {
@@ -111,7 +106,6 @@ impl Placement {
             pix_offset: (0, 0),
             parent: None,
             rel_offset: (0, 0),
-            wrap_offset: None,
         }
     }
 
@@ -413,18 +407,18 @@ impl ImageGrid {
         }
     }
 
-    /// Re-anchor every placement through `f`, which maps `(line,
-    /// wrap_offset)` before a reflow to the same after it. Used when a
-    /// reflow renumbers the lines, so each placement follows the text it
-    /// sits on. Relative children are re-resolved from their (mapped)
-    /// parents afterwards.
-    pub fn map_anchors(&mut self, f: impl Fn(i64, Option<u32>) -> (i64, Option<u32>)) {
+    /// Re-anchor every placement through `f`, which maps the `(line,
+    /// col)` of its top-left cell before a reflow to the same text's cell
+    /// after it. Used when a reflow renumbers the lines, so each placement
+    /// follows the text it sits on. Relative children are re-resolved from
+    /// their (mapped) parents afterwards.
+    pub fn map_anchors(&mut self, f: impl Fn(i64, u16) -> (i64, u16)) {
         if self.placements.is_empty() {
             return;
         }
         self.bounds = None;
         for (_, p) in &mut self.placements {
-            (p.line, p.wrap_offset) = f(p.line, p.wrap_offset);
+            (p.line, p.col) = f(p.line, p.col);
         }
         self.resolve_relative_positions();
     }
