@@ -66,7 +66,7 @@ fn snapshot(t: &mut Term) -> Snapshot {
         title: t.title().to_owned(),
         clipboard: t.drain_clipboard_requests(),
         replies: t.drain_pty_replies(),
-        images: t.image_registry().len(),
+        images: t.image_store().len(),
     }
 }
 
@@ -159,7 +159,7 @@ fn kitty_graphics_apc_through_passthrough() {
     assert_wrapped_matches_direct(&inner);
     let mut t = new_term();
     Parser::new().advance(&mut t, &wrap(&inner));
-    assert!(t.image_registry().contains(42));
+    assert!(t.image_store().contains(42));
     let replies = String::from_utf8_lossy(&t.drain_pty_replies()).into_owned();
     assert!(replies.contains(";OK"), "{replies:?}");
 }
@@ -179,7 +179,7 @@ fn kitty_chunked_upload_split_across_passthroughs() {
     let mut p = Parser::new();
     p.advance(&mut t, &wrap(&first));
     p.advance(&mut t, &wrap(&second));
-    assert!(t.image_registry().contains(7));
+    assert!(t.image_store().contains(7));
 }
 
 #[test]
@@ -235,7 +235,7 @@ const TMUX_OUTER_OUTPUT: &[u8] = include_bytes!("fixtures/tmux-outer-output.bin"
 
 fn assert_fixture_effects(t: &mut Term) {
     assert_eq!(t.title(), "wrapped title");
-    assert!(t.image_registry().contains(42));
+    assert!(t.image_store().contains(42));
     let clip = t.drain_clipboard_requests();
     assert!(
         matches!(&clip[..], [ClipboardRequest::Set { data, .. }] if data == b"hello"),

@@ -61,7 +61,7 @@ pub use toastty_config::CursorShape;
 /// to graphics types via `toastty_term` instead of taking a direct dep
 /// on `toastty-graphics`.
 pub use toastty_graphics::{
-    ImageData, ImageGrid, ImageRegistry, PlaceholderSlice, Placement, SrcRect, VirtualPlacement,
+    ImageData, ImageGrid, ImageRegistry, ImageStore, PlaceholderSlice, Placement, SrcRect, VirtualPlacement,
     VirtualPlacements, placeholder_slice,
 };
 

@@ -176,7 +176,7 @@ pub fn build_image_instances(
         if placement.cols == 0 || placement.rows == 0 || placement.clip_rows.is_empty() {
             continue;
         }
-        let Some(image) = registry.get(placement.image_id) else {
+        let Some(image) = registry.get(placement.key) else {
             continue;
         };
         // What part of the image is shown (spec defaults + intersection
