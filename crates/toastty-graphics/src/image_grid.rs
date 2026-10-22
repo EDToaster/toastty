@@ -407,6 +407,22 @@ impl ImageGrid {
         }
     }
 
+    /// Re-anchor every placement through `f`, which maps the `(line,
+    /// col)` of its top-left cell before a reflow to the same text's cell
+    /// after it. Used when a reflow renumbers the lines, so each placement
+    /// follows the text it sits on. Relative children are re-resolved from
+    /// their (mapped) parents afterwards.
+    pub fn map_anchors(&mut self, f: impl Fn(i64, u16) -> (i64, u16)) {
+        if self.placements.is_empty() {
+            return;
+        }
+        self.bounds = None;
+        for (_, p) in &mut self.placements {
+            (p.line, p.col) = f(p.line, p.col);
+        }
+        self.resolve_relative_positions();
+    }
+
     /// Move every placement whose shown part reaches screen row
     /// `from_row` or below (`end > from_row`) by `delta` lines, untrimmed,
     /// then re-resolve relative children. Used for a full-screen scroll
@@ -450,6 +466,19 @@ impl ImageGrid {
         region: Range<u16>,
         delta: i32,
     ) -> Vec<Placement> {
+        self.scroll_region_where(top_line, region, delta, |_| true)
+    }
+
+    /// [`Self::scroll_region`], moving only the placements `only` accepts
+    /// (e.g. those inside DECSLRM left/right margins, or placeholder
+    /// tiles on IL/DL). The rest are left alone.
+    pub fn scroll_region_where(
+        &mut self,
+        top_line: i64,
+        region: Range<u16>,
+        delta: i32,
+        only: impl Fn(&Placement) -> bool,
+    ) -> Vec<Placement> {
         if delta == 0 || region.is_empty() {
             return Vec::new();
         }
@@ -461,7 +490,16 @@ impl ImageGrid {
         while i < self.placements.len() {
             let p = &mut self.placements[i].1;
             let shown = p.screen_rows(top_line);
-            if shown.is_empty() || shown.start < rt || shown.end > rb {
+            // Relative children don't scroll on their own: they follow
+            // their parent through `resolve_relative_positions`, so a
+            // child inside the region whose parent is outside keeps its
+            // place and its whole box (kitty-ref).
+            if shown.is_empty()
+                || shown.start < rt
+                || shown.end > rb
+                || p.parent.is_some()
+                || !only(p)
+            {
                 i += 1;
                 continue;
             }
@@ -729,6 +767,25 @@ mod tests {
         g.add(p(1, 104..106, 0..5, 0));
         g.scroll_region(100, 3..9, -1);
         assert_eq!(g.iter().next().unwrap().screen_rows(100), 3..5);
+    }
+
+    #[test]
+    fn scroll_region_leaves_relative_children_to_their_parent() {
+        // #40 review: a child inside the region whose parent is outside
+        // used to be moved and cropped, then snapped back by the resolve
+        // with its crop left behind. kitty keeps it whole.
+        let mut g = ImageGrid::new();
+        let mut parent = p(1, 1..3, 0..4, 0);
+        parent.placement_id = 1;
+        g.add(parent);
+        let mut child = rel(2, 2, (1, 1), (0, 4));
+        child.rows = 3;
+        child.clip_rows = 0..3;
+        g.add_relative(child).unwrap();
+        g.scroll_region(0, 5..20, -2);
+        g.resolve_relative_positions();
+        let c = g.find(2, 2).unwrap();
+        assert_eq!((c.line, c.clip_rows.clone()), (5, 0..3));
     }
 
     #[test]

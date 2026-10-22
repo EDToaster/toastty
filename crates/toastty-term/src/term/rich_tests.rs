@@ -33,6 +33,9 @@ struct Fake {
     calls: Arc<AtomicUsize>,
     last: Arc<Mutex<Option<LastReq>>>,
     no_image: bool,
+    /// Add an extra blank row when cells are wider than 10 px, so a
+    /// cell-size change alters the block's row count.
+    taller_when_wide: bool,
 }
 
 impl RichBlockLayout for Fake {
@@ -82,6 +85,9 @@ impl RichBlockLayout for Fake {
             }
         }
         if text.is_empty() {
+            text.push(Vec::new());
+        }
+        if self.taller_when_wide && req.cell_w > 10 {
             text.push(Vec::new());
         }
         let rows = u16::try_from(text.len()).unwrap().min(req.max_rows);
@@ -829,4 +835,35 @@ fn wide_cluster_never_straddles_the_last_column() {
     assert_eq!(cells[8].ch, '\u{2764}');
     assert_eq!(extras.grapheme_tail(cells[8].extra), "\u{fe0f}");
     assert!(cells[9].is_continuation);
+}
+
+#[test]
+fn cell_size_relayout_moves_images_with_their_text() {
+    // #31 review: the same-size reflow a rich-block re-layout does must
+    // carry image placements along too.
+    let mut t = Term::new(10, 20, 10);
+    let fake = Fake {
+        taller_when_wide: true,
+        ..Fake::default()
+    };
+    t.set_rich_layout(Box::new(fake.clone()));
+    t.set_cell_pixel_size(10, 20);
+    feed(&mut t, &osc("abc"));
+    feed(&mut t, b"y");
+    let y_row = t.cursor().row;
+    feed(
+        &mut t,
+        b"\x1b_Ga=T,f=32,s=1,v=1,i=1,c=2,r=1,C=1,q=2;/wAA/w==\x1b\\",
+    );
+    let p = t.image_grid().iter().next().unwrap().clone();
+    assert_eq!(p.line - t.image_top_line(), i64::from(y_row));
+    t.set_cell_pixel_size(12, 20);
+    assert!(t.sync_rich_blocks());
+    assert_eq!(row_text(&t, y_row + 1), "y", "the block grew by a row");
+    let p = t.image_grid().iter().next().unwrap();
+    assert_eq!(
+        p.line - t.image_top_line(),
+        i64::from(y_row) + 1,
+        "image followed"
+    );
 }
