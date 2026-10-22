@@ -75,7 +75,14 @@ impl Utf8Sanitizer {
     /// - `end` stops before a trailing partial character, which the
     ///   sanitizer must hold.
     /// - An invalid chunk gives an empty span: all of it is sanitized.
+    #[cfg(test)]
     pub(crate) fn clean_span(&self, bytes: &[u8]) -> (usize, usize) {
+        self.clean_span_ascii(bytes).0
+    }
+
+    /// [`Self::clean_span`], plus whether the span's bytes (everything
+    /// from its start on) are all ASCII.
+    pub(crate) fn clean_span_ascii(&self, bytes: &[u8]) -> ((usize, usize), bool) {
         let start = if self.tail_len == 0 {
             0
         } else {
@@ -94,18 +101,19 @@ impl Utf8Sanitizer {
                 .take_while(|b| (0x80..0xC0).contains(*b))
                 .count();
             if cont < want && cont < bytes.len() {
-                return (0, 0); // Broken across chunks: rare, sanitize all.
+                return ((0, 0), false); // Broken across chunks: rare, sanitize all.
             }
             cont
         };
-        // One SIMD pass covers ASCII too (simdutf8 has its own ASCII
-        // fast path, cheaper than `is_ascii`).
         let rest = &bytes[start..];
+        if rest.is_ascii() {
+            return ((start, bytes.len()), true);
+        }
         let cut = complete_prefix_len(rest);
         if simdutf8::basic::from_utf8(&rest[..cut]).is_ok() {
-            (start, start + cut)
+            ((start, start + cut), false)
         } else {
-            (start, start)
+            ((start, start), false)
         }
     }
 

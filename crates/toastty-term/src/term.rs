@@ -6296,6 +6296,21 @@ mod tests {
     }
 
     #[test]
+    fn non_ascii_byte_aborts_csi_and_escape_like_kitty() {
+        // WIRE-17: kitty 0.49.2 aborts a CSI at a byte >= 0x80 and prints
+        // the rest; the SGR must not apply. WIRE-18: ESC + a non-ASCII
+        // byte is dropped, the rest printed. Checked with get-text.
+        let mut t = Term::new(3, 40, 0);
+        feed(&mut t, b"\x1b[3\x9c1mX\r\n\x1b\xe2\x82\xacA\r\n\x1b[3\xc3\xa91mY");
+        assert_eq!(row_text(&t, 0), "1mX");
+        assert_eq!(row_text(&t, 1), "\u{FFFD}\u{FFFD}A");
+        assert_eq!(row_text(&t, 2), "\u{FFFD}1mY");
+        let x = &t.row(0).cells[2];
+        assert_eq!(x.ch, 'X');
+        assert_eq!(x.style.fg, crate::Color::Default, "SGR 31 was aborted");
+    }
+
+    #[test]
     fn erase_display_modes() {
         // mode 0 — cursor to end
         let mut t = Term::new(3, 5, 0);
