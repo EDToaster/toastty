@@ -47,12 +47,36 @@ use wgpu::{
 use crate::chip::ChipFade;
 use crate::chip::pipeline::{ChipPipeline, ChipUniform};
 use crate::image::atlas::ImageTextureCache;
-use crate::image::instance::{ImageInstance, build_image_instances, split_layers};
+use crate::image::instance::{
+    ImageInstance, Layer, build_image_instances, classify_layer, split_layers,
+};
 use crate::image::pipeline::ImagePipeline;
 use crate::rgp::{GpuAssetCache, Rgp3dPipeline};
 use crate::text::glyph_rasterizer::{DEFAULT_LINE_HEIGHT_RATIO, GlyphRasterizer, LineGlyphs};
 use crate::text::instance::{CellInstance, CellRenderOpts, Theme};
 use crate::text::pipeline::{GlobalsUbo, TextPipeline};
+
+/// True when any placement sits in the kitty `z < INT32_MIN/2` band,
+/// which draws under non-default cell backgrounds (SIZE-9).
+fn has_below_cell_bg_placements(grid: &toastty_term::ImageGrid) -> bool {
+    grid.iter()
+        .any(|p| classify_layer(p.z) == Layer::BelowCellBg)
+}
+
+/// Drop the cell-background quads painted in the default background
+/// color, so `z < INT32_MIN/2` images drawn before the bg pass show
+/// through default-bg cells while non-default backgrounds (SGR colors,
+/// reverse video, selection) still cover them.
+///
+/// Only valid on a full-clear frame: the clear already paints the
+/// default background (premultiplied, so a transparent theme bg stays
+/// transparent), which makes these quads redundant everywhere else.
+/// Cursor, decoration and cover quads carry extra flags and are kept.
+// Exact compare is intended: default-bg quads carry `theme.bg` verbatim.
+#[allow(clippy::float_cmp)]
+fn drop_default_bg_quads(instances: &mut Vec<CellInstance>, default_bg: [f32; 4]) {
+    instances.retain(|i| i.flags != crate::text::instance::FLAG_NO_GLYPH || i.bg != default_bg);
+}
 
 /// Append instances for `term` into `out`. The closure pulls glyph
 /// slots from the line cache; missing entries fall through to a
@@ -319,6 +343,9 @@ pub struct Renderer {
     /// Rich slices were drawn last frame (a frame that stops drawing
     /// them must repaint everything).
     rich_drawn_last: bool,
+    /// A `z < INT32_MIN/2` placement was on screen last frame. Those
+    /// frames drop default-bg quads, which needs a full clear.
+    below_bg_drawn_last: bool,
     /// Last viewport offset rendered. When it changes we force a full
     /// clear — partial redraw can't reliably overpaint the previous
     /// frame at the new y-translation (blank cells skip emission, so
@@ -1004,6 +1031,7 @@ impl Renderer {
             rich_tex_cache: crate::image::rich::RichTextureCache::default(),
             rich_instances: Vec::new(),
             rich_drawn_last: false,
+            below_bg_drawn_last: false,
             last_view_offset: (0, 0.0),
             scratch_depth_texture,
             scratch_depth_view,
@@ -2261,6 +2289,18 @@ impl Renderer {
         }
         self.rich_drawn_last = rich_active;
 
+        // SIZE-9: `z < INT32_MIN/2` images draw before the bg pass, and
+        // that frame skips the default-bg quads so they show through
+        // default-bg cells. A partial (LoadOp::Load) frame would leave
+        // stale pixels in the skipped cells, so repaint everything while
+        // such a placement is (or just was) on screen.
+        let below_bg_active = has_below_cell_bg_placements(term.image_grid());
+        if below_bg_active || self.below_bg_drawn_last {
+            self.needs_full_clear = true;
+            term.mark_all_dirty();
+        }
+        self.below_bg_drawn_last = below_bg_active;
+
         // The chip is translucent: compositing it over a LoadOp::Load
         // partial frame would stack on last frame's chip. While it is
         // (or just was) on screen, repaint everything underneath.
@@ -2592,6 +2632,9 @@ impl Renderer {
             );
             if !cursor_visible {
                 instances.pop();
+            }
+            if below_bg_active {
+                drop_default_bg_quads(&mut instances, theme.bg);
             }
         } else {
             build_term_dirty_instances_into(
@@ -3890,5 +3933,94 @@ mod reverse_video_tests {
         assert_eq!(rev.bg, [0.9, 0.8, 0.7, 0.5]);
         assert_eq!(rev.palette, base.palette);
         assert_eq!(rev.cursor, base.cursor);
+    }
+}
+
+#[cfg(test)]
+mod below_cell_bg_tests {
+    use super::*;
+
+    /// SIZE-9: only placements with `z < INT32_MIN/2` switch the frame
+    /// into the "images under non-default backgrounds" mode.
+    #[test]
+    fn below_cell_bg_detection_uses_the_kitty_band() {
+        use toastty_term::{ImageGrid, Placement, SrcRect};
+        let place = |z: i32| Placement {
+            image_id: 1,
+            placement_id: 0,
+            row_range: 0..1,
+            col_range: 0..1,
+            src_rect: SrcRect::FULL,
+            z,
+            pix_offset: (0, 0),
+            parent: None,
+            rel_offset: (0, 0),
+        };
+        let mut grid = ImageGrid::new();
+        assert!(!has_below_cell_bg_placements(&grid));
+        grid.add(place(0));
+        grid.add(place(-1));
+        grid.add(place(i32::MIN / 2));
+        assert!(!has_below_cell_bg_placements(&grid));
+        grid.add(place(i32::MIN / 2 - 1));
+        assert!(has_below_cell_bg_placements(&grid));
+    }
+
+    /// SIZE-9: default-bg cell quads are dropped (the image shows
+    /// through), while SGR backgrounds, reverse video, selection and the
+    /// cursor keep their quads (they cover the image).
+    #[test]
+    fn drop_default_bg_quads_keeps_non_default_backgrounds() {
+        use crate::text::instance::{
+            EdgeBleed, FLAG_CURSOR, FLAG_NO_GLYPH, Theme, build_instances_into,
+        };
+        let theme = Theme::default_dark();
+        let mut term = Term::new(1, 10, 0);
+        let mut parser = toastty_parser::Parser::new();
+        // cols 0-1 default text, 2-3 red bg, 4-5 reverse, 6 blank, 7-8
+        // selected blanks, cursor parked at col 9.
+        parser.advance(&mut term, b"ab\x1b[41mcd\x1b[0m\x1b[7mef\x1b[0m\x1b[1;10H");
+        let mut v = Vec::new();
+        build_instances_into(
+            &mut v,
+            &term,
+            (10.0, 20.0),
+            &theme,
+            None,
+            |_, _, _, _| None,
+            |_, c| c == 7 || c == 8,
+            EdgeBleed::default(),
+            20.0,
+        );
+        let bg_cols = |v: &[CellInstance]| -> Vec<u32> {
+            v.iter()
+                .filter(|i| i.flags == FLAG_NO_GLYPH)
+                .map(|i| (i.pos[0] / 10.0) as u32)
+                .collect()
+        };
+        assert_eq!(bg_cols(&v), vec![0, 1, 2, 3, 4, 5, 7, 8]);
+
+        drop_default_bg_quads(&mut v, theme.bg);
+        assert_eq!(bg_cols(&v), vec![2, 3, 4, 5, 7, 8]);
+        assert!(
+            v.iter().any(|i| i.flags & FLAG_CURSOR != 0),
+            "cursor quad is kept"
+        );
+    }
+
+    /// A transparent theme bg is still matched exactly, so its default
+    /// cells are dropped too (the clear paints the same premultiplied
+    /// color), while an opaque explicit color is kept.
+    #[test]
+    fn drop_default_bg_quads_matches_transparent_default() {
+        use crate::text::instance::CellInstance;
+        let default_bg = [0.1, 0.1, 0.1, 0.5];
+        let mut v = vec![
+            CellInstance::background([0.0, 0.0], [10.0, 20.0], default_bg),
+            CellInstance::background([10.0, 0.0], [10.0, 20.0], [0.1, 0.1, 0.1, 1.0]),
+        ];
+        drop_default_bg_quads(&mut v, default_bg);
+        assert_eq!(v.len(), 1);
+        assert!((v[0].pos[0] - 10.0).abs() < 1e-6);
     }
 }
