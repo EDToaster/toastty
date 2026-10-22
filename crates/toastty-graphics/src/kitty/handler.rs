@@ -14,13 +14,18 @@
 //! - `m=0` (or no `m=`) is the final chunk; concatenate, decode, dispatch.
 //! - A header mismatch between chunks → `Einval` and we abandon the upload.
 //! - Cap on pending buffer size — overflow → `Efbig`.
+//! - Global caps on in-flight uploads (count and total bytes) evict the
+//!   least recently active one; an upload idle for
+//!   [`PENDING_UPLOAD_TTL`] is freed (SEC-6).
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 
 use super::decode::{DecodeError, decode};
-use super::header::{Action, Compression, DeleteSpec, Header, Quiet, Transmission};
+use super::header::{Action, Compression, DeleteSpec, Format, Header, Quiet, Transmission};
+use super::medium::{self, FileError, FileRequest};
 use super::placeholder::VirtualPlacement;
 use super::reply::{ErrorCode, encode_error, encode_ok};
 use crate::image_grid::{Placement, RelativeError, SrcRect};
@@ -29,6 +34,25 @@ use crate::registry::ImageData;
 /// Maximum pending-upload buffer size in bytes. Larger uploads are
 /// rejected mid-stream with [`ErrorCode::Efbig`].
 pub const DEFAULT_PENDING_CAP: usize = 64 * 1024 * 1024;
+
+/// Most chunked uploads in flight at once (SEC-6). The spec says a client
+/// must finish one upload before it starts another, so this only has to
+/// absorb abandoned ones. Starting one more evicts the least recently
+/// active upload.
+pub const MAX_PENDING_UPLOADS: usize = 8;
+
+/// Cap on the buffers of all in-flight uploads together (SEC-6). Room for
+/// a new chunk is made by evicting the least recently active other
+/// uploads. At least [`DEFAULT_PENDING_CAP`], so one upload always fits.
+pub const DEFAULT_PENDING_TOTAL_CAP: usize = 2 * DEFAULT_PENDING_CAP;
+
+/// An upload that receives no chunk for this long is abandoned, and its
+/// buffer freed on the next graphics command (SEC-6).
+pub const PENDING_UPLOAD_TTL: Duration = Duration::from_mins(1);
+
+/// Decoded-image quota for sinks that don't report one
+/// ([`KittySink::max_image_bytes`]). kitty's per-image `MAX_DATA_SZ`.
+pub const DEFAULT_MAX_IMAGE_BYTES: u64 = 400_000_000;
 
 /// Calls back into the host (a `Term`) for each Kitty action.
 ///
@@ -94,6 +118,16 @@ pub trait KittySink {
         u64::MAX
     }
 
+    /// Largest decoded image, in RGBA8 bytes, the host could ever store
+    /// (its registry cap, not what is free right now: inserts evict).
+    ///
+    /// The handler bounds work by it *before* allocating: zlib inflation
+    /// (SEC-5), a PNG's IHDR dimensions (SEC-7) and `t=f`/`t=t` reads
+    /// (SEC-3). Default [`DEFAULT_MAX_IMAGE_BYTES`].
+    fn max_image_bytes(&self) -> u64 {
+        DEFAULT_MAX_IMAGE_BYTES
+    }
+
     /// Hint: the cursor should advance after a `TransmitAndPlace` that
     /// didn't set `C=1`. The host translates this into actual cursor
     /// motion. Default is a no-op so simple test sinks don't need to
@@ -156,10 +190,16 @@ struct PendingUpload {
     /// Concatenated base64 bytes (NOT decoded yet — kitty's
     /// reassembly happens on the wire-format bytes).
     buf: Vec<u8>,
+    /// When the latest chunk arrived; drives [`PENDING_UPLOAD_TTL`]
+    /// expiry.
+    last_chunk: Instant,
+    /// Handler-wide chunk counter at the latest chunk. Orders eviction
+    /// (least recently active first) without relying on clock ticks.
+    last_seq: u64,
 }
 
 /// Top-level Kitty dispatcher.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct KittyHandler {
     /// Pending chunked uploads keyed by `i=` (image id). For `I=`
     /// (image number) we don't currently maintain a parallel slot —
@@ -177,6 +217,16 @@ pub struct KittyHandler {
     active_upload_id: Option<u32>,
     /// Per-instance override of [`DEFAULT_PENDING_CAP`].
     pending_cap: usize,
+    /// Per-instance override of [`DEFAULT_PENDING_TOTAL_CAP`].
+    pending_total_cap: usize,
+    /// Chunks seen so far; stamps [`PendingUpload::last_seq`].
+    chunk_seq: u64,
+}
+
+impl Default for KittyHandler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl KittyHandler {
@@ -187,12 +237,22 @@ impl KittyHandler {
             pending: HashMap::new(),
             active_upload_id: None,
             pending_cap: DEFAULT_PENDING_CAP,
+            pending_total_cap: DEFAULT_PENDING_TOTAL_CAP,
+            chunk_seq: 0,
         }
     }
 
-    /// Override the maximum pending-upload buffer size.
+    /// Override the maximum pending-upload buffer size. The global cap
+    /// grows with it if needed, so a single upload always fits.
     pub fn set_pending_cap(&mut self, cap: usize) {
         self.pending_cap = cap;
+        self.pending_total_cap = self.pending_total_cap.max(cap);
+    }
+
+    /// Bytes buffered across all in-flight chunked uploads.
+    #[must_use]
+    pub fn pending_bytes(&self) -> usize {
+        self.pending.values().map(|p| p.buf.len()).sum()
     }
 
     /// Number of in-flight chunked uploads.
@@ -211,6 +271,7 @@ impl KittyHandler {
         body: &[u8],
         sink: &mut S,
     ) -> Result<(), HandlerError> {
+        self.expire_pending(Instant::now());
         let header = match super::header::parse(header_bytes) {
             Ok(h) => h,
             Err(e) => {
@@ -275,6 +336,7 @@ impl KittyHandler {
         }
     }
 
+    #[allow(clippy::needless_pass_by_value, clippy::unused_self)]
     fn handle_query<S: KittySink>(&mut self, header: Header, body: &[u8], sink: &mut S) {
         // Empty body: app is probing for protocol support, not testing
         // a specific payload. Reply OK directly.
@@ -300,37 +362,9 @@ impl KittyHandler {
                 return;
             }
         };
-        let raw = match header.compression {
-            Compression::None => decoded,
-            Compression::Zlib => match inflate_zlib(&decoded) {
-                Ok(d) => d,
-                Err(e) => {
-                    reply_error_if_verbose(
-                        &header,
-                        sink,
-                        ErrorCode::Einval,
-                        &format!("zlib decompress: {e}"),
-                    );
-                    return;
-                }
-            },
-        };
-        match decode(
-            header.format,
-            &raw,
-            header.source_width,
-            header.source_height,
-        ) {
+        match decode_payload(&header, decoded, sink.max_image_bytes()) {
             Ok(_) => reply_ok_if_verbose(&header, sink),
-            Err(e) => {
-                let code = match e {
-                    DecodeError::BadPng(_) => ErrorCode::Ebadf,
-                    DecodeError::LengthMismatch { .. } | DecodeError::MissingDims { .. } => {
-                        ErrorCode::Einval
-                    }
-                };
-                reply_error_if_verbose(&header, sink, code, &e.to_string());
-            }
+            Err(e) => reply_error_if_verbose(&header, sink, e.code, &e.detail),
         }
     }
 
@@ -373,7 +407,7 @@ impl KittyHandler {
         let has_route = header.image_id != 0 || self.active_upload_id.is_some();
 
         // Continuation: append to the existing pending buffer.
-        if has_route && let Some(pending) = self.pending.get_mut(&key) {
+        if has_route && let Some(pending) = self.pending.get(&key) {
             // Compare critical header fields. Mismatches → Einval and
             // abandon the upload. Skip the check when the continuation
             // chunk was routed via `active_upload_id` (its header is
@@ -394,7 +428,13 @@ impl KittyHandler {
                 reply_error_if_verbose(&head, sink, ErrorCode::Efbig, "pending overflow");
                 return;
             }
+            // SEC-6: stay under the global cap by evicting other uploads.
+            self.make_room(Some(key), body.len());
+            self.chunk_seq += 1;
+            let pending = self.pending.get_mut(&key).expect("make_room keeps `key`");
             pending.buf.extend_from_slice(body);
+            pending.last_chunk = Instant::now();
+            pending.last_seq = self.chunk_seq;
             if header.more {
                 return;
             }
@@ -422,12 +462,18 @@ impl KittyHandler {
             // anonymous uploads (no `i=` on any chunk). Continuation
             // chunks omit `i=` in every real-world client, so this is
             // the only state we can route them back through.
+            // SEC-6: free a slot and room under the global byte cap first.
+            self.pending.remove(&key);
+            self.make_room(None, body.len());
+            self.chunk_seq += 1;
             self.active_upload_id = Some(key);
             self.pending.insert(
                 key,
                 PendingUpload {
                     head: header,
                     buf: body.to_vec(),
+                    last_chunk: Instant::now(),
+                    last_seq: self.chunk_seq,
                 },
             );
             return;
@@ -456,7 +502,61 @@ impl KittyHandler {
         };
         // After base64 decode, direct and medium transmissions converge:
         // `decoded` is the raw (still possibly zlib-compressed) payload.
-        self.finalize_decoded(header, decoded, sink);
+        self.finalize_decoded(header, decoded, PayloadSource::Direct, sink);
+    }
+
+    /// Drop uploads that have had no chunk for [`PENDING_UPLOAD_TTL`].
+    /// Silent: the client that abandoned them isn't listening.
+    fn expire_pending(&mut self, now: Instant) {
+        let before = self.pending.len();
+        self.pending
+            .retain(|_, p| now.saturating_duration_since(p.last_chunk) < PENDING_UPLOAD_TTL);
+        if self.pending.len() != before {
+            tracing::debug!(
+                expired = before - self.pending.len(),
+                "kitty: expired abandoned chunked uploads"
+            );
+            self.forget_active_if_gone();
+        }
+    }
+
+    /// Evict least-recently-active uploads (never `keep`) until there is
+    /// a free slot (when starting a new upload, `keep == None`) and
+    /// `incoming` more bytes fit under the global byte cap. Silent, like
+    /// expiry.
+    fn make_room(&mut self, keep: Option<u32>, incoming: usize) {
+        loop {
+            let need_slot = keep.is_none() && self.pending.len() >= MAX_PENDING_UPLOADS;
+            let over_bytes = self.pending_bytes() + incoming > self.pending_total_cap;
+            if !need_slot && !over_bytes {
+                break;
+            }
+            let Some(victim) = self
+                .pending
+                .iter()
+                .filter(|(k, _)| Some(**k) != keep)
+                .min_by_key(|(_, p)| p.last_seq)
+                .map(|(k, _)| *k)
+            else {
+                break;
+            };
+            let freed = self.pending.remove(&victim).map_or(0, |p| p.buf.len());
+            tracing::debug!(
+                image_id = victim,
+                freed,
+                "kitty: evicted an in-flight chunked upload"
+            );
+        }
+        self.forget_active_if_gone();
+    }
+
+    fn forget_active_if_gone(&mut self) {
+        if self
+            .active_upload_id
+            .is_some_and(|k| !self.pending.contains_key(&k))
+        {
+            self.active_upload_id = None;
+        }
     }
 
     /// M6: non-direct transmission mediums — `t=f` (file), `t=t` (temp
@@ -464,66 +564,25 @@ impl KittyHandler {
     ///
     /// For `t=f`/`t=t` the body is a base64-encoded filesystem PATH; we
     /// read its bytes (honoring `O=` offset and `S=` size) and feed them
-    /// into the same decode tail as direct transmission. `t=t` also
-    /// deletes the file afterwards, but only when the path is under a
-    /// system temp dir (or carries kitty's `tty-graphics-protocol`
-    /// marker). `t=s` is ENOTSUP — see the match arm.
+    /// into the same decode tail as direct transmission. The path policy
+    /// (regular files only, no `/proc`/`/sys`/`/dev`, non-blocking open,
+    /// bounded read, `t=t` deletion rules) lives in [`medium`]. Every
+    /// failure, up to and including decoding the bytes read, replies
+    /// `EBADF:Failed to read image file` (SEC-4). `t=s` is ENOTSUP — see
+    /// the match arm.
     #[allow(clippy::needless_pass_by_value)]
     fn handle_medium_transmit<S: KittySink>(&mut self, header: Header, body: &[u8], sink: &mut S) {
         match header.transmission {
             Transmission::Direct => unreachable!("direct handled by caller"),
             Transmission::File | Transmission::TempFile => {
-                // The body is a base64-encoded path. Decode it, read the
-                // file, optionally delete (temp), then run the decode tail.
-                let path_bytes = match decode_base64(body) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        reply_error_if_verbose(
-                            &header,
-                            sink,
-                            ErrorCode::Einval,
-                            &format!("bad base64 path: {e}"),
-                        );
-                        return;
-                    }
-                };
-                let path = match std::str::from_utf8(&path_bytes) {
-                    Ok(p) => std::path::PathBuf::from(p),
-                    Err(e) => {
-                        reply_error_if_verbose(
-                            &header,
-                            sink,
-                            ErrorCode::Einval,
-                            &format!("non-utf8 path: {e}"),
-                        );
-                        return;
-                    }
-                };
-                let raw = match read_file_range(&path, header.offset, header.size) {
+                let raw = match read_medium_file(&header, body, sink.max_image_bytes()) {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        // File missing / unreadable → EBADF, matching
-                        // reference kitty's reply for an unusable file.
-                        reply_error_if_verbose(
-                            &header,
-                            sink,
-                            ErrorCode::Ebadf,
-                            &format!("file read: {e}"),
-                        );
+                        reply_file_error(&header, sink, &e);
                         return;
                     }
                 };
-                // Temp-file medium: delete after reading, but only when
-                // the path lives under a system temp directory. Reference
-                // kitty restricts temp-file deletion this way (paths under
-                // the temp dir or a `tty-graphics-protocol` marker) so a
-                // hostile client can't trick the terminal into unlinking
-                // an arbitrary file. Best-effort: ignore unlink errors.
-                if matches!(header.transmission, Transmission::TempFile) && is_under_temp_dir(&path)
-                {
-                    let _ = std::fs::remove_file(&path);
-                }
-                self.finalize_decoded(header, raw, sink);
+                self.finalize_decoded(header, raw, PayloadSource::File, sink);
             }
             Transmission::Shared => {
                 // POSIX shared memory (`shm_open`/`mmap`/`shm_unlink`)
@@ -548,39 +607,24 @@ impl KittyHandler {
     /// Preserves the B12 `U=1` virtual-placement guard and the M1–M5
     /// cursor-advance / pixel-offset / aspect-ratio placement behavior.
     #[allow(clippy::needless_pass_by_value, clippy::unused_self)]
-    fn finalize_decoded<S: KittySink>(&mut self, header: Header, decoded: Vec<u8>, sink: &mut S) {
-        // Optional zlib decompression.
-        let raw = match header.compression {
-            Compression::None => decoded,
-            Compression::Zlib => match inflate_zlib(&decoded) {
-                Ok(d) => d,
-                Err(e) => {
-                    reply_error_if_verbose(
-                        &header,
-                        sink,
-                        ErrorCode::Einval,
-                        &format!("zlib decompress: {e}"),
-                    );
-                    return;
-                }
-            },
-        };
-
-        let img = match decode(
-            header.format,
-            &raw,
-            header.source_width,
-            header.source_height,
-        ) {
+    fn finalize_decoded<S: KittySink>(
+        &mut self,
+        header: Header,
+        decoded: Vec<u8>,
+        source: PayloadSource,
+        sink: &mut S,
+    ) {
+        let img = match decode_payload(&header, decoded, sink.max_image_bytes()) {
             Ok(d) => d,
             Err(e) => {
-                let code = match e {
-                    DecodeError::BadPng(_) => ErrorCode::Ebadf,
-                    DecodeError::LengthMismatch { .. } | DecodeError::MissingDims { .. } => {
-                        ErrorCode::Einval
+                match source {
+                    // SEC-4: a decode error would reveal what the file
+                    // holds (its size, whether it is a PNG).
+                    PayloadSource::File => reply_file_error(&header, sink, &e.detail),
+                    PayloadSource::Direct => {
+                        reply_error_if_verbose(&header, sink, e.code, &e.detail);
                     }
-                };
-                reply_error_if_verbose(&header, sink, code, &e.to_string());
+                }
                 return;
             }
         };
@@ -753,83 +797,130 @@ fn decode_base64(input: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())
 }
 
-fn inflate_zlib(input: &[u8]) -> Result<Vec<u8>, String> {
+/// Where a payload's bytes came from. File payloads get SEC-4's uniform
+/// error reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayloadSource {
+    /// `t=d`: the bytes were in the escape code.
+    Direct,
+    /// `t=f` / `t=t`: the bytes were read from a file.
+    File,
+}
+
+/// A failed [`decode_payload`]: the reply code and detail.
+#[derive(Debug)]
+struct PayloadError {
+    code: ErrorCode,
+    detail: String,
+}
+
+/// Inflate (`o=z`) and decode (`f=`) a payload, within `quota` bytes of
+/// decoded image.
+fn decode_payload(header: &Header, data: Vec<u8>, quota: u64) -> Result<ImageData, PayloadError> {
+    let raw = match header.compression {
+        Compression::None => data,
+        Compression::Zlib => {
+            // SEC-5: never inflate past what the image can use: exactly
+            // `s*v*bpp` for raw pixels, the quota for PNG.
+            let limit = raw_pixel_bytes(header).map_or(quota, |n| n.min(quota));
+            inflate_zlib(&data, limit).map_err(|e| PayloadError {
+                code: ErrorCode::Einval,
+                detail: format!("zlib decompress: {e}"),
+            })?
+        }
+    };
+    decode(
+        header.format,
+        &raw,
+        header.source_width,
+        header.source_height,
+        quota,
+    )
+    .map_err(|e| PayloadError {
+        code: match e {
+            DecodeError::BadPng(_) => ErrorCode::Ebadf,
+            DecodeError::PngTooLarge { .. } => ErrorCode::Enomem,
+            DecodeError::LengthMismatch { .. } | DecodeError::MissingDims { .. } => {
+                ErrorCode::Einval
+            }
+        },
+        detail: e.to_string(),
+    })
+}
+
+/// `s * v * bytes-per-pixel` for raw formats with both dimensions set;
+/// `None` for PNG (sized by its own header) or missing dimensions.
+fn raw_pixel_bytes(header: &Header) -> Option<u64> {
+    let bpp = match header.format {
+        Format::Rgb24 => 3,
+        Format::Rgba32 => 4,
+        Format::Png => return None,
+    };
+    if header.source_width == 0 || header.source_height == 0 {
+        return None;
+    }
+    Some(u64::from(header.source_width) * u64::from(header.source_height) * bpp)
+}
+
+/// Inflate a zlib stream, failing as soon as the output would pass
+/// `limit` bytes (SEC-5), so a small bomb can't allocate gigabytes.
+fn inflate_zlib(input: &[u8], limit: u64) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let mut out = Vec::new();
-    let mut d = flate2::read::ZlibDecoder::new(input);
-    d.read_to_end(&mut out).map_err(|e| e.to_string())?;
+    flate2::read::ZlibDecoder::new(input)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|e| e.to_string())?;
+    if out.len() as u64 > limit {
+        return Err(format!("inflated data exceeds {limit} bytes"));
+    }
     Ok(out)
 }
 
-/// Read `[offset, offset+size)` bytes from `path`. `size == 0` means
-/// "read to EOF" (per the kitty `S=` convention for file transfers).
-///
-/// SECURITY: this opens exactly the path the client gave us with the
-/// terminal process's own privileges. That is the intended model — the
-/// terminal is reading the user's own files on the user's behalf (this
-/// is how `kitten icat --transfer-mode=file` ships large images). We do
-/// not resolve symlinks specially or apply any allow-list; the OS
-/// permission check is the boundary.
-fn read_file_range(path: &std::path::Path, offset: u32, size: u32) -> std::io::Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path)?;
-    if offset > 0 {
-        f.seek(SeekFrom::Start(u64::from(offset)))?;
-    }
-    if size == 0 {
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
-        Ok(buf)
-    } else {
-        let mut buf = vec![0u8; size as usize];
-        // The file may be shorter than `S=` claims; read what we can and
-        // truncate. `read_exact` would error on a short file, which is
-        // harsher than the reference (it reads min(S, remaining)).
-        let mut filled = 0usize;
-        while filled < buf.len() {
-            match f.read(&mut buf[filled..])? {
-                0 => break,
-                n => filled += n,
-            }
-        }
-        buf.truncate(filled);
-        Ok(buf)
-    }
+/// Read the file a `t=f` / `t=t` command names. `body` is the base64
+/// path. See [`medium::read_image_file`] for the policy.
+fn read_medium_file(header: &Header, body: &[u8], quota: u64) -> Result<Vec<u8>, FileError> {
+    let path_bytes = decode_base64(body).map_err(|e| FileError(format!("bad base64 path: {e}")))?;
+    let path = path_from_bytes(path_bytes);
+    // Uncompressed raw pixels need exactly `s*v*bpp` bytes: read that
+    // much and no more. A longer file is fine (kitty ignores the tail), a
+    // shorter one fails. Otherwise read `S=` bytes, or to EOF.
+    let size = match (header.size, header.compression) {
+        (0, Compression::None) => raw_pixel_bytes(header).unwrap_or(0),
+        (size, _) => u64::from(size),
+    };
+    medium::read_image_file(&FileRequest {
+        path: &path,
+        offset: u64::from(header.offset),
+        size,
+        max: quota,
+        delete_temp: matches!(header.transmission, Transmission::TempFile),
+    })
 }
 
-/// True iff `path` lives under a system temporary directory. Used to
-/// gate `t=t` (temp-file) deletion: reference kitty only unlinks
-/// temp-transfer files that sit under the temp dir (or carry a
-/// `tty-graphics-protocol` marker), so a malicious client can't coax
-/// the terminal into deleting an arbitrary file via `t=t`.
-fn is_under_temp_dir(path: &std::path::Path) -> bool {
-    // Compare against the canonicalized temp dir AND the raw temp dir.
-    // Many clients write to `$TMPDIR/...` without resolving symlinks
-    // (on macOS `/tmp` -> `/private/tmp`, and `$TMPDIR` is a long
-    // `/var/folders/...` path), so we accept either form.
-    let candidates = [
-        std::env::temp_dir(),
-        std::path::PathBuf::from("/tmp"),
-        std::path::PathBuf::from("/var/tmp"),
-        std::path::PathBuf::from("/dev/shm"),
-    ];
-    let canon = std::fs::canonicalize(path).ok();
-    for base in candidates {
-        if path.starts_with(&base) {
-            return true;
-        }
-        if let Some(canon) = &canon
-            && let Ok(canon_base) = std::fs::canonicalize(&base)
-            && canon.starts_with(&canon_base)
-        {
-            return true;
-        }
-    }
-    // Reference kitty also honors a `tty-graphics-protocol` filename
-    // marker regardless of directory. Mirror that escape hatch.
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.contains("tty-graphics-protocol"))
+/// Paths are bytes on the wire; on unix they need not be UTF-8.
+#[cfg(unix)]
+fn path_from_bytes(bytes: Vec<u8>) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(bytes).into()
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: Vec<u8>) -> std::path::PathBuf {
+    String::from_utf8_lossy(&bytes).into_owned().into()
+}
+
+/// SEC-4: every `t=f` / `t=t` failure gets the same reply, so a remote or
+/// sandboxed client learns nothing about files it can't read itself. The
+/// real reason goes to the local log only.
+fn reply_file_error<S: KittySink>(header: &Header, sink: &mut S, reason: &dyn std::fmt::Display) {
+    tracing::debug!(
+        image_id = header.image_id,
+        image_number = header.image_number,
+        %reason,
+        "kitty: file medium failed"
+    );
+    reply_error_if_verbose(header, sink, ErrorCode::Ebadf, medium::FILE_READ_ERROR);
 }
 
 fn default_placement_from_header(
@@ -1582,6 +1673,99 @@ mod tests {
         assert_eq!(h.pending_uploads(), 0);
     }
 
+    fn start_upload(h: &mut KittyHandler, sink: &mut MockSink, id: u32, body: &[u8]) {
+        let header = format!("Ga=t,f=32,s=1,v=1,i={id},m=1");
+        h.process(header.as_bytes(), body, sink).unwrap();
+    }
+
+    /// SEC-6: more than [`MAX_PENDING_UPLOADS`] in flight evicts the
+    /// least recently active ones, silently.
+    #[test]
+    fn pending_upload_count_is_capped() {
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        let n = MAX_PENDING_UPLOADS as u32 + 2;
+        for id in 1..=n {
+            start_upload(&mut h, &mut sink, id, b"AAAA");
+        }
+        assert_eq!(h.pending_uploads(), MAX_PENDING_UPLOADS);
+        assert!(!h.pending.contains_key(&1) && !h.pending.contains_key(&2));
+        assert!((3..=n).all(|id| h.pending.contains_key(&id)));
+        assert_eq!(h.active_upload_id, Some(n));
+        assert!(sink.replies.is_empty(), "eviction is silent");
+    }
+
+    /// SEC-6: all buffers together stay under the global byte cap, both
+    /// when an upload starts and when one grows.
+    #[test]
+    fn pending_total_bytes_are_capped() {
+        let mut h = KittyHandler::new();
+        h.pending_cap = 60;
+        h.pending_total_cap = 90;
+        let mut sink = MockSink::with_budget(1 << 30);
+        start_upload(&mut h, &mut sink, 1, &[b'A'; 40]);
+        start_upload(&mut h, &mut sink, 2, &[b'A'; 40]);
+        assert_eq!(h.pending_bytes(), 80);
+        // 120 > 90: the oldest (1) goes.
+        start_upload(&mut h, &mut sink, 3, &[b'A'; 40]);
+        assert!(!h.pending.contains_key(&1));
+        assert_eq!(h.pending_bytes(), 80);
+        // Growing 3 to 60 would make 100 > 90: 2 goes, 3 is kept.
+        h.process(b"Gm=1", &[b'A'; 20], &mut sink).unwrap();
+        assert!(!h.pending.contains_key(&2));
+        assert_eq!(h.pending_bytes(), 60);
+        assert!(sink.replies.is_empty(), "eviction is silent");
+    }
+
+    /// The checklist repro, scaled down: many abandoned uploads with
+    /// different ids never hold more than the global cap.
+    #[test]
+    fn many_abandoned_uploads_stay_under_the_cap() {
+        let mut h = KittyHandler::new();
+        h.pending_total_cap = 1000;
+        let mut sink = MockSink::with_budget(1 << 30);
+        for id in 1..=16 {
+            start_upload(&mut h, &mut sink, id, &[b'A'; 300]);
+            assert!(h.pending_bytes() <= 1000);
+        }
+        assert_eq!(h.pending_uploads(), 3);
+    }
+
+    /// SEC-6: an upload with no chunk for [`PENDING_UPLOAD_TTL`] is freed,
+    /// and headerless continuations no longer route to it.
+    #[test]
+    fn abandoned_upload_expires() {
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        start_upload(&mut h, &mut sink, 1, b"AAAA");
+        h.expire_pending(Instant::now());
+        assert_eq!(h.pending_uploads(), 1, "fresh upload must survive");
+        h.expire_pending(Instant::now() + PENDING_UPLOAD_TTL + Duration::from_secs(1));
+        assert_eq!(h.pending_uploads(), 0);
+        assert_eq!(h.pending_bytes(), 0);
+        assert_eq!(h.active_upload_id, None);
+    }
+
+    /// A continuation chunk refreshes the TTL.
+    #[test]
+    fn continuation_refreshes_expiry() {
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        start_upload(&mut h, &mut sink, 1, b"AAAA");
+        let t0 = h.pending[&1].last_chunk;
+        h.process(b"Gm=1", b"AAAA", &mut sink).unwrap();
+        assert!(h.pending[&1].last_chunk >= t0);
+        h.expire_pending(h.pending[&1].last_chunk + PENDING_UPLOAD_TTL / 2);
+        assert_eq!(h.pending_uploads(), 1);
+    }
+
+    #[test]
+    fn default_handler_has_default_caps() {
+        let h = KittyHandler::default();
+        assert_eq!(h.pending_cap, DEFAULT_PENDING_CAP);
+        assert_eq!(h.pending_total_cap, DEFAULT_PENDING_TOTAL_CAP);
+    }
+
     #[test]
     fn medium_query_still_enotsup() {
         // M6: Query (`a=q`) with a non-direct medium remains ENOTSUP —
@@ -1935,12 +2119,14 @@ mod major_medium_tests {
     use super::*;
 
     /// Minimal sink: records registrations, placements, and replies.
-    /// The cursor/cell/budget methods fall back to trait defaults.
+    /// The cursor/cell/budget methods fall back to trait defaults;
+    /// `quota` overrides [`KittySink::max_image_bytes`].
     #[derive(Debug, Default)]
     struct MockSink {
         registered: Vec<(u32, ImageData)>,
         placements: Vec<Placement>,
         replies: Vec<Vec<u8>>,
+        quota: Option<u64>,
     }
 
     impl KittySink for MockSink {
@@ -1961,6 +2147,9 @@ mod major_medium_tests {
         fn queue_reply(&mut self, bytes: &[u8]) {
             self.replies.push(bytes.to_vec());
         }
+        fn max_image_bytes(&self) -> u64 {
+            self.quota.unwrap_or(DEFAULT_MAX_IMAGE_BYTES)
+        }
     }
 
     fn replies_joined(sink: &MockSink) -> String {
@@ -1970,15 +2159,18 @@ mod major_medium_tests {
             .collect()
     }
 
-    /// Unique temp path under the system temp dir (so `t=t` deletion is
-    /// allowed). Includes the pid + a counter to avoid collisions across
+    /// Unique temp path under the system temp dir, with the
+    /// `tty-graphics-protocol` marker (so `t=t` deletion is allowed).
+    /// Includes the pid + a counter to avoid collisions across
     /// concurrent test threads.
     fn unique_temp_path(tag: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        std::env::temp_dir().join(format!("toastty-medium-{tag}-{pid}-{n}.rgba"))
+        std::env::temp_dir().join(format!(
+            "tty-graphics-protocol-toastty-medium-{tag}-{pid}-{n}.rgba"
+        ))
     }
 
     fn b64_path(path: &std::path::Path) -> Vec<u8> {
@@ -2089,10 +2281,9 @@ mod major_medium_tests {
             sink.registered.is_empty(),
             "no image must register on read failure"
         );
-        let joined = replies_joined(&sink);
-        assert!(
-            joined.contains("EBADF") || joined.contains("ENOENT"),
-            "expected EBADF/ENOENT, got {joined:?}"
+        assert_eq!(
+            replies_joined(&sink),
+            "\x1b_Gi=9;EBADF:Failed to read image file\x1b\\"
         );
     }
 
@@ -2107,6 +2298,320 @@ mod major_medium_tests {
         assert!(sink.registered.is_empty());
         let joined = replies_joined(&sink);
         assert!(joined.contains("ENOTSUP"), "got {joined:?}");
+    }
+
+    // ---- SEC-1..SEC-5, SEC-7 through the handler ----
+
+    const FILE_ERR: &str = "EBADF:Failed to read image file";
+
+    /// A private directory for one test (its name carries the
+    /// `tty-graphics-protocol` marker), removed on drop.
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let dir = unique_temp_path(tag).with_extension("d");
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn b64(bytes: &[u8]) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .encode(bytes)
+            .into_bytes()
+    }
+
+    fn zlib(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        e.write_all(bytes).unwrap();
+        e.finish().unwrap()
+    }
+
+    fn run(header: &str, body: &[u8], quota: Option<u64>) -> MockSink {
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink {
+            quota,
+            ..MockSink::default()
+        };
+        h.process(header.as_bytes(), body, &mut sink).unwrap();
+        sink
+    }
+
+    /// SEC-4: every way a file read can fail puts the same bytes on the
+    /// wire, so a client can't tell "missing" from "directory" from "not a
+    /// PNG" or learn a file's size. kitty: `EBADF:Failed to read image
+    /// file` for all of them. (kitty answers `EBADPNG` for a readable
+    /// non-PNG; we don't, see the checklist.)
+    #[test]
+    fn file_failures_all_reply_identically() {
+        use std::os::unix::fs::symlink;
+        let d = TestDir::new("sec4");
+        std::fs::write(d.path("short.rgba"), [1, 2, 3]).unwrap();
+        std::fs::write(d.path("notpng.png"), b"hello, not a png").unwrap();
+        std::fs::write(d.path("garbage.z"), b"not zlib").unwrap();
+        std::fs::write(
+            d.path("big.png"),
+            crate::kitty::decode::test_png::claiming(12000, 12000),
+        )
+        .unwrap();
+        std::fs::write(d.path("pixels.rgba"), [0u8; 64]).unwrap();
+        std::fs::create_dir(d.path("adir")).unwrap();
+        symlink(d.path("loop-b"), d.path("loop-a")).unwrap();
+        symlink(d.path("loop-a"), d.path("loop-b")).unwrap();
+        symlink("/dev/zero", d.path("zero-link")).unwrap();
+        let path = |p: std::path::PathBuf| b64_path(&p);
+        let abs = |p: &str| b64_path(std::path::Path::new(p));
+        let cases: Vec<(&str, &str, Vec<u8>, Option<u64>)> = vec![
+            ("missing", "f=32,s=1,v=1", path(d.path("nope")), None),
+            ("directory", "f=32,s=1,v=1", path(d.path("adir")), None),
+            ("symlink loop", "f=32,s=1,v=1", path(d.path("loop-a")), None),
+            (
+                "short raw file",
+                "f=32,s=1,v=1",
+                path(d.path("short.rgba")),
+                None,
+            ),
+            (
+                "S= past EOF",
+                "f=100,S=100",
+                path(d.path("short.rgba")),
+                None,
+            ),
+            (
+                "O= past EOF",
+                "f=100,O=10",
+                path(d.path("short.rgba")),
+                None,
+            ),
+            (
+                "raw length mismatch",
+                "f=32,s=1,v=1,S=3",
+                path(d.path("short.rgba")),
+                None,
+            ),
+            ("not a PNG", "f=100", path(d.path("notpng.png")), None),
+            ("PNG over quota", "f=100", path(d.path("big.png")), None),
+            (
+                "bad zlib",
+                "f=32,s=1,v=1,o=z",
+                path(d.path("garbage.z")),
+                None,
+            ),
+            (
+                "file over quota",
+                "f=100",
+                path(d.path("pixels.rgba")),
+                Some(32),
+            ),
+            (
+                "raw size over quota",
+                "f=32,s=4,v=4",
+                path(d.path("pixels.rgba")),
+                Some(32),
+            ),
+            ("/dev/zero", "f=32,s=1,v=1", abs("/dev/zero"), None),
+            ("/dev/zero, no size", "f=100", abs("/dev/zero"), None),
+            (
+                "symlink to /dev/zero",
+                "f=100",
+                path(d.path("zero-link")),
+                None,
+            ),
+            ("/dev/null", "f=32,s=1,v=1", abs("/dev/null"), None),
+            (
+                "/proc/self/cmdline",
+                "f=32,s=1,v=1",
+                abs("/proc/self/cmdline"),
+                None,
+            ),
+            (
+                "bad base64 path",
+                "f=32,s=1,v=1",
+                b"!!!not base64!!!".to_vec(),
+                None,
+            ),
+            ("empty path", "f=32,s=1,v=1", Vec::new(), None),
+        ];
+        for (i, (name, keys, body, quota)) in cases.into_iter().enumerate() {
+            let id = 300 + i as u32;
+            let sink = run(&format!("Ga=t,t=f,{keys},i={id}"), &body, quota);
+            assert!(sink.registered.is_empty(), "{name}: must not register");
+            assert_eq!(
+                replies_joined(&sink),
+                format!("\x1b_Gi={id};{FILE_ERR}\x1b\\"),
+                "{name}"
+            );
+        }
+    }
+
+    /// SEC-2: `t=f`/`t=t` on a FIFO answers at once instead of blocking
+    /// in `open()` until a writer appears, and `t=t` keeps the FIFO.
+    #[test]
+    fn fifo_replies_ebadf_without_blocking() {
+        let d = TestDir::new("fifo");
+        let fifo = d.path("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for medium in ["f", "t"] {
+            let body = b64_path(&fifo);
+            let header = format!("Ga=t,t={medium},f=32,s=2,v=2,i=7");
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(replies_joined(&run(&header, &body, None)));
+            });
+            let reply = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("t=f on a FIFO blocked the handler");
+            assert_eq!(reply, format!("\x1b_Gi=7;{FILE_ERR}\x1b\\"), "t={medium}");
+            assert!(fifo.exists(), "t={medium} must not delete a FIFO");
+        }
+    }
+
+    /// Raw pixels need `s*v*bpp` bytes; like kitty, only that much is
+    /// read and a longer file is accepted.
+    #[test]
+    fn t_f_raw_reads_only_the_bytes_it_needs() {
+        let d = TestDir::new("long");
+        let p = d.path("long.rgba");
+        let mut bytes = vec![7u8; 4];
+        bytes.extend_from_slice(&[0u8; 60]);
+        std::fs::write(&p, &bytes).unwrap();
+        let sink = run("Ga=t,t=f,f=32,s=1,v=1,i=8", &b64_path(&p), None);
+        assert_eq!(replies_joined(&sink), "\x1b_Gi=8;OK\x1b\\");
+        assert_eq!(sink.registered[0].1.pixels, vec![7u8; 4]);
+    }
+
+    #[test]
+    fn t_f_zlib_file_decodes() {
+        let d = TestDir::new("zf");
+        let p = d.path("px.z");
+        std::fs::write(&p, zlib(&[1, 2, 3, 255])).unwrap();
+        let sink = run("Ga=t,t=f,f=32,s=1,v=1,o=z,i=9", &b64_path(&p), None);
+        assert_eq!(replies_joined(&sink), "\x1b_Gi=9;OK\x1b\\");
+        assert_eq!(sink.registered[0].1.pixels, vec![1, 2, 3, 255]);
+    }
+
+    /// SEC-1: a temp file without the marker is read but kept.
+    #[test]
+    fn t_t_without_marker_keeps_the_file() {
+        let path = std::env::temp_dir().join(format!(
+            "toastty-medium-nomarker-{}-{}.rgba",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, [1, 2, 3, 255]).unwrap();
+        let sink = run("Ga=t,t=t,f=32,s=1,v=1,i=10", &b64_path(&path), None);
+        assert_eq!(replies_joined(&sink), "\x1b_Gi=10;OK\x1b\\");
+        assert!(path.exists(), "no marker: t=t must keep the file");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// kitty deletes a `t=t` file it could open even when the read or
+    /// the decode then fails.
+    #[test]
+    fn t_t_deletes_even_when_read_or_decode_fails() {
+        let d = TestDir::new("ttfail");
+        let short = d.path("short.rgba");
+        let notpng = d.path("notpng.png");
+        std::fs::write(&short, [1, 2]).unwrap();
+        std::fs::write(&notpng, b"not a png").unwrap();
+        for (keys, p) in [("f=32,s=1,v=1", &short), ("f=100", &notpng)] {
+            let sink = run(&format!("Ga=t,t=t,{keys},i=11"), &b64_path(p), None);
+            assert_eq!(
+                replies_joined(&sink),
+                format!("\x1b_Gi=11;{FILE_ERR}\x1b\\")
+            );
+            assert!(!p.exists(), "{} must be deleted", p.display());
+        }
+    }
+
+    /// SEC-1 through the handler, with the real temp roots: `..` that
+    /// stays inside the temp dir still deletes. (Escapes out of the temp
+    /// dir are tested in `medium` against a private root, so no test
+    /// ever points `t=t` at a file outside its own sandbox.)
+    #[test]
+    fn t_t_dotdot_inside_temp_dir_deletes() {
+        let d = TestDir::new("dotdot");
+        let inside = d.path("x.rgba");
+        std::fs::write(&inside, [1, 2, 3, 255]).unwrap();
+        std::fs::create_dir(d.path("sub")).unwrap();
+        let sent = d.path("sub/../x.rgba");
+        let sink = run("Ga=t,t=t,f=32,s=1,v=1,i=12", &b64_path(&sent), None);
+        assert_eq!(replies_joined(&sink), "\x1b_Gi=12;OK\x1b\\");
+        assert!(!inside.exists());
+    }
+
+    /// SEC-5: a zlib bomb stops at the expected `s*v*bpp` size instead of
+    /// being inflated in full first.
+    #[test]
+    fn zlib_bomb_stops_at_expected_size() {
+        let bomb = zlib(&vec![0u8; 16 << 20]);
+        assert!(bomb.len() < 64 * 1024);
+        let sink = run("Ga=t,f=32,s=1,v=1,o=z,i=3", &b64(&bomb), None);
+        assert_eq!(
+            replies_joined(&sink),
+            "\x1b_Gi=3;EINVAL:zlib decompress: inflated data exceeds 4 bytes\x1b\\"
+        );
+        // Same for `a=q`.
+        let sink = run("Ga=q,f=32,s=1,v=1,o=z,i=3", &b64(&bomb), None);
+        assert!(replies_joined(&sink).contains("exceeds 4 bytes"));
+    }
+
+    /// SEC-5: `f=100,o=z` has no `s*v`, so the quota bounds it.
+    #[test]
+    fn zlib_png_is_bounded_by_quota() {
+        let z = zlib(&vec![0u8; 1 << 20]);
+        let sink = run("Ga=t,f=100,o=z,i=4", &b64(&z), Some(1024));
+        assert_eq!(
+            replies_joined(&sink),
+            "\x1b_Gi=4;EINVAL:zlib decompress: inflated data exceeds 1024 bytes\x1b\\"
+        );
+    }
+
+    #[test]
+    fn inflate_zlib_limit_is_exact() {
+        let z = zlib(&[1, 2, 3, 4]);
+        assert_eq!(inflate_zlib(&z, 4).unwrap(), vec![1, 2, 3, 4]);
+        assert!(inflate_zlib(&z, 3).is_err());
+        assert_eq!(inflate_zlib(&z, u64::MAX).unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    /// SEC-7: an oversized PNG is refused from its IHDR, before decoding,
+    /// with kitty's `ENOMEM:PNG image is too large`.
+    #[test]
+    fn png_over_quota_replies_enomem_like_kitty() {
+        let png = crate::kitty::decode::test_png::claiming(12000, 12000);
+        let sink = run("Ga=t,f=100,i=6", &b64(&png), None);
+        assert_eq!(
+            replies_joined(&sink),
+            "\x1b_Gi=6;ENOMEM:PNG image is too large\x1b\\"
+        );
+        let sink = run("Ga=q,f=100,i=6", &b64(&png), None);
+        assert_eq!(
+            replies_joined(&sink),
+            "\x1b_Gi=6;ENOMEM:PNG image is too large\x1b\\"
+        );
+        // The sink's quota is what counts.
+        let small = crate::kitty::decode::test_png::claiming(16, 16);
+        let sink = run("Ga=t,f=100,i=6", &b64(&small), Some(1023));
+        assert!(replies_joined(&sink).contains("ENOMEM"));
     }
 }
 

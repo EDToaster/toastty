@@ -20,8 +20,14 @@ gltf = { version = "=1.4.1", default-features = false, features = ["utils"] }
 # tree (default `ahash` feature on; no other transitives we don't
 # already pull). v1 ignores materials (no `.mtl` resolution).
 tobj = "=4.0.3"
+tracing.workspace = true
 
 toastty-parser.workspace = true
+
+# `t=f` / `t=t` file mediums: `open(O_NONBLOCK | O_NOFOLLOW)` so a client
+# can't park the terminal in `open()` on a FIFO (SEC-2).
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
