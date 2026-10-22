@@ -686,7 +686,7 @@ Done in #28. See
     shows two copies.
   - Cause: `register_image` (`term.rs:4591-4650`) replaces the registry entry
     without dropping that id's placements.
-  - Fixed in #WW. Re-transmitting an id deletes the old image and all its
+  - Fixed in #42. Re-transmitting an id deletes the old image and all its
     placements; the new data shows once placed (kitty-ref: `a=T` red then
     `a=t` blue shows nothing; a second `a=T` leaves one copy). Each
     transmission gets a fresh store key. See
@@ -710,7 +710,7 @@ Done in #28. See
   - Cause: `registry.rs:163, 252` (`next_free_id` hands out the lowest free
     id). Allocate from the top of the id space, or keep anonymous images
     out of the id table.
-  - Fixed in #WW. Anonymous images (no `i=`, no `I=`) have no client id at
+  - Fixed in #42. Anonymous images (no `i=`, no `I=`) have no client id at
     all, so no id or id-range command reaches them (kitty-ref: one survives
     `d=R,x=1,y=4294967295`, `a=t,i=1` and `d=I,i=1`). Positional deletes
     still remove them. `I=` without `i=` gets the lowest free id, as in
@@ -729,7 +729,7 @@ Done in #28. See
   - This bites in practice: a full-screen previewer deleting its own ids
     wipes a shell's icat image that had the same id.
   - Cause: `term.rs:4513, 4854` don't check the stashed main-screen grid.
-  - Fixed in #WW. One `ImageStore` per screen (bytes, ids, numbers,
+  - Fixed in #42. One `ImageStore` per screen (bytes, ids, numbers,
     quota), swapped with the image grid on screen switches. Deletes
     (`d=i/I/n/N/r/R`, positional), same-id replacement and quota eviction
     on one screen can't reach the other. Each screen has its own quota,
@@ -738,7 +738,7 @@ Done in #28. See
   same id.**
   - Seen once and not reproduced in 8 more runs.
   - Possibly a renderer race on same-id replacement. Keep an eye on it.
-  - Not reproduced in #WW: 40 live same-id re-sends (20 alternating
+  - Not reproduced in #42: 40 live same-id re-sends (20 alternating
     red/blue, 20 identical), grabbed 0.25 s after each, all showed the
     right image. Each re-send now gets a fresh store key, so nothing keyed
     on the id can go stale.
