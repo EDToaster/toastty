@@ -90,26 +90,22 @@ pub enum WindowError {
 /// Custom user-event payload — sent via [`WindowHandle::wake`] from
 /// background threads (e.g. the mio PTY thread).
 ///
-/// `PtyBytes` and `PtyClosed` correspond 1:1 to
-/// [`toastty_io::UserEvent`]; the `From` impl below makes the
-/// `spawn_pty_reader<EventLoopProxy<UserEvent>>` call site work
-/// without any per-call conversion.
+/// `PtyReady` corresponds 1:1 to [`toastty_io::UserEvent`]; the `From`
+/// impl below makes the `spawn_pty_reader<EventLoopProxy<UserEvent>>`
+/// call site work without any per-call conversion.
 #[derive(Debug)]
 pub enum UserEvent {
     /// Wake the event loop. Surfaces as [`Event::User`].
     Wake,
-    /// PTY bytes ready, from `toastty-io::spawn_pty_reader`. Surfaces as
-    /// [`Event::PtyBytes`].
-    PtyBytes(Vec<u8>),
-    /// PTY closed (child exited / EIO). Surfaces as [`Event::PtyClosed`].
-    PtyClosed,
+    /// The PTY reader has bytes (or the close) for the main thread, from
+    /// `toastty-io::spawn_pty_reader`. Surfaces as [`Event::PtyReady`].
+    PtyReady,
 }
 
 impl From<toastty_io::UserEvent> for UserEvent {
     fn from(ev: toastty_io::UserEvent) -> Self {
         match ev {
-            toastty_io::UserEvent::PtyBytes(b) => UserEvent::PtyBytes(b),
-            toastty_io::UserEvent::PtyClosed => UserEvent::PtyClosed,
+            toastty_io::UserEvent::PtyReady => UserEvent::PtyReady,
         }
     }
 }
@@ -559,8 +555,7 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<'_, A> {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, ev: UserEvent) {
         let mapped = match ev {
             UserEvent::Wake => Event::User,
-            UserEvent::PtyBytes(b) => Event::PtyBytes(b),
-            UserEvent::PtyClosed => Event::PtyClosed,
+            UserEvent::PtyReady => Event::PtyReady,
         };
         self.dispatch(mapped, event_loop);
     }

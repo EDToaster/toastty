@@ -6,9 +6,9 @@
 //!
 //! The render thread (winit main thread on macOS) owns the parser,
 //! `Term`, and `Renderer`. A background mio thread reads bytes from
-//! the PTY master and posts them via `EventLoopProxy::send_event` as
-//! `Event::PtyBytes(...)`; the binary feeds those to the parser and
-//! requests a redraw.
+//! the PTY master into a bounded buffer and wakes the loop with
+//! `Event::PtyReady`; the binary drains that buffer into the parser
+//! and requests a redraw.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -279,9 +279,10 @@ struct Toastty {
     parser: Parser,
     term: Term,
     pty: Option<Pty>,
-    /// `JoinHandle` for the mio reader; held so we don't drop it. The
-    /// thread exits on its own when the PTY closes or the proxy goes away.
-    reader: Option<std::thread::JoinHandle<()>>,
+    /// The main thread's end of the mio reader: the PTY output read so
+    /// far, drained on `Event::PtyReady`. The thread exits on its own when
+    /// the PTY closes or the proxy goes away.
+    reader: Option<toastty_io::PtyReader>,
     /// Background writer that drains queued bytes to the PTY master in
     /// order. Routing writes through here (instead of a direct
     /// `Pty::write`) guarantees the whole payload lands even when the
@@ -307,7 +308,7 @@ struct Toastty {
     /// other reload keeps it. See [`toastty::font_zoom`].
     font_zoom: FontZoom,
     /// Last title we pushed to `winit::Window::set_title`. Tracked so
-    /// we don't churn the compositor on every `PtyBytes` batch — only
+    /// we don't churn the compositor on every `PtyReady` batch — only
     /// change the title when it actually differs.
     last_title: Option<String>,
     /// Most recent mouse pixel position; tracked so motion events that
@@ -945,13 +946,73 @@ impl Toastty {
         }
     }
 
-    /// Feed a batch of PTY bytes through the parser. Returns whether a
-    /// fresh BSU (mode 2026 begin-synchronized-update) just went high
-    /// during this batch — the caller uses that signal to schedule the
-    /// watchdog redraw via `ControlSignal::RedrawIn(BSU_TIMEOUT)`.
-    fn handle_pty_bytes(&mut self, bytes: &[u8]) -> bool {
+    /// Drain the PTY reader into the parser (`Event::PtyReady`). Bytes
+    /// the reader buffers past its cap wait in the kernel's buffer, which
+    /// blocks the child: memory stays flat however fast it writes.
+    fn handle_pty_ready(&mut self) -> ControlSignal {
+        let Some(mut reader) = self.reader.take() else {
+            return ControlSignal::Continue;
+        };
+        let mut parsed = false;
+        loop {
+            let avail = reader.peek(usize::MAX);
+            if avail.is_empty() {
+                break;
+            }
+            let now = Instant::now();
+            let n = avail.len();
+            self.handle_pty_bytes(avail);
+            self.stats.pty_batch(now, n, now.elapsed());
+            reader.consume(n);
+            parsed = true;
+        }
+        let finished = reader.is_finished();
+        self.reader = Some(reader);
+        if finished {
+            // Every byte read before the close is parsed by now.
+            return self.handle_pty_closed();
+        }
+        if !parsed {
+            // A wake for bytes an earlier pass already took.
+            return ControlSignal::Continue;
+        }
+        // New output may have rewritten or moved the hovered link;
+        // re-resolve it (clears when it's gone).
+        if self.term.link_hover().is_some() {
+            self.refresh_link_hover();
+        }
+        if self.term.pause_rendering() {
+            // Mid synchronized update: `render_term` would just skip, so
+            // instead of redrawing now, wake at the BSU watchdog deadline.
+            // `handle_pty_bytes` fires the watchdog when more bytes
+            // arrive after it; this covers BSU-then-silence.
+            let left = self.term.sync_output_started_at().map_or(BSU_TIMEOUT, |t| {
+                (t + BSU_TIMEOUT).saturating_duration_since(Instant::now())
+            });
+            return ControlSignal::RedrawIn(left);
+        }
+        // RedrawIn(ZERO) — not Continue — to force the event loop to
+        // wake immediately. On macOS, plain `request_redraw()` doesn't
+        // wake from Wait reliably; RedrawIn sets ControlFlow::Poll,
+        // which does.
+        ControlSignal::RedrawIn(Duration::ZERO)
+    }
+
+    /// The PTY closed and its last bytes are parsed: reap and exit.
+    fn handle_pty_closed(&mut self) -> ControlSignal {
+        debug!("pty closed; exiting");
+        self.stats.write();
+        toastty::perf_stats::finish_profiler();
+        if let Some(pty) = self.pty.as_mut() {
+            let _ = pty.wait();
+        }
+        ControlSignal::Exit
+    }
+
+    /// Feed one slice of PTY bytes through the parser, then service what
+    /// it queued (title, clipboard, replies, BSU watchdog).
+    fn handle_pty_bytes(&mut self, bytes: &[u8]) {
         self.pty_log.log(Direction::FromApp, bytes);
-        let was_paused = self.term.pause_rendering();
         // Refresh the foreground-process CWD before parsing this
         // batch — if an RGP `r;path=...` arrives in these bytes,
         // `Term::register_asset_by_path` needs to know the current
@@ -1006,11 +1067,6 @@ impl Toastty {
                 w.request_redraw();
             }
         }
-
-        // A fresh BSU started in this batch — caller will schedule a
-        // wake-up at BSU_TIMEOUT so the watchdog above eventually
-        // fires even if the app sends no more bytes.
-        !was_paused && self.term.pause_rendering()
     }
 }
 
@@ -1164,7 +1220,7 @@ impl Toastty {
 
         // Spawn the mio reader thread. It posts user-events via the
         // winit `EventLoopProxy`, which arrive in `App::event` as
-        // `Event::PtyBytes` / `Event::PtyClosed`.
+        // `Event::PtyReady`.
         let proxy = handle.event_loop_proxy();
         let reader = match toastty_io::spawn_pty_reader(pty.master_fd(), proxy) {
             Ok(j) => j,
@@ -1370,7 +1426,7 @@ impl Toastty {
             // guaranteed: the loop's RedrawIn handler issues the
             // `request_redraw` + `ControlFlow::Poll` wake, which a bare
             // `request_redraw()` from `Wait` doesn't do reliably on macOS
-            // (same reasoning as the `Event::PtyBytes` path).
+            // (same reasoning as the `Event::PtyReady` path).
             ControlSignal::RedrawIn(Duration::ZERO)
         } else {
             self.close_now()
@@ -2937,43 +2993,7 @@ impl App for Toastty {
                     signal
                 }
             }
-            Event::PtyBytes(bytes) => {
-                let at = Instant::now();
-                let fresh_bsu = self.handle_pty_bytes(&bytes);
-                self.stats.pty_batch(at, bytes.len(), at.elapsed());
-                // New output may have rewritten or moved the hovered
-                // link; re-resolve it (clears when it's gone).
-                if self.term.link_hover().is_some() {
-                    self.refresh_link_hover();
-                }
-                // If a BSU just went high we still want to wake the
-                // event loop, but at the watchdog deadline rather than
-                // immediately — `render_term` would just skip while the
-                // pause is active. The watchdog inside
-                // `handle_pty_bytes` already fires if the previous BSU
-                // had already expired; this branch covers the
-                // "BSU-then-silence" case where no further bytes
-                // arrive to drive the watchdog.
-                //
-                // RedrawIn(ZERO) — not Continue — to force the event
-                // loop to wake immediately. On macOS, plain
-                // `request_redraw()` doesn't wake from Wait reliably;
-                // RedrawIn sets ControlFlow::WaitUntil(now) which does.
-                if fresh_bsu {
-                    ControlSignal::RedrawIn(BSU_TIMEOUT)
-                } else {
-                    ControlSignal::RedrawIn(Duration::ZERO)
-                }
-            }
-            Event::PtyClosed => {
-                debug!("pty closed; exiting");
-                self.stats.write();
-                toastty::perf_stats::finish_profiler();
-                if let Some(pty) = self.pty.as_mut() {
-                    let _ = pty.wait();
-                }
-                ControlSignal::Exit
-            }
+            Event::PtyReady => self.handle_pty_ready(),
             Event::User => {
                 // The config watcher wakes the loop via Wake on file
                 // changes. Drain its pending flag (atomic swap) and

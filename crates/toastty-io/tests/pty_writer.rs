@@ -8,24 +8,16 @@
 //! the foreground app in paste-collect mode. `PtyWriter` must deliver every
 //! byte in order regardless of ring size.
 
+mod common;
+
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use toastty_io::{
-    EventSink, SinkClosed, UserEvent, spawn_pty_reader_with_sink, spawn_pty_writer,
-};
+use common::{Batch, ChannelSink, recv_batch};
+use toastty_io::{PtyReader, UserEvent, spawn_pty_reader_with_sink, spawn_pty_writer};
 use toastty_pty::{Pty, PtySpec};
-
-struct ChannelSink(Mutex<mpsc::Sender<UserEvent>>);
-
-impl EventSink for ChannelSink {
-    fn send(&self, ev: UserEvent) -> Result<(), SinkClosed> {
-        let g = self.0.lock().map_err(|_| SinkClosed)?;
-        g.send(ev).map_err(|_| SinkClosed)
-    }
-}
 
 /// Put the tty behind `fd` into raw mode so bytes round-trip 1:1 through
 /// `cat` (no echo, no CR/LF translation) and the ~1 KiB input ring is the
@@ -47,7 +39,12 @@ fn make_raw(fd: BorrowedFd<'_>) {
 
 /// Collect echoed bytes from the reader channel until `want` bytes have
 /// arrived or `max` elapses.
-fn collect_until(rx: &mpsc::Receiver<UserEvent>, want: usize, max: Duration) -> Vec<u8> {
+fn collect_until(
+    reader: &mut PtyReader,
+    rx: &mpsc::Receiver<UserEvent>,
+    want: usize,
+    max: Duration,
+) -> Vec<u8> {
     let deadline = Instant::now() + max;
     let mut bytes = Vec::new();
     while bytes.len() < want {
@@ -55,9 +52,9 @@ fn collect_until(rx: &mpsc::Receiver<UserEvent>, want: usize, max: Duration) -> 
         if now >= deadline {
             break;
         }
-        match rx.recv_timeout(deadline - now) {
-            Ok(UserEvent::PtyBytes(mut b)) => bytes.append(&mut b),
-            Ok(UserEvent::PtyClosed) | Err(_) => break,
+        match recv_batch(reader, rx, deadline - now) {
+            Some(Batch::Bytes(mut b)) => bytes.append(&mut b),
+            Some(Batch::Closed) | None => break,
         }
     }
     bytes
@@ -84,7 +81,7 @@ fn large_paste_delivers_every_byte_including_terminator() {
 
     let (tx, rx) = mpsc::channel();
     let sink = ChannelSink(Mutex::new(tx));
-    let _reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("spawn reader");
+    let mut reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("spawn reader");
     let writer = spawn_pty_writer(pty.master_fd()).expect("spawn writer");
 
     // 8 KiB: many times the ~1 KiB ring, so the writer parks on POLLOUT
@@ -92,7 +89,7 @@ fn large_paste_delivers_every_byte_including_terminator() {
     let paste = bracketed_paste(8192);
     writer.send(&paste);
 
-    let got = collect_until(&rx, paste.len(), Duration::from_secs(5));
+    let got = collect_until(&mut reader, &rx, paste.len(), Duration::from_secs(5));
 
     assert_eq!(
         got.len(),
@@ -119,7 +116,7 @@ fn writes_are_delivered_in_order() {
 
     let (tx, rx) = mpsc::channel();
     let sink = ChannelSink(Mutex::new(tx));
-    let _reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("spawn reader");
+    let mut reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("spawn reader");
     let writer = spawn_pty_writer(pty.master_fd()).expect("spawn writer");
 
     // Interleave a big (ring-spanning) send with small ones; order must be
@@ -136,7 +133,7 @@ fn writes_are_delivered_in_order() {
         expected.extend_from_slice(chunk);
     }
 
-    let got = collect_until(&rx, expected.len(), Duration::from_secs(5));
+    let got = collect_until(&mut reader, &rx, expected.len(), Duration::from_secs(5));
     assert_eq!(got, expected, "bytes arrived out of order or incomplete");
 
     drop(writer);
