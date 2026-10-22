@@ -78,6 +78,23 @@ impl RowDamage {
         }
     }
 
+    /// Mark each column in `[start, end)`: the same set (and the same
+    /// representation, no `all_cols` promotion) as one [`Self::mark`]
+    /// per column, for a run of printed cells.
+    #[inline]
+    pub fn mark_cols(&mut self, start: u16, end: u16) {
+        if self.all_cols || start >= end {
+            return;
+        }
+        if self.cols.last().is_none_or(|&last| start > last) {
+            self.cols.extend(start..end);
+            return;
+        }
+        for c in start..end {
+            self.mark(c);
+        }
+    }
+
     /// Mark the half-open range `[start, end)` dirty, clamped to
     /// `cols_in_row`. If the range covers the entire row, flips the
     /// `all_cols` shortcut (saving a per-column insert burst).
@@ -95,14 +112,7 @@ impl RowDamage {
             self.mark_all();
             return;
         }
-        if self.cols.last().is_none_or(|&last| start > last) {
-            // Past everything marked so far (a print run): append.
-            self.cols.extend(start..end);
-            return;
-        }
-        for c in start..end {
-            self.mark(c);
-        }
+        self.mark_cols(start, end);
     }
 
     /// Promote this row to "everything dirty". Drops the per-column list.

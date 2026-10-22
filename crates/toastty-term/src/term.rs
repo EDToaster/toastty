@@ -2583,6 +2583,81 @@ impl Term {
         }
     }
 
+    /// Print a run of printable ASCII (`0x20..=0x7E`): exactly
+    /// [`Self::print_char`] per byte, a row segment at a time. Within a
+    /// segment that fits before the right edge, nothing per-character can
+    /// differ: every byte is one cell wide, never a placeholder or a
+    /// grapheme extension, no wrap is pending after the first, and a
+    /// wide cluster can only be orphaned at the segment's two ends. So
+    /// the row is looked up once, the cells are written in one loop and
+    /// the damage marked as one span. Wrapping, IRM and DECAWM-off at the
+    /// edge go through `print_char` one byte at a time.
+    fn print_ascii(&mut self, mut run: &[u8]) {
+        while let Some(&first) = run.first() {
+            let right_edge = self.print_right_edge();
+            let (row, col) = (self.cursor.row, self.cursor.col);
+            if self.vt.insert_mode || col >= right_edge || self.wrap_pending() {
+                self.print_char(char::from(first));
+                run = &run[1..];
+                continue;
+            }
+            let n = run.len().min(usize::from(right_edge - col));
+            let (seg, rest) = run.split_at(n);
+            run = rest;
+            #[allow(clippy::cast_possible_truncation)] // n <= right_edge - col
+            let end = col + n as u16;
+            self.vt.wrap_pending_at = None;
+            let style = self.cursor.style;
+            let template = Cell {
+                ch: ' ',
+                style,
+                is_continuation: false,
+                hyperlink_id: self.current_hyperlink,
+                extra: None,
+            };
+            let max_cols = self.cols;
+            let r = self.active_grid_mut().row_mut(row);
+            // `clear_wide_orphans` for the whole segment.
+            let cells = r.cells();
+            let left_orphan = col > 0
+                && cells
+                    .get(usize::from(col))
+                    .is_some_and(|c| c.is_continuation);
+            let right_orphan = cells
+                .get(usize::from(end))
+                .is_some_and(|c| c.is_continuation);
+            let blank = Cell {
+                hyperlink_id: None,
+                ..template
+            };
+            if left_orphan {
+                r.put(col - 1, blank, max_cols);
+            }
+            if right_orphan {
+                r.put(end, blank, max_cols);
+            }
+            r.write_ascii(col, seg, template, max_cols);
+            if let Some(d) = self.damage.rows.get_mut(usize::from(row)) {
+                if left_orphan {
+                    d.mark(col - 1);
+                }
+                d.mark_cols(col, end);
+                if right_orphan {
+                    d.mark(end);
+                }
+            }
+            self.vt.last_graphic = Some(char::from(seg[n - 1]));
+            if end >= right_edge && (right_edge < self.cols || !self.vt.autowrap) {
+                // As in `print_char`: park on the last column and defer
+                // the wrap (or remember the cell, DECAWM off).
+                self.cursor.col = right_edge - 1;
+                self.vt.wrap_pending_at = Some((row, self.cursor.col));
+            } else {
+                self.cursor.col = end;
+            }
+        }
+    }
+
     /// Record that an HT advanced the cursor over `[from, to)` on `row`, so
     /// copy can reproduce the literal tab (bug #20; kitty and Ghostty do
     /// the same, xterm copies spaces). Only done when every cell in the
@@ -4267,6 +4342,10 @@ fn ansi_color(idx: u16, bright: bool) -> Color {
 impl Perform for Term {
     fn print(&mut self, c: char) {
         self.print_char(c);
+    }
+
+    fn print_ascii(&mut self, run: &[u8]) {
+        Term::print_ascii(self, run);
     }
 
     fn execute(&mut self, byte: u8) {

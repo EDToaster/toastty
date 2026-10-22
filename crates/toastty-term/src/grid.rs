@@ -140,6 +140,29 @@ impl Row {
         }
     }
 
+    /// Write one cell per byte of `run` (printable ASCII) at
+    /// `col..col + run.len()`, each `template` with that character: the
+    /// same as one [`Row::put`] per byte. The caller keeps the run inside
+    /// `max_cols`.
+    #[inline]
+    pub(crate) fn write_ascii(&mut self, col: u16, run: &[u8], template: Cell, max_cols: u16) {
+        self.rich = None;
+        let start = col as usize;
+        let end = (start + run.len()).min(max_cols as usize);
+        if end > self.cells.len() {
+            self.cells.resize(end, Cell::BLANK);
+        }
+        for (slot, &b) in self.cells[start..end].iter_mut().zip(run) {
+            *slot = Cell {
+                ch: char::from(b),
+                ..template
+            };
+        }
+        #[allow(clippy::cast_possible_truncation)] // end <= max_cols
+        let end = end as u16;
+        self.used = self.used.max(end);
+    }
+
     /// Erase cells in `[start, end)` (open at end) — used by EL handlers.
     pub fn erase(&mut self, start: u16, end: u16, style: Style) {
         self.rich = None;
