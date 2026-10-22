@@ -4738,9 +4738,15 @@ impl Term {
         // The cursor advance below scrolls the screen as far as it has to
         // go, and the image rides up with its text.
         let cur_row = self.cursor.row;
-        let start_col = self.cursor_col();
+        // A sixel in the pending-wrap state starts in the last column
+        // (unlike a kitty image, which kitty puts past the edge).
+        self.cursor.col = self.cursor.col.min(self.cols.saturating_sub(1));
+        let start_col = self.cursor.col;
 
-        self.place_image(Placement::new(id, rows, cols));
+        // Drawn at its native pixel size; the cell box is the reservation.
+        let mut placement = Placement::new(id, rows, cols);
+        (placement.fit_cols, placement.fit_rows) = (0, 0);
+        self.place_image(placement);
 
         let image_bottom = cur_row.saturating_add(rows).saturating_sub(1);
         // DECSET 8452: cursor lands on the image's last row, one column
@@ -4897,7 +4903,10 @@ impl KittySink for Term {
         // `C=1` image at the bottom is clipped rather than scrolling the
         // screen (SCR-10).
         placement.line = self.image_top_line() + i64::from(self.cursor.row);
-        placement.col = self.cursor.col.min(self.cols.saturating_sub(1));
+        // In the pending-wrap state (`col == cols`) kitty puts the image
+        // past the right edge, where it is cropped away (kitty-ref), and
+        // the cursor then wraps (`advance_cursor_after_placement`).
+        placement.col = self.cursor.col.min(self.cols);
         placement.clip_rows = 0..placement.rows;
         // M5: re-emitting the same `(image_id, placement_id)` must
         // REPLACE the prior placement, not stack on top of it. Per spec:
@@ -5218,7 +5227,18 @@ impl KittySink for Term {
         // (which skips this call) never scrolls (SCR-10). The image is
         // anchored to its line, so it rides up with the text instead of
         // being squashed. A cursor below the region just clamps.
-        let target_row = self.cursor.row.saturating_add(rows.saturating_sub(1));
+        //
+        // PLC-5: a column at or past the right edge wraps like kitty's
+        // `if (x >= columns) { x = 0; y++; }`, so text after an image
+        // that ends on the last column starts on the next line instead
+        // of hiding under the image.
+        let end_col = start_col.saturating_add(cols);
+        let wrap = end_col >= self.cols;
+        let target_row = self
+            .cursor
+            .row
+            .saturating_add(rows.saturating_sub(1))
+            .saturating_add(u16::from(wrap));
         let bot = self.scroll_bot.min(self.rows.saturating_sub(1));
         let in_region = (self.scroll_top..=bot).contains(&self.cursor.row);
         if in_region && target_row > bot {
@@ -5235,9 +5255,8 @@ impl KittySink for Term {
         } else {
             self.cursor.row = target_row.min(self.rows.saturating_sub(1));
         }
-        self.cursor.col = start_col
-            .saturating_add(cols)
-            .min(self.cols.saturating_sub(1));
+        self.cursor.col = if wrap { 0 } else { end_col };
+        self.vt.wrap_pending_at = None;
     }
 
     fn image_exists(&self, id: u32) -> bool {
@@ -5260,7 +5279,8 @@ impl KittySink for Term {
     }
 
     fn cursor_col(&self) -> u16 {
-        self.cursor.col.min(self.cols.saturating_sub(1))
+        // `cols` in the pending-wrap state: the image goes past the edge.
+        self.cursor.col.min(self.cols)
     }
 
     fn cell_pixel_size(&self) -> (u16, u16) {
@@ -11697,5 +11717,101 @@ mod placement_resize_tests {
         print_placeholder_on_row_5(&mut t);
         feed(&mut t, b"\x1b[3;1H\x1b[2M");
         assert_eq!(placeholder_run_row(&t), 3);
+    }
+}
+
+/// A3: native sizing and the cursor after a placement (SIZE-7, PLC-5).
+#[cfg(test)]
+mod placement_size_tests {
+    use super::*;
+    use toastty_parser::Parser;
+
+    fn feed(t: &mut Term, bytes: &[u8]) {
+        let mut p = Parser::new();
+        p.advance(t, bytes);
+    }
+
+    /// Transmit-and-place a `w`x`h` RGBA image (id 1) with extra `keys`.
+    fn place_px(t: &mut Term, w: u32, h: u32, keys: &str) {
+        use base64::Engine;
+        let px = vec![255u8; (w * h * 4) as usize];
+        let mut payload = format!("\x1b_Ga=T,f=32,s={w},v={h},i=1,q=2{keys};").into_bytes();
+        payload.extend_from_slice(
+            base64::engine::general_purpose::STANDARD
+                .encode(&px)
+                .as_bytes(),
+        );
+        payload.extend_from_slice(b"\x1b\\");
+        feed(t, &payload);
+    }
+
+    fn only(t: &Term) -> &Placement {
+        t.image_grid().iter().next().expect("placement")
+    }
+
+    #[test]
+    fn natural_size_reserves_ceil_cells_and_keeps_pixels() {
+        let mut t = Term::new(24, 80, 0);
+        t.set_cell_pixel_size(10, 19);
+        place_px(&mut t, 205, 105, ",C=1");
+        let p = only(&t);
+        assert_eq!((p.cols, p.rows), (21, 6));
+        assert_eq!((p.fit_cols, p.fit_rows), (0, 0), "drawn at native size");
+        assert_eq!(p.draw_rect((205, 105), (10.0, 19.0)).1, (205.0, 105.0));
+    }
+
+    #[test]
+    fn size7_wide_image_keeps_its_box_past_the_edge() {
+        // Truncated on the right at native scale, never squashed.
+        let mut t = Term::new(24, 80, 0);
+        t.set_cell_pixel_size(10, 19);
+        feed(&mut t, b"\x1b[1;41H");
+        place_px(&mut t, 1500, 10, ",C=1");
+        let p = only(&t);
+        assert_eq!((p.col, p.cols), (40, 150), "box runs past column 80");
+        assert_eq!(p.draw_rect((1500, 10), (10.0, 19.0)).1, (1500.0, 10.0));
+    }
+
+    #[test]
+    fn plc5_cursor_wraps_after_an_image_ending_at_the_right_edge() {
+        // kitty-ref: text after the image starts on column 1 of the next
+        // line, not hidden under the image's last column.
+        let mut t = Term::new(24, 80, 0);
+        t.set_cell_pixel_size(10, 19);
+        feed(&mut t, b"\x1b[6;61H"); // col 60: a 20-col image ends at 79
+        place_px(&mut t, 200, 100, "");
+        assert_eq!((t.cursor().row, t.cursor().col), (5 + 6 - 1 + 1, 0));
+        feed(&mut t, b"Z");
+        assert_eq!(t.row(11).cells[0].ch, 'Z');
+        // Not at the edge: one past the image, on its last row.
+        let mut t = Term::new(24, 80, 0);
+        t.set_cell_pixel_size(10, 19);
+        feed(&mut t, b"\x1b[6;21H");
+        place_px(&mut t, 200, 100, "");
+        assert_eq!((t.cursor().row, t.cursor().col), (10, 40));
+    }
+
+    #[test]
+    fn pending_wrap_puts_the_image_past_the_edge_like_kitty() {
+        // kitty-ref: after a full line the image is placed past the right
+        // edge (nothing visible) and the cursor wraps to the next line.
+        let mut t = Term::new(24, 80, 0);
+        t.set_cell_pixel_size(10, 19);
+        feed(&mut t, b"\x1b[6;1H");
+        feed(&mut t, &[b'x'; 80]);
+        place_px(&mut t, 200, 100, "");
+        assert_eq!(only(&t).col, 80);
+        assert_eq!((t.cursor().row, t.cursor().col), (5 + 6 - 1 + 1, 0));
+    }
+
+    #[test]
+    fn sixel_draws_at_native_size() {
+        let mut t = Term::new(24, 80, 0);
+        t.set_cell_pixel_size(10, 19);
+        // A 1x6 sixel band: "#0;2;100;0;0#0~" paints one column, 6 rows.
+        feed(&mut t, b"\x1bPq#0;2;100;0;0#0~\x1b\\");
+        let p = only(&t);
+        assert_eq!((p.fit_cols, p.fit_rows), (0, 0));
+        assert_eq!((p.cols, p.rows), (1, 1));
     }
 }
