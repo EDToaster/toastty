@@ -12,6 +12,13 @@
 //! before vte sees it. An incomplete sequence at the end of a chunk is
 //! held back (at most 3 bytes) until the next chunk completes or breaks
 //! it; one cut off by ESC becomes U+FFFD, as in vte and kitty.
+//!
+//! Cost: ASCII text costs one `is_ascii` scan. Other text is checked with
+//! SIMD (`simdutf8`) up to its last character boundary, which is valid
+//! in almost every chunk (a 4096-byte read of CJK nearly always ends
+//! partway through a character, so validating the whole chunk would
+//! fail). Only the 0..=3-byte tail, or a prefix that really is invalid,
+//! goes through the slower `std::str::from_utf8` loop.
 
 /// UTF-8 encoding of U+FFFD REPLACEMENT CHARACTER.
 const REPLACEMENT: &[u8] = "\u{FFFD}".as_bytes();
@@ -24,11 +31,88 @@ pub(crate) struct Utf8Sanitizer {
     tail_len: usize,
 }
 
+/// Length of the longest prefix of `bytes` that doesn't end partway
+/// through a character: looks back at most 3 bytes for a lead byte whose
+/// sequence runs past the end. Says nothing about validity.
+fn complete_prefix_len(bytes: &[u8]) -> usize {
+    let n = bytes.len();
+    for back in 1..=n.min(3) {
+        let b = bytes[n - back];
+        if b < 0x80 {
+            return n;
+        }
+        if b >= 0xC0 {
+            let need = if b >= 0xF0 {
+                4
+            } else if b >= 0xE0 {
+                3
+            } else {
+                2
+            };
+            return if need > back { n - back } else { n };
+        }
+    }
+    n
+}
+
 impl Utf8Sanitizer {
+    /// True while an incomplete sequence from an earlier chunk is held.
+    pub(crate) fn holds_partial(&self) -> bool {
+        self.tail_len > 0
+    }
+
+    /// The span `[start, end)` of `bytes` (one parser input chunk) whose
+    /// ground text can skip this sanitizer: valid UTF-8 that starts and
+    /// ends on character boundaries. Checked once per chunk (`is_ascii`,
+    /// else SIMD), so escape-heavy output doesn't pay a check for every
+    /// short run between escapes.
+    ///
+    /// - `start` skips the continuation bytes that complete a held
+    ///   character: the sanitizer must see those first. After them it
+    ///   holds nothing, unless they are all of `bytes`. If a held
+    ///   character is broken instead (a non-continuation byte comes
+    ///   first), the span is empty and the whole chunk is sanitized.
+    /// - `end` stops before a trailing partial character, which the
+    ///   sanitizer must hold.
+    /// - An invalid chunk gives an empty span: all of it is sanitized.
+    pub(crate) fn clean_span(&self, bytes: &[u8]) -> (usize, usize) {
+        let start = if self.tail_len == 0 {
+            0
+        } else {
+            let lead = self.tail[0];
+            let need: usize = if lead >= 0xF0 {
+                4
+            } else if lead >= 0xE0 {
+                3
+            } else {
+                2
+            };
+            let want = need.saturating_sub(self.tail_len);
+            let cont = bytes
+                .iter()
+                .take(want)
+                .take_while(|b| (0x80..0xC0).contains(*b))
+                .count();
+            if cont < want && cont < bytes.len() {
+                return (0, 0); // Broken across chunks: rare, sanitize all.
+            }
+            cont
+        };
+        // One SIMD pass covers ASCII too (simdutf8 has its own ASCII
+        // fast path, cheaper than `is_ascii`).
+        let rest = &bytes[start..];
+        let cut = complete_prefix_len(rest);
+        if simdutf8::basic::from_utf8(&rest[..cut]).is_ok() {
+            (start, start + cut)
+        } else {
+            (start, start)
+        }
+    }
+
     /// Clean `bytes` (ground text) and pass the result to `out`, in
     /// order, possibly in several pieces. `cut_by_esc` says an ESC
     /// follows directly, so an incomplete trailing sequence is final.
-    pub(crate) fn feed(&mut self, mut bytes: &[u8], cut_by_esc: bool, out: &mut dyn FnMut(&[u8])) {
+    pub(crate) fn feed(&mut self, mut bytes: &[u8], cut_by_esc: bool, out: &mut impl FnMut(&[u8])) {
         if self.tail_len > 0 {
             bytes = self.finish_tail(bytes, cut_by_esc, out);
             if self.tail_len > 0 {
@@ -40,6 +124,18 @@ impl Utf8Sanitizer {
                 out(bytes);
             }
             return;
+        }
+        // Fast path: SIMD-validate everything up to the last character
+        // boundary; usually that is all of it but a partial character.
+        let cut = complete_prefix_len(bytes);
+        if simdutf8::basic::from_utf8(&bytes[..cut]).is_ok() {
+            if cut > 0 {
+                out(&bytes[..cut]);
+            }
+            bytes = &bytes[cut..];
+            if bytes.is_empty() {
+                return;
+            }
         }
         loop {
             match std::str::from_utf8(bytes) {
@@ -79,7 +175,7 @@ impl Utf8Sanitizer {
         &mut self,
         bytes: &'b [u8],
         cut_by_esc: bool,
-        out: &mut dyn FnMut(&[u8]),
+        out: &mut impl FnMut(&[u8]),
     ) -> &'b [u8] {
         let held = self.tail_len;
         let mut buf = [0u8; 4];
@@ -211,5 +307,51 @@ mod tests {
         assert_eq!(v, "\u{FFFD}".as_bytes());
         s.feed(b"ok", false, &mut |b| v.extend_from_slice(b));
         assert_eq!(v, "\u{FFFD}ok".as_bytes());
+    }
+
+    #[test]
+    fn complete_prefix_stops_before_a_partial_character() {
+        assert_eq!(complete_prefix_len(b""), 0);
+        assert_eq!(complete_prefix_len(b"abc"), 3);
+        assert_eq!(complete_prefix_len("a€".as_bytes()), 4);
+        assert_eq!(complete_prefix_len(b"a\xe2\x82"), 1);
+        assert_eq!(complete_prefix_len(b"a\xf0\x9f\x98"), 1);
+        assert_eq!(complete_prefix_len("😀".as_bytes()), 4);
+        // Not a validity check: stray continuations and bad leads pass.
+        assert_eq!(complete_prefix_len(b"a\x80\x80\x80"), 4);
+        assert_eq!(complete_prefix_len(b"a\xff"), 1);
+    }
+
+    #[test]
+    fn clean_span_covers_valid_text_up_to_the_last_boundary() {
+        let s = Utf8Sanitizer::default();
+        assert_eq!(s.clean_span(b"plain ascii"), (0, 11));
+        assert_eq!(s.clean_span("한글".as_bytes()), (0, 6));
+        assert_eq!(
+            s.clean_span(b"\xed\x95\x9c\xea"),
+            (0, 3),
+            "partial last char"
+        );
+        assert_eq!(
+            s.clean_span(b"bad \x9c here"),
+            (0, 0),
+            "invalid: all sanitized"
+        );
+    }
+
+    #[test]
+    fn clean_span_starts_after_completing_a_held_character() {
+        let mut s = Utf8Sanitizer::default();
+        let mut v = Vec::new();
+        s.feed(b"\xe2\x82", false, &mut |b| v.extend_from_slice(b));
+        assert!(s.holds_partial());
+        // The held € finishes with 0xAC; the span starts after it.
+        assert_eq!(s.clean_span(b"\xacxyz"), (1, 4));
+        // Broken by a non-continuation byte: sanitize the whole chunk.
+        assert_eq!(s.clean_span(b"xyz"), (0, 0));
+        // Too short to finish it: nothing left to skip.
+        let mut s = Utf8Sanitizer::default();
+        s.feed(b"\xf0", false, &mut |b| v.extend_from_slice(b));
+        assert_eq!(s.clean_span(b"\x9f\x98"), (2, 2));
     }
 }
