@@ -258,6 +258,5 @@ way in is `mmap`, which is `unsafe`, and `toastty-graphics` is
 `shm_unlink`s it (`rustix::shm::unlink`, safe) so a client that ignores
 the reply doesn't leak the object, and replies the uniform EBADF. A
 client that probes with `a=q,t=s` (icat's `--detect-support`) then falls
-back to `t=t`/`t=d` on its own. **Pending a PM/user decision:** whether to
-read macOS shm through a small audited `unsafe` `mmap` (in a separate
-crate, or by lifting the forbid for one module), or to leave it as is.
+back to `t=t`/`t=d` on its own. **Decision (PM/user): decided: unsupported on macOS (keeps `#![forbid(unsafe_code)]`; clients fall back to file/base64).** No audited `unsafe` `mmap` reader
+will be added.

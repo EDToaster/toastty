@@ -1025,7 +1025,7 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
     measured cases match kitty 0.49.2 except that decode failures are
     EBADF, not `EBADPNG` (SEC-4). Design and table:
     `docs/decisions/kitty-file-medium.md`.
-  - **macOS / non-Linux: known limitation, pending a PM/user decision.**
+  - **macOS / non-Linux: decided: unsupported on macOS (keeps `#![forbid(unsafe_code)]`; clients fall back to file/base64).** Closed.
     macOS shm can only be read with `mmap`, which is `unsafe`, and
     `toastty-graphics` is `#![forbid(unsafe_code)]`. Off Linux `t=s`
     `shm_unlink`s the name (safe) and replies EBADF, so icat falls back
@@ -1209,7 +1209,7 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
     `Header::frame()`, `Header::animation()` and `Header::composition()` give
     the animation meaning of the overloaded keys.
 - [x] **P1 — Shared-memory transmission** (`t=s`). See WIRE-2.
-  - Fixed in #51 for Linux; macOS pending a decision (see WIRE-2).
+  - Fixed in #51 for Linux; macOS: decided: unsupported on macOS (keeps `#![forbid(unsafe_code)]`; clients fall back to file/base64) (see WIRE-2). Closed.
 - [x] **P2 — Usage hints** (`N=1` transient).
   - The key is accepted and ignored, which the spec allows.
   - It could feed eviction priority.
