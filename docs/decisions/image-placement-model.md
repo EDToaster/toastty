@@ -87,6 +87,54 @@ uses it too. A full-screen scroll up moves the ids, not the placements, so:
 - SD then SU restores an image that SD pushed partly below the screen.
 - ED 2 keeps images that are entirely in scrollback.
 
+## Size
+
+The cell box is only a **reservation**. It drives cursor motion, cell
+hit-tests and deletes. What is drawn is decided at render time, with the
+current cell size, by `Placement::draw_rect` (A3). The rules below were
+measured on kitty 0.49.2 with PIL bounding boxes (9×20 px cells):
+
+| Given | Drawn size | Reserved cells |
+|---|---|---|
+| neither `c=` nor `r=` | the source rect's native pixels (205×105 → 205×105; 3×50 → 3×50) | `ceil((w + X) / cell_w)` × `ceil((h + Y) / cell_h)` |
+| only `c=` | width `c·cell_w − X`, height from the source aspect, rounded (400×200 `c=10` → 90×45; 333×100 `c=10` → 90×27) | `c` × `ceil((h + Y) / cell_h)` |
+| only `r=` | height `r·cell_h − Y`, width from the aspect (400×200 `r=3` → 120×60) | `ceil((w + X) / cell_w)` × `r` |
+| both | the box less the offsets, stretched (200×100 `c=4,r=8` → 36×160) | `c` × `r` |
+
+- The spec says to letterbox when both are given. kitty stretches, and so
+  does toastty (SIZE-3).
+- `X=`/`Y=` are clamped to `cell − 1` (`X=25,Y=40` → +8,+19). They also
+  widen the reservation: `X=8,Y=19` on 200×100 reserves 24×6 cells.
+- The source rect (`x`/`y`/`w`/`h`) is kept as given. `SrcRect::resolve`
+  applies the spec's defaults and intersects it with the image:
+  - unset `w`/`h` run to the edge (`x=150` alone → 50×100);
+  - a rect partly outside shows the inside part (`x=150,w=100` → 50×100);
+  - a rect fully outside shows nothing;
+  - an oversized rect shows the full image.
+
+  The size and aspect come from the resolved rect (`w=60,h=40,c=12` →
+  108×72).
+- **Font zoom** keeps native-size images at their pixels, and
+  `c=`/`r=` images at their cell span. kitty-ref after two zoom steps:
+  205×105 stays 205×105, and `c=10` on 400×200 becomes 120×60 at 12 px
+  cells. This falls out of computing the size at render time (SIZE-11).
+- **Pixel exactness:** the quad's origin is snapped to whole window
+  pixels, including a centered grid's half-pixel lead
+  (`ImageView::origin`). A native-size image then maps texels 1:1 under
+  the linear sampler. The scroll offset stays exact, as it does for text.
+- **Edges:**
+  - A box wider or taller than the space left keeps its size and is
+    cropped at the grid edge at native scale (SIZE-7; 1500×100 at column
+    20 shows its first 800 px).
+  - In the pending-wrap state, kitty puts the image past the right edge,
+    so it is invisible, and toastty does the same.
+  - After a placement that reaches the right edge, the cursor wraps to
+    column 1 of the next line: kitty's `if (x >= columns) { x = 0; y++; }`
+    (PLC-5).
+- Placeholder tiles and the `Placement::new` default have `fit_cols` /
+  `fit_rows` equal to the box, so they stretch to their cells as before.
+  Sixel images draw at native size.
+
 ## Rendering
 
 `build_image_instances` (`crates/toastty-render/src/image/instance.rs`) takes
@@ -110,12 +158,8 @@ an `ImageView { top_line, scroll_px, clip }`:
 
 ## Interfaces for later work
 
-- **A3, native pixel sizing.** The destination size is computed in one place:
-  `dst_w`/`dst_h` in `build_image_instances`. Today it is `cols × cell_w` by
-  `rows × cell_h`. A3 can add a pixel size to `Placement` and use it there.
-  The crop and UV math already works for any destination rect. `rows`/`cols`
-  stay the cell *reservation*, which drives cursor movement and cell
-  hit-testing.
+- **Native pixel sizing (A3, done).** See "Size" above. A future
+  letterbox option would only change `Placement::draw_rect`.
 - **A5, per-screen image stores.** `ImageGrid` is already per screen (active
   plus stashed). Line ids are per `Grid`, so a per-screen registry can sit
   beside each `ImageGrid` without touching the anchoring.

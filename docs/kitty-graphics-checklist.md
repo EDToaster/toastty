@@ -312,7 +312,7 @@ UVs at draw time. Don't patch each item separately.
 
 ## 2. Sizing, scaling and rendering
 
-- [ ] **P0 — SIZE-1. Images are stretched to whole cells instead of drawn at
+- [x] **P0 — SIZE-1. Images are stretched to whole cells instead of drawn at
   native size.**
   - Repro: `K send a=T,i=1 --png img.png` with images of 205×105, 40×40, 3×50
     and 1×1.
@@ -327,21 +327,31 @@ UVs at draw time. Don't patch each item separately.
       (1.33 becomes 1.13).
   - Cause: `instance.rs:149-154` sizes the quad as `cols*cell_w × rows*cell_h`.
     `Placement` has no pixel size (`crates/toastty-graphics/src/kitty/handler.rs:825-900`).
-- [ ] **P1 — SIZE-2. Giving only `c=` or only `r=` distorts the image.**
+  - Fixed in #39. Drawn at the source's native pixel size, with the origin
+    snapped to whole pixels, so texels map 1:1. The cell box is only the
+    reservation. Measured: 205×105 → 205×105 (was 210×114), 40×40 → 40×40,
+    3×50 → 3×50, 1×1 → 1×1.
+- [x] **P1 — SIZE-2. Giving only `c=` or only `r=` distorts the image.**
   - Repro: a 400×200 image with `c=10`.
   - Expected (spec): "the other one is computed based on the source image
     aspect ratio, so that the image is displayed without distortion". kitty
     draws it at 90×45.
   - Actual: rows round up to 3, and the image is stretched to 100×57.
   - Cause: `handler.rs:857-869` plus SIZE-1.
-- [ ] **P2 — SIZE-3. Giving both `c=` and `r=` stretches the image; the spec
+  - Fixed in #39. The other side follows the source aspect, rounded to
+    whole pixels, like kitty (400×200 `c=10` → 90×45 on kitty's 9 px cells,
+    100×50 on toastty's 10×19).
+- [x] **P2 — SIZE-3. Giving both `c=` and `r=` stretches the image; the spec
   says letterbox.**
   - Spec: "When both are specified the image is letterboxed/pillarboxed to
     prevent distortion".
   - kitty 0.49.2 actually stretches too (36×160 for `c=4,r=8`), so toastty
     currently matches kitty.
   - Decide which one to follow, then add a test.
-- [ ] **P1 — SIZE-4. The cell span and aspect ratio come from the full image,
+  - Decided in #39: match kitty 0.49.2. Re-verified on kitty-ref: `c=4,r=8`
+    on 200×100 is 36×160, stretched to the box less any `X`/`Y`. Locked by
+    `kitty_ref_sizes_match`.
+- [x] **P1 — SIZE-4. The cell span and aspect ratio come from the full image,
   not the source rect.**
   - Repro: a 200×100 image with `x=0,y=0,w=60,h=40`, with no `c=`/`r=`, then
     with `c=12`.
@@ -349,7 +359,10 @@ UVs at draw time. Don't patch each item separately.
   - Actual: toastty draws 210×114, a blurry 3.5× zoom, and 120×76.
   - Cause: `handler.rs:851-869` uses `img_w`/`img_h` instead of the source
     rect's size.
-- [ ] **P1 — SIZE-5. A partial source rect is ignored.**
+  - Fixed in #39. The span and aspect come from the resolved source rect
+    (`w=60,h=40` → 60×40; with `c=12` → 120×80 on 10 px cells, kitty 108×72
+    on 9 px).
+- [x] **P1 — SIZE-5. A partial source rect is ignored.**
   - Repro: `w=` only, `h=` only, `x=` only or `y=` only.
   - Expected (spec): the defaults are "the entire width/height" from
     `x`/`y`. kitty crops accordingly.
@@ -359,7 +372,10 @@ UVs at draw time. Don't patch each item separately.
     - `SrcRect::is_full()` (`image_grid.rs:86-88`) treats `w==0 || h==0` as
       full.
     - So any rect with one dimension unset collapses to the full image.
-- [ ] **P1 — SIZE-6. The source rect isn't intersected with the image.**
+  - Fixed in #39. The rect is kept as given and resolved with the spec's
+    defaults (`SrcRect::resolve`). `w=50`, `h=30`, `x=150` and `y=70` alone
+    give 50×100, 200×30, 50×100 and 200×30, as in kitty.
+- [x] **P1 — SIZE-6. The source rect isn't intersected with the image.**
   - Repro: a rect partly outside the image, fully outside it, or larger
     than it.
   - Expected (spec): "The displayed area is the intersection of the
@@ -370,7 +386,9 @@ UVs at draw time. Don't patch each item separately.
   - Cause:
     - `instance.rs:151-160` computes UVs past 1.0.
     - The sampler clamps to the edge (`crates/toastty-render/src/image/pipeline.rs:164-166`).
-- [ ] **P1 — SIZE-7. Images wider or taller than the space left are squashed,
+  - Fixed in #39. Intersected with the image: partly outside → 50×100,
+    fully outside → nothing, oversized → the full image, matching kitty.
+- [x] **P1 — SIZE-7. Images wider or taller than the space left are squashed,
   not truncated.**
   - Repro: a 1500×100 image, or `c=300,r=100`, or an image placed with the
     cursor mid-line.
@@ -381,6 +399,10 @@ UVs at draw time. Don't patch each item separately.
     - The clamp at `term.rs:4717-4725` trims cells but not `src_rect`.
     - In pending-wrap state the image is squashed into the last column
       (`term.rs:4685`).
+  - Fixed in #39. The box keeps its size and is cropped at native scale at
+    the grid edge (1500×100 at column 20 shows its first 800 px). In the
+    pending-wrap state kitty puts the image past the right edge (invisible)
+    and wraps the cursor; toastty now does the same.
 - [x] **P0 — SIZE-8. At most 14 images render; the rest silently disappear.**
   - Repro:
     - 20, 40 or 500 placements of distinct images, e.g. a grid of
@@ -437,7 +459,7 @@ UVs at draw time. Don't patch each item separately.
       explicit `\e[48;2;r;g;bm` equal to the default RGB covers the image
       in toastty (the cell is painted opaque), but in kitty it lets the
       image through and is drawn translucent.
-- [ ] **P2 — SIZE-10. `X=`/`Y=` pixel offsets aren't clamped to the cell, and
+- [x] **P2 — SIZE-10. `X=`/`Y=` pixel offsets aren't clamped to the cell, and
   aren't fitted into `c`/`r`.**
   - Repro: `X=25,Y=40` with 10×19 cells, and `X=5,c=6`.
   - Expected (spec): "the offsets must be smaller than the size of the
@@ -446,12 +468,19 @@ UVs at draw time. Don't patch each item separately.
   - Actual: toastty applies the values as given, and the image overruns the
     box by 5 px.
   - Cause: `instance.rs:143-146` and `handler.rs:893`.
-- [ ] **P2 — SIZE-11. Font zoom rescales natural-size images.**
+  - Fixed in #39. Clamped to `cell − 1` (kitty: +8,+19 for `X=25,Y=40`),
+    and fitted inside `c`/`r` (`X=5,c=6` → 49×25 on kitty, 55×28 on
+    toastty's 10 px cells). The offset also widens the reservation, as in
+    kitty.
+- [x] **P2 — SIZE-11. Font zoom rescales natural-size images.**
   - Expected: kitty keeps a natural-size image (no `c=`/`r=`) at its pixel
     size. For placements with explicit `c=`/`r=` it keeps the cell span and
     rescales; toastty matches kitty there.
   - Actual: toastty keeps the 21×6-cell span and grows the image from
     205×105 to 273×156. This falls out of SIZE-1.
+  - Fixed in #39. The size is computed at render time: after zooming,
+    205×105 stays 205×105 (was 231×132), and `c=10` on 400×200 rescales to
+    110×55 at 11 px cells (kitty: 120×60 at 12 px).
 - [ ] **P2 — SIZE-12. Downscaling aliases badly.**
   - Repro: a 1500×900 grid image with `c=30`.
   - Actual: the 10 px grid's vertical lines vanish. kitty also aliases, but
@@ -668,11 +697,13 @@ Done in #28. See
   - Cause: `registry.rs:163, 252` (`next_free_id` hands out the lowest free
     id). Allocate from the top of the id space, or keep anonymous images
     out of the id table.
-- [ ] **P2 — PLC-5. A placement that ends at the right edge clamps the cursor
+- [x] **P2 — PLC-5. A placement that ends at the right edge clamps the cursor
   to the last column.**
   - Actual: the next text lands hidden under the image. kitty wraps to
     column 1 of the next line.
   - Cause: `term.rs:4984-5010`.
+  - Fixed in #39. The cursor wraps to column 1 of the next line, as in kitty
+    (`if (x >= columns) { x = 0; y++; }`).
 - [ ] **P2 — PLC-6. Main and alt screens share one image store.**
   - Repro: `d=I` on the alt screen.
   - Actual: it frees the main screen's image, which is blank after leaving
