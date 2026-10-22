@@ -834,6 +834,41 @@ pub fn glyph_fg(cell: &Cell, fg: [f32; 4], bg: [f32; 4]) -> [f32; 4] {
     }
 }
 
+/// [`glyph_fg`] for a stream of cells, remembering the last faint
+/// colour. [`dim_color`] costs nine `powf`s and faint text comes in
+/// runs of the same colours, so a screen of it would otherwise spend
+/// milliseconds per frame recomputing one value. Keys compare bit for
+/// bit, so the result is always exactly `dim_color`'s.
+#[derive(Debug, Default)]
+struct DimMemo(Option<([u32; 8], [f32; 4])>);
+
+impl DimMemo {
+    #[inline]
+    fn glyph_fg(&mut self, cell: &Cell, fg: [f32; 4], bg: [f32; 4]) -> [f32; 4] {
+        if !cell.style.flags.dim() {
+            return fg;
+        }
+        let key = [
+            fg[0].to_bits(),
+            fg[1].to_bits(),
+            fg[2].to_bits(),
+            fg[3].to_bits(),
+            bg[0].to_bits(),
+            bg[1].to_bits(),
+            bg[2].to_bits(),
+            bg[3].to_bits(),
+        ];
+        match self.0 {
+            Some((k, v)) if k == key => v,
+            _ => {
+                let v = dim_color(fg, bg);
+                self.0 = Some((key, v));
+                v
+            }
+        }
+    }
+}
+
 /// Emit a cell's glyph(s) and decoration strips, shared by the full and
 /// partial-redraw builders so the two can't drift.
 ///
@@ -1075,6 +1110,7 @@ pub fn build_instances_into_opts<F, S>(
         0.0
     };
 
+    let mut dim_memo = DimMemo::default();
     let bottom_id = term.bottom_id();
     let view_offset_lines = term.view_offset_lines();
     let needed = usize::from(rows_rendered) * usize::from(cols);
@@ -1118,7 +1154,7 @@ pub fn build_instances_into_opts<F, S>(
             let pos = [f32::from(c) * cell_w, f32::from(r) * cell_h + y_translate];
             let (fg, bg) = resolve_cell_colors(cell, theme, ext_palette);
             let bg = if selected { theme.selection_bg } else { bg };
-            let fg = glyph_fg(cell, fg, bg);
+            let fg = dim_memo.glyph_fg(cell, fg, bg);
 
             // Width-2 (CJK) primaries: widen the bg quad to span both
             // columns so the continuation half isn't left showing the
@@ -1359,6 +1395,7 @@ pub fn build_dirty_instances_into_opts<F, S>(
     } else {
         0.0
     };
+    let mut dim_memo = DimMemo::default();
     let bottom_id = term.bottom_id();
     let view_offset_lines = term.view_offset_lines();
 
@@ -1399,7 +1436,7 @@ pub fn build_dirty_instances_into_opts<F, S>(
             let pos = [f32::from(c) * cell_w, f32::from(r) * cell_h + y_translate];
             let (fg, bg) = resolve_cell_colors(cell, theme, ext_palette);
             let bg = if selected { theme.selection_bg } else { bg };
-            let fg = glyph_fg(cell, fg, bg);
+            let fg = dim_memo.glyph_fg(cell, fg, bg);
 
             // Width-2 (CJK) primaries: widen the bg quad to span both
             // columns so the continuation half isn't left showing the
@@ -3811,6 +3848,29 @@ mod tests {
                 srgb_channel_to_linear_exact(v).to_bits(),
                 "channel {v}"
             );
+        }
+    }
+
+    #[test]
+    fn dim_memo_matches_dim_color() {
+        let mut term = Term::new(1, 4, 0);
+        feed(&mut term, b"\x1b[2;31ma\x1b[2;32mb");
+        let dim = *term.row(0).cells().first().unwrap();
+        let plain = Cell::BLANK;
+        let mut memo = DimMemo::default();
+        let red = [0.8, 0.1, 0.1, 1.0];
+        let dark = [0.07, 0.07, 0.09, 1.0];
+        let green = [0.1, 0.8, 0.1, 1.0];
+        let pairs = [
+            (red, dark),
+            (red, dark),
+            (green, dark),
+            (red, dark),
+            (red, green),
+        ];
+        for (fg, bg) in pairs {
+            assert_eq!(memo.glyph_fg(&dim, fg, bg), dim_color(fg, bg));
+            assert_eq!(memo.glyph_fg(&plain, fg, bg), fg);
         }
     }
 }
