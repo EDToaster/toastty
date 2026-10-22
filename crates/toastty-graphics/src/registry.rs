@@ -94,6 +94,10 @@ pub struct ImageRegistry<K: RegistryKey = u32> {
     generations: HashMap<K, u64>,
     /// Next generation to hand out. Starts at 1, never reused.
     next_generation: u64,
+    /// Ids sent with the transient usage hint (`N=1`). Under storage
+    /// pressure they are evicted before other images without placements
+    /// (spec "Usage hints"; §9).
+    transient: HashSet<K>,
 }
 
 impl<K: RegistryKey> ImageRegistry<K> {
@@ -116,6 +120,7 @@ impl<K: RegistryKey> ImageRegistry<K> {
             revision: 0,
             generations: HashMap::new(),
             next_generation: 1,
+            transient: HashSet::new(),
         }
     }
 
@@ -215,8 +220,11 @@ impl<K: RegistryKey> ImageRegistry<K> {
     /// currently have live placements. Per the kitty spec — "existing
     /// images without placements will be preferentially deleted" — the
     /// eviction prefers unpinned images and only evicts a pinned image
-    /// when no unpinned candidate remains. Both passes still respect LRU
-    /// order (oldest first).
+    /// when no unpinned candidate remains. Among unpinned images, ones
+    /// marked transient ([`set_transient`](Self::set_transient), `N=1`)
+    /// go first. Every pass respects LRU order (oldest first).
+    ///
+    /// The new entry starts out non-transient; mark it after inserting.
     pub fn insert_with_pinned(
         &mut self,
         id: K,
@@ -243,6 +251,8 @@ impl<K: RegistryKey> ImageRegistry<K> {
             // Drop the stale LRU entry; we'll push the fresh one below.
             self.lru.retain(|x| *x != final_id);
         }
+        // A usage hint belongs to the data it was sent with.
+        self.transient.remove(&final_id);
 
         // Evict until we have room. Don't ever evict the id we're about
         // to insert (removed above so it's no longer in `lru`).
@@ -253,11 +263,13 @@ impl<K: RegistryKey> ImageRegistry<K> {
         // fall back to the strict LRU front (which may be pinned).
         let mut evicted = Vec::new();
         while self.total_bytes + need > self.cap_bytes {
-            // Prefer the oldest unpinned image.
+            // Prefer the oldest unpinned transient image, then the oldest
+            // unpinned one.
             let victim = self
                 .lru
                 .iter()
-                .position(|x| !pinned.contains(x))
+                .position(|x| !pinned.contains(x) && self.transient.contains(x))
+                .or_else(|| self.lru.iter().position(|x| !pinned.contains(x)))
                 // Fall back to the strict LRU front if everything left is
                 // pinned (we must still free space to honor the cap).
                 .or_else(|| (!self.lru.is_empty()).then_some(0));
@@ -270,6 +282,7 @@ impl<K: RegistryKey> ImageRegistry<K> {
             let Some(victim) = self.lru.remove(at) else {
                 break;
             };
+            self.transient.remove(&victim);
             if let Some(victim_data) = self.entries.remove(&victim) {
                 self.total_bytes -= self.cost(&victim_data);
                 self.generations.remove(&victim);
@@ -289,8 +302,24 @@ impl<K: RegistryKey> ImageRegistry<K> {
         })
     }
 
+    /// Mark `id` as transient (`N=1`) or not. No-op for an unknown id.
+    pub fn set_transient(&mut self, id: K, transient: bool) {
+        if transient && self.entries.contains_key(&id) {
+            self.transient.insert(id);
+        } else {
+            self.transient.remove(&id);
+        }
+    }
+
+    /// True iff `id` is stored and marked transient.
+    #[must_use]
+    pub fn is_transient(&self, id: K) -> bool {
+        self.transient.contains(&id)
+    }
+
     /// Remove `id`. Returns the freed image if it was present.
     pub fn remove(&mut self, id: K) -> Option<ImageData> {
+        self.transient.remove(&id);
         let data = self.entries.remove(&id)?;
         self.total_bytes -= self.cost(&data);
         self.generations.remove(&id);
@@ -313,6 +342,7 @@ impl<K: RegistryKey> ImageRegistry<K> {
             let Some(victim) = self.lru.pop_front() else {
                 break;
             };
+            self.transient.remove(&victim);
             if let Some(data) = self.entries.remove(&victim) {
                 self.total_bytes -= self.cost(&data);
                 self.generations.remove(&victim);
@@ -596,6 +626,45 @@ mod tests {
             .insert_with_pinned(4, img(2, 2, 0), &HashSet::new())
             .unwrap();
         assert_eq!(res.evicted, vec![1]);
+    }
+
+    /// §9 usage hints: an unplaced transient image is evicted before an
+    /// older non-transient one, but a placed (pinned) image is still kept
+    /// over an unplaced one.
+    #[test]
+    fn transient_images_are_evicted_first() {
+        let mut r = ImageRegistry::<u32>::new(48);
+        r.insert(1, img(2, 2, 1)).unwrap(); // oldest, normal
+        r.insert(2, img(2, 2, 2)).unwrap();
+        r.set_transient(2, true);
+        r.insert(3, img(2, 2, 3)).unwrap();
+        assert!(r.is_transient(2));
+        let ins = r.insert(4, img(2, 2, 4)).unwrap();
+        assert_eq!(ins.evicted, vec![2], "transient goes first");
+        assert!(!r.is_transient(2));
+        // Pinned transient is protected like any pinned image.
+        r.set_transient(3, true);
+        let pinned: HashSet<u32> = [3].into_iter().collect();
+        let ins = r.insert_with_pinned(5, img(2, 2, 5), &pinned).unwrap();
+        assert_eq!(
+            ins.evicted,
+            vec![1],
+            "oldest unpinned, not pinned transient"
+        );
+    }
+
+    #[test]
+    fn transient_flag_is_cleared_by_replace_and_remove() {
+        let mut r = ImageRegistry::<u32>::new(1024);
+        r.insert(1, img(1, 1, 1)).unwrap();
+        r.set_transient(1, true);
+        r.insert(1, img(1, 1, 2)).unwrap();
+        assert!(!r.is_transient(1), "a re-send without N=1 is not transient");
+        r.set_transient(1, true);
+        r.remove(1);
+        assert!(!r.is_transient(1));
+        r.set_transient(9, true);
+        assert!(!r.is_transient(9), "unknown ids are not marked");
     }
 
     #[test]
