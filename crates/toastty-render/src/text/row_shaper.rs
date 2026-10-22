@@ -90,8 +90,7 @@ impl RowShaper {
                 continue;
             }
             let row = term.view_row(r);
-            self.row_blink[ri] = row_has_blink(row);
-            fill_row_text(
+            self.row_blink[ri] = fill_row_text(
                 &mut self.text,
                 term,
                 row,
@@ -123,16 +122,20 @@ impl RowShaper {
     }
 }
 
-/// Fill `out` with the text the shaper sees for `row`.
+/// Fill `out` with the text the shaper sees for `row`, and return
+/// whether the row holds visible blinking text (`row_has_blink`, folded
+/// into the same pass over the cells).
 ///
 /// Continuation cells are excluded: they're the second half of a width-2
 /// cluster whose primary cell already contributes its full multi-cell
 /// glyph to the shaper. Feeding the continuation in as a space would
 /// insert an extra glyph cosmic-text would shape, shifting every
 /// downstream cluster's snapped column by one.
-fn fill_row_text(out: &mut String, term: &Term, row: &toastty_term::Row, suppress: bool) {
+fn fill_row_text(out: &mut String, term: &Term, row: &toastty_term::Row, suppress: bool) -> bool {
     out.clear();
+    let mut blink = false;
     for c in row.cells() {
+        blink |= c.style.flags.blink() && !c.style.flags.hidden();
         if c.is_continuation {
             continue;
         }
@@ -159,6 +162,8 @@ fn fill_row_text(out: &mut String, term: &Term, row: &toastty_term::Row, suppres
             out.push_str(term.grapheme_tail(c));
         }
     }
+    debug_assert_eq!(blink, row_has_blink(row));
+    blink
 }
 
 #[cfg(test)]
