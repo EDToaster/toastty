@@ -1096,6 +1096,19 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
     kitty 0.49.2 treats CAN, SUB and an ESC not followed by `\` as data
     and keeps going to ST or BEL (checked live). toastty ends the string
     on them, as xterm and vte do.
+- [x] **P2 — WIRE-15. A DCS cancelled by CAN or SUB is still acted on.**
+  Found in the #36 review.
+  - vte unhooks a DCS the same way on every terminator, so `Term::unhook`
+    ran for a cancelled one too:
+    - `ESC P $ q m CAN` got a full DECRQSS reply;
+    - a sixel cut off by CAN was still placed.
+  - Expected: xterm aborts the DCS on CAN / SUB.
+  - kitty 0.49.2 (checked live) treats CAN / SUB as data, see WIRE-13. So
+    it never answers a query cut off by one either; a later ST answers for
+    the whole body, CAN included (`ESC P 0 $ r`).
+  - Fix: the parser's DCS state calls `Perform::dcs_cancel` before passing
+    CAN / SUB to vte. `Term` then drops the pending query or sixel, so the
+    `unhook` that follows does nothing. Fixed in #45.
 - [x] **P2 — WIRE-6. Malformed headers get an EINVAL reply; kitty stays
   silent.**
   - Cases: `s=abc`, `s=`, `a=X`, `t=x`, `o=y`, `x=-5`. (Re-measured for

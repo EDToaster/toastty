@@ -26,6 +26,13 @@ pub trait Perform {
     }
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
 
+    /// The DCS in progress was cancelled by CAN or SUB. vte still calls
+    /// [`Self::unhook`] for it (it unhooks the same way on every
+    /// terminator), so a handler that acts on `unhook` (a query reply, a
+    /// sixel) must drop what it buffered here. Called just before that
+    /// `unhook`.
+    fn dcs_cancel(&mut self) {}
+
     /// Beginning of an APC payload (`ESC _`). The header parameters
     /// (e.g. kitty graphics `a=T,f=24,s=...`) appear in subsequent
     /// [`Self::apc_chunk`] calls — the parser does not split header
@@ -106,6 +113,9 @@ impl<H: BufferedApc> Perform for BufferingApcHandler<H> {
     }
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
         self.inner.esc_dispatch(intermediates, ignore, byte);
+    }
+    fn dcs_cancel(&mut self) {
+        self.inner.dcs_cancel();
     }
 
     fn apc_start(&mut self) {
