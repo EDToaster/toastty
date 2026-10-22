@@ -711,7 +711,7 @@ impl Term {
             return;
         }
         let g = self.active_grid();
-        let (first, last) = (line_i64(g.oldest_retained_id()), line_i64(g.bottom_id()));
+        let (first, last) = (oldest_line_of(g), line_i64(g.bottom_id()));
         if !self.image_grid.retain_lines(first, last).is_empty() {
             self.image_revision = self.image_revision.wrapping_add(1);
         }
@@ -5037,7 +5037,17 @@ impl KittySink for Term {
         let bot = self.scroll_bot.min(self.rows.saturating_sub(1));
         let in_region = (self.scroll_top..=bot).contains(&self.cursor.row);
         if in_region && target_row > bot {
-            for _ in bot..target_row {
+            // Past the region height a partial region is all blank, so
+            // stop there; a full-screen scroll stops once it has cycled
+            // the whole ring (screen plus history). This bounds the cost
+            // of a huge `r=` (e.g. 65535).
+            let full = self.scroll_top == 0 && bot == self.rows.saturating_sub(1);
+            let limit = if full {
+                self.active_grid().cap()
+            } else {
+                usize::from(bot - self.scroll_top + 1)
+            };
+            for _ in 0..usize::from(target_row - bot).min(limit) {
                 self.region_scroll_up();
             }
             self.cursor.row = bot;
@@ -5275,6 +5285,16 @@ fn top_line_of(g: &Grid) -> i64 {
     line_i64(g.bottom_id()) - i64::from(g.visible_rows().saturating_sub(1))
 }
 
+/// Line id of `g`'s oldest retained row (top of the history), in the
+/// signed space placements use. Computed from the top line rather than
+/// `Grid::oldest_retained_id`, which saturates at 0 when `bottom_id` has
+/// been driven below the visible height (SD / RI with no history on the
+/// current grid): the top line may be negative then, and a saturated
+/// bound would evict images that are still on screen.
+fn oldest_line_of(g: &Grid) -> i64 {
+    top_line_of(g) - i64::from(g.history_lines())
+}
+
 /// A `Grid` line id as the signed id placements use. Ids start near 0
 /// and grow by one per scrolled line, so they never reach `i64::MAX`.
 #[allow(clippy::cast_possible_wrap)]
@@ -5298,7 +5318,7 @@ fn reanchor_images(images: &mut ImageGrid, old_top: i64, grid: &Grid, cols: u16)
     changed |= !images
         .remove_where(|p| p.screen_rows(new_top).start >= rows || p.col >= cols)
         .is_empty();
-    let first = line_i64(grid.oldest_retained_id());
+    let first = oldest_line_of(grid);
     changed |= !images.retain_lines(first, i64::MAX).is_empty();
     changed
 }
@@ -10660,6 +10680,57 @@ mod placement_model_tests {
         // Rows 4..7 straddle the bottom margin (5), so the image stays
         // put while the region scrolls (SCR-5 rule).
         assert_eq!(t.prows(only(&t)), 4..7);
+    }
+
+    #[test]
+    fn sd_moves_top_straddling_image_and_its_child_together() {
+        // Review repro: parent c=20,r=6 at row 1 with a child at V=4,
+        // three LFs at the bottom (parent on rows -2..4), then SD 2.
+        // kitty-ref moves both down 2 rows. Holds on the current grid
+        // (rows renumbered) and with #23 (ids fixed, explicit shift).
+        let mut t = Term::new(10, 30, 100);
+        feed(&mut t, b"\x1b[2;1H");
+        place(&mut t, 1, 20, 6, ",C=1,p=1");
+        place(&mut t, 2, 2, 1, ",C=1,a=t");
+        feed(&mut t, b"\x1b_Ga=p,i=2,p=2,P=1,Q=1,V=4,q=2\x1b\\");
+        feed(&mut t, b"\x1b[10;1H\n\n\n");
+        let parent_rows = |t: &Term| t.prows(t.image_grid().find(1, 1).unwrap());
+        assert_eq!(parent_rows(&t), -2..4);
+        feed(&mut t, b"\x1b[2T");
+        assert_eq!(parent_rows(&t), 0..6, "the hidden top rows come back");
+        let (parent, child) = (
+            t.image_grid().find(1, 1).unwrap(),
+            t.image_grid().find(2, 2).unwrap(),
+        );
+        assert_eq!(child.line - parent.line, 4, "child keeps its offset");
+    }
+
+    #[test]
+    fn sd_without_history_keeps_on_screen_images() {
+        // Review repro: SD on a grid with no history drove the top line
+        // negative while `oldest_retained_id` saturated at 0, so the
+        // eviction dropped an on-screen image.
+        let mut t = Term::new(10, 20, 100);
+        feed(&mut t, b"\x1b[3T\x1b[H");
+        place(&mut t, 1, 4, 2, ",C=1");
+        feed(&mut t, b"\x1b[T");
+        assert_eq!(t.image_grid().len(), 1);
+        assert_eq!(t.prows(only(&t)), 1..3);
+        // The alt screen never has history.
+        feed(&mut t, b"\x1b[?1049h\x1b[5T\x1b[H");
+        place(&mut t, 1, 4, 2, ",C=1");
+        feed(&mut t, b"\x1bM\x1bM");
+        assert_eq!(t.prows(only(&t)), 2..4);
+    }
+
+    #[test]
+    fn huge_rows_in_a_region_scroll_at_most_the_region() {
+        let mut t = Term::new(10, 20, 100);
+        feed(&mut t, b"\x1b[3;8r\x1b[5;1H");
+        let start = std::time::Instant::now();
+        place(&mut t, 1, 4, 65535, "");
+        assert!(start.elapsed() < std::time::Duration::from_millis(50));
+        assert_eq!(t.cursor().row, 7, "cursor on the bottom margin");
     }
 
     #[test]
