@@ -28,6 +28,9 @@ pub enum ErrorCode {
     Enodata,
     /// PNG data could not be decoded.
     Ebadpng,
+    /// A chunked query arrived in the middle of an upload (kitty's
+    /// `EILSEQ:More payload loading refers to non-existent image`).
+    Eilseq,
     /// Decoded image would exceed the image quota (kitty's reply to an
     /// oversized PNG, checked on the IHDR before decoding).
     Enomem,
@@ -53,6 +56,7 @@ impl ErrorCode {
             ErrorCode::Enomem => "ENOMEM",
             ErrorCode::Enodata => "ENODATA",
             ErrorCode::Ebadpng => "EBADPNG",
+            ErrorCode::Eilseq => "EILSEQ",
             ErrorCode::Enoparent => "ENOPARENT",
             ErrorCode::Ecycle => "ECYCLE",
             ErrorCode::Etoodeep => "ETOODEEP",
