@@ -4518,10 +4518,13 @@ impl Term {
         header: &toastty_graphics::kitty::header::Header,
         uppercase: bool,
     ) -> Vec<Placement> {
+        // `i=` is taken as is: removing placements / bytes of an id that
+        // has neither is a no-op, and leftover placements of an id whose
+        // data is already gone get cleaned up.
         let target = if header.image_id != 0 {
-            Some(header.image_id).filter(|&id| self.image_registry.contains(id))
+            Some(header.image_id)
         } else if header.image_number != 0 {
-            self.image_number_to_id.get(&header.image_number).copied()
+            self.newest_image_for_number(header.image_number)
         } else {
             None
         };
@@ -10156,6 +10159,47 @@ mod major_delete_tests {
         assert!(!has_placement_for(&t, 2));
         assert!(t.image_registry().contains(1), "older one kept");
         assert!(has_placement_for(&t, 1));
+    }
+
+    #[test]
+    fn repeated_number_deletes_walk_back_through_older_images() {
+        // #35 review: freeing the newest image with I=7 must leave the
+        // older ones reachable by I=7, for d=F and d=N alike (kitty
+        // removes all of them over repeated deletes).
+        for sel in ["F", "N"] {
+            let mut t = Term::new(8, 8, 0);
+            transmit_place_numbered(&mut t, 0, 0, 7); // id 1
+            transmit_place_numbered(&mut t, 2, 0, 7); // id 2
+            transmit_place_numbered(&mut t, 4, 0, 7); // id 3 (newest)
+            let del = format!("\x1b_Ga=d,d={sel},I=7\x1b\\");
+            feed(&mut t, del.as_bytes());
+            assert!(!t.image_registry().contains(3), "d={sel}: newest first");
+            assert!(t.image_registry().contains(2) && t.image_registry().contains(1));
+            feed(&mut t, del.as_bytes());
+            assert!(!t.image_registry().contains(2), "d={sel}: then the next");
+            assert!(t.image_registry().contains(1));
+            feed(&mut t, del.as_bytes());
+            assert!(!t.image_registry().contains(1), "d={sel}: then the oldest");
+            assert!(t.image_grid().is_empty(), "d={sel}");
+            // Nothing left with that number: a no-op.
+            feed(&mut t, del.as_bytes());
+        }
+    }
+
+    #[test]
+    fn number_map_follows_reregistration() {
+        // Re-transmitting an id moves it to the newest slot of its new
+        // number and out of its old one.
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_numbered(&mut t, 0, 0, 7); // id 1
+        transmit_place_numbered(&mut t, 2, 0, 7); // id 2
+        assert_eq!(t.newest_image_for_number(7), Some(2));
+        // Re-register id 1 with no number (i= only): it leaves I=7.
+        transmit_place_at(&mut t, 4, 0, 1, 0, 0);
+        feed(&mut t, b"\x1b_Ga=d,d=N,I=7\x1b\\");
+        assert!(!t.image_registry().contains(2));
+        assert!(t.image_registry().contains(1), "id 1 no longer has I=7");
+        assert_eq!(t.newest_image_for_number(7), None);
     }
 
     #[test]
