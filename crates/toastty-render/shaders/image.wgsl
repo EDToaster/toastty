@@ -1,9 +1,10 @@
 // M11a image pipeline shader.
 //
-// One draw call per image (kitty stores each image as its own GPU
-// texture; max 16 active textures per [`ImagePipeline`]). We vertex-pull
-// 4 corners per instance and sample a single bound texture. Output is
-// alpha-over against whatever the swapchain holds.
+// One draw call per run of same-texture instances (each image is its
+// own GPU texture). We vertex-pull 4 corners per instance and sample a
+// single bound texture, trilinear: textures drawn downscaled carry a
+// mip chain (see `mip.wgsl`). Output is alpha-over against whatever the
+// swapchain holds.
 
 struct ImageInstance {
     // Top-left in screen pixels.
@@ -66,6 +67,9 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    // Plain trilinear (`LOD_BIAS` = 0 in src/image/mip.rs: a negative
+    // bias re-introduces aliasing at moderate downscales). At 1:1 or when
+    // upscaling the LOD is <= 0, so level 0 is read exactly as before.
     let sample = textureSample(image_tex, image_sampler, in.uv);
     return sample;
 }

@@ -5,10 +5,12 @@
 //!   LRU mirror of `ImageRegistry`.
 //! - [`instance`] — `ImageInstance` GPU layout + `build_image_instances`.
 //! - [`pipeline`] — `ImagePipeline`, the wgpu pipeline + bind group.
+//! - `mip` — mip levels for images drawn downscaled (SIZE-12).
 //! - [`placeholder`] — instances for kitty Unicode-placeholder cells.
 
 pub mod atlas;
 pub mod instance;
+mod mip;
 pub mod pipeline;
 pub mod placeholder;
 pub mod rich;
