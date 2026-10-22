@@ -462,3 +462,180 @@ fn placeholder_origin_is_the_minimum_cell() {
     assert_eq!(t.placeholder_origin(42, 3), Some((2, 2)));
     assert_eq!(t.placeholder_origin(42, 4), None);
 }
+
+// ---- review fixes (#28) ---------------------------------------------
+
+/// Placeholder cell with arbitrary diacritic indices (beyond the short
+/// `DIACRITICS` table above).
+fn cell_any(row: u16, col: u16, msb: u16) -> String {
+    use toastty_graphics::kitty::placeholder::index_to_diacritic;
+    let mut s = String::from(crate::PLACEHOLDER);
+    for i in [row, col, msb] {
+        s.push(index_to_diacritic(i).unwrap());
+    }
+    s
+}
+
+/// Print `n` placeholder cells with distinct (row, col, msb) triples,
+/// starting at triple number `from`, as kitten icat would over many
+/// images with random ids. Each lands in the extras table as its own
+/// entry.
+fn print_distinct(t: &mut Term, from: u32, n: u32) {
+    let mut s = String::from("\x1b[38;5;42m");
+    for k in from..from + n {
+        let (row, col, msb) = (
+            (k % 200) as u16,
+            ((k / 200) % 200) as u16,
+            (k / 40_000) as u16,
+        );
+        s.push_str(&cell_any(row, col, msb));
+    }
+    s.push_str("\x1b[39m");
+    feed(t, s.as_bytes());
+}
+
+#[test]
+fn a_full_extras_table_reclaims_scrolled_off_placeholders() {
+    // #28 review blocker: every distinct placeholder cell took a table
+    // entry for the rest of the session, so ~100 icat runs blanked new
+    // images and dropped combining marks. Entries whose cells are gone
+    // are now reclaimed when the table fills.
+    let mut t = Term::new(4, 20, 10);
+    let max = crate::extra::MAX_ENTRIES as u32;
+    print_distinct(&mut t, 0, max + 5_000);
+    // The table filled, was reclaimed, and is still accepting.
+    assert!(t.extras.len() <= crate::extra::MAX_ENTRIES);
+    // A new placeholder keeps its diacritics…
+    feed(&mut t, b"\r\n\x1b[38;5;7m");
+    feed(&mut t, cell(&[3, 4]).as_bytes());
+    let r = runs(&t, t.cursor().row);
+    assert_eq!(
+        r.last().map(|r| (r.image_id, r.img_row, r.img_col)),
+        Some((7, 3, 4))
+    );
+    // …and so does a combining mark.
+    feed(&mut t, "\x1b[39me\u{301}".as_bytes());
+    let row = t.active_grid().row(t.cursor().row);
+    let e = row.cells[usize::from(t.cursor().col) - 1];
+    assert_eq!(t.grapheme_tail(&e), "\u{301}");
+}
+
+#[test]
+fn long_icat_loops_stay_bounded() {
+    // Two table-fulls of distinct cells: what's live is bounded by
+    // what's on the grids (here 4 + 10 rows of 20 cells), not by
+    // history.
+    let mut t = Term::new(4, 20, 10);
+    let max = crate::extra::MAX_ENTRIES as u32;
+    for round in 0..2 {
+        print_distinct(&mut t, round * max, max);
+    }
+    t.collect_extras();
+    assert!(t.extras.len() <= 14 * 20, "{} live entries", t.extras.len());
+    // Reclamation never frees what's still on screen.
+    let r = runs(&t, 3);
+    assert!(!r.is_empty());
+    for c in &t.active_grid().row(3).cells {
+        if c.ch == crate::PLACEHOLDER {
+            assert!(matches!(t.cell_extra(c), Some(CellExtra::Placeholder(_))));
+        }
+    }
+}
+
+#[test]
+fn copy_keeps_the_diacritics_like_kitty() {
+    let mut t = Term::new(2, 8, 0);
+    feed(&mut t, b"\x1b[38;5;42m");
+    let printed = format!("{}{}{}", cell(&[1, 2]), cell(&[]), cell(&[1, 4, 3]));
+    feed(&mut t, printed.as_bytes());
+    let mut sel = crate::selection::Selection::new(
+        crate::selection::Pos::new(t.bottom_id() - 1, 0),
+        crate::selection::SelectionMode::Char,
+    );
+    sel.set_active(crate::selection::Pos::new(t.bottom_id() - 1, 2));
+    t.set_selection(sel);
+    assert_eq!(
+        t.extract_selection_text().as_deref(),
+        Some(printed.as_str())
+    );
+}
+
+#[test]
+fn retransmit_on_alt_drops_mains_stale_placement() {
+    // #28 review: re-transmission / eviction only cleaned the active
+    // screen's table, so a stashed placement's old c/r applied to an
+    // image that later reused the id.
+    let mut t = Term::new(6, 10, 0);
+    transmit(&mut t, "a=T,i=5,U=1,c=3,r=2", 4, 2);
+    feed(&mut t, b"\x1b[?1049h");
+    transmit(&mut t, "a=t,i=5", 8, 8);
+    feed(&mut t, b"\x1b[?1049l");
+    assert!(!t.virtual_placements().contains_image(5));
+}
+
+#[test]
+fn eviction_or_free_on_alt_drops_mains_stale_placement() {
+    let mut t = Term::new(6, 10, 0);
+    transmit(&mut t, "a=T,i=5,U=1,c=3,r=2", 4, 2);
+    transmit(&mut t, "a=T,i=6,U=1,c=3,r=2", 4, 2);
+    feed(&mut t, b"\x1b[?1049h");
+    // Evict everything while alt is up, then reuse id 5 there.
+    t.set_image_cap(1);
+    assert!(!t.image_registry().contains(5));
+    feed(&mut t, b"\x1b[?1049l");
+    assert!(!t.virtual_placements().contains_image(5), "evicted on alt");
+    // Reusing the id on main doesn't bring the old c/r back.
+    t.set_image_cap(64 * 1024 * 1024);
+    transmit(&mut t, "a=t,i=5", 8, 8);
+    assert!(t.virtual_placements().find(5, 0).is_none());
+    // A byte-freeing delete on alt also cleans main's table.
+    transmit(&mut t, "a=T,i=7,U=1,c=3,r=2", 4, 2);
+    feed(&mut t, b"\x1b[?1049h\x1b_Ga=d,d=I,i=7,q=2\x1b\\\x1b[?1049l");
+    assert!(!t.virtual_placements().contains_image(7));
+}
+
+#[test]
+fn scrollback_full_of_live_images_drops_the_oldest_not_the_newest() {
+    // The reviewer's case with everything still in scrollback: more
+    // distinct placeholder cells than the table holds are all live.
+    // The oldest scrollback rows give up their image data so new images
+    // keep working, and combining marks have their own reserve.
+    let mut t = Term::new(4, 20, 10_000);
+    let max = crate::extra::MAX_ENTRIES as u32;
+    print_distinct(&mut t, 0, max + 20_000);
+    assert!(t.extras.placeholder_count() <= crate::extra::MAX_PLACEHOLDER_ENTRIES);
+    // New placeholder cells resolve.
+    feed(&mut t, b"\r\n\x1b[38;5;7m");
+    feed(&mut t, cell(&[3, 4]).as_bytes());
+    let r = runs(&t, t.cursor().row);
+    assert_eq!(
+        r.last().map(|r| (r.image_id, r.img_row, r.img_col)),
+        Some((7, 3, 4))
+    );
+    // The newest scrollback rows still have theirs; the oldest don't.
+    let mut out = Vec::new();
+    t.placeholder_runs(t.primary.scrollback_row(0).unwrap(), &mut out);
+    assert!(!out.is_empty(), "recent history keeps its images");
+    let oldest = t.primary.history_lines() - 1;
+    out.clear();
+    t.placeholder_runs(t.primary.scrollback_row(oldest).unwrap(), &mut out);
+    assert!(out.is_empty(), "the oldest history row gave its data up");
+    // Combining marks are unaffected.
+    feed(&mut t, "\x1b[39me\u{301}".as_bytes());
+    let row = t.active_grid().row(t.cursor().row);
+    let e = row.cells[usize::from(t.cursor().col) - 1];
+    assert_eq!(t.grapheme_tail(&e), "\u{301}");
+}
+
+#[test]
+fn graphemes_keep_their_reserve() {
+    // Placeholders are capped below the table size, so a grapheme can
+    // always be interned while placeholders are at their quota.
+    let mut t = Term::new(4, 20, 10_000);
+    print_distinct(&mut t, 0, crate::extra::MAX_ENTRIES as u32);
+    assert!(t.extras.placeholder_count() <= crate::extra::MAX_PLACEHOLDER_ENTRIES);
+    assert!(
+        !t.extras
+            .would_reject(&CellExtra::Grapheme("\u{302}".into()))
+    );
+}

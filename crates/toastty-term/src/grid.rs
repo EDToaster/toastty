@@ -238,6 +238,13 @@ impl Grid {
         (self.head + idx as usize) % self.rows.len()
     }
 
+    /// Every ring slot — visible, scrollback and blank — in storage
+    /// order. For whole-grid scans that must not miss a cell (the extras
+    /// table's id reclamation), not for display.
+    pub(crate) fn ring_rows(&self) -> impl Iterator<Item = &Row> {
+        self.rows.iter()
+    }
+
     /// Borrow visible row `idx` (0-based, top of viewport = 0).
     pub fn row(&self, idx: u16) -> &Row {
         &self.rows[self.slot(idx)]
@@ -261,6 +268,17 @@ impl Grid {
         let offset = (n as usize) + 1;
         let slot = (self.head + cap - (offset % cap)) % cap;
         Some(&self.rows[slot])
+    }
+
+    /// Mutable [`Grid::scrollback_row`].
+    pub(crate) fn scrollback_row_mut(&mut self, n: u32) -> Option<&mut Row> {
+        if n >= self.history_lines {
+            return None;
+        }
+        let cap = self.rows.len();
+        let offset = (n as usize) + 1;
+        let slot = (self.head + cap - (offset % cap)) % cap;
+        Some(&mut self.rows[slot])
     }
 
     /// Scroll up by one: the top row rotates into scrollback, a fresh

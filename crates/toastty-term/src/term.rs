@@ -13,7 +13,7 @@ use crate::cell::{Cell, Color, Style, StyleFlags, UnderlineStyle};
 use crate::cursor::Cursor;
 use crate::damage::Damage;
 use crate::dcs_query::{DcsQuery, DcsQueryKind, QueryState};
-use crate::extra::{CellExtra, ExtraTable, MAX_GRAPHEME_EXTRA_BYTES};
+use crate::extra::{CellExtra, CellExtraId, ExtraTable, MAX_GRAPHEME_EXTRA_BYTES};
 use crate::grid::Grid;
 use toastty_config::CursorShape;
 use toastty_graphics::kitty::handler::{KittyHandler, KittySink};
@@ -270,8 +270,13 @@ pub struct Term {
     /// Intern table for per-cell extras: grapheme-cluster tails
     /// (combining marks, ZWJ / VS sequences) and tab-start markers.
     /// Cells hold a `NonZeroU16` id into it; see `extra.rs`. Shared by
-    /// the primary and alt grids, reset by RIS (which wipes both).
+    /// the primary and alt grids, reset by RIS (which wipes both). When
+    /// it fills, unreferenced ids are reclaimed ([`Term::intern_extra`]).
     extras: ExtraTable,
+    /// Rejected interns to wait out before the next reclamation scan,
+    /// after a scan that freed almost nothing (see
+    /// [`Term::intern_extra`]).
+    extras_gc_cooldown: u32,
     /// FIFO of OSC 52 clipboard requests waiting on the binary to
     /// service through `arboard`. Drained by [`Term::drain_clipboard_requests`].
     clipboard_requests: Vec<ClipboardRequest>,
@@ -560,6 +565,7 @@ impl Term {
             hyperlinks: Vec::new(),
             current_hyperlink: None,
             extras: ExtraTable::default(),
+            extras_gc_cooldown: 0,
             clipboard_requests: Vec::new(),
             security: SecurityFlags::default(),
             apc_buffer: Vec::new(),
@@ -745,7 +751,7 @@ impl Term {
         if !evicted.is_empty() {
             for id in &evicted {
                 self.image_grid.remove_image(*id);
-                self.virtual_placements.remove_image(*id);
+                self.forget_virtual_placements(*id);
             }
             self.image_revision = self.image_revision.wrapping_add(1);
             self.mark_all_dirty();
@@ -799,6 +805,64 @@ impl Term {
         self.extras.get(cell.extra?)
     }
 
+    /// Intern a cell extra for a cell about to be written. When the
+    /// table can't take it, first reclaim the ids no cell refers to any
+    /// more ([`Term::collect_extras`]). For a placeholder over its quota
+    /// that isn't enough when scrollback holds many distinct images, so
+    /// the oldest scrollback rows' placeholder data is dropped as well
+    /// ([`Term::drop_old_placeholder_extras`]): old images blank, new ones
+    /// keep working, and combining marks never compete with them. Only if
+    /// all that frees nothing is the extra dropped (`None`).
+    ///
+    /// Callers must not hold extra ids outside the grids across this call
+    /// (a reclaimed id is reissued). Every print-path caller writes the
+    /// returned id straight into the grid.
+    pub(crate) fn intern_extra(&mut self, extra: CellExtra) -> Option<CellExtraId> {
+        if self.extras.would_reject(&extra) {
+            if self.extras_gc_cooldown > 0 {
+                self.extras_gc_cooldown -= 1;
+                return None;
+            }
+            let mut freed = self.collect_extras();
+            if matches!(extra, CellExtra::Placeholder(_))
+                && self.extras.placeholder_count() > crate::extra::MAX_PLACEHOLDER_ENTRIES / 2
+            {
+                freed +=
+                    self.drop_old_placeholder_extras(crate::extra::MAX_PLACEHOLDER_ENTRIES / 2);
+            }
+            // A scan costs one pass over every grid row. If it freed
+            // little, what's there is genuinely live; don't rescan on
+            // every following print.
+            if freed < crate::extra::MAX_ENTRIES / 16 {
+                self.extras_gc_cooldown = 4096;
+            }
+        }
+        self.extras.intern(extra)
+    }
+
+    /// Free every extras-table entry that no cell refers to: a mark pass
+    /// over every ring slot of both grids (visible, scrollback and blank
+    /// slots, so nothing reachable is missed) plus the spare blank row.
+    /// Returns the number of entries freed.
+    pub(crate) fn collect_extras(&mut self) -> usize {
+        let mut live = vec![false; crate::extra::MAX_ENTRIES + 1];
+        let rows = self
+            .primary
+            .ring_rows()
+            .chain(self.alt.ring_rows())
+            .chain(std::iter::once(&self.blank_row));
+        for row in rows {
+            for c in &row.cells {
+                if let Some(id) = c.extra {
+                    live[usize::from(id.get())] = true;
+                }
+            }
+        }
+        let freed = self.extras.retain(|id| live[usize::from(id.get())]);
+        tracing::debug!(target: "term", freed, live = self.extras.len(), "extras table reclaimed");
+        freed
+    }
+
     /// The codepoints that follow `cell.ch` in the cell's grapheme
     /// cluster (`""` for the common single-codepoint cell). The renderer
     /// appends this after `cell.ch` when building a row's shaping text so
@@ -843,8 +907,13 @@ impl Term {
             }
             extra => {
                 out.push(if cell.ch == '\0' { ' ' } else { cell.ch });
-                if let Some(CellExtra::Grapheme(tail)) = extra {
-                    out.push_str(tail);
+                match extra {
+                    Some(CellExtra::Grapheme(tail)) => out.push_str(tail),
+                    // kitty copies a placeholder cell with the diacritics
+                    // it was printed with, so pasting it reproduces the
+                    // image cell.
+                    Some(CellExtra::Placeholder(ph)) => out.extend(ph.diacritics()),
+                    _ => {}
                 }
             }
         }
@@ -2308,7 +2377,7 @@ impl Term {
             return;
         }
         let first = run[0];
-        let Some(id) = self.extras.intern(CellExtra::Tab(to - from)) else {
+        let Some(id) = self.intern_extra(CellExtra::Tab(to - from)) else {
             return;
         };
         let max_cols = self.cols;
@@ -2420,7 +2489,7 @@ impl Term {
         new_tail.push_str(tail);
         new_tail.push(c);
         cluster.push(c);
-        let Some(id) = self.extras.intern(CellExtra::Grapheme(new_tail.into())) else {
+        let Some(id) = self.intern_extra(CellExtra::Grapheme(new_tail.into())) else {
             // Table full: fall back to the old behaviour for zero-width
             // codepoints (dropped); a joining wide codepoint prints as
             // its own cell.
@@ -3777,8 +3846,9 @@ impl Term {
         self.cursor_underline_color = None;
         self.current_hyperlink = None;
         // Both grids were just rebuilt, so no cell references an extra
-        // any more — drop the table (the only point it can shrink).
+        // any more — drop the table.
         self.extras = ExtraTable::default();
+        self.extras_gc_cooldown = 0;
         // Scroll region back to the full screen.
         self.scroll_top = 0;
         self.scroll_bot = self.rows.saturating_sub(1);
@@ -4390,6 +4460,7 @@ impl Term {
     fn remove_image_bytes(&mut self, id: u32) {
         self.image_registry.remove(id);
         self.image_number_to_id.retain(|_, v| *v != id);
+        self.forget_virtual_placements(id);
     }
 
     /// Free image bytes for every image that just lost its last
@@ -4506,12 +4577,19 @@ impl KittySink for Term {
             .iter()
             .map(|p| p.image_id)
             .chain(self.virtual_placements.iter().map(|v| v.image_id))
+            .chain(
+                self.stashed_virtual_placements
+                    .iter()
+                    .flat_map(|t| t.iter().map(|v| v.image_id)),
+            )
             .collect();
         // Re-transmitting an id replaces the image, and the spec says its
         // placements go with it. kitty 0.49.2 drops the virtual ones (the
         // placeholder cells stay blank until a new `U=1`), so do the same.
-        if id_request != 0 && self.image_registry.contains(id_request) {
-            self.virtual_placements.remove_image(id_request);
+        // Both screens: the registry is shared, so a placement left on the
+        // other screen would otherwise apply its old box to the new image.
+        if id_request != 0 {
+            self.forget_virtual_placements(id_request);
         }
         match self
             .image_registry
@@ -4529,7 +4607,7 @@ impl KittySink for Term {
                 // placements + mark cells dirty, and prune number→id
                 // entries pointing at them.
                 for evicted in &inserted.evicted {
-                    self.virtual_placements.remove_image(*evicted);
+                    self.forget_virtual_placements(*evicted);
                     let dropped = self.image_grid.remove_image(*evicted);
                     for p in dropped {
                         mark_placement_dirty(self, &p);

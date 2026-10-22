@@ -191,7 +191,7 @@ impl Term {
         if placement_id == 0 {
             return None;
         }
-        self.extras.intern(CellExtra::Placeholder(PlaceholderExtra {
+        self.intern_extra(CellExtra::Placeholder(PlaceholderExtra {
             placement_id,
             ..PlaceholderExtra::default()
         }))
@@ -230,7 +230,7 @@ impl Term {
         if !ph.push_diacritic(idx) {
             return true;
         }
-        let Some(id) = self.extras.intern(CellExtra::Placeholder(ph)) else {
+        let Some(id) = self.intern_extra(CellExtra::Placeholder(ph)) else {
             return true;
         };
         let max_cols = self.cols;
@@ -244,6 +244,83 @@ impl Term {
         );
         self.mark_cell(row, col);
         true
+    }
+
+    /// Keep at most `target` distinct placeholder entries referenced by
+    /// dropping the placeholder data (diacritics, placement id) of the
+    /// oldest scrollback rows, then reclaim. The visible screen and the
+    /// alt grid are never touched. Stripped cells stay `U+10EEEE` text
+    /// but draw nothing, like an image evicted by quota. Returns the
+    /// number of entries freed.
+    pub(super) fn drop_old_placeholder_extras(&mut self, target: usize) -> usize {
+        let extras = &self.extras;
+        let is_placeholder =
+            |id: CellExtraId| matches!(extras.get(id), Some(CellExtra::Placeholder(_)));
+        let mut seen = vec![false; crate::extra::MAX_ENTRIES + 1];
+        let mut count = 0usize;
+        let mut note = |row: &Row, count: &mut usize| {
+            for c in &row.cells {
+                if let Some(id) = c.extra
+                    && !seen[usize::from(id.get())]
+                    && is_placeholder(id)
+                {
+                    seen[usize::from(id.get())] = true;
+                    *count += 1;
+                }
+            }
+        };
+        for r in 0..self.primary.visible_rows() {
+            note(self.primary.row(r), &mut count);
+        }
+        for row in self.alt.ring_rows() {
+            note(row, &mut count);
+        }
+        // Newest scrollback row first: find the first one that takes the
+        // count past `target`; it and everything older is stripped.
+        let hist = self.primary.history_lines();
+        let mut cut = hist;
+        for n in 0..hist {
+            if let Some(row) = self.primary.scrollback_row(n) {
+                note(row, &mut count);
+            }
+            if count > target {
+                cut = n;
+                break;
+            }
+        }
+        if cut == hist {
+            return 0;
+        }
+        for n in cut..hist {
+            let Some(row) = self.primary.scrollback_row_mut(n) else {
+                continue;
+            };
+            for c in &mut row.cells {
+                if c.extra.is_some_and(|id| {
+                    matches!(self.extras.get(id), Some(CellExtra::Placeholder(_)))
+                }) {
+                    c.extra = None;
+                }
+            }
+        }
+        tracing::debug!(target: "term", rows = hist - cut, "dropped placeholder data of old scrollback");
+        self.mark_all_dirty();
+        self.collect_extras()
+    }
+
+    /// Drop image `id`'s virtual placements on *both* screens. Called
+    /// whenever the image's bytes are replaced or freed (re-transmit,
+    /// eviction, byte-freeing delete). The registry is shared between the
+    /// screens, so a placement left in the stashed table would otherwise
+    /// apply its old `c`/`r` to whatever image later reuses the id.
+    pub(super) fn forget_virtual_placements(&mut self, id: u32) {
+        let mut dropped = self.virtual_placements.remove_image(id);
+        if let Some(stashed) = self.stashed_virtual_placements.as_mut() {
+            dropped |= stashed.remove_image(id);
+        }
+        if dropped {
+            self.image_revision = self.image_revision.wrapping_add(1);
+        }
     }
 
     /// The active screen's virtual (`U=1`) placements.
