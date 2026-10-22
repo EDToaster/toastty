@@ -8182,6 +8182,30 @@ mod tests {
     }
 
     #[test]
+    fn string_sequences_with_utf8_0x9c_print_nothing() {
+        // WIRE-5 (the stress run's `bel_8bit` case): `М` is `\xd0\x9c`,
+        // whose 0x9C used to end the APC / DCS and print the rest of
+        // the payload. kitty swallows the whole sequence.
+        for intro in [&b"\x1b_X"[..], b"\x1bPz", b"\x1b]7777;", b"\x1b^", b"\x1bX"] {
+            let mut t = Term::new(2, 40, 0);
+            let mut bytes = b"[".to_vec();
+            bytes.extend_from_slice(intro);
+            bytes.extend_from_slice("hello \u{41c} world".as_bytes());
+            bytes.extend_from_slice(b"\x1b\\]");
+            feed(&mut t, &bytes);
+            let row: String = t.row(0).cells.iter().map(|c| c.ch).collect();
+            assert_eq!(row.trim_end(), "[]", "intro {intro:x?}");
+        }
+        // A KGP command after a 0x9C-bearing non-G APC still works.
+        let mut t = Term::new(4, 8, 0);
+        let mut payload = b"\x1b_X\xd0\x9c\x1b\\\x1b_Ga=t,f=32,s=1,v=1,i=7;".to_vec();
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        assert!(t.image_registry().contains(7));
+    }
+
+    #[test]
     fn apc_kitty_oversized_payload_replies_efbig() {
         let mut t = Term::new(2, 4, 0);
         // Shrink the cap so the test isn't sensitive to the default.
