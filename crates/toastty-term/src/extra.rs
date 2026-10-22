@@ -1,8 +1,9 @@
 //! Per-cell "extra" payloads that don't fit in [`Cell`](crate::Cell)'s
 //! single `char`: the trailing codepoints of a multi-codepoint grapheme
 //! cluster (combining marks, ZWJ emoji sequences, variation selectors,
-//! regional-indicator pairs under DECSET 2027) and the horizontal-tab
-//! marker that lets copy reproduce a literal `\t`.
+//! regional-indicator pairs under DECSET 2027), the horizontal-tab
+//! marker that lets copy reproduce a literal `\t`, and the diacritics +
+//! placement id of a kitty Unicode-placeholder cell.
 //!
 //! # Why an intern table
 //!
@@ -22,8 +23,10 @@
 //!
 //! Entries are deduplicated (`"\u{301}"` is stored once no matter how
 //! many cells carry it), so the table size is bounded by the number of
-//! *distinct* extras a session ever sees, not by grid size. It is capped
-//! at [`MAX_ENTRIES`] distinct values; past that, new extras are dropped
+//! *distinct* live extras, not by grid size. It is capped at
+//! [`MAX_ENTRIES`] distinct values; when it fills, `Term` frees the
+//! entries no cell refers to any more (see `Term::intern_extra`), and
+//! only if everything is still in use are new extras dropped
 //! (the pre-fix behaviour) rather than growing memory without bound.
 //! Each grapheme's extra text is likewise capped at
 //! [`MAX_GRAPHEME_EXTRA_BYTES`] so a stream of combining marks can't
@@ -37,6 +40,14 @@ pub type CellExtraId = NonZeroU16;
 
 /// Maximum number of distinct extras retained per terminal.
 pub(crate) const MAX_ENTRIES: usize = u16::MAX as usize;
+
+/// Most live [`CellExtra::Placeholder`] entries the table holds. The
+/// rest of [`MAX_ENTRIES`] stays reserved for grapheme tails and tab
+/// markers, so a scrollback full of distinct placeholder images can never
+/// starve combining marks. `Term` keeps placeholders under this by
+/// reclaiming, and if need be by dropping the image data of the oldest
+/// scrollback rows (see `Term::intern_extra`).
+pub(crate) const MAX_PLACEHOLDER_ENTRIES: usize = MAX_ENTRIES / 4 * 3;
 
 /// Maximum UTF-8 length of the codepoints attached after a cell's base
 /// `char`. 64 bytes comfortably fits the longest RGI emoji ZWJ
@@ -57,39 +68,154 @@ pub enum CellExtra {
     /// as long as those cells are still blank — matching kitty and
     /// Ghostty, which preserve tabs in copied text (xterm copies spaces).
     Tab(u16),
+    /// The per-cell data of a kitty Unicode-placeholder cell
+    /// (`Cell::ch == U+10EEEE`) that the cell's style doesn't already
+    /// hold. The image id's low bits are the cell's foreground colour.
+    /// A placeholder cell with no extra is a bare cell with placement
+    /// id 0.
+    Placeholder(PlaceholderExtra),
+}
+
+/// See [`CellExtra::Placeholder`]. The diacritic fields hold the
+/// diacritic's table index **plus one**, so `0` means "not given" and
+/// the value is inherited from the cell to the left at render time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct PlaceholderExtra {
+    /// Placement id, from the SGR 58 underline colour when the cell was
+    /// printed (`0` = any virtual placement of the image).
+    pub placement_id: u32,
+    /// First diacritic: the image row.
+    pub row: u16,
+    /// Second diacritic: the image column.
+    pub col: u16,
+    /// Third diacritic: bits 24..32 of the image id.
+    pub id_msb: u16,
+}
+
+impl PlaceholderExtra {
+    /// Record the next diacritic (table index `idx`) in stream order.
+    /// Returns `false` when all three slots are already taken.
+    pub fn push_diacritic(&mut self, idx: u16) -> bool {
+        let v = idx.saturating_add(1);
+        if self.row == 0 {
+            self.row = v;
+        } else if self.col == 0 {
+            self.col = v;
+        } else if self.id_msb == 0 {
+            self.id_msb = v;
+        } else {
+            return false;
+        }
+        true
+    }
+
+    /// The diacritic codepoints this cell was printed with, in stream
+    /// order (row, column, id-MSB; stops at the first one not given).
+    pub fn diacritics(&self) -> impl Iterator<Item = char> {
+        [self.row, self.col, self.id_msb]
+            .into_iter()
+            .take_while(|&v| v != 0)
+            .filter_map(|v| toastty_graphics::kitty::placeholder::index_to_diacritic(v - 1))
+    }
 }
 
 /// Deduplicating intern table for [`CellExtra`] values.
+///
+/// Ids are recycled: [`ExtraTable::retain`] frees the entries no cell
+/// refers to any more (the owner — [`crate::Term`] — finds those by
+/// scanning its grids when the table fills up), and later interns reuse
+/// the freed ids.
 #[derive(Debug, Default)]
 pub struct ExtraTable {
-    entries: Vec<CellExtra>,
+    /// Slot `id - 1`; `None` = freed, its id is on `free`.
+    entries: Vec<Option<CellExtra>>,
     index: HashMap<CellExtra, CellExtraId>,
+    free: Vec<CellExtraId>,
+    /// Live entries that are [`CellExtra::Placeholder`].
+    placeholders: usize,
 }
 
 impl ExtraTable {
     /// Intern `extra`, returning its id. Returns `None` once the table
-    /// holds [`MAX_ENTRIES`] distinct values and `extra` isn't one of
+    /// holds [`MAX_ENTRIES`] distinct live values (or, for a placeholder,
+    /// [`MAX_PLACEHOLDER_ENTRIES`] placeholders) and `extra` isn't one of
     /// them — callers then fall back to dropping the extra.
     pub fn intern(&mut self, extra: CellExtra) -> Option<CellExtraId> {
         if let Some(&id) = self.index.get(&extra) {
             return Some(id);
         }
-        if self.entries.len() >= MAX_ENTRIES {
+        let placeholder = matches!(extra, CellExtra::Placeholder(_));
+        if placeholder && self.placeholders >= MAX_PLACEHOLDER_ENTRIES {
             return None;
         }
-        self.entries.push(extra.clone());
-        // `len()` is 1..=MAX_ENTRIES here, so both conversions succeed.
-        let id = u16::try_from(self.entries.len())
-            .ok()
-            .and_then(NonZeroU16::new)?;
+        let id = if let Some(id) = self.free.pop() {
+            self.entries[usize::from(id.get()) - 1] = Some(extra.clone());
+            id
+        } else {
+            if self.entries.len() >= MAX_ENTRIES {
+                return None;
+            }
+            self.entries.push(Some(extra.clone()));
+            // `len()` is 1..=MAX_ENTRIES here, so both conversions succeed.
+            u16::try_from(self.entries.len())
+                .ok()
+                .and_then(NonZeroU16::new)?
+        };
         self.index.insert(extra, id);
+        if placeholder {
+            self.placeholders += 1;
+        }
         Some(id)
     }
 
-    /// Resolve an id. `None` for ids this table never issued.
+    /// True when [`ExtraTable::intern`] would refuse `extra`: the table is
+    /// full and `extra` isn't already in it.
+    #[must_use]
+    pub fn would_reject(&self, extra: &CellExtra) -> bool {
+        let full = if matches!(extra, CellExtra::Placeholder(_)) {
+            self.placeholders >= MAX_PLACEHOLDER_ENTRIES
+                || (self.free.is_empty() && self.entries.len() >= MAX_ENTRIES)
+        } else {
+            self.free.is_empty() && self.entries.len() >= MAX_ENTRIES
+        };
+        full && !self.index.contains_key(extra)
+    }
+
+    /// Number of live [`CellExtra::Placeholder`] entries.
+    #[must_use]
+    pub fn placeholder_count(&self) -> usize {
+        self.placeholders
+    }
+
+    /// Free every entry whose id `live` returns `false` for. Returns the
+    /// number of entries freed. The caller must have checked every cell
+    /// that could still hold an id: a freed id is handed out again.
+    pub fn retain(&mut self, mut live: impl FnMut(CellExtraId) -> bool) -> usize {
+        let mut freed = 0;
+        for (i, slot) in self.entries.iter_mut().enumerate() {
+            let Some(id) = u16::try_from(i + 1).ok().and_then(NonZeroU16::new) else {
+                continue;
+            };
+            if slot.is_some() && !live(id) {
+                if let Some(old) = slot.take() {
+                    if matches!(old, CellExtra::Placeholder(_)) {
+                        self.placeholders -= 1;
+                    }
+                    self.index.remove(&old);
+                }
+                self.free.push(id);
+                freed += 1;
+            }
+        }
+        freed
+    }
+
+    /// Resolve an id. `None` for ids this table never issued (or freed).
     #[must_use]
     pub fn get(&self, id: CellExtraId) -> Option<&CellExtra> {
-        self.entries.get(usize::from(id.get()) - 1)
+        self.entries
+            .get(usize::from(id.get()) - 1)
+            .and_then(Option::as_ref)
     }
 
     /// The grapheme tail for `id`, or `""` for a tab marker / unknown id.
@@ -101,16 +227,16 @@ impl ExtraTable {
         }
     }
 
-    /// Number of distinct entries interned so far.
+    /// Number of live (interned, not freed) entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.len() - self.free.len()
     }
 
-    /// True when nothing has been interned yet.
+    /// True when no entry is live.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 }
 
@@ -155,6 +281,64 @@ mod tests {
         // Full: a new value is refused, an existing one still resolves.
         assert_eq!(t.intern(CellExtra::Grapheme("x".into())), None);
         assert!(t.intern(CellExtra::Tab(0)).is_some());
+    }
+
+    #[test]
+    fn retain_frees_and_recycles_ids() {
+        let mut t = ExtraTable::default();
+        let a = t.intern(CellExtra::Tab(1)).unwrap();
+        let b = t.intern(CellExtra::Tab(2)).unwrap();
+        assert_eq!(t.retain(|id| id == b), 1);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.get(a), None, "freed id resolves to nothing");
+        assert_eq!(t.get(b), Some(&CellExtra::Tab(2)));
+        // The freed id is reused; the old value is no longer deduped to it.
+        let c = t.intern(CellExtra::Tab(3)).unwrap();
+        assert_eq!(c, a);
+        assert_eq!(t.intern(CellExtra::Tab(1)).map(|id| id == a), Some(false));
+    }
+
+    #[test]
+    fn full_table_accepts_again_after_retain() {
+        let mut t = ExtraTable::default();
+        for span in 0..=u16::MAX {
+            if t.len() == MAX_ENTRIES {
+                break;
+            }
+            t.intern(CellExtra::Tab(span));
+        }
+        let x = CellExtra::Grapheme("x".into());
+        assert!(t.would_reject(&x));
+        assert!(!t.would_reject(&CellExtra::Tab(0)), "already present");
+        t.retain(|id| id.get() % 2 == 0);
+        assert!(!t.would_reject(&x));
+        assert!(t.intern(x).is_some());
+    }
+
+    #[test]
+    fn placeholders_stop_at_their_quota() {
+        let mut t = ExtraTable::default();
+        let ph = |n: usize| {
+            CellExtra::Placeholder(PlaceholderExtra {
+                placement_id: u32::try_from(n).unwrap(),
+                ..PlaceholderExtra::default()
+            })
+        };
+        for n in 0..MAX_PLACEHOLDER_ENTRIES {
+            assert!(t.intern(ph(n)).is_some());
+        }
+        assert_eq!(t.placeholder_count(), MAX_PLACEHOLDER_ENTRIES);
+        assert!(t.would_reject(&ph(usize::MAX >> 40)));
+        assert_eq!(t.intern(ph(1 << 20)), None, "over the placeholder quota");
+        assert!(t.intern(ph(5)).is_some(), "existing values still resolve");
+        // The reserve: graphemes and tabs still go in.
+        let g = CellExtra::Grapheme("\u{301}".into());
+        assert!(!t.would_reject(&g));
+        assert!(t.intern(g).is_some());
+        // Freeing placeholders gives the quota back.
+        assert_eq!(t.retain(|id| id.get() > 10), 10);
+        assert_eq!(t.placeholder_count(), MAX_PLACEHOLDER_ENTRIES - 10);
+        assert!(t.intern(ph(1 << 20)).is_some());
     }
 
     #[test]

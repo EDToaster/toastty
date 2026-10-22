@@ -3,13 +3,21 @@
 //!
 //! Apps emit a `U+10EEEE` "image placeholder" codepoint followed by up
 //! to three combining diacritics that encode `(row, col, image_id_high)`
-//! values 0..N. The base placeholder + the SGR foreground (interpreted
-//! as the low byte of the image id) + the diacritics fully address a
-//! placement.
+//! values 0..N. The base placeholder + the SGR foreground (the low 8 or
+//! 24 bits of the image id) + the SGR underline colour (the placement
+//! id) + the diacritics fully address a slice of a virtual placement.
+//!
+//! This module holds the protocol-level pieces: the diacritic table,
+//! the per-screen [`VirtualPlacements`] table, and the fit geometry
+//! ([`placeholder_slice`]). The cells themselves live in the terminal
+//! grid like any text; `toastty-term` resolves runs of them and the
+//! renderer draws them every frame.
 //!
 //! Reference:
 //! <https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders>.
 //! The diacritic list comes from kitty's published table.
+
+use std::collections::HashMap;
 
 /// The base placeholder codepoint.
 pub const PLACEHOLDER: char = '\u{10EEEE}';
@@ -48,6 +56,274 @@ pub fn is_diacritic(c: char) -> bool {
 #[must_use]
 pub fn is_placeholder(c: char) -> bool {
     c == PLACEHOLDER
+}
+
+/// A virtual placement, created with `U=1` on `a=T` / `a=p`.
+///
+/// It is invisible. It's the prototype that placeholder cells refer to:
+/// the image is fitted, aspect-preserving and centred, into a box of
+/// `cols × rows` cells, and each placeholder cell shows its slice of
+/// that box (see [`placeholder_slice`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualPlacement {
+    pub image_id: u32,
+    /// Client placement id (`p=`); `0` when the client gave none.
+    pub placement_id: u32,
+    /// Box width in cells (`c=`). `0` means unset: the image's natural
+    /// width, `ceil(img_w / cell_w)`, resolved at render time.
+    pub cols: u32,
+    /// Box height in cells (`r=`). `0` means unset, as for `cols`.
+    pub rows: u32,
+    /// Z-index (`z=`) of the images drawn over the placeholder cells.
+    pub z: i32,
+}
+
+/// Upper bound on stored virtual placements. Anonymous ones (`p=0`)
+/// accumulate like kitty's, so a client that re-sends `a=p,U=1` in a
+/// loop would otherwise grow the table without bound; past the cap the
+/// oldest entry is dropped.
+pub const MAX_VIRTUAL_PLACEMENTS: usize = 4096;
+
+/// The virtual placements of one screen.
+///
+/// Placeholder cells look their placement up here at render time, so
+/// the table only has to be right when a frame is built: placeholders
+/// printed before the image (or its virtual placement) arrive show up
+/// as soon as it does.
+///
+/// Lookups run once per placeholder run per frame, so they are indexed
+/// rather than scanned: per image, the placements in creation order
+/// (`p=0` takes the first), plus a map for named `(image, p)` pairs. A
+/// stream that piles thousands of placements onto one image therefore
+/// can't make each frame cost thousands of comparisons per run.
+#[derive(Debug, Clone, Default)]
+pub struct VirtualPlacements {
+    /// Per image, `(seq, placement)` sorted by `seq` (creation order).
+    by_image: HashMap<u32, Vec<(u64, VirtualPlacement)>>,
+    /// `(image, placement id != 0)` → `seq` of that entry.
+    named: HashMap<(u32, u32), u64>,
+    len: usize,
+    next_seq: u64,
+}
+
+impl VirtualPlacements {
+    /// Add `vp`. A non-zero placement id replaces the existing
+    /// placement with the same `(image, placement)` in place, keeping its
+    /// age, as for ordinary placements. Anonymous placements (`p=0`)
+    /// always add a new entry, matching kitty.
+    pub fn insert(&mut self, vp: VirtualPlacement) {
+        if vp.placement_id != 0
+            && let Some(&seq) = self.named.get(&(vp.image_id, vp.placement_id))
+            && let Some(slot) = self.slot_mut(vp.image_id, seq)
+        {
+            *slot = vp;
+            return;
+        }
+        if self.len >= MAX_VIRTUAL_PLACEMENTS {
+            self.remove_oldest();
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.by_image
+            .entry(vp.image_id)
+            .or_default()
+            .push((seq, vp));
+        if vp.placement_id != 0 {
+            self.named.insert((vp.image_id, vp.placement_id), seq);
+        }
+        self.len += 1;
+    }
+
+    fn slot_mut(&mut self, image_id: u32, seq: u64) -> Option<&mut VirtualPlacement> {
+        let list = self.by_image.get_mut(&image_id)?;
+        let i = list.binary_search_by_key(&seq, |e| e.0).ok()?;
+        Some(&mut list[i].1)
+    }
+
+    /// Drop the oldest placement overall (the cap). Rare: one pass over
+    /// the images, not the placements.
+    fn remove_oldest(&mut self) {
+        let Some((&image_id, _)) = self
+            .by_image
+            .iter()
+            .min_by_key(|(_, list)| list.first().map_or(u64::MAX, |e| e.0))
+        else {
+            return;
+        };
+        let mut first = true;
+        self.remove_where(|v| {
+            let hit = first && v.image_id == image_id;
+            if hit {
+                first = false;
+            }
+            hit
+        });
+    }
+
+    /// The virtual placement a placeholder cell refers to. A non-zero
+    /// `placement_id` must match exactly. `0` picks the image's first
+    /// virtual placement (the spec lets the terminal choose any; kitty
+    /// takes the oldest).
+    #[must_use]
+    pub fn find(&self, image_id: u32, placement_id: u32) -> Option<&VirtualPlacement> {
+        let list = self.by_image.get(&image_id)?;
+        if placement_id == 0 {
+            return list.first().map(|e| &e.1);
+        }
+        let seq = *self.named.get(&(image_id, placement_id))?;
+        let i = list.binary_search_by_key(&seq, |e| e.0).ok()?;
+        Some(&list[i].1)
+    }
+
+    /// True when any virtual placement refers to `image_id`.
+    #[must_use]
+    pub fn contains_image(&self, image_id: u32) -> bool {
+        self.by_image.contains_key(&image_id)
+    }
+
+    /// Remove every entry matching `pred` (visited per image in creation
+    /// order). Returns `true` when anything was removed.
+    pub fn remove_where(&mut self, mut pred: impl FnMut(&VirtualPlacement) -> bool) -> bool {
+        let before = self.len;
+        let named = &mut self.named;
+        let len = &mut self.len;
+        self.by_image.retain(|_, list| {
+            list.retain(|(_, v)| {
+                let drop = pred(v);
+                if drop {
+                    *len -= 1;
+                    if v.placement_id != 0 {
+                        named.remove(&(v.image_id, v.placement_id));
+                    }
+                }
+                !drop
+            });
+            !list.is_empty()
+        });
+        self.len != before
+    }
+
+    /// Remove every virtual placement of `image_id`.
+    pub fn remove_image(&mut self, image_id: u32) -> bool {
+        let Some(list) = self.by_image.remove(&image_id) else {
+            return false;
+        };
+        self.len -= list.len();
+        for (_, v) in &list {
+            if v.placement_id != 0 {
+                self.named.remove(&(v.image_id, v.placement_id));
+            }
+        }
+        true
+    }
+
+    /// Iterate every placement (grouped by image, unspecified order
+    /// between images).
+    pub fn iter(&self) -> impl Iterator<Item = &VirtualPlacement> {
+        self.by_image.values().flat_map(|l| l.iter().map(|e| &e.1))
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn clear(&mut self) {
+        self.by_image.clear();
+        self.named.clear();
+        self.len = 0;
+    }
+}
+
+/// What a run of placeholder cells draws: a destination rectangle and
+/// the matching part of the image.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlaceholderSlice {
+    /// Top-left of the drawn rectangle, in pixels, relative to the
+    /// top-left corner of the run's first cell.
+    pub dst_pos: [f32; 2],
+    /// Size of the drawn rectangle in pixels. Never larger than the run.
+    pub dst_size: [f32; 2],
+    /// Normalised (0..1) image coordinates of the rectangle's corners.
+    pub uv_min: [f32; 2],
+    pub uv_max: [f32; 2],
+}
+
+/// Where the image lands in a run of `n_cols` placeholder cells that
+/// show image cell `(img_row, img_col .. img_col + n_cols)` of a virtual
+/// placement `vp_cols × vp_rows` cells big.
+///
+/// Matches kitty (`grman_put_cell_image`):
+///
+/// - A `0` box dimension falls back to the image's natural size in
+///   cells, `ceil(img_dim / cell_dim)`, independently per axis.
+/// - The image is fitted into the box with its aspect ratio kept and
+///   centred on the other axis (letterbox / pillarbox).
+/// - The run shows its part of the box. Whatever part of the run lies
+///   outside the fitted image stays blank, so the result is cropped to
+///   the image, never stretched. `None` when nothing of the image falls
+///   inside the run.
+#[must_use]
+#[allow(clippy::cast_precision_loss)] // image / box sizes are far below 2^24.
+pub fn placeholder_slice(
+    img_size: (u32, u32),
+    vp_size: (u32, u32),
+    cell: (f32, f32),
+    img_row: u32,
+    img_col: u32,
+    n_cols: u32,
+) -> Option<PlaceholderSlice> {
+    let (img_w, img_h) = img_size;
+    let (cw, ch) = cell;
+    if img_w == 0 || img_h == 0 || n_cols == 0 || cw <= 0.0 || ch <= 0.0 {
+        return None;
+    }
+    let (iw, ih) = (img_w as f32, img_h as f32);
+    let natural = |dim: f32, cell: f32| (dim / cell).ceil().max(1.0);
+    let box_cols = if vp_size.0 == 0 {
+        natural(iw, cw)
+    } else {
+        vp_size.0 as f32
+    };
+    let box_rows = if vp_size.1 == 0 {
+        natural(ih, ch)
+    } else {
+        vp_size.1 as f32
+    };
+    let (box_w, box_h) = (box_cols * cw, box_rows * ch);
+    // Fit: scale so the image touches the box on one axis, then centre
+    // it on the other. Same comparison as kitty, cross-multiplied.
+    let (scale, off_x, off_y) = if iw * box_h > ih * box_w {
+        let s = box_w / iw;
+        (s, 0.0, (box_h - ih * s) / 2.0)
+    } else {
+        let s = box_h / ih;
+        (s, (box_w - iw * s) / 2.0, 0.0)
+    };
+    // The run and the fitted image, both in box pixels.
+    let run_left = img_col as f32 * cw;
+    let run_top = img_row as f32 * ch;
+    let left = run_left.max(off_x);
+    let top = run_top.max(off_y);
+    let right = (run_left + n_cols as f32 * cw).min(off_x + iw * scale);
+    let bottom = (run_top + ch).min(off_y + ih * scale);
+    // Sub-pixel slivers (float noise at an exact edge) draw nothing.
+    if right - left < 0.01 || bottom - top < 0.01 {
+        return None;
+    }
+    let to_u = |x: f32| ((x - off_x) / (iw * scale)).clamp(0.0, 1.0);
+    let to_v = |y: f32| ((y - off_y) / (ih * scale)).clamp(0.0, 1.0);
+    Some(PlaceholderSlice {
+        dst_pos: [left - run_left, top - run_top],
+        dst_size: [right - left, bottom - top],
+        uv_min: [to_u(left), to_v(top)],
+        uv_max: [to_u(right), to_v(bottom)],
+    })
 }
 
 /// Kitty's published placeholder diacritic table.
@@ -138,5 +414,151 @@ mod tests {
     fn out_of_range_index_returns_none() {
         let n = diacritic_count() as u16;
         assert_eq!(index_to_diacritic(n), None);
+    }
+
+    fn vp(image_id: u32, placement_id: u32, cols: u32, rows: u32) -> VirtualPlacement {
+        VirtualPlacement {
+            image_id,
+            placement_id,
+            cols,
+            rows,
+            z: 0,
+        }
+    }
+
+    #[test]
+    fn virtual_find_prefers_exact_placement_and_oldest_for_zero() {
+        let mut t = VirtualPlacements::default();
+        t.insert(vp(7, 0, 10, 5));
+        t.insert(vp(7, 0, 4, 2));
+        t.insert(vp(7, 3, 20, 3));
+        assert_eq!(t.len(), 3, "anonymous placements accumulate");
+        // pid 0 → the oldest placement of the image (kitty).
+        assert_eq!(t.find(7, 0).map(|v| (v.cols, v.rows)), Some((10, 5)));
+        assert_eq!(t.find(7, 3).map(|v| (v.cols, v.rows)), Some((20, 3)));
+        assert!(t.find(7, 9).is_none(), "unknown pid finds nothing");
+        assert!(t.find(8, 0).is_none());
+    }
+
+    #[test]
+    fn virtual_insert_with_pid_replaces_in_place() {
+        let mut t = VirtualPlacements::default();
+        t.insert(vp(1, 2, 10, 5));
+        t.insert(vp(1, 2, 3, 3));
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.find(1, 2).map(|v| v.cols), Some(3));
+    }
+
+    #[test]
+    fn virtual_index_stays_consistent() {
+        // The hostile shape from the #28 review: thousands of placements
+        // of one image. Lookups go through the index, and it must agree
+        // with the table after replaces and removals.
+        let mut t = VirtualPlacements::default();
+        t.insert(vp(1, 0, 1, 1));
+        for p in 1..4000 {
+            t.insert(vp(1, p, p, 1));
+        }
+        assert_eq!(t.len(), 4000);
+        assert!(t.find(1, 70_000).is_none(), "unknown pid");
+        assert_eq!(t.find(1, 2500).map(|v| v.cols), Some(2500));
+        // Replacing a named placement keeps its age: pid 0 still finds
+        // the very first (anonymous) one.
+        t.insert(vp(1, 2500, 9, 9));
+        assert_eq!(t.find(1, 2500).map(|v| v.cols), Some(9));
+        assert_eq!(t.find(1, 0).map(|v| v.cols), Some(1));
+        // Removing entries removes their index too.
+        assert!(t.remove_where(|v| v.placement_id % 2 == 0));
+        assert!(t.find(1, 2500).is_none());
+        assert_eq!(t.find(1, 2501).map(|v| v.cols), Some(2501));
+        // The anonymous one is gone; pid 0 now picks the oldest left.
+        assert_eq!(t.find(1, 0).map(|v| v.placement_id), Some(1));
+        assert_eq!(t.len(), 2000);
+        t.insert(vp(1, 2500, 3, 3));
+        assert_eq!(t.find(1, 2500).map(|v| v.cols), Some(3));
+        assert_eq!(t.len(), 2001);
+    }
+
+    #[test]
+    fn virtual_remove_and_cap() {
+        let mut t = VirtualPlacements::default();
+        t.insert(vp(1, 0, 1, 1));
+        t.insert(vp(2, 0, 1, 1));
+        assert!(t.contains_image(1));
+        assert!(t.remove_image(1));
+        assert!(!t.remove_image(1));
+        assert!(!t.contains_image(1));
+        for i in 0..MAX_VIRTUAL_PLACEMENTS + 10 {
+            t.insert(vp(100, 0, i as u32, 1));
+        }
+        assert_eq!(t.len(), MAX_VIRTUAL_PLACEMENTS);
+        assert!(!t.contains_image(2), "oldest entry dropped at the cap");
+    }
+
+    fn approx(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-3
+    }
+
+    #[test]
+    fn slice_fits_wide_image_to_width_and_centres_vertically() {
+        // 200×100 image in a 10×5 box of 10×20 cells = 100×100 px:
+        // scaled to 100×50, centred at y = 25..75.
+        let cell = (10.0, 20.0);
+        // Row 0 (y 0..20) is above the image: blank (PH-3).
+        assert!(placeholder_slice((200, 100), (10, 5), cell, 0, 0, 10).is_none());
+        // Row 1 (y 20..40) shows image rows 0..15 px of 50: y 25..40.
+        let s = placeholder_slice((200, 100), (10, 5), cell, 1, 0, 10).unwrap();
+        assert!(approx(s.dst_pos[1], 5.0) && approx(s.dst_size[1], 15.0));
+        assert!(approx(s.dst_pos[0], 0.0) && approx(s.dst_size[0], 100.0));
+        assert!(approx(s.uv_min[1], 0.0) && approx(s.uv_max[1], 0.3));
+        // Row 2 (y 40..60) is fully inside the image.
+        let s = placeholder_slice((200, 100), (10, 5), cell, 2, 0, 10).unwrap();
+        assert!(approx(s.dst_pos[1], 0.0) && approx(s.dst_size[1], 20.0));
+        assert!(approx(s.uv_min[1], 0.3) && approx(s.uv_max[1], 0.7));
+        // Row 4 (y 80..100) is below the image.
+        assert!(placeholder_slice((200, 100), (10, 5), cell, 4, 0, 10).is_none());
+    }
+
+    #[test]
+    fn slice_partial_run_maps_to_its_columns() {
+        // Cols 5..10 of the same box: the right half of the image.
+        let s = placeholder_slice((200, 100), (10, 5), (10.0, 20.0), 2, 5, 5).unwrap();
+        assert!(approx(s.dst_size[0], 50.0));
+        assert!(approx(s.uv_min[0], 0.5) && approx(s.uv_max[0], 1.0));
+    }
+
+    #[test]
+    fn slice_tall_box_pillarboxes() {
+        // 200×100 image in a 20×3 box of 9×20 cells = 180×60 px: fit to
+        // height → 120×60, centred at x = 30..150 (kitty reference).
+        let cell = (9.0, 20.0);
+        let s = placeholder_slice((200, 100), (20, 3), cell, 0, 0, 20).unwrap();
+        assert!(approx(s.dst_pos[0], 30.0) && approx(s.dst_size[0], 120.0));
+        assert!(approx(s.uv_min[0], 0.0) && approx(s.uv_max[0], 1.0));
+        // Cells 0..3 (x 0..27) are left of the image.
+        assert!(placeholder_slice((200, 100), (20, 3), cell, 0, 0, 3).is_none());
+    }
+
+    #[test]
+    fn slice_zero_box_uses_natural_size_per_axis() {
+        // c only: rows fall back to ceil(100 / 20) = 5, not to the
+        // aspect-derived 3 (kitty 0.49.2: the image sits 27.5 px down).
+        let cell = (9.0, 20.0);
+        let s = placeholder_slice((200, 100), (10, 0), cell, 1, 0, 10).unwrap();
+        assert!(approx(s.dst_pos[1], 7.5));
+        // Neither: 23×5 cells, the image at native scale, centred x.
+        let s = placeholder_slice((200, 100), (0, 0), cell, 0, 0, 23).unwrap();
+        assert!(approx(s.dst_pos[0], 3.5) && approx(s.dst_size[0], 200.0));
+        assert!(approx(s.dst_size[1], 20.0));
+    }
+
+    #[test]
+    fn slice_outside_the_box_is_blank() {
+        // A placeholder past the box (row 7 of a 5-row box) is blank.
+        assert!(placeholder_slice((200, 100), (10, 5), (10.0, 20.0), 7, 0, 10).is_none());
+        assert!(placeholder_slice((200, 100), (10, 5), (10.0, 20.0), 2, 12, 3).is_none());
+        // Degenerate inputs.
+        assert!(placeholder_slice((0, 100), (10, 5), (10.0, 20.0), 2, 0, 3).is_none());
+        assert!(placeholder_slice((200, 100), (10, 5), (10.0, 20.0), 2, 0, 0).is_none());
     }
 }

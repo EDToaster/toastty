@@ -2949,6 +2949,32 @@ impl Renderer {
                     cell_size,
                 );
             }
+            // Unicode-placeholder images, resolved from the rows drawn
+            // this frame (#28). Built before the textures are resolved,
+            // which binds their texture slots like any other instance;
+            // re-sorts `tmp` by (z, id) for the split.
+            if term.has_virtual_placements() {
+                let view_pixel = term.view_offset_pixel();
+                crate::image::placeholder::build_placeholder_instances(
+                    &mut tmp,
+                    term,
+                    cell_size,
+                    crate::image::placeholder::RowLayout {
+                        rows_rendered: crate::text::instance::rows_to_render(
+                            rows,
+                            view_pixel,
+                            cell_size.1,
+                            content_dims.1,
+                        ),
+                        y_translate: if view_pixel > 0.0 {
+                            view_pixel - cell_size.1
+                        } else {
+                            0.0
+                        },
+                    },
+                    (!(self.needs_full_clear || damage_all)).then(|| term.damage()),
+                );
+            }
             let stats = image_pipeline.resolve_kitty_textures(
                 &self.device,
                 &self.queue,

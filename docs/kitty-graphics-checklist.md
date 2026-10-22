@@ -413,7 +413,20 @@ The fix: keep virtual placements, including their `c`/`r`, in a table.
 Resolve placeholder cells at render time from the cell grid, like text, so
 erasing, scrolling, scrollback and reflow all work for free.
 
-- [ ] **P0 — PH-1. Placeholder images don't follow their cells.**
+Done in #28. See
+[`decisions/unicode-placeholders.md`](decisions/unicode-placeholders.md).
+
+- **Deliberate divergence from kitty.** Placeholder cells keep their
+  diacritics in toastty's shared extras table. When scrollback holds
+  more distinct live placeholder cells than its quota (about 49k), the
+  oldest scrollback rows lose their placeholder images: the text stays
+  and the image no longer draws. kitty keeps them.
+  - **Known edge case.** The visible screen and the alt screen are never
+    stripped. If both show huge distinct placeholder images at once (more
+    than about 24.5k distinct cells each), new placeholder cells can
+    still hit the cap and stay blank.
+
+- [x] **P0 — PH-1. Placeholder images don't follow their cells.**
   - Repro:
     - Draw a placeholder image, then write text over some rows, run
       `CSI 2K`/EL/ECH/DCH/ICH, or overwrite with spaces.
@@ -425,7 +438,8 @@ erasing, scrolling, scrollback and reflow all work for free.
     - In tmux, the image from window 0 is drawn over window 1, and after a
       split it crosses the pane border. `tmux refresh-client` doesn't help.
   - Only ED 2/3, deletes and row shifts remove the tiles.
-- [ ] **P0 — PH-2. Placeholder images aren't scaled to the virtual
+  - Fixed in #28.
+- [x] **P0 — PH-2. Placeholder images aren't scaled to the virtual
   placement.**
   - Repro: `K send a=T,i=1,U=1,q=2,c=10,r=5 --png img.png` with a 200×100
     image, then print a 10×5 block of placeholders. Or run
@@ -435,45 +449,59 @@ erasing, scrolling, scrollback and reflow all work for free.
   - Actual: a native-scale top-left crop.
   - Cause: `term.rs:2571-2629`. This also means the placement id in the
     underline colour can't select a different size.
-- [ ] **P1 — PH-3. Cells past the image's edge show a stretched 1 px edge
+  - Fixed in #28.
+- [x] **P1 — PH-3. Cells past the image's edge show a stretched 1 px edge
   strip.**
   - Expected: blank. With icat at the default cell size, toastty shows a
     white bar under the image instead.
   - Cause: the clamp at `term.rs:2620-2623`.
-- [ ] **P1 — PH-4. Placeholder images are lost in scrollback.**
+  - Fixed in #28.
+- [x] **P1 — PH-4. Placeholder images are lost in scrollback.**
   - Repro: scroll placeholder lines into history, then scroll back.
   - Expected: they're text, so kitty shows them.
   - Actual: they're missing. A leftover strip stays pinned at screen row 0.
   - Cause: tiles are `ImageGrid` placements, so SCR-2 applies;
     `image_grid.rs:356`.
-- [ ] **P1 — PH-5. Placeholders printed before the image arrives never
+  - Fixed in #28.
+- [x] **P1 — PH-5. Placeholders printed before the image arrives never
   display.**
   - Expected: kitty shows the image once it's transmitted.
   - Cause: the lookup at `term.rs:2610` is never re-checked.
-- [ ] **P1 — PH-6. Re-sending an image after `d=I` doesn't refill existing
+  - Fixed in #28.
+- [x] **P1 — PH-6. Re-sending an image after `d=I` doesn't refill existing
   placeholder cells.**
   - Expected: kitty shows the new image in the existing cells.
-- [ ] **P1 — PH-7. Positional deletes erase placeholder images.**
+  - Fixed in #28. Re-transmitting an id without `U=1` drops its virtual
+    placements, per the spec and kitty 0.49.2. The cells stay blank until a
+    new `U=1`.
+- [x] **P1 — PH-7. Positional deletes erase placeholder images.**
   - Repro: `d=a` removes them, and `d=p` punches a one-cell hole.
   - Expected: kitty leaves placeholder images alone for position-based
     selectors.
-- [ ] **P1 — PH-8. Narrowing the window permanently truncates a placeholder
+  - Fixed in #28. ED 2/3 and RIS also keep virtual placements, as in
+    kitty.
+- [x] **P1 — PH-8. Narrowing the window permanently truncates a placeholder
   image.**
   - Repro: narrow the window, then widen it again.
   - Actual: the text reflows back, but the image stays cut to the narrow
     width.
   - Cause: `clip_to` (`term.rs:1865`).
-- [ ] **P2 — PH-9. The image shows through placeholders without any `U=1`
+  - Fixed in #28.
+- [x] **P2 — PH-9. The image shows through placeholders without any `U=1`
   virtual placement.**
   - Expected: kitty shows nothing.
-- [ ] **P2 — PH-10. Basic SGR colours (30–37, 90–97) aren't accepted as the
+  - Fixed in #28.
+- [x] **P2 — PH-10. Basic SGR colours (30–37, 90–97) aren't accepted as the
   image id.**
   - Only `38;5` and `38;2` work.
   - Cause: `term.rs:5210`.
-- [ ] **P2 — PH-11. Bare `U+10EEEE` cells with no diacritics render image
+  - Fixed in #28.
+- [x] **P2 — PH-11. Bare `U+10EEEE` cells with no diacritics render image
   row 0.**
   - Expected: kitty shows nothing.
   - Lenient rather than harmful.
+  - Fixed in #28. A run whose first cell has no row diacritic is blank,
+    as in kitty. A missing column defaults to 0.
 
 ## 4. Relative placements
 
