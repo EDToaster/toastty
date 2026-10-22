@@ -11097,6 +11097,31 @@ mod minor_term_tests {
     }
 
     #[test]
+    fn resize_moves_alt_images_left_by_legacy_exit_with_the_alt_text() {
+        // #27 x #31: after a 1047 exit the alt screen's images stay stashed
+        // with its text. A resize must leave them where they would be had
+        // the alt screen stayed up. (The alt grid's resize keeps its line
+        // ids, so #31's alt re-anchoring is a no-op and the stash needs
+        // none; this pins that down.)
+        let rows_after = |stay: bool| {
+            let mut t = Term::new(10, 20, 0);
+            feed(&mut t, b"\x1b[?1047h\x1b[9;1H");
+            place_image(&mut t, 7);
+            feed(&mut t, b"\x1b[10;1H\n\n\n");
+            if !stay {
+                feed(&mut t, b"\x1b[?1047l");
+            }
+            t.resize(5, 20);
+            t.resize(7, 12);
+            if !stay {
+                feed(&mut t, b"\x1b[?1047h");
+            }
+            t.image_grid().iter().find(|p| p.image_id == 7).map(|p| t.prows(p))
+        };
+        assert_eq!(rows_after(false), rows_after(true));
+    }
+
+    #[test]
     fn decset_1048_saves_and_restores_cursor_only() {
         let mut t = Term::new(8, 8, 0);
         // Move cursor to (row 2, col 3), then save via 1048.
