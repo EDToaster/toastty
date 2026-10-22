@@ -7,8 +7,9 @@
 //!
 //! Key types follow kitty 0.49.2's parser, not the per-action meaning:
 //! every key has one wire type (unsigned 32-bit, signed 32-bit, or a
-//! one-character flag) whatever the action, and the action decides what
-//! the value means. The animation actions reuse many placement keys
+//! one-character enum for `a`, `t`, `o`, `d`) whatever the action, and the
+//! action decides what the value means. `q=` and `m=` are numbers:
+//! `q>=2` is silent, any non-zero `m=` means more. The animation actions reuse many placement keys
 //! (`c`, `r`, `x`, `y`, `z`, `X`, `Y`, `s`, `v`, `C`); read them through
 //! [`Header::frame`], [`Header::animation`] and [`Header::composition`]
 //! instead of the placement-named fields.
@@ -425,32 +426,17 @@ fn apply(h: &mut Header, key: &str, value: &str) -> Result<(), KittyHeaderError>
                 }
             };
         }
-        "m" => {
-            h.more = match value {
-                "0" => false,
-                "1" => true,
-                _ => {
-                    return Err(KittyHeaderError::BadEnum {
-                        key: key.to_string(),
-                        value: value.to_string(),
-                    });
-                }
-            };
-        }
+        // A number in kitty: any non-zero value means "more chunks".
+        "m" => h.more = parse_u32(key, value)? != 0,
         "i" => h.image_id = parse_u32(key, value)?,
         "I" => h.image_number = parse_u32(key, value)?,
         "p" => h.placement_id = parse_u32(key, value)?,
+        // A number in kitty: `q=2` and above are silent.
         "q" => {
-            h.quiet = match value {
-                "0" => Quiet::Verbose,
-                "1" => Quiet::NoOk,
-                "2" => Quiet::Silent,
-                _ => {
-                    return Err(KittyHeaderError::BadEnum {
-                        key: key.to_string(),
-                        value: value.to_string(),
-                    });
-                }
+            h.quiet = match parse_u32(key, value)? {
+                0 => Quiet::Verbose,
+                1 => Quiet::NoOk,
+                _ => Quiet::Silent,
             };
         }
         "s" => h.source_width = parse_u32(key, value)?,
@@ -595,9 +581,8 @@ mod tests {
             b"Ga=p,P=-1",
             b"Ga=T,z=4294967296",
             b"Ga=T,x=-5",
-            b"Ga=t,q=3",
             b"Ga=t,q=-1",
-            b"Ga=t,m=2",
+            b"Ga=t,m=-1",
             b"Ga=t,o=",
             b"Ga=t,o=y",
             b"Ga=t,t=x",
@@ -613,6 +598,10 @@ mod tests {
         assert_eq!(parse(b"Ga=T,z=-7").unwrap().z, -7);
         assert_eq!(parse(b"Ga=t,N=1").unwrap().usage_hint, 1);
         assert!(parse(b"Ga=t,U=2").unwrap().unicode_placeholder);
+        // `q=` and `m=` are numbers too (review of #37): kitty treats
+        // `q=3` as silent and `m=2` as `m=1`.
+        assert_eq!(parse(b"Ga=t,q=3").unwrap().quiet, Quiet::Silent);
+        assert!(parse(b"Ga=t,m=2").unwrap().more);
     }
 
     #[test]
