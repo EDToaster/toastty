@@ -52,6 +52,20 @@ pub struct CellRenderOpts {
     /// [`DecorationMetrics::fallback`] for the cell height (tests and
     /// GPU-less callers).
     pub decor: Option<DecorationMetrics>,
+    /// Full builder only: leave out the background quads of cells whose
+    /// (post-selection) background is exactly `theme.bg`. Only valid when
+    /// the frame starts with `LoadOp::Clear(theme.bg)`, which has already
+    /// painted those pixels with the same premultiplied value the quad
+    /// would write (the bg pass blends with REPLACE). That only holds
+    /// while no other bg quad overlaps the cell, so callers must leave
+    /// this off whenever edge bleed is active: an edge cell's grown quad
+    /// reaches over neighbouring (partial) rows, and a default-bg quad
+    /// drawn after it is what paints over that bleed. On a typical text
+    /// screen most visible cells are on the default bg, so this roughly
+    /// halves the instances built and uploaded per full redraw. The
+    /// partial-redraw builder ignores it: under `LoadOp::Load` its bg
+    /// quads erase the previous frame.
+    pub skip_default_bg: bool,
 }
 
 impl Default for CellRenderOpts {
@@ -59,6 +73,7 @@ impl Default for CellRenderOpts {
         Self {
             blink_on: true,
             decor: None,
+            skip_default_bg: false,
         }
     }
 }
@@ -161,6 +176,16 @@ pub struct EdgeBleed<'a> {
     /// by column. Consulted only when `vertical == SolidLine`; pass `&[]`
     /// otherwise.
     pub col_fills: &'a [bool],
+}
+
+/// Whether a full build may use [`CellRenderOpts::skip_default_bg`].
+/// Not while edge bleed is active: a grown edge quad reaches over the
+/// neighbouring (partial) rows, and the default-bg quads drawn after it
+/// are what paint over that bleed. The SIZE-9 below-cell-bg frames drop
+/// default-bg quads regardless (the image must show through them).
+#[must_use]
+pub fn may_skip_default_bg(bleed: &EdgeBleed<'_>, below_bg_active: bool) -> bool {
+    !bleed.active || below_bg_active
 }
 
 /// Grow an edge cell's background quad outward into the padding gutter so
@@ -1102,29 +1127,35 @@ pub fn build_instances_into_opts<F, S>(
                 && bleed
                     .vertical
                     .gate(bleed.col_fills.get(c as usize).copied().unwrap_or(false));
-            let (bg_pos, bg_size) = extend_edge_quad(
-                pos,
-                [bg_w, cell_h],
-                c,
-                r,
-                cols,
-                rows,
-                pixel_extra,
-                is_wide,
-                bleed.pad,
-                bleed_h,
-                bleed_v,
-            );
-            out.push(CellInstance {
-                pos: bg_pos,
-                size: bg_size,
-                uv_min: [0.0, 0.0],
-                uv_max: [0.0, 0.0],
-                fg,
-                bg,
-                flags: FLAG_NO_GLYPH,
-                pad: [0; 3],
-            });
+            // Exact compare is intended: default-bg cells carry
+            // `theme.bg` verbatim (see `CellRenderOpts::skip_default_bg`).
+            #[allow(clippy::float_cmp)]
+            let bg_is_clear = opts.skip_default_bg && bg == theme.bg;
+            if !bg_is_clear {
+                let (bg_pos, bg_size) = extend_edge_quad(
+                    pos,
+                    [bg_w, cell_h],
+                    c,
+                    r,
+                    cols,
+                    rows,
+                    pixel_extra,
+                    is_wide,
+                    bleed.pad,
+                    bleed_h,
+                    bleed_v,
+                );
+                out.push(CellInstance {
+                    pos: bg_pos,
+                    size: bg_size,
+                    uv_min: [0.0, 0.0],
+                    uv_max: [0.0, 0.0],
+                    fg,
+                    bg,
+                    flags: FLAG_NO_GLYPH,
+                    pad: [0; 3],
+                });
+            }
 
             push_cell_foreground(
                 out,
@@ -1264,6 +1295,12 @@ pub fn build_dirty_instances_into_opts<F, S>(
         // extra (blank) row is emitted.
         let (rows, _) = term.size();
         let content_h = f32::from(rows) * cell_size.1;
+        // Keep every bg quad: this builder's callers may be on a
+        // `LoadOp::Load` frame.
+        let opts = CellRenderOpts {
+            skip_default_bg: false,
+            ..*opts
+        };
         build_instances_into_opts(
             out,
             term,
@@ -1274,7 +1311,7 @@ pub fn build_dirty_instances_into_opts<F, S>(
             is_selected,
             bleed,
             content_h,
-            opts,
+            &opts,
         );
         if !cursor_visible {
             // Drop the trailing cursor instance the full builder
@@ -3462,6 +3499,7 @@ mod tests {
         let opts = CellRenderOpts {
             blink_on: true,
             decor: Some(metrics),
+            skip_default_bg: false,
         };
         let v = build_sgr(&term_with(b"\x1b[9;53mA"), &opts, false);
         let strike = with_flag(&v, FLAG_STRIKETHROUGH);
@@ -3594,6 +3632,7 @@ mod tests {
         let off = CellRenderOpts {
             blink_on: false,
             decor: None,
+            skip_default_bg: false,
         };
         let v = build_sgr(&t, &on, false);
         assert_eq!(glyphs(&v).len(), 2);
@@ -3616,6 +3655,7 @@ mod tests {
             CellRenderOpts {
                 blink_on: false,
                 decor: Some(DecorationMetrics::new(16.0, 13.0, None)),
+                skip_default_bg: false,
             },
         ] {
             let full = build_sgr(&t, &opts, false);
@@ -3637,5 +3677,113 @@ mod tests {
         assert!(row_has_blink(term_with(b"a\x1b[6mb").row(0)));
         assert!(!row_has_blink(term_with(b"a\x1b[5;8mb").row(0)));
         assert!(!row_has_blink(term_with(b"a\x1b[5;25mb").row(0)));
+    }
+
+    fn build_skipping(term: &Term, theme: &Theme, selected: &[u16]) -> Vec<CellInstance> {
+        let mut v = Vec::new();
+        build_instances_into_opts(
+            &mut v,
+            term,
+            (10.0, 20.0),
+            theme,
+            None,
+            |_, _, _, _| None,
+            |_, c| selected.contains(&c),
+            EdgeBleed::default(),
+            20.0,
+            &CellRenderOpts {
+                skip_default_bg: true,
+                ..CellRenderOpts::default()
+            },
+        );
+        v
+    }
+
+    /// `skip_default_bg` leaves out exactly the default-bg cell quads:
+    /// SGR backgrounds, reverse video, selection and the cursor keep
+    /// theirs, and the glyph-pass instances are untouched.
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn skip_default_bg_keeps_non_default_backgrounds() {
+        let theme = Theme::default_dark();
+        let mut term = Term::new(1, 10, 0);
+        // cols 0-1 default text, 2-3 red bg, 4-5 reverse, 6 blank, 7-8
+        // selected blanks, cursor parked at col 9.
+        feed(&mut term, b"ab\x1b[41mcd\x1b[0m\x1b[7mef\x1b[0m\x1b[1;10H");
+        let bg_cols = |v: &[CellInstance]| -> Vec<u32> {
+            v.iter()
+                .filter(|i| i.flags == FLAG_NO_GLYPH)
+                .map(|i| (i.pos[0] / 10.0) as u32)
+                .collect()
+        };
+        let mut all = Vec::new();
+        build_instances_into(
+            &mut all,
+            &term,
+            (10.0, 20.0),
+            &theme,
+            None,
+            |_, _, _, _| None,
+            |_, c| c == 7 || c == 8,
+            EdgeBleed::default(),
+            20.0,
+        );
+        assert_eq!(bg_cols(&all), vec![0, 1, 2, 3, 4, 5, 7, 8]);
+        let skipped = build_skipping(&term, &theme, &[7, 8]);
+        assert_eq!(bg_cols(&skipped), vec![2, 3, 4, 5, 7, 8]);
+        assert!(skipped.iter().any(|i| i.flags & FLAG_CURSOR != 0));
+        // Same instances otherwise, in the same order.
+        let rest = |v: &[CellInstance]| -> Vec<CellInstance> {
+            v.iter()
+                .filter(|i| !(i.flags == FLAG_NO_GLYPH && i.bg == theme.bg))
+                .copied()
+                .collect()
+        };
+        assert_eq!(rest(&all), skipped);
+    }
+
+    /// A transparent theme bg is matched exactly too: the clear paints
+    /// the same premultiplied colour the quad would.
+    #[test]
+    fn skip_default_bg_matches_transparent_default() {
+        let theme = Theme {
+            bg: [0.1, 0.1, 0.1, 0.5],
+            ..Theme::default_dark()
+        };
+        let mut term = Term::new(1, 4, 0);
+        feed(&mut term, b"ab\x1b[48;2;1;2;3mc");
+        let v = build_skipping(&term, &theme, &[]);
+        let bgs: Vec<_> = v.iter().filter(|i| i.flags == FLAG_NO_GLYPH).collect();
+        assert_eq!(bgs.len(), 1, "only the RGB-bg cell keeps its quad");
+        assert!((bgs[0].pos[0] - 20.0).abs() < 1e-6);
+    }
+
+    /// The dirty builder's `damage.all` fallback keeps every bg quad even
+    /// when asked to skip: it may be drawing under `LoadOp::Load`.
+    #[test]
+    fn dirty_builder_ignores_skip_default_bg() {
+        let theme = Theme::default_dark();
+        let mut term = Term::new(1, 4, 0);
+        feed(&mut term, b"ab");
+        term.mark_all_dirty();
+        let opts = CellRenderOpts {
+            skip_default_bg: true,
+            ..CellRenderOpts::default()
+        };
+        let mut v = Vec::new();
+        build_dirty_instances_into_opts(
+            &mut v,
+            &term,
+            term.damage(),
+            (10.0, 20.0),
+            &theme,
+            None,
+            true,
+            |_, _, _, _| None,
+            |_, _| false,
+            EdgeBleed::default(),
+            &opts,
+        );
+        assert_eq!(v.iter().filter(|i| i.flags == FLAG_NO_GLYPH).count(), 2);
     }
 }

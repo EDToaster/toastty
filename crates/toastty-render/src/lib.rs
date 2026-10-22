@@ -85,35 +85,16 @@ fn below_bg_forces_full_redraw(active: bool, drawn_last: &mut bool) -> bool {
 }
 
 /// Post-process the full-build cell instances: drop the trailing cursor
-/// instance when the cursor is hidden, and, while a below-cell-bg image
-/// is on screen, the default-bg quads it must show through.
-fn finish_full_build(
-    instances: &mut Vec<CellInstance>,
-    cursor_visible: bool,
-    below_bg_active: bool,
-    default_bg: [f32; 4],
-) {
+/// instance when the cursor is hidden.
+///
+/// While a `z < INT32_MIN/2` image is on screen the builder runs with
+/// [`CellRenderOpts::skip_default_bg`], so that image (drawn before the
+/// bg pass) shows through default-bg cells while non-default backgrounds
+/// (SGR colors, reverse video, selection) still cover it (SIZE-9).
+fn finish_full_build(instances: &mut Vec<CellInstance>, cursor_visible: bool) {
     if !cursor_visible {
         instances.pop();
     }
-    if below_bg_active {
-        drop_default_bg_quads(instances, default_bg);
-    }
-}
-
-/// Drop the cell-background quads painted in the default background
-/// color, so `z < INT32_MIN/2` images drawn before the bg pass show
-/// through default-bg cells while non-default backgrounds (SGR colors,
-/// reverse video, selection) still cover them.
-///
-/// Only valid on a full-clear frame: the clear already paints the
-/// default background (premultiplied, so a transparent theme bg stays
-/// transparent), which makes these quads redundant everywhere else.
-/// Cursor, decoration and cover quads carry extra flags and are kept.
-// Exact compare is intended: default-bg quads carry `theme.bg` verbatim.
-#[allow(clippy::float_cmp)]
-fn drop_default_bg_quads(instances: &mut Vec<CellInstance>, default_bg: [f32; 4]) {
-    instances.retain(|i| i.flags != crate::text::instance::FLAG_NO_GLYPH || i.bg != default_bg);
 }
 
 /// Append instances for `term` into `out`. The closure pulls glyph
@@ -2604,6 +2585,9 @@ impl Renderer {
         let cell_opts = crate::text::instance::CellRenderOpts {
             blink_on: self.text_blink.blink_on(),
             decor: Some(text.rasterizer.decoration_metrics()),
+            // Only consulted by the full builder, which only runs on
+            // `LoadOp::Clear(theme.bg)` frames.
+            skip_default_bg: crate::text::instance::may_skip_default_bg(&bleed, below_bg_active),
         };
         let t_bi = if trace {
             Some(std::time::Instant::now())
@@ -2625,7 +2609,7 @@ impl Renderer {
                 content_dims.1,
                 &cell_opts,
             );
-            finish_full_build(&mut instances, cursor_visible, below_bg_active, theme.bg);
+            finish_full_build(&mut instances, cursor_visible);
         } else {
             build_term_dirty_instances_into(
                 &mut instances,
@@ -4062,93 +4046,25 @@ mod below_cell_bg_tests {
         assert!(!below_bg_forces_full_redraw(false, &mut drawn_last));
     }
 
-    /// `finish_full_build` (what `render_term` calls on the full path):
-    /// default-bg quads go only with the flag on; the hidden cursor is
-    /// popped either way.
+    /// The hidden cursor (the full build's last instance) is popped.
     #[test]
-    fn finish_full_build_drops_default_bg_only_when_below_bg_active() {
-        use crate::text::instance::{FLAG_CURSOR, FLAG_NO_GLYPH, Theme, build_instances};
+    fn finish_full_build_pops_hidden_cursor() {
+        use crate::text::instance::{FLAG_CURSOR, Theme, build_instances};
         let theme = Theme::default_dark();
         let mut term = Term::new(1, 6, 0);
         let mut parser = toastty_parser::Parser::new();
         parser.advance(&mut term, b"ab\x1b[41mcd\x1b[0m");
         let built = build_instances(&term, (10.0, 20.0), &theme, None, |_, _, _, _| None);
-        let bg_quads = |v: &[CellInstance]| v.iter().filter(|i| i.flags == FLAG_NO_GLYPH).count();
         let has_cursor = |v: &[CellInstance]| v.iter().any(|i| i.flags & FLAG_CURSOR != 0);
-        assert_eq!(bg_quads(&built), 4);
 
         let mut v = built.clone();
-        finish_full_build(&mut v, true, false, theme.bg);
-        assert_eq!((bg_quads(&v), has_cursor(&v)), (4, true));
+        finish_full_build(&mut v, true);
+        assert_eq!(v, built);
+        assert!(has_cursor(&v));
 
         let mut v = built.clone();
-        finish_full_build(&mut v, true, true, theme.bg);
-        assert_eq!((bg_quads(&v), has_cursor(&v)), (2, true), "only red stays");
-
-        let mut v = built.clone();
-        finish_full_build(&mut v, false, false, theme.bg);
-        assert_eq!((bg_quads(&v), has_cursor(&v)), (4, false));
-
-        let mut v = built;
-        finish_full_build(&mut v, false, true, theme.bg);
-        assert_eq!((bg_quads(&v), has_cursor(&v)), (2, false));
-    }
-
-    /// SIZE-9: default-bg cell quads are dropped (the image shows
-    /// through), while SGR backgrounds, reverse video, selection and the
-    /// cursor keep their quads (they cover the image).
-    #[test]
-    fn drop_default_bg_quads_keeps_non_default_backgrounds() {
-        use crate::text::instance::{
-            EdgeBleed, FLAG_CURSOR, FLAG_NO_GLYPH, Theme, build_instances_into,
-        };
-        let theme = Theme::default_dark();
-        let mut term = Term::new(1, 10, 0);
-        let mut parser = toastty_parser::Parser::new();
-        // cols 0-1 default text, 2-3 red bg, 4-5 reverse, 6 blank, 7-8
-        // selected blanks, cursor parked at col 9.
-        parser.advance(&mut term, b"ab\x1b[41mcd\x1b[0m\x1b[7mef\x1b[0m\x1b[1;10H");
-        let mut v = Vec::new();
-        build_instances_into(
-            &mut v,
-            &term,
-            (10.0, 20.0),
-            &theme,
-            None,
-            |_, _, _, _| None,
-            |_, c| c == 7 || c == 8,
-            EdgeBleed::default(),
-            20.0,
-        );
-        let bg_cols = |v: &[CellInstance]| -> Vec<u32> {
-            v.iter()
-                .filter(|i| i.flags == FLAG_NO_GLYPH)
-                .map(|i| (i.pos[0] / 10.0) as u32)
-                .collect()
-        };
-        assert_eq!(bg_cols(&v), vec![0, 1, 2, 3, 4, 5, 7, 8]);
-
-        drop_default_bg_quads(&mut v, theme.bg);
-        assert_eq!(bg_cols(&v), vec![2, 3, 4, 5, 7, 8]);
-        assert!(
-            v.iter().any(|i| i.flags & FLAG_CURSOR != 0),
-            "cursor quad is kept"
-        );
-    }
-
-    /// A transparent theme bg is still matched exactly, so its default
-    /// cells are dropped too (the clear paints the same premultiplied
-    /// color), while an opaque explicit color is kept.
-    #[test]
-    fn drop_default_bg_quads_matches_transparent_default() {
-        use crate::text::instance::CellInstance;
-        let default_bg = [0.1, 0.1, 0.1, 0.5];
-        let mut v = vec![
-            CellInstance::background([0.0, 0.0], [10.0, 20.0], default_bg),
-            CellInstance::background([10.0, 0.0], [10.0, 20.0], [0.1, 0.1, 0.1, 1.0]),
-        ];
-        drop_default_bg_quads(&mut v, default_bg);
-        assert_eq!(v.len(), 1);
-        assert!((v[0].pos[0] - 10.0).abs() < 1e-6);
+        finish_full_build(&mut v, false);
+        assert_eq!(v.len(), built.len() - 1);
+        assert!(!has_cursor(&v));
     }
 }

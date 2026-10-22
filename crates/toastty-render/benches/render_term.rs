@@ -27,7 +27,9 @@ use pollster::block_on;
 use toastty_parser::Parser;
 use toastty_render::DEFAULT_LINE_HEIGHT;
 use toastty_render::text::glyph_rasterizer::GlyphRasterizer;
-use toastty_render::text::instance::{CellInstance, EdgeBleed, Theme, build_instances_into};
+use toastty_render::text::instance::{
+    CellInstance, CellRenderOpts, EdgeBleed, Theme, build_instances_into_opts,
+};
 use toastty_render::text::pipeline::{self, GlobalsUbo, TextPipeline};
 use toastty_render::text::row_shaper::RowShaper;
 use toastty_render::{instance_descriptor, instance_flags_for_release};
@@ -168,7 +170,13 @@ impl Harness {
 
         let theme = self.theme;
         let rows_ref = &self.rows;
-        build_instances_into(
+        // Same options as the renderer's full-redraw frames.
+        let opts = CellRenderOpts {
+            blink_on: true,
+            decor: Some(self.rasterizer.decoration_metrics()),
+            skip_default_bg: true,
+        };
+        build_instances_into_opts(
             &mut self.instances,
             term,
             cell_size,
@@ -178,6 +186,7 @@ impl Harness {
             |_, _| false,
             EdgeBleed::default(),
             f32::from(term.size().0) * cell_size.1,
+            &opts,
         );
         if self.cpu_only {
             return;
@@ -291,7 +300,13 @@ impl Harness {
         let t_build = Instant::now();
         let theme = self.theme;
         let rows_ref = &self.rows;
-        build_instances_into(
+        // Same options as the renderer's full-redraw frames.
+        let opts = CellRenderOpts {
+            blink_on: true,
+            decor: Some(self.rasterizer.decoration_metrics()),
+            skip_default_bg: true,
+        };
+        build_instances_into_opts(
             &mut self.instances,
             term,
             cell_size,
@@ -301,6 +316,7 @@ impl Harness {
             |_, _| false,
             EdgeBleed::default(),
             f32::from(term.size().0) * cell_size.1,
+            &opts,
         );
         let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
         let n_instances = self.instances.len();
