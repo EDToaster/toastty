@@ -2906,6 +2906,7 @@ impl Renderer {
                 top_line: term.image_top_line(),
                 scroll_px,
                 clip: image_clip(term, cell_size, content_dims.1),
+                origin: self.content_origin(),
             };
             let mut tmp: Vec<ImageInstance> = Vec::new();
             build_image_instances(

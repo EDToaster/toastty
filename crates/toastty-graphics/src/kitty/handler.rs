@@ -830,74 +830,62 @@ fn default_placement_from_header(
     cell_pw: u16,
     cell_ph: u16,
 ) -> Placement {
-    // Source rect: take what the header asked for, defaulting to
-    // "full image" when unset.
-    let src = if header.src_w == 0 && header.src_h == 0 {
-        SrcRect::FULL
-    } else {
-        SrcRect {
-            x: header.src_x,
-            y: header.src_y,
-            w: header.src_w,
-            h: header.src_h,
-        }
+    // Source rect as given: an unset `w`/`h` means "to the edge" from
+    // `x`/`y` (SIZE-5), so keep every key. The renderer resolves it
+    // against the image with the same `SrcRect::resolve` (SIZE-6).
+    let src = SrcRect {
+        x: header.src_x,
+        y: header.src_y,
+        w: header.src_w,
+        h: header.src_h,
     };
-    // Cell span: when `c=`/`r=` are specified, use them. Otherwise the
-    // kitty spec says the image occupies `ceil(img_dim / cell_dim)`
-    // cells. Falling through to 1×1 (the old behavior) made
-    // unannotated transmits — e.g. Ratty's widget demo — render as a
-    // single cell band.
-    //
-    // M4: when ONLY ONE of `c=`/`r=` is given, the other axis is
-    // derived from the source aspect ratio in PIXEL space, not from the
-    // image's natural cell count. Per spec, the image is scaled to fit
-    // the given axis preserving aspect ratio:
-    //   cols * cell_pw : rows * cell_ph == img_w : img_h
-    // So when only `c=` is set:
-    //   rows = ceil(cols * cell_pw * img_h / (img_w * cell_ph))
-    // and symmetrically when only `r=` is set:
-    //   cols = ceil(rows * cell_ph * img_w / (img_h * cell_pw))
-    // Both-zero keeps the natural-size derivation; both-set is verbatim.
-    let cell_pw = u32::from(cell_pw.max(1));
-    let cell_ph = u32::from(cell_ph.max(1));
-    let derived_cols = (img_w + cell_pw - 1) / cell_pw;
-    let derived_rows = (img_h + cell_ph - 1) / cell_ph;
-    let img_w_eff = img_w.max(1);
-    let img_h_eff = img_h.max(1);
-    let (cols, rows) = match (header.cols, header.rows) {
-        // Both set: use verbatim.
-        (c, r) if c != 0 && r != 0 => (c as u16, r as u16),
-        // Only `c=`: derive rows from the source aspect ratio.
-        (c, 0) if c != 0 => {
-            let num = c * cell_pw * img_h_eff;
-            let den = img_w_eff * cell_ph;
-            let r = ((num + den - 1) / den).max(1);
-            (c as u16, r as u16)
-        }
-        // Only `r=`: derive cols from the source aspect ratio.
-        (0, r) if r != 0 => {
-            let num = r * cell_ph * img_w_eff;
-            let den = img_h_eff * cell_pw;
-            let c = ((num + den - 1) / den).max(1);
-            (c as u16, r as u16)
-        }
-        // Neither set: natural cell count.
-        _ => (derived_cols.max(1) as u16, derived_rows.max(1) as u16),
-    };
-    // The host anchors the box at the cursor (see `Term::place_image`);
-    // we carry only the SPAN here, anchored at line 0 / column 0. M3:
-    // `X=`/`Y=` are NOT cell offsets — they are intra-cell pixel offsets,
-    // threaded via `pix_offset` below, so they must NOT shift the box.
-    let mut p = Placement::new(id, rows, cols);
+    // The drawn size follows kitty 0.49.2 (`Placement::draw_rect`): the
+    // source rect's native pixels with no `c=`/`r=` (SIZE-1, SIZE-4), the
+    // given side plus the source aspect ratio with only one (SIZE-2), the
+    // box with both (SIZE-3: kitty stretches). The cell box reserved for
+    // it is `c=`/`r=` when given, else `ceil((drawn + offset) / cell)`,
+    // which is what kitty reserves (and moves the cursor by).
+    let cols_req = u16::try_from(header.cols).unwrap_or(u16::MAX);
+    let rows_req = u16::try_from(header.rows).unwrap_or(u16::MAX);
+    let mut p = Placement::new(id, rows_req.max(1), cols_req.max(1));
     p.placement_id = header.placement_id;
     p.src_rect = src;
     p.z = header.z;
+    p.fit_cols = cols_req;
+    p.fit_rows = rows_req;
     // M3: `X=` / `Y=` are sub-cell pixel offsets within the first cell,
-    // applied at render time. They do not move the placement's cells.
-    // (Header field names kept as `cell_x`/`cell_y` for now.) The
-    // relative branch in `handle_place` sets `parent` / `rel_offset`
+    // applied at render time; they don't move the box. Clamped to the
+    // cell like kitty (SIZE-10). (Header names kept as `cell_x`/`cell_y`.)
+    // The relative branch in `handle_place` sets `parent` / `rel_offset`
     // for `a=p` with `P=`/`Q=` set (M13).
-    p.pix_offset = (header.cell_x, header.cell_y);
+    let cw = u32::from(cell_pw.max(1));
+    let ch = u32::from(cell_ph.max(1));
+    p.pix_offset = (header.cell_x.min(cw - 1), header.cell_y.min(ch - 1));
+    let shown = if img_w == 0 || img_h == 0 {
+        // Image size unknown (not registered): reserve a single cell.
+        (0, 0)
+    } else {
+        let r = src.resolve(img_w, img_h);
+        (r.w, r.h)
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let ((ox, oy), (w, h)) = p.draw_rect(shown, (cw as f32, ch as f32));
+    let span = |px: f32, off: f32, cell: u32| -> u16 {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let n = ((px + off) / cell as f32).ceil() as u32;
+        u16::try_from(n.max(1)).unwrap_or(u16::MAX)
+    };
+    if cols_req == 0 {
+        p.cols = span(w, ox, cw);
+    }
+    if rows_req == 0 {
+        p.rows = span(h, oy, ch);
+    }
+    p.clip_rows = 0..p.rows;
     p
 }
 
@@ -1843,10 +1831,13 @@ mod major_place_handler_tests {
         assert_eq!((p.cols, p.rows), (7, 9));
     }
 
-    // ---- M3: X=/Y= map to pix_offset, leave cell ranges alone ----
+    // ---- M3 / SIZE-10: X=/Y= are pixel offsets, clamped to the cell ----
 
     #[test]
-    fn m3_xy_become_pixel_offset_not_cell_range() {
+    fn m3_xy_become_pixel_offset_and_widen_the_reservation() {
+        // The box stays at the cursor (`col`/`line` untouched), but like
+        // kitty the reservation covers the offset too: ceil((16+3)/8) = 3
+        // (kitty-ref: X=8,Y=19 on 200x100 with 9x20 cells reserves 24x6).
         let base = default_placement_from_header(&Header::default(), 1, 16, 16, 8, 8);
         let header = Header {
             cell_x: 3,
@@ -1856,15 +1847,96 @@ mod major_place_handler_tests {
         let p = default_placement_from_header(&header, 1, 16, 16, 8, 8);
         assert_eq!(p.pix_offset, (3, 4));
         assert_eq!(
-            (p.col, p.cols),
-            (base.col, base.cols),
-            "X must not shift the cell range"
+            (p.col, p.line),
+            (base.col, base.line),
+            "the box doesn't move"
         );
-        assert_eq!(
-            (p.line, p.rows),
-            (base.line, base.rows),
-            "Y must not shift the cell range"
-        );
+        assert_eq!((base.cols, base.rows), (2, 2));
+        assert_eq!((p.cols, p.rows), (3, 3));
+    }
+
+    #[test]
+    fn size10_offsets_clamp_to_the_cell() {
+        // kitty-ref, 9x20 cells: X=25,Y=40 lands at +8,+19.
+        let header = Header {
+            cell_x: 25,
+            cell_y: 40,
+            ..Header::default()
+        };
+        let p = default_placement_from_header(&header, 1, 200, 100, 9, 20);
+        assert_eq!(p.pix_offset, (8, 19));
+        assert_eq!((p.cols, p.rows), (24, 6));
+    }
+
+    /// `(cols, rows)` reserved and the drawn `(w, h)` for `header` on a
+    /// `w`x`h` image with 9x20 cells (kitty-ref's), as kitty measures it.
+    fn fit(header: &Header, w: u32, h: u32) -> ((u16, u16), (f32, f32)) {
+        let p = default_placement_from_header(header, 1, w, h, 9, 20);
+        let src = p.src_rect.resolve(w, h);
+        ((p.cols, p.rows), p.draw_rect((src.w, src.h), (9.0, 20.0)).1)
+    }
+
+    fn hdr(f: impl FnOnce(&mut Header)) -> Header {
+        let mut h = Header::default();
+        f(&mut h);
+        h
+    }
+
+    #[test]
+    fn kitty_ref_sizes_match() {
+        // Every expected size below was measured on kitty 0.49.2 (PIL
+        // bounding boxes, 9x20 cells; see the A3 PR).
+        // SIZE-1: native size.
+        assert_eq!(fit(&Header::default(), 205, 105).1, (205.0, 105.0));
+        assert_eq!(fit(&Header::default(), 205, 105).0, (23, 6));
+        assert_eq!(fit(&Header::default(), 3, 50).1, (3.0, 50.0));
+        assert_eq!(fit(&Header::default(), 1, 1).1, (1.0, 1.0));
+        // SIZE-2: one side given, the other from the aspect ratio.
+        assert_eq!(fit(&hdr(|h| h.cols = 10), 400, 200).1, (90.0, 45.0));
+        assert_eq!(fit(&hdr(|h| h.cols = 10), 400, 200).0, (10, 3));
+        assert_eq!(fit(&hdr(|h| h.rows = 3), 400, 200).1, (120.0, 60.0));
+        assert_eq!(fit(&hdr(|h| h.cols = 10), 333, 100).1, (90.0, 27.0));
+        assert_eq!(fit(&hdr(|h| h.rows = 1), 100, 333).1, (6.0, 20.0));
+        // SIZE-3: both given: kitty stretches to the box.
+        let both = hdr(|h| (h.cols, h.rows) = (4, 8));
+        assert_eq!(fit(&both, 200, 100), ((4, 8), (36.0, 160.0)));
+        // SIZE-4: size and aspect come from the source rect.
+        let src = hdr(|h| (h.src_w, h.src_h) = (60, 40));
+        assert_eq!(fit(&src, 200, 100), ((7, 2), (60.0, 40.0)));
+        let src12 = hdr(|h| (h.src_w, h.src_h, h.cols) = (60, 40, 12));
+        assert_eq!(fit(&src12, 200, 100).1, (108.0, 72.0));
+        // SIZE-5: a partial rect runs to the edge.
+        assert_eq!(fit(&hdr(|h| h.src_w = 50), 200, 100).1, (50.0, 100.0));
+        assert_eq!(fit(&hdr(|h| h.src_h = 30), 200, 100).1, (200.0, 30.0));
+        assert_eq!(fit(&hdr(|h| h.src_x = 150), 200, 100).1, (50.0, 100.0));
+        assert_eq!(fit(&hdr(|h| h.src_y = 70), 200, 100).1, (200.0, 30.0));
+        // SIZE-6: intersected with the image.
+        let part = hdr(|h| (h.src_x, h.src_w) = (150, 100));
+        assert_eq!(fit(&part, 200, 100).1, (50.0, 100.0));
+        let over = hdr(|h| (h.src_w, h.src_h) = (500, 500));
+        assert_eq!(fit(&over, 200, 100).1, (200.0, 100.0));
+        let out = hdr(|h| (h.src_x, h.src_w) = (250, 50));
+        let p = default_placement_from_header(&out, 1, 200, 100, 9, 20);
+        assert!(p.src_rect.resolve(200, 100).is_empty(), "shows nothing");
+        // SIZE-10: offsets fitted inside c/r.
+        let xc = hdr(|h| (h.cell_x, h.cols) = (5, 6));
+        assert_eq!(fit(&xc, 200, 100).1, (49.0, 25.0));
+        let yr = hdr(|h| (h.cell_y, h.rows) = (7, 3));
+        assert_eq!(fit(&yr, 200, 100).1, (106.0, 53.0));
+        let xyb = hdr(|h| (h.cell_x, h.cell_y, h.cols, h.rows) = (5, 7, 6, 3));
+        assert_eq!(fit(&xyb, 200, 100).1, (49.0, 53.0));
+        let x3 = hdr(|h| (h.cell_x, h.cols) = (3, 7));
+        assert_eq!(fit(&x3, 333, 100).1, (60.0, 18.0));
+    }
+
+    #[test]
+    fn size11_zoom_keeps_native_size_and_rescales_cell_fits() {
+        // kitty-ref after two font-size steps (cells ~12x29): a natural
+        // 205x105 stays 205x105; c=10 on 400x200 becomes 120x60.
+        let nat = default_placement_from_header(&Header::default(), 1, 205, 105, 9, 20);
+        assert_eq!(nat.draw_rect((205, 105), (12.0, 29.0)).1, (205.0, 105.0));
+        let c10 = default_placement_from_header(&hdr(|h| h.cols = 10), 1, 400, 200, 9, 20);
+        assert_eq!(c10.draw_rect((400, 200), (12.0, 29.0)).1, (120.0, 60.0));
     }
 }
 

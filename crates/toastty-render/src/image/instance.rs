@@ -122,6 +122,10 @@ pub struct ImageView {
     /// Visible area `[x0, y0, x1, y1]` in pixels, relative to the content
     /// origin. Images are cropped to it.
     pub clip: [f32; 4],
+    /// The content origin in window pixels (the shader adds it). Image
+    /// origins are snapped so `origin + pos` is a whole pixel, which a
+    /// centered grid's half-pixel lead would otherwise break.
+    pub origin: [f32; 2],
 }
 
 impl ImageView {
@@ -133,6 +137,7 @@ impl ImageView {
             top_line,
             scroll_px: 0.0,
             clip: [0.0, 0.0, size.0, size.1],
+            origin: [0.0, 0.0],
         }
     }
 }
@@ -167,17 +172,31 @@ pub fn build_image_instances(
         if placement.cols == 0 || placement.rows == 0 || placement.clip_rows.is_empty() {
             continue;
         }
+        let Some(image) = registry.get(placement.image_id) else {
+            continue;
+        };
+        // What part of the image is shown (spec defaults + intersection
+        // with the image, SIZE-5/6); nothing when it lies outside.
+        let src = placement.src_rect.resolve(image.width, image.height);
+        if src.is_empty() {
+            continue;
+        }
         // Top-left of the reserved cell box. Rows are relative to the
         // live screen (negative = in scrollback).
         let row = (placement.line - view.top_line) as f32;
         let box_x = f32::from(placement.col) * cw;
         let box_y = row * ch + view.scroll_px;
-        // Destination rect: the box, shifted by the M3 `X=`/`Y=`
-        // intra-cell pixel offsets, stretched over the whole box.
-        let dst_x = box_x + placement.pix_offset.0 as f32;
-        let dst_y = box_y + placement.pix_offset.1 as f32;
-        let dst_w = f32::from(placement.cols) * cw;
-        let dst_h = f32::from(placement.rows) * ch;
+        // Destination rect, at the current cell size (SIZE-1/2/3/10/11):
+        // native pixels unless `c=`/`r=` were given. Its origin is snapped
+        // to whole pixels (the scroll offset stays exact, as for text), so
+        // a native-size image maps texels 1:1 with no resampling blur.
+        let ((ox, oy), (dst_w, dst_h)) = placement.draw_rect((src.w, src.h), cell_size);
+        if dst_w <= 0.0 || dst_h <= 0.0 {
+            continue;
+        }
+        let snap = |v: f32, o: f32| (o + v).round() - o;
+        let dst_x = snap(box_x + ox, view.origin[0]);
+        let dst_y = snap(row * ch + oy, view.origin[1]) + view.scroll_px;
         // Crop: the view, narrowed by any margin clip. An unclipped edge
         // doesn't constrain (the `Y=` shift may push the image past the
         // box's last row, as before).
@@ -197,23 +216,13 @@ pub fn build_image_instances(
         if x1 <= x0 || y1 <= y0 {
             continue;
         }
-        let Some(image) = registry.get(placement.image_id) else {
-            continue;
-        };
         let Some(entry) = cache.get(placement.image_id) else {
             continue;
         };
-        let (uv_min, uv_max) = if placement.src_rect.is_full() {
-            ([0.0, 0.0], [1.0, 1.0])
-        } else {
-            let iw = image.width.max(1) as f32;
-            let ih = image.height.max(1) as f32;
-            let x0 = placement.src_rect.x as f32 / iw;
-            let y0 = placement.src_rect.y as f32 / ih;
-            let x1 = (placement.src_rect.x + placement.src_rect.w) as f32 / iw;
-            let y1 = (placement.src_rect.y + placement.src_rect.h) as f32 / ih;
-            ([x0, y0], [x1, y1])
-        };
+        let iw = image.width.max(1) as f32;
+        let ih = image.height.max(1) as f32;
+        let uv_min = [src.x as f32 / iw, src.y as f32 / ih];
+        let uv_max = [(src.x + src.w) as f32 / iw, (src.y + src.h) as f32 / ih];
         // Map the cropped rect back through the dst -> uv linear map.
         let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
         let uv0 = [
@@ -435,6 +444,100 @@ mod tests {
         assert_near(i.size, [20.0, 20.0], "");
         assert_near(i.uv_min, [0.0, 0.75], "");
         assert_near(i.uv_max, [0.5, 1.0], "");
+    }
+
+    /// A placement drawn at native size (no `c=`/`r=`).
+    fn natural(rows: std::ops::Range<i64>, cols: std::ops::Range<u16>) -> Placement {
+        let mut p = place(1, rows, cols, 0);
+        (p.fit_cols, p.fit_rows) = (0, 0);
+        p
+    }
+
+    #[test]
+    fn natural_size_draws_texels_one_to_one() {
+        // SIZE-1: a 205x105 image in a 21x6-cell box is drawn 205x105 at
+        // a whole-pixel origin, UVs covering the whole texture.
+        let mut grid = ImageGrid::new();
+        grid.add(natural(2..8, 3..24));
+        let out = build(&grid, 205, 105, (10.0, 19.0), &view());
+        let i = out[0];
+        assert_near(i.pos, [30.0, 38.0], "");
+        assert_near(i.size, [205.0, 105.0], "");
+        assert_near(i.uv_min, [0.0, 0.0], "");
+        assert_near(i.uv_max, [1.0, 1.0], "");
+        // A fractional cell size still lands on whole pixels.
+        let out = build(&grid, 205, 105, (9.6, 19.4), &view());
+        assert_near(out[0].pos, [29.0, 39.0], "28.8, 38.8 rounded");
+        assert_near(out[0].size, [205.0, 105.0], "");
+        // A centered grid's half-pixel origin: snapped in window space.
+        let mut v = view();
+        v.origin = [0.5, 0.25];
+        let out = build(&grid, 205, 105, (10.0, 19.0), &v);
+        assert_near(out[0].pos, [30.5, 37.75], "origin + pos = 31, 38");
+    }
+
+    #[test]
+    fn natural_size_wider_than_the_screen_is_truncated_not_squashed() {
+        // SIZE-7: cropped at the clip edge at native scale.
+        let mut grid = ImageGrid::new();
+        grid.add(natural(0..1, 40..190));
+        let v = ImageView::live(0, (800.0, 600.0));
+        let out = build(&grid, 1500, 10, (10.0, 19.0), &v);
+        let i = out[0];
+        assert_near(i.pos, [400.0, 0.0], "");
+        assert_near(i.size, [400.0, 10.0], "");
+        assert_near(i.uv_max, [400.0 / 1500.0, 1.0], "");
+    }
+
+    #[test]
+    fn partial_src_rect_and_offsets_follow_kitty() {
+        // SIZE-5: `x=150` alone shows the right 50 px; SIZE-10: X=25 on
+        // 10 px cells clamps to 9.
+        let mut grid = ImageGrid::new();
+        let mut p = natural(0..6, 0..6);
+        p.src_rect = SrcRect {
+            x: 150,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
+        p.pix_offset = (25, 0);
+        grid.add(p);
+        let out = build(&grid, 200, 100, (10.0, 19.0), &view());
+        let i = out[0];
+        assert_near(i.pos, [9.0, 0.0], "");
+        assert_near(i.size, [50.0, 100.0], "");
+        assert_near(i.uv_min, [0.75, 0.0], "");
+        assert_near(i.uv_max, [1.0, 1.0], "");
+    }
+
+    #[test]
+    fn src_rect_outside_the_image_draws_nothing() {
+        // SIZE-6: kitty shows nothing (no edge-pixel smear).
+        let mut grid = ImageGrid::new();
+        let mut p = natural(0..6, 0..6);
+        p.src_rect = SrcRect {
+            x: 250,
+            y: 0,
+            w: 50,
+            h: 0,
+        };
+        grid.add(p);
+        assert!(build(&grid, 200, 100, (10.0, 19.0), &view()).is_empty());
+    }
+
+    #[test]
+    fn cols_only_follows_aspect_at_the_current_cell_size() {
+        // SIZE-2 / SIZE-11: c=10 on 400x200 is 100x50 at 10 px cells and
+        // 120x60 at 12 px cells.
+        let mut grid = ImageGrid::new();
+        let mut p = place(1, 0..3, 0..10, 0);
+        p.fit_rows = 0;
+        grid.add(p);
+        let out = build(&grid, 400, 200, (10.0, 19.0), &view());
+        assert_near(out[0].size, [100.0, 50.0], "");
+        let out = build(&grid, 400, 200, (12.0, 29.0), &view());
+        assert_near(out[0].size, [120.0, 60.0], "");
     }
 
     #[test]

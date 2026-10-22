@@ -26,6 +26,14 @@
 //! DECSTBM margin scrolls narrow so an image scrolled against a margin
 //! stays cut there (kitty does the same).
 //!
+//! ## Size (see `docs/decisions/image-placement-model.md`)
+//!
+//! The cell box is only a reservation (it drives cursor motion and cell
+//! hit-tests). The drawn size comes from [`Placement::draw_rect`], at
+//! render time with the current cell size: native pixels when neither
+//! `c=` nor `r=` was given, the box when both were, and the given side
+//! plus the source aspect ratio when only one was (kitty 0.49.2).
+//!
 //! Lookups are linear today (`O(n)` per query). Image placements are
 //! few, so this is pragmatic. If it ever shows up in profiling, swap for
 //! an interval tree.
@@ -58,10 +66,17 @@ pub struct Placement {
     /// image pushed against a margin is permanently cut there; nothing
     /// else touches it.
     pub clip_rows: Range<u16>,
-    /// Sub-rect of the source image to show, in source pixels.
-    /// Stored as `(x, y, w, h)`. Use `full_image` to cover the whole
-    /// image (the renderer interprets `w == 0 || h == 0` as "full").
+    /// Sub-rect of the source image to show, in source pixels, as given
+    /// (kitty's `x=`/`y=`/`w=`/`h=`). [`SrcRect::resolve`] applies the
+    /// spec's defaults and intersects it with the image; use
+    /// [`SrcRect::FULL`] for the whole image.
     pub src_rect: SrcRect,
+    /// Kitty's `c=` / `r=` as given, `0` = not given. They decide the
+    /// drawn size ([`Self::draw_rect`]); [`Self::cols`]/[`Self::rows`] are
+    /// the reservation derived from them.
+    pub fit_cols: u16,
+    /// Kitty's `r=` as given, `0` = not given. See [`Self::fit_cols`].
+    pub fit_rows: u16,
     /// Z order. `z >= 0` renders above text; `z < 0` renders below.
     /// Ties broken by insertion order.
     pub z: i32,
@@ -108,6 +123,8 @@ impl Placement {
             cols,
             clip_rows: 0..rows,
             src_rect: SrcRect::FULL,
+            fit_cols: cols,
+            fit_rows: rows,
             z: 0,
             pix_offset: (0, 0),
             parent: None,
@@ -149,13 +166,49 @@ impl Placement {
     pub fn on_row(&self, top_line: i64, row: u16) -> bool {
         self.screen_rows(top_line).contains(&i64::from(row))
     }
+
+    /// Where the image is drawn relative to the top-left of its cell box,
+    /// and how big, in pixels: `((dx, dy), (w, h))`. `src` is the source
+    /// size after [`SrcRect::resolve`] and `cell` the cell size.
+    ///
+    /// Matches kitty 0.49.2 (measured on kitty-ref):
+    /// - `X=`/`Y=` are clamped to the cell (`cell - 1`).
+    /// - Neither `c=` nor `r=`: native size, `src` exactly.
+    /// - Both: the box less the offsets (stretched; kitty doesn't
+    ///   letterbox, though the spec says to).
+    /// - Only `c=`: width is the box less `X`, height follows the source
+    ///   aspect ratio, rounded to whole pixels. Only `r=` likewise.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // pixel sizes fit an f32 mantissa.
+    pub fn draw_rect(&self, src: (u32, u32), cell: (f32, f32)) -> ((f32, f32), (f32, f32)) {
+        let ox = (self.pix_offset.0 as f32).min((cell.0 - 1.0).max(0.0));
+        let oy = (self.pix_offset.1 as f32).min((cell.1 - 1.0).max(0.0));
+        let (sw, sh) = (src.0 as f32, src.1 as f32);
+        let size = match (self.fit_cols, self.fit_rows) {
+            (0, 0) => (sw, sh),
+            (c, 0) => {
+                let w = (f32::from(c) * cell.0 - ox).max(0.0);
+                let h = if sw > 0.0 { (w * sh / sw).round() } else { 0.0 };
+                (w, h)
+            }
+            (0, r) => {
+                let h = (f32::from(r) * cell.1 - oy).max(0.0);
+                let w = if sh > 0.0 { (h * sw / sh).round() } else { 0.0 };
+                (w, h)
+            }
+            (c, r) => (
+                (f32::from(c) * cell.0 - ox).max(0.0),
+                (f32::from(r) * cell.1 - oy).max(0.0),
+            ),
+        };
+        ((ox, oy), size)
+    }
 }
 
-/// Pixel rectangle on the source image, in image pixels.
-///
-/// `w == 0 || h == 0` means "use full image size" — the renderer needs
-/// the image dimensions to materialize the full rect and we don't store
-/// those on `Placement`.
+/// Pixel rectangle on the source image, in image pixels, as the client
+/// gave it: `w == 0` / `h == 0` mean "to the right / bottom edge". The
+/// all-zero [`SrcRect::FULL`] is the whole image. [`SrcRect::resolve`]
+/// turns it into the rectangle actually shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SrcRect {
     pub x: u32,
@@ -173,9 +226,41 @@ impl SrcRect {
         h: 0,
     };
 
-    /// True iff this is the "full image" sentinel.
+    /// True iff this is the "full image" sentinel (all zero).
     #[must_use]
     pub fn is_full(&self) -> bool {
+        *self == Self::FULL
+    }
+
+    /// The rectangle actually shown from an `img_w` × `img_h` image, per
+    /// the spec: an unset (`0`) width/height means "the entire width /
+    /// height" from `x`/`y`, and "the displayed area is the intersection
+    /// of the specified rectangle with the source image rectangle". The
+    /// result may be empty (a rect entirely outside the image shows
+    /// nothing, as in kitty). Idempotent: resolving a resolved rect
+    /// changes nothing.
+    #[must_use]
+    pub fn resolve(&self, img_w: u32, img_h: u32) -> Self {
+        let x = self.x.min(img_w);
+        let y = self.y.min(img_h);
+        let avail_w = img_w - x;
+        let avail_h = img_h - y;
+        let w = if self.w == 0 {
+            avail_w
+        } else {
+            self.w.min(avail_w)
+        };
+        let h = if self.h == 0 {
+            avail_h
+        } else {
+            self.h.min(avail_h)
+        };
+        Self { x, y, w, h }
+    }
+
+    /// True when the rect shows no pixels.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
         self.w == 0 || self.h == 0
     }
 }
