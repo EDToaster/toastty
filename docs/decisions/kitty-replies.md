@@ -173,3 +173,24 @@ Deliberate divergences:
 - the three base64 leniencies above;
 - `a=f` during a load, which needs animation (stack E);
 - the stale-id reply for dimensions over 10000.
+
+## File-medium queries and usage hints (B4a: WIRE-1, §9 `N=1`)
+
+- **`a=q` with `t=f` / `t=t`** goes through the same hardened read path as
+  a transmit (`KittyHandler::query_medium` → `medium::read_image_file`),
+  `t=t` deletion rule included. Order, as in kitty 0.49.2: a query without
+  `i=` is ignored and the file isn't touched; `f=` and the dimensions are
+  checked before the file is opened (`EINVAL:Zero width/height not
+  allowed`); every failure after that, decode errors too, is the uniform
+  `EBADF:Failed to read image file`; success is `OK`, nothing is stored.
+  The same pre-check now applies to file-medium transmits.
+- **Short files.** A file shorter than `S=` is read to its end; too little
+  data then fails in the decoder (uniform EBADF). kitty does this, and
+  `kitten icat --detect-support` depends on it.
+- **`t=s`** still replies ENOTSUP to `a=q` (shared memory is its own PR).
+  Detection therefore reports `files`, not kitty's `memory`, for now.
+- **Usage hints.** `N` is a bitmask; bit 0 is "transient". After a
+  successful store the handler calls `KittySink::mark_transient`; `Term`
+  marks the registry entry. Eviction order under pressure: unplaced
+  transient (LRU), then unplaced, then placed. A re-send of the id clears
+  the mark, since the hint belongs to the data it came with.
