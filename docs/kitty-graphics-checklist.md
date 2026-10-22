@@ -686,12 +686,26 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
   - In the other direction, toastty is more lenient than kitty about
     embedded whitespace and chunks that aren't a multiple of 4. Keep that.
   - Cause: `decode_base64` (`handler.rs:733-744`).
-- [ ] **P2 — WIRE-5. An 8-bit `0x9C` byte inside an APC ends it.**
+- [x] **P2 — WIRE-5. An 8-bit `0x9C` byte inside an APC ends it.**
   - Repro: a non-G APC whose UTF-8 text contains `U+041C` (`\xd0\x9c`).
   - Actual: the rest of the payload is printed to the screen. kitty
     swallows the whole sequence.
   - Cause: `crates/toastty-parser/src/parser.rs:171-181`. In UTF-8 mode,
     C1 ST shouldn't end an APC.
+  - Checked against kitty 0.49.2 for OSC, DCS, APC, PM and SOS. kitty ends
+    none of them on 0x9C, whether it is a bare byte, the tail of
+    `\xd0\x9c`, or U+009C (`\xc2\x9c`). toastty ended APC (its own
+    scanner) and DCS (vte's passthrough) on it.
+  - Fix: the APC scanner ends only on `ESC \\` / BEL. A new scanner state
+    drops 0x9C inside a DCS before vte sees it (vte ignores bytes >= 0x80
+    in a DCS anyway). OSC, PM and SOS were already right. Fixed in #32.
+- [ ] **P3 — WIRE-13. BEL doesn't end a DCS, PM or SOS; kitty ends all string
+  types on BEL.** Found while checking WIRE-5.
+  - Repro: `ESC P z hello BEL world ESC \\` (likewise `ESC ^` and `ESC X`).
+  - kitty 0.49.2 ends the string at BEL and prints ` world`. toastty (vte)
+    keeps going to `ESC \\` and prints nothing.
+  - OSC and APC already end on BEL in both.
+  - xterm only accepts BEL for OSC, so this is a kitty-ism. Low impact.
 - [ ] **P2 — WIRE-6. Malformed headers get an EINVAL reply; kitty stays
   silent.**
   - Cases: `s=abc`, `s=`, `q=3`, `m=2`, `a=X`, `t=x`, `o=y`, `x=-5`,
