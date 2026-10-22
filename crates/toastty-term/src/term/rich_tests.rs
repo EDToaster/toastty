@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use toastty_parser::Parser;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::rich::{
     RichBlockLayout, RichImage, RichLayout, RichLayoutRequest, RichLinkSpan, RichTextRun,
@@ -12,7 +13,7 @@ use crate::rich::{
 use crate::selection::{Pos, Selection, SelectionMode};
 use crate::{RichEnv, SecurityFlags, Term};
 
-/// `(cols, cell_w, cell_h, font_px, allow_local_files, base_dir)`
+/// `(cols, cell_w, cell_h, font_px, allow_local_files, base_dir, mono_family)`
 type LastReq = (
     u16,
     u32,
@@ -53,17 +54,27 @@ impl RichBlockLayout for Fake {
         let mut text = Vec::new();
         let mut links = Vec::new();
         for line in req.source.lines() {
-            let chars: Vec<char> = line.chars().collect();
-            if chars.is_empty() {
+            if line.is_empty() {
                 text.push(Vec::new());
                 continue;
             }
-            for chunk in chars.chunks(cols) {
-                let s: String = chunk.iter().collect();
+            // Wrap at `cols` cells, whole grapheme clusters per row.
+            let mut chunks: Vec<(String, usize)> = vec![];
+            let mut cur = (String::new(), 0);
+            for g in line.graphemes(true) {
+                let w = super::block_cluster_cells(g);
+                if cur.1 + w > cols && !cur.0.is_empty() {
+                    chunks.push(std::mem::take(&mut cur));
+                }
+                cur.0.push_str(g);
+                cur.1 += w;
+            }
+            chunks.push(cur);
+            for (s, cells) in chunks {
                 if let Some(url) = s.strip_prefix("link:") {
                     links.push(RichLinkSpan {
                         row: u16::try_from(text.len()).unwrap(),
-                        cols: 0..u16::try_from(chunk.len()).unwrap(),
+                        cols: 0..u16::try_from(cells).unwrap(),
                         url: url.to_owned(),
                     });
                 }
@@ -688,4 +699,134 @@ fn block_text_is_written_one_grapheme_cluster_per_cell() {
         t.extract_selection_text().as_deref(),
         Some("x\u{2764}\u{fe0f}y \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}z e\u{301}!.")
     );
+}
+
+#[test]
+fn block_cluster_cells_matches_the_layout_engine() {
+    // Same case table as `grapheme_cell_widths` in toastty-markdown
+    // (`layout/grid.rs`): the two rules must agree or the cells drift
+    // from the drawn glyphs. Keep both tables in sync.
+    for (g, w) in [
+        ("a", 1),
+        ("\u{4e2d}", 2),
+        ("e\u{301}", 1),
+        ("\u{2764}\u{fe0f}", 2),
+        ("\u{2764}", 1),
+        ("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}", 2),
+        ("\u{1f1e8}\u{1f1e6}", 2),
+        ("\u{200b}", 0),
+        ("\u{301}", 0),
+        ("\u{1b}", 0),
+    ] {
+        assert_eq!(super::block_cluster_cells(g), w, "{g:?}");
+    }
+}
+
+/// Copy of the whole block row `r` (from the top of the screen).
+fn copy_row(t: &mut Term, r: u16) -> Option<String> {
+    let top = t.bottom_id() - u64::from(t.size().0 - 1) + u64::from(r);
+    let mut sel = Selection::new(Pos::new(top, 0), SelectionMode::Char);
+    sel.set_active(Pos::new(top, t.size().1 - 1));
+    t.set_selection(sel);
+    t.extract_selection_text()
+}
+
+#[test]
+fn grapheme_tails_survive_resize_relayout() {
+    let (mut t, fake) = term(4, 20, 10);
+    let line = "e\u{301} \u{2764}\u{fe0f} \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} abcdefgh";
+    feed(&mut t, &osc(line));
+    let tails = |t: &Term, r: u16| -> Vec<String> {
+        t.row(r)
+            .cells
+            .iter()
+            .map(|c| t.grapheme_tail(c).to_owned())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let want = ["\u{301}", "\u{fe0f}", "\u{200d}\u{1f469}\u{200d}\u{1f467}"];
+    assert_eq!(tails(&t, 0), want);
+    assert_eq!(copy_row(&mut t, 0).as_deref(), Some(line));
+    // 16 cells: wraps at 12 (after "abcd"), clusters kept whole.
+    t.resize(4, 12);
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+    let block = t.row(0).rich.unwrap().block;
+    let rows: Vec<u16> = (0..4)
+        .filter(|&r| t.row(r).rich.is_some_and(|x| x.block == block))
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(tails(&t, rows[0]), want);
+    assert_eq!(row_text(&t, rows[1]), "efgh");
+    // Back to 20: one row again, tails intact, copy round-trips.
+    t.resize(4, 20);
+    let r = (0..4)
+        .find(|&r| t.row(r).rich.is_some_and(|x| x.block == block))
+        .unwrap();
+    assert_eq!(tails(&t, r), want);
+    assert_eq!(copy_row(&mut t, r).as_deref(), Some(line));
+}
+
+fn one_run(text: &str) -> RichLayout {
+    RichLayout {
+        rows: 1,
+        image: None,
+        text: vec![vec![RichTextRun {
+            col: 0,
+            text: text.to_owned(),
+        }]],
+        links: vec![],
+    }
+}
+
+#[test]
+fn long_grapheme_tails_are_clipped_to_the_cap() {
+    // 40 combining acutes (80 bytes) on one base: the tail keeps the
+    // first 64 bytes (32 marks), on a char boundary.
+    let marks = "\u{301}".repeat(40);
+    let text = format!("e{marks}x\u{2764}{}", "\u{fe0f}".repeat(30));
+    let mut extras = crate::extra::ExtraTable::default();
+    let rows = super::build_block_rows(&one_run(&text), 1, 10, &mut vec![], &mut extras);
+    let cells = &rows[0].cells;
+    assert_eq!(cells[0].ch, 'e');
+    let tail = extras.grapheme_tail(cells[0].extra);
+    assert_eq!(tail.len(), crate::extra::MAX_GRAPHEME_EXTRA_BYTES);
+    assert!(tail.chars().all(|c| c == '\u{301}'));
+    assert_eq!(cells[1].ch, 'x');
+    // 3-byte VS16s: clipped to 63 bytes (21 of them), never mid-char.
+    assert_eq!(cells[2].ch, '\u{2764}');
+    assert_eq!(extras.grapheme_tail(cells[2].extra), "\u{fe0f}".repeat(21));
+    assert!(cells[3].is_continuation);
+}
+
+#[test]
+fn wide_cluster_never_straddles_the_last_column() {
+    let mut extras = crate::extra::ExtraTable::default();
+    // 9 cells, then a 2-cell cluster that would need columns 9 and 10.
+    let rows = super::build_block_rows(
+        &one_run("123456789\u{2764}\u{fe0f}"),
+        1,
+        10,
+        &mut vec![],
+        &mut extras,
+    );
+    let cells = &rows[0].cells;
+    assert_eq!(cells.len(), 10);
+    assert_eq!(cells[8].ch, '9');
+    assert_eq!(
+        cells[9],
+        crate::cell::Cell::BLANK,
+        "dropped, not half drawn"
+    );
+    // It fits when it ends exactly on the last column.
+    let rows = super::build_block_rows(
+        &one_run("12345678\u{2764}\u{fe0f}"),
+        1,
+        10,
+        &mut vec![],
+        &mut extras,
+    );
+    let cells = &rows[0].cells;
+    assert_eq!(cells[8].ch, '\u{2764}');
+    assert_eq!(extras.grapheme_tail(cells[8].extra), "\u{fe0f}");
+    assert!(cells[9].is_continuation);
 }

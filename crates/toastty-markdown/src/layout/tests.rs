@@ -1238,6 +1238,15 @@ fn very_narrow_panels_stay_on_the_grid() {
 fn ligature_fonts_stay_on_the_grid() {
     // Needs an installed font with programming ligatures; skipped
     // otherwise (like `system_renderer_smoke`, it uses system fonts).
+    //
+    // Fonts like Fira Code, JetBrains Mono and Cascadia draw `->` etc.
+    // as contextual alternates, one glyph per character, so this checks
+    // that substituted glyphs stay on the grid. A real font that maps
+    // one glyph onto several grapheme clusters wasn't available to test
+    // (JetBrains Mono: 0 such glyphs); that path of `snap_to_cells` is
+    // covered only by the synthetic
+    // `inline::tests::graphemes_split_over_shaping_clusters_are_one_unit`.
+    // The count is printed so a font that does it shows up here.
     let mut r = Renderer::new();
     let candidates = [
         "Fira Code",
@@ -1259,10 +1268,33 @@ fn ligature_fonts_stay_on_the_grid() {
             continue;
         }
         tried += 1;
-        eprintln!("ligature_fonts_stay_on_the_grid: checking {family}");
+        let ligatures = multi_grapheme_glyphs(&mut r, line, &p);
+        eprintln!("ligature_fonts_stay_on_the_grid: {family}: {ligatures} multi-cluster glyphs");
         assert_on_grid(&l, &p, &[line]);
     }
     if tried == 0 {
         eprintln!("ligature_fonts_stay_on_the_grid: no ligature font installed, skipped");
     }
+}
+
+/// Glyphs of `line`, shaped as a code-block line with `r`'s current
+/// fonts, that cover more than one grapheme cluster.
+fn multi_grapheme_glyphs(r: &mut Renderer, line: &str, p: &LayoutParams) -> usize {
+    let span = super::inline::SpanInfo {
+        mono: true,
+        size: p.font_px,
+        bold: false,
+        italic: false,
+        color: [255; 4],
+        underline: false,
+        strike: false,
+        boxed: super::inline::Boxed::None,
+        bg: [0; 4],
+        rise: 0.0,
+        link: None,
+    };
+    let mut para = super::inline::Para::default();
+    para.text(line, span);
+    para.grid = Some(p.cell_w);
+    super::inline::Shaped::new(&mut r.fonts, &r.cache.fonts, &para).multi_grapheme_glyphs()
 }

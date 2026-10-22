@@ -10,7 +10,10 @@ use crate::{LinkSpan, TextRun};
 /// text into the grid: its Unicode width capped at 2 (so `❤️` and ZWJ
 /// emoji sequences are 2, like DECSET 2027), and 0 for controls and
 /// zero-width clusters, which take no cell. Must match
-/// `block_cluster_cells` in toastty-term (`term/rich_term.rs`).
+/// `block_cluster_cells` in toastty-term (`term/rich_term.rs`); both
+/// sides test the same case table (`grapheme_cell_widths` here,
+/// `block_cluster_cells_matches_the_layout_engine` there), so change
+/// them together.
 pub(crate) fn grapheme_cells(g: &str) -> u32 {
     if g.starts_with(char::is_control) {
         return 0;

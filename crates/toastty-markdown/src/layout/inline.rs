@@ -427,6 +427,20 @@ impl Shaped {
         }
     }
 
+    /// Glyphs whose source text covers more than one grapheme cluster
+    /// (ligatures such as `->` in Fira Code).
+    #[cfg(test)]
+    pub(crate) fn multi_grapheme_glyphs(&self) -> usize {
+        self.glyphs
+            .iter()
+            .filter(|g| {
+                self.text
+                    .get(g.start..g.end)
+                    .is_some_and(|t| t.graphemes(true).nth(1).is_some())
+            })
+            .count()
+    }
+
     fn width(&self, r: &std::ops::Range<usize>) -> f32 {
         self.glyphs[r.clone()].iter().map(Glyph::adv).sum()
     }

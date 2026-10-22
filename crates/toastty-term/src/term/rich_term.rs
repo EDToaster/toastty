@@ -34,8 +34,10 @@ pub(super) fn intern_url(table: &mut Vec<String>, url: &str) -> Option<Hyperlink
 /// capped at 2 (so `❤️` and ZWJ emoji sequences are one 2-cell cluster,
 /// as under DECSET 2027), and 0 for controls and zero-width clusters,
 /// which are dropped. The layout engine places the block's glyphs by the
-/// same rule (`grapheme_cells` in toastty-markdown), so the cells line up
-/// with the image.
+/// same rule (`grapheme_cells` in toastty-markdown `layout/grid.rs`), so
+/// the cells line up with the image. Both sides test the same case table
+/// (`block_cluster_cells_matches_the_layout_engine` here,
+/// `grapheme_cell_widths` there); change them together.
 fn block_cluster_cells(g: &str) -> usize {
     if g.starts_with(char::is_control) {
         return 0;
