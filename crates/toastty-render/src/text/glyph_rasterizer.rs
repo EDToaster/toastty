@@ -13,6 +13,7 @@ use cosmic_text::{
 };
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::sync::Arc;
 use toastty_protocols::unicode_core::cluster_cell_width;
 use unicode_width::UnicodeWidthChar;
 use wgpu::{Device, Extent3d, Queue, Texture, TextureFormat};
@@ -50,6 +51,14 @@ enum FastChar {
     Skip,
     /// Cached; index into [`GlyphRasterizer::fast_slots`].
     Cached(u32),
+}
+
+/// Memoised shape of one row text; see [`GlyphRasterizer::shape_line_memo`].
+#[derive(Debug)]
+struct MemoEntry {
+    glyphs: Arc<LineGlyphs>,
+    /// [`GlyphRasterizer::memo_frame`] of the last lookup that hit it.
+    last_used: u64,
 }
 
 /// Mask atlas dims (R8) and color atlas dims (BGRA8) — generously sized
@@ -351,6 +360,19 @@ pub struct GlyphRasterizer {
     /// Slots the [`FastChar::Cached`] entries point at. Append-only
     /// between [`Self::rebuild_fast_chars`] calls.
     fast_slots: Vec<GlyphSlot>,
+    /// Shaped rows keyed by their exact text, one map per mode-2027
+    /// state. Lets a row whose text was shaped recently (it scrolled,
+    /// or was repainted in new colours) skip shaping and the
+    /// `LineGlyphs` allocation. Cleared whenever an earlier shape could
+    /// go stale: a char turning uncacheable, an atlas eviction, a size
+    /// change. Trimmed by [`Self::trim_line_memo`].
+    line_memo: [HashMap<Box<str>, MemoEntry>; 2],
+    /// Frame counter for [`MemoEntry::last_used`], advanced by
+    /// [`Self::trim_line_memo`].
+    memo_frame: u64,
+    /// Set when [`Self::ensure_atlas_slot`] returned `None` (no atlas
+    /// room, no image); [`Self::shape_line_memo`] then skips memoising.
+    slot_failed: bool,
 }
 
 impl GlyphRasterizer {
@@ -472,6 +494,9 @@ impl GlyphRasterizer {
             requested_family_available,
             fast_chars: initial_fast_chars(),
             fast_slots: Vec::new(),
+            line_memo: [HashMap::new(), HashMap::new()],
+            memo_frame: 0,
+            slot_failed: false,
         }
     }
 
@@ -515,6 +540,7 @@ impl GlyphRasterizer {
         self.placements.clear();
         self.char_cache.clear();
         self.rebuild_fast_chars();
+        self.clear_line_memo();
     }
 
     /// Recompute `fast_chars[ch]` from the char sets, with the same
@@ -571,19 +597,32 @@ impl GlyphRasterizer {
         let new = self.char_cache_misses.insert(ch);
         if new {
             self.sync_fast_char(ch);
+            // Same rule as `mark_uncacheable`: a char-cache change drops
+            // the memoised rows rather than reasoning about which could
+            // have shaped differently.
+            self.clear_line_memo();
         }
         new
     }
 
     /// Record `ch` as contextually shaped (see `uncacheable_chars`) and
-    /// evict its `char_cache` entry. Returns true if it was new.
+    /// evict its `char_cache` entry. Returns true if it was new. Rows
+    /// shaped earlier may have served the old standalone glyph for it,
+    /// so the line memo is dropped too.
     fn mark_uncacheable(&mut self, ch: char) -> bool {
         let new = self.uncacheable_chars.insert(ch);
         if new {
             self.char_cache.remove(&ch);
             self.sync_fast_char(ch);
+            self.clear_line_memo();
         }
         new
+    }
+
+    fn clear_line_memo(&mut self) {
+        for m in &mut self.line_memo {
+            m.clear();
+        }
     }
 
     /// Glyph id this char would produce shaped alone, with no
@@ -969,6 +1008,68 @@ impl GlyphRasterizer {
         self.char_cache.get(&ch).map(|slot| Some(*slot))
     }
 
+    /// [`Self::shape_line`] through the row-text memo: a row whose exact
+    /// text (and mode-2027 state) was shaped recently gets the same
+    /// shared `LineGlyphs` back without shaping. Scrolling and
+    /// full-screen repaints in new colours re-dirty rows whose text
+    /// hasn't changed; for rows that need cosmic-text (CJK, emoji,
+    /// ligatures) this skips ~100 µs of layout per row.
+    ///
+    /// Call [`Self::trim_line_memo`] once per frame to bound it.
+    pub fn shape_line_memo(
+        &mut self,
+        queue: &Queue,
+        text: &str,
+        mode_2027_active: bool,
+    ) -> Arc<LineGlyphs> {
+        let frame = self.memo_frame;
+        let m = usize::from(mode_2027_active);
+        if let Some(e) = self.line_memo[m].get_mut(text) {
+            e.last_used = frame;
+            return Arc::clone(&e.glyphs);
+        }
+        self.slot_failed = false;
+        let glyphs = Arc::new(self.shape_line(queue, text, mode_2027_active));
+        // A glyph that got no atlas slot (atlas full even after evicting)
+        // left its cell blank: don't memoise that, so the row is shaped
+        // again next time it is dirty, as without the memo.
+        if self.slot_failed {
+            return glyphs;
+        }
+        // Shaping may have cleared the memo (a char turned uncacheable,
+        // an atlas shelf was evicted); this fresh shape is still valid.
+        self.line_memo[m].insert(
+            text.into(),
+            MemoEntry {
+                glyphs: Arc::clone(&glyphs),
+                last_used: frame,
+            },
+        );
+        glyphs
+    }
+
+    /// End-of-frame bookkeeping for [`Self::shape_line_memo`]: advance
+    /// the frame counter and, once a memo map holds more than
+    /// `2 * keep` rows, drop all but the `keep` most recently used.
+    pub fn trim_line_memo(&mut self, keep: usize) {
+        self.memo_frame += 1;
+        for m in &mut self.line_memo {
+            if m.len() <= keep.saturating_mul(2) {
+                continue;
+            }
+            let mut stamps: Vec<u64> = m.values().map(|e| e.last_used).collect();
+            let cut = stamps.len() - keep;
+            let cutoff = *stamps.select_nth_unstable(cut).1;
+            m.retain(|_, e| e.last_used >= cutoff);
+        }
+    }
+
+    /// Rows currently memoised (both mode-2027 states).
+    #[must_use]
+    pub fn line_memo_len(&self) -> usize {
+        self.line_memo.iter().map(HashMap::len).sum()
+    }
+
     /// Slow path: cosmic-text shaping. Populates `char_cache` /
     /// `char_cache_misses` with whatever cosmic-text resolves so that
     /// future calls with the same characters can take the fast path.
@@ -1188,6 +1289,13 @@ impl GlyphRasterizer {
     /// [`Self::baseline_y`] to convert swash's bearing into a cell-relative
     /// offset — never a per-line value (see that field's docs for why).
     fn ensure_atlas_slot(&mut self, queue: &Queue, glyph: &LayoutGlyph) -> Option<GlyphSlot> {
+        let slot = self.ensure_atlas_slot_inner(queue, glyph);
+        self.slot_failed |= slot.is_none();
+        slot
+    }
+
+    /// [`Self::ensure_atlas_slot`] without the failure bookkeeping.
+    fn ensure_atlas_slot_inner(&mut self, queue: &Queue, glyph: &LayoutGlyph) -> Option<GlyphSlot> {
         let baseline_y = self.baseline_y;
         let physical = glyph.physical((0.0, 0.0), 1.0);
         let cache_key: CacheKey = physical.cache_key;
@@ -1267,6 +1375,8 @@ impl GlyphRasterizer {
                 "atlas {layer:?} full — evicting LRU shelf to make room for {w}x{h} glyph",
             );
             self.atlas.evict_oldest_shelf(layer);
+            // Memoised rows may point at the evicted shelf.
+            self.clear_line_memo();
             match self.atlas.reserve(key, layer, w, h) {
                 Ok(s) => s,
                 Err(e) => {
@@ -2539,6 +2649,102 @@ mod tests {
         }
     }
 
+    /// The row memo hands back the same shared shape for the same text
+    /// and mode, keeps the two modes apart, is dropped when a char turns
+    /// uncacheable, and is bounded by `trim_line_memo`.
+    #[test]
+    fn line_memo_reuses_and_invalidates() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        let a = rasterizer.shape_line_memo(&queue, "memo 你好 row", false);
+        let b = rasterizer.shape_line_memo(&queue, "memo 你好 row", false);
+        assert!(Arc::ptr_eq(&a, &b), "same text must hit the memo");
+        let fresh = rasterizer.shape_line(&queue, "memo 你好 row", false);
+        assert_eq!(a.by_column, fresh.by_column);
+        assert_eq!(a.secondary, fresh.secondary);
+
+        let c = rasterizer.shape_line_memo(&queue, "memo 你好 row", true);
+        assert!(!Arc::ptr_eq(&a, &c), "mode 2027 has its own memo");
+
+        rasterizer.mark_uncacheable('m');
+        assert_eq!(
+            rasterizer.line_memo_len(),
+            0,
+            "uncacheable char drops the memo"
+        );
+        let d = rasterizer.shape_line_memo(&queue, "memo 你好 row", false);
+        assert!(!Arc::ptr_eq(&a, &d));
+
+        for i in 0..50 {
+            let _ = rasterizer.shape_line_memo(&queue, &format!("row {i}"), false);
+            rasterizer.trim_line_memo(8);
+        }
+        assert!(rasterizer.line_memo_len() <= 2 * 8 + 1);
+        // The most recent rows survive a trim.
+        let last = rasterizer.shape_line_memo(&queue, "row 49", false);
+        let again = rasterizer.shape_line_memo(&queue, "row 49", false);
+        assert!(Arc::ptr_eq(&last, &again));
+    }
+
+    /// A new cache miss drops the memo, like a new uncacheable char.
+    #[test]
+    fn cache_miss_drops_line_memo() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        let _ = rasterizer.shape_line_memo(&queue, "memo row", false);
+        assert_eq!(rasterizer.line_memo_len(), 1);
+        assert!(rasterizer.mark_cache_miss('\u{E0001}'));
+        assert_eq!(rasterizer.line_memo_len(), 0);
+        // Already known: nothing to drop.
+        let _ = rasterizer.shape_line_memo(&queue, "memo row", false);
+        assert!(!rasterizer.mark_cache_miss('\u{E0001}'));
+        assert_eq!(rasterizer.line_memo_len(), 1);
+    }
+
+    /// A row whose glyph got no atlas slot (here: a glyph bigger than the
+    /// whole atlas) is not memoised, so it is shaped again next time.
+    #[test]
+    fn row_with_failed_slot_is_not_memoised() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        rasterizer.set_font_size(1500.0, DEFAULT_LINE_HEIGHT_RATIO);
+        let lg = rasterizer.shape_line_memo(&queue, "W", false);
+        assert!(lg.get(0, 'W').is_none(), "glyph should not fit the atlas");
+        assert_eq!(rasterizer.line_memo_len(), 0);
+        // A row that does fit is memoised as usual.
+        let _ = rasterizer.shape_line_memo(&queue, " ", false);
+        assert_eq!(rasterizer.line_memo_len(), 1);
+    }
+
+    /// Regression (review of the dropped shape-run cache): a neutral-only
+    /// word shaped at RTL level must not leak its mirrored glyphs into an
+    /// LTR line with the same word, through any cache. The RTL line opens
+    /// with a Latin char so the paragraph stays LTR: an RTL paragraph is
+    /// right-aligned in the infinitely wide shaping buffer, and its glyph
+    /// x overflows cosmic-text's subpixel binning in debug builds.
+    #[test]
+    fn rtl_neutral_word_does_not_leak_into_ltr_row() {
+        type Cell = Option<(char, [f32; 2], [f32; 2], bool)>;
+        let (_device, queue, mut warm) = make_rasterizer();
+        let (_device, queue2, mut fresh) = make_rasterizer();
+        let rtl =
+            "a \u{05E9}\u{05DC}\u{05D5}\u{05DD} (( \u{05E2}\u{05D5}\u{05DC}\u{05DD} [< \u{05E9}";
+        let ltr = "x (( y [<";
+        let _ = warm.shape_line_memo(&queue, rtl, false);
+        let got = warm.shape_line_memo(&queue, ltr, false);
+        let want = fresh.shape_line(&queue2, ltr, false);
+        // Slots sit at different atlas positions in the two rasterizers;
+        // compare what each visible cell draws (blanks draw nothing).
+        let cells = |lg: &LineGlyphs| -> Vec<Cell> {
+            lg.by_column
+                .iter()
+                .map(|c| {
+                    c.filter(|(ch, _)| *ch != ' ')
+                        .map(|(ch, s)| (ch, s.glyph_size, s.glyph_offset, s.is_color))
+                })
+                .collect()
+        };
+        assert_eq!(cells(&got), cells(&want));
+        assert!(got.get(7, '[').is_some() && got.get(8, '<').is_some());
+    }
+
     /// `set_font_size` rebuilds the dense table: nothing stays cached at
     /// the old size, so the next line goes through the slow path.
     #[test]
@@ -2548,5 +2754,6 @@ mod tests {
         assert!(rasterizer.try_shape_line_fast("abc").is_some());
         rasterizer.set_font_size(20.0, DEFAULT_LINE_HEIGHT_RATIO);
         assert!(rasterizer.try_shape_line_fast("abc").is_none());
+        assert_eq!(rasterizer.line_memo_len(), 0);
     }
 }

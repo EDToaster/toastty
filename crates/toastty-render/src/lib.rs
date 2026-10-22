@@ -52,9 +52,10 @@ use crate::image::instance::{
 };
 use crate::image::pipeline::ImagePipeline;
 use crate::rgp::{GpuAssetCache, Rgp3dPipeline};
-use crate::text::glyph_rasterizer::{DEFAULT_LINE_HEIGHT_RATIO, GlyphRasterizer, LineGlyphs};
+use crate::text::glyph_rasterizer::{DEFAULT_LINE_HEIGHT_RATIO, GlyphRasterizer};
 use crate::text::instance::{CellInstance, CellRenderOpts, Theme};
 use crate::text::pipeline::{GlobalsUbo, TextPipeline};
+use crate::text::row_shaper::RowShaper;
 
 /// True when a placement that actually draws sits in the kitty
 /// `z < INT32_MIN/2` band, which draws under non-default cell
@@ -126,7 +127,7 @@ fn build_term_instances_into(
     cell_size: (f32, f32),
     theme: &Theme,
     ext_palette: &[[f32; 4]; 256],
-    row_glyphs: &[Option<LineGlyphs>],
+    row_glyphs: &RowShaper,
     bleed: EdgeBleed<'_>,
     content_h: f32,
     opts: &CellRenderOpts,
@@ -137,10 +138,7 @@ fn build_term_instances_into(
         cell_size,
         theme,
         Some(ext_palette),
-        |row, col, ch, _style| {
-            let lg = row_glyphs.get(row as usize)?.as_ref()?;
-            lg.get(col, ch)
-        },
+        |row, col, ch, _style| row_glyphs.glyph(row, col, ch),
         |line_id, col| term.is_cell_selected(line_id, col),
         bleed,
         content_h,
@@ -159,7 +157,7 @@ fn build_term_dirty_instances_into(
     theme: &Theme,
     ext_palette: &[[f32; 4]; 256],
     cursor_visible: bool,
-    row_glyphs: &[Option<LineGlyphs>],
+    row_glyphs: &RowShaper,
     bleed: EdgeBleed<'_>,
     opts: &CellRenderOpts,
 ) {
@@ -171,10 +169,7 @@ fn build_term_dirty_instances_into(
         theme,
         Some(ext_palette),
         cursor_visible,
-        |row, col, ch, _style| {
-            let lg = row_glyphs.get(row as usize)?.as_ref()?;
-            lg.get(col, ch)
-        },
+        |row, col, ch, _style| row_glyphs.glyph(row, col, ch),
         |line_id, col| term.is_cell_selected(line_id, col),
         bleed,
         opts,
@@ -902,28 +897,11 @@ struct TextState {
     rasterizer: GlyphRasterizer,
     pipeline: TextPipeline,
     bind_group: wgpu::BindGroup,
-    /// Row-shape cache. `line_cache[r]` holds the shaped glyphs for row
-    /// `r` of the active grid; `None` slots are re-shaped on the next
-    /// frame. Sized to match the term's current visible-row count;
-    /// resized in `render_term` on geometry change.
-    ///
-    /// This is the minimum-viable subset of decision #7 / M9 needed to
-    /// kill the per-keystroke render cost — shape only dirty rows, reuse
-    /// cached glyphs for the rest.
-    line_cache: Vec<Option<LineGlyphs>>,
-    /// `row_blink[r]` is true when rendered row `r` holds a visible
-    /// SGR-blink cell. Parallel to `line_cache` and refreshed for the
-    /// same (dirty) rows, so finding blinking text costs nothing on
-    /// clean frames. Drives [`TextBlink`].
-    row_blink: Vec<bool>,
+    /// Row-shape cache + the per-frame shaping loop.
+    rows: RowShaper,
     /// Reusable instance buffer. Cleared (not freed) at the start of
     /// every `render_term` so the allocation survives across frames.
     instances_scratch: Vec<CellInstance>,
-    /// Reusable per-row text buffer. `render_term` clears + repopulates
-    /// this for each dirty row instead of allocating a fresh `String`,
-    /// which previously showed up in profile traces as per-row alloc
-    /// churn (one allocation per dirty row, every frame).
-    line_text_scratch: String,
 }
 
 impl std::fmt::Debug for TextState {
@@ -1208,10 +1186,8 @@ impl Renderer {
             rasterizer,
             pipeline,
             bind_group,
-            line_cache: Vec::new(),
-            row_blink: Vec::new(),
+            rows: RowShaper::new(),
             instances_scratch: Vec::new(),
-            line_text_scratch: String::new(),
         });
         // Lazy-init the image pipeline alongside the text pipeline so
         // both are ready before the first `render_term`. The image
@@ -1251,7 +1227,7 @@ impl Renderer {
         };
         text.rasterizer.set_font_size(font_size_px, line_height);
         // Cached rows hold atlas slots from the old packer: re-shape all.
-        text.line_cache.clear();
+        text.rows.invalidate();
         self.needs_full_clear = true;
     }
 
@@ -2288,7 +2264,12 @@ impl Renderer {
         if rich_active != self.rich_drawn_last {
             self.needs_full_clear = true;
         }
-        let mut rich_suppress = vec![false; usize::from(term.size().0) + 2];
+        // Rows whose text is suppressed for a rich slice. Left empty
+        // (no allocation) on the common frame without rich blocks.
+        let mut rich_suppress = Vec::new();
+        if rich_active {
+            rich_suppress.resize(usize::from(term.size().0) + 2, false);
+        }
         for d in &rich_draws {
             if let Some(slot) = rich_suppress.get_mut(usize::from(d.0)) {
                 *slot = true;
@@ -2419,7 +2400,7 @@ impl Renderer {
         if text_blink_due {
             self.text_blink.tick(now);
             if let Some(text) = self.text.as_ref() {
-                mark_blinking_cells_dirty(term, &text.row_blink);
+                mark_blinking_cells_dirty(term, text.rows.row_blink());
             }
         }
         // If the term has blink disabled, the cursor must always be
@@ -2452,19 +2433,6 @@ impl Renderer {
             cell_size = text.rasterizer.cell_size();
             atlas_dims = text.rasterizer.atlas_dims();
 
-            // Resize the row-shape cache. We allocate two extra slots
-            // beyond `rows`: one for the partial *top* row during sub-pixel
-            // scrolling, one for the partial *bottom* row when the content
-            // area isn't a whole number of cells tall. Sizing for the worst
-            // case avoids reallocation churn as the scroll offset crosses
-            // cell boundaries. Growth is dirty (new entries are `None`);
-            // shrinking just drops old slots.
-            let cache_len = rows as usize + 2;
-            if text.line_cache.len() != cache_len {
-                text.line_cache.resize(cache_len, None);
-            }
-            text.row_blink.resize(cache_len, false);
-
             // Number of rows to render this frame: content rows, plus the
             // partial top row (sub-row pixel offset) and the trailing
             // partial bottom row (floor-divided grid leftover). See
@@ -2476,81 +2444,25 @@ impl Renderer {
                 content_dims.1,
             );
 
-            // Re-shape only dirty rows; reuse cached `LineGlyphs` for
-            // the rest. The atlas itself never shrinks, so a clean row's
-            // glyph slots stay valid across frames.
-            let damage = term.damage();
-            let mut shaped = 0u32;
             let t_shape = if trace {
                 Some(std::time::Instant::now())
             } else {
                 None
             };
-            for r in 0..rows_rendered {
-                let is_dirty = damage.all
-                    || damage.rows.get(r as usize).is_some_and(|rd| !rd.is_empty())
-                    || text.line_cache[r as usize].is_none();
-                if !is_dirty {
-                    continue;
-                }
-                let row = term.view_row(r);
-                text.row_blink[r as usize] = crate::text::instance::row_has_blink(row);
-                // Reuse the cross-row scratch String instead of
-                // allocating a fresh one per dirty row.
-                //
-                // Continuation cells are excluded: they're the second
-                // half of a width-2 cluster whose primary cell already
-                // contributes its full multi-cell glyph to the shaper.
-                // Feeding the continuation in as a space would insert
-                // an extra glyph cosmic-text would shape, shifting every
-                // downstream cluster's snapped column by one.
-                text.line_text_scratch.clear();
-                // A row showing a rich-block slice draws the image
-                // instead of its text glyphs (the cells keep the text
-                // for selection / copy / the evicted fallback).
-                let suppress = rich_suppress.get(r as usize).copied().unwrap_or(false);
-                for c in row.cells() {
-                    if c.is_continuation {
-                        continue;
-                    }
-                    if suppress {
-                        text.line_text_scratch.push(' ');
-                        continue;
-                    }
-                    // Replace Kitty Unicode placeholder cells
-                    // (U+10EEEE) with a space before shaping. The
-                    // codepoint shapes to `.notdef` and its
-                    // cluster width can throw off the snap of
-                    // neighboring chars — we don't want it in the
-                    // glyph cache and the image pipeline draws
-                    // the real pixels anyway.
-                    let ch = if c.ch == '\0' || c.ch == toastty_term::PLACEHOLDER {
-                        ' '
-                    } else {
-                        c.ch
-                    };
-                    text.line_text_scratch.push(ch);
-                    // The rest of a multi-codepoint grapheme (combining
-                    // marks, ZWJ tail, VS16) so it shapes as one cluster;
-                    // its extra glyphs come back as secondary glyphs of
-                    // this cell (see `instance::secondary_glyph_key`).
-                    if c.extra.is_some() && ch != ' ' {
-                        text.line_text_scratch.push_str(term.grapheme_tail(c));
-                    }
-                }
-                let lg = text.rasterizer.shape_line(
-                    &self.queue,
-                    &text.line_text_scratch,
-                    term.grapheme_cluster_mode(),
-                );
-                text.line_cache[r as usize] = Some(lg);
-                shaped += 1;
-            }
+            let shaped = text.rows.shape_rows(
+                &mut text.rasterizer,
+                &self.queue,
+                term,
+                rows_rendered,
+                &rich_suppress,
+            );
             if let Some(t) = t_shape {
                 let ms = t.elapsed().as_secs_f64() * 1000.0;
                 tracing::info!(target: "render_trace", "shape rows={shaped} took={ms:.3}ms");
             }
-            any_blink = text.row_blink[..rows_rendered as usize].iter().any(|b| *b);
+            any_blink = text.rows.row_blink()[..rows_rendered as usize]
+                .iter()
+                .any(|b| *b);
             // make_bind_group used to be rebuilt every frame "in case
             // the atlas textures grew". They don't grow inside the
             // render path — `queue.write_texture` makes uploads visible
@@ -2708,7 +2620,7 @@ impl Renderer {
                 cell_size,
                 &theme,
                 ext_palette,
-                &text.line_cache,
+                &text.rows,
                 bleed,
                 content_dims.1,
                 &cell_opts,
@@ -2722,7 +2634,7 @@ impl Renderer {
                 &theme,
                 ext_palette,
                 cursor_visible,
-                &text.line_cache,
+                &text.rows,
                 bleed,
                 &cell_opts,
             );

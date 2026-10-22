@@ -9,8 +9,14 @@
 //!   iterations (the realistic keystroke case).
 //! - `fullframe_300x120` / `single_cell_change_300x120`: the same two
 //!   cases at twice the row count, to show how shaping cost scales.
+//! - `fullframe_unicode_200x60`: full repaint of unchanged mixed-script
+//!   text (CJK, emoji, box drawing), the rows that need cosmic-text.
+//! - `scroll_ascii_200x60` / `scroll_unicode_200x60`: one new line of
+//!   output per frame at the live bottom, so every row shifts.
 //!
 //! Run with `cargo bench -p toastty-render --bench render_term -- --quick`.
+//! `TOASTTY_BENCH_CPU_ONLY=1` stops each frame after shaping + instance
+//! building (no GPU work), for low-noise CPU numbers.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,9 +26,10 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use pollster::block_on;
 use toastty_parser::Parser;
 use toastty_render::DEFAULT_LINE_HEIGHT;
-use toastty_render::text::glyph_rasterizer::{GlyphRasterizer, LineGlyphs};
+use toastty_render::text::glyph_rasterizer::GlyphRasterizer;
 use toastty_render::text::instance::{CellInstance, EdgeBleed, Theme, build_instances_into};
 use toastty_render::text::pipeline::{self, GlobalsUbo, TextPipeline};
+use toastty_render::text::row_shaper::RowShaper;
 use toastty_render::{instance_descriptor, instance_flags_for_release};
 use toastty_term::Term;
 use wgpu::{
@@ -50,10 +57,14 @@ struct Harness {
     width: u32,
     height: u32,
     theme: Theme,
-    /// Mirrors `TextState::line_cache` in `Renderer`.
-    line_cache: Vec<Option<LineGlyphs>>,
+    /// The renderer's own row-shape cache + shaping loop.
+    rows: RowShaper,
     /// Mirrors `TextState::instances_scratch` in `Renderer`.
     instances: Vec<CellInstance>,
+    /// `TOASTTY_BENCH_CPU_ONLY=1`: stop after shaping + instance
+    /// building, so the numbers exclude GPU work (and the noise of other
+    /// processes sharing the GPU).
+    cpu_only: bool,
 }
 
 impl Harness {
@@ -134,8 +145,9 @@ impl Harness {
             width,
             height,
             theme: Theme::default_dark(),
-            line_cache: Vec::new(),
+            rows: RowShaper::new(),
             instances: Vec::new(),
+            cpu_only: std::env::var_os("TOASTTY_BENCH_CPU_ONLY").is_some(),
         }
     }
 
@@ -151,47 +163,25 @@ impl Harness {
         let cell_size = self.rasterizer.cell_size();
         let atlas_dims = self.rasterizer.atlas_dims();
 
-        if self.line_cache.len() != rows as usize {
-            self.line_cache.resize(rows as usize, None);
-        }
-
-        let damage = term.damage();
-        for r in 0..rows {
-            let is_dirty = damage.all
-                || damage.rows.get(r as usize).is_some_and(|rd| !rd.is_empty())
-                || self.line_cache[r as usize].is_none();
-            if !is_dirty {
-                continue;
-            }
-            let row = term.row(r);
-            let line_text: String = row
-                .cells()
-                .iter()
-                .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
-                .collect();
-            self.line_cache[r as usize] = Some(self.rasterizer.shape_line(
-                &self.queue,
-                &line_text,
-                term.grapheme_cluster_mode(),
-            ));
-        }
+        self.rows
+            .shape_rows(&mut self.rasterizer, &self.queue, term, rows, &[]);
 
         let theme = self.theme;
-        let line_cache_ref = &self.line_cache;
+        let rows_ref = &self.rows;
         build_instances_into(
             &mut self.instances,
             term,
             cell_size,
             &theme,
             None,
-            |row, col, ch, _style| {
-                let lg = line_cache_ref.get(row as usize)?.as_ref()?;
-                lg.get(col, ch)
-            },
+            |row, col, ch, _style| rows_ref.glyph(row, col, ch),
             |_, _| false,
             EdgeBleed::default(),
             f32::from(term.size().0) * cell_size.1,
         );
+        if self.cpu_only {
+            return;
+        }
         let instances = &self.instances;
 
         let mut encoder = self
@@ -273,35 +263,16 @@ impl Harness {
         let cell_size = self.rasterizer.cell_size();
         let atlas_dims = self.rasterizer.atlas_dims();
 
-        if self.line_cache.len() != rows as usize {
-            self.line_cache.resize(rows as usize, None);
-        }
-        let damage = term.damage();
-        let mut shaped = 0usize;
-
-        // Phase A: shape (dirty rows only, unless `force_full`).
+        // Phase A: shape (dirty rows only; `force_full` also drops the
+        // row-shape cache, though rows still hit the rasterizer's
+        // row-text memo).
         let t_shape = Instant::now();
-        for r in 0..rows {
-            let is_dirty = force_full
-                || damage.all
-                || damage.rows.get(r as usize).is_some_and(|rd| !rd.is_empty())
-                || self.line_cache[r as usize].is_none();
-            if !is_dirty {
-                continue;
-            }
-            let row = term.row(r);
-            let line_text: String = row
-                .cells()
-                .iter()
-                .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
-                .collect();
-            self.line_cache[r as usize] = Some(self.rasterizer.shape_line(
-                &self.queue,
-                &line_text,
-                term.grapheme_cluster_mode(),
-            ));
-            shaped += 1;
+        if force_full {
+            self.rows.invalidate();
         }
+        let shaped = self
+            .rows
+            .shape_rows(&mut self.rasterizer, &self.queue, term, rows, &[]);
         let shape_ms = t_shape.elapsed().as_secs_f64() * 1000.0;
 
         // Phase B: bind group (post-fix this is a no-op; left here for
@@ -319,17 +290,14 @@ impl Harness {
         // Phase C: build_instances.
         let t_build = Instant::now();
         let theme = self.theme;
-        let line_cache_ref = &self.line_cache;
+        let rows_ref = &self.rows;
         build_instances_into(
             &mut self.instances,
             term,
             cell_size,
             &theme,
             None,
-            |row, col, ch, _style| {
-                let lg = line_cache_ref.get(row as usize)?.as_ref()?;
-                lg.get(col, ch)
-            },
+            |row, col, ch, _style| rows_ref.glyph(row, col, ch),
             |_, _| false,
             EdgeBleed::default(),
             f32::from(term.size().0) * cell_size.1,
@@ -546,6 +514,102 @@ fn bench_single_cell_change_fullscreen(c: &mut Criterion) {
     });
 }
 
+/// Mixed-script lines: CJK, emoji, box drawing, accents. Every line
+/// with a wide char goes through cosmic-text (the slow path) whenever
+/// it is shaped.
+const UNICODE_LINES: [&str; 4] = [
+    "│ src/main.rs │ 你好世界 ideographs こんにちは 한글 — CJK wide cells ├──┤ ",
+    "Emoji 🚀 rocket ✨ sparkles 👍 thumbs ═══ café naïve résumé Ω λ Ж ░▒▓█ ",
+    "日本語のテキスト mixed with ASCII words and → arrows ← and … ellipses ",
+    "status: ok ✔ 进度 50% ⣿⣿⣿⣿⡇ elapsed 00:12 — 中文 漢字 ",
+];
+
+fn unicode_line(i: usize, cols: u16) -> String {
+    let base = UNICODE_LINES[i % UNICODE_LINES.len()];
+    let mut line = format!("{i:>6} ");
+    // Fill to (roughly) the grid width without wrapping; wide chars
+    // count as two columns.
+    let mut w = line.len();
+    for ch in base.chars().cycle() {
+        let cw = if ch.is_ascii() || ('\u{2190}'..='\u{2bff}').contains(&ch) { 1 } else { 2 };
+        if w + cw > usize::from(cols) {
+            break;
+        }
+        line.push(ch);
+        w += cw;
+    }
+    line
+}
+
+fn make_term_unicode(rows: u16, cols: u16) -> Term {
+    let mut term = Term::new(rows, cols, 0);
+    let mut parser = Parser::new();
+    for i in 0..usize::from(rows) {
+        let mut l = unicode_line(i, cols);
+        if i + 1 < usize::from(rows) {
+            l.push_str("\r\n");
+        }
+        parser.advance(&mut term, l.as_bytes());
+    }
+    term
+}
+
+fn bench_fullframe_unicode(c: &mut Criterion) {
+    let (width, height) = viewport_pixels(ROWS, COLS);
+    let mut harness = Harness::new(width, height);
+    let mut term = make_term_unicode(ROWS, COLS);
+    harness.render_term(&term);
+    term.clear_damage();
+    c.bench_function("fullframe_unicode_200x60", |b| {
+        b.iter(|| {
+            // Full repaint of unchanged text (a TUI repainting in new
+            // colours, or a viewport change).
+            term.mark_all_dirty();
+            harness.render_term(&term);
+            term.clear_damage();
+        });
+    });
+}
+
+/// New output at the live bottom: one new line per frame, every other
+/// row shifts up one (and is dirty).
+fn bench_scroll(c: &mut Criterion, name: &str, unicode: bool) {
+    let (width, height) = viewport_pixels(ROWS, COLS);
+    let mut harness = Harness::new(width, height);
+    let mut term = if unicode {
+        make_term_unicode(ROWS, COLS)
+    } else {
+        make_term_filled(ROWS, COLS)
+    };
+    let mut parser = Parser::new();
+    parser.advance(&mut term, b"\x1b[60;1H");
+    harness.render_term(&term);
+    term.clear_damage();
+    let mut i = 0usize;
+    c.bench_function(name, |b| {
+        b.iter(|| {
+            i += 1;
+            let line = if unicode {
+                unicode_line(i, COLS)
+            } else {
+                format!("{i:>6} lorem ipsum dolor sit amet, consectetur adipiscing elit")
+            };
+            parser.advance(&mut term, b"\r\n");
+            parser.advance(&mut term, line.as_bytes());
+            harness.render_term(&term);
+            term.clear_damage();
+        });
+    });
+}
+
+fn bench_scroll_ascii(c: &mut Criterion) {
+    bench_scroll(c, "scroll_ascii_200x60", false);
+}
+
+fn bench_scroll_unicode(c: &mut Criterion) {
+    bench_scroll(c, "scroll_unicode_200x60", true);
+}
+
 /// Phase breakdown — runs once when `TOASTTY_BENCH_BREAKDOWN=1` is set,
 /// otherwise registered as a no-op criterion bench. Prints per-section
 /// wall time for both the cached single-cell case and the worst-case
@@ -594,6 +658,9 @@ criterion_group!(
     bench_single_cell_change,
     bench_fullframe_fullscreen,
     bench_single_cell_change_fullscreen,
+    bench_fullframe_unicode,
+    bench_scroll_ascii,
+    bench_scroll_unicode,
     bench_phase_breakdown,
 );
 criterion_main!(benches);

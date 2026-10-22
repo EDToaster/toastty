@@ -10,6 +10,7 @@
 //! - [`viewport`] — smooth-scroll state (pure).
 //! - [`presentation`] — UTS #51 emoji-vs-text presentation selection.
 //! - [`glyph_rasterizer`] — cosmic-text + swash + GPU atlas upload.
+//! - [`row_shaper`] — per-frame row shaping + the row-shape cache.
 //! - [`pipeline`] — wgpu pipeline that consumes `[CellInstance]`.
 //!
 //! See [`docs/decisions/text-stack.md`](../../../docs/decisions/text-stack.md).
@@ -23,3 +24,4 @@ pub mod viewport;
 
 pub mod glyph_rasterizer;
 pub mod pipeline;
+pub mod row_shaper;
