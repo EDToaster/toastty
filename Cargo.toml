@@ -41,6 +41,7 @@ swash = "=0.2.7"
 # selection.
 unic-emoji-char = "=0.9.0"
 memchr = "=2.8.0"
+simdutf8 = "=0.1.5"
 unicode-width = "=0.2.2"
 # Extended grapheme cluster boundaries (UAX #29) for joining codepoints
 # into a cell's grapheme in `Term::print`. Already in the tree via
