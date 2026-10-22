@@ -1146,6 +1146,8 @@ impl Toastty {
                 return None;
             }
         };
+        // Compile the shaders while the font thread may still be busy.
+        renderer.prepare_pipelines();
         let font_px = self.scaled_font_px();
         let line_height = self.config.font.line_height;
         if let Some(fonts) = self.preload.take_fonts(&self.config.font.family) {

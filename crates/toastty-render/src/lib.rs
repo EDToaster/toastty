@@ -469,6 +469,10 @@ pub struct Renderer {
     /// Text pipeline lives lazily — `with_font` initializes it; `render`
     /// (M4a path) tolerates its absence; `render_term` requires it.
     text: Option<TextState>,
+    /// Text pipeline built by [`Renderer::prepare_pipelines`] before any
+    /// font was loaded; the next [`Renderer::with_loaded_fonts`] takes it
+    /// instead of building its own.
+    spare_text_pipeline: Option<TextPipeline>,
     /// Theme used by `render_term` when emitting instances: `base_theme`,
     /// or its fg/bg swap while the terminal is in reverse video
     /// (DECSCNM).
@@ -1164,6 +1168,7 @@ impl Renderer {
             config,
             clear_color: [0.07, 0.07, 0.09, 1.0],
             text: None,
+            spare_text_pipeline: None,
             theme: Theme::default_dark(),
             base_theme: Theme::default_dark(),
             reverse_video: false,
@@ -1282,7 +1287,10 @@ impl Renderer {
     pub fn with_loaded_fonts(&mut self, fonts: LoadedFonts, font_size_px: f32, line_height: f32) {
         let rasterizer =
             GlyphRasterizer::with_fonts(&self.device, fonts, font_size_px, line_height);
-        let pipeline = TextPipeline::new(&self.device, self.config.format);
+        let pipeline = self
+            .spare_text_pipeline
+            .take()
+            .unwrap_or_else(|| TextPipeline::new(&self.device, self.config.format));
 
         let mask_view = text::pipeline::default_view(rasterizer.mask_texture());
         let color_view = text::pipeline::default_view(rasterizer.color_texture());
@@ -1295,9 +1303,29 @@ impl Renderer {
             rows: RowShaper::new(),
             instances_scratch: Vec::new(),
         });
-        // Lazy-init the image pipeline alongside the text pipeline so
-        // both are ready before the first `render_term`. The image
-        // pipeline shares the swapchain format.
+        // Ready before the first `render_term`.
+        self.prepare_aux_pipelines();
+        // Font swap invalidates the cell grid — force the next frame
+        // to clear.
+        self.needs_full_clear = true;
+    }
+
+    /// Build the GPU pipelines (text, images, chips, RGP) now. They depend
+    /// only on the device and the surface format, not on the font, so a
+    /// caller still waiting for [`LoadedFonts`] from another thread can
+    /// compile them in the meantime (~5 ms of shader compilation at
+    /// startup). Optional: [`Self::with_loaded_fonts`] builds whatever is
+    /// missing.
+    pub fn prepare_pipelines(&mut self) {
+        if self.text.is_none() && self.spare_text_pipeline.is_none() {
+            self.spare_text_pipeline = Some(TextPipeline::new(&self.device, self.config.format));
+        }
+        self.prepare_aux_pipelines();
+    }
+
+    /// Create the image, chip and RGP pipelines if they don't exist yet.
+    /// They share the swapchain format.
+    fn prepare_aux_pipelines(&mut self) {
         if self.image_pipeline.is_none() {
             self.image_pipeline = Some(ImagePipeline::new(&self.device, self.config.format));
         }
@@ -1307,13 +1335,9 @@ impl Renderer {
         if self.chip_pipeline.is_none() {
             self.chip_pipeline = Some(ChipPipeline::new(&self.device, self.config.format));
         }
-        // Same for the RGP pipeline.
         if self.rgp_pipeline.is_none() {
             self.rgp_pipeline = Some(Rgp3dPipeline::new(&self.device, self.config.format));
         }
-        // Font swap invalidates the cell grid — force the next frame
-        // to clear.
-        self.needs_full_clear = true;
     }
 
     /// Change only the font size, keeping the family, font database and
