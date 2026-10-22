@@ -35,7 +35,7 @@ mod viewport;
 pub use cell::{Cell, Color, HyperlinkId, Style, StyleFlags, UnderlineStyle};
 pub use cursor::Cursor;
 pub use damage::{Damage, RowDamage};
-pub use extra::{CellExtra, CellExtraId, ExtraTable};
+pub use extra::{CellExtra, CellExtraId, ExtraTable, PlaceholderExtra};
 pub use grid::{Grid, RelayoutFn, Row, RowLocation};
 pub use link::{LinkHit, LinkSource, LinkSpan, MAX_SCAN_ROWS};
 pub use rich::{
@@ -47,8 +47,8 @@ pub use selection::{Pos, Selection, SelectionMode};
 pub use term::{
     ClipboardRequest, ClipboardTarget, ClipboardTargets, KITTY_FLAG_DISAMBIGUATE,
     KITTY_FLAG_REPORT_ALL_AS_ESC, KITTY_FLAG_REPORT_ALTERNATE, KITTY_FLAG_REPORT_EVENTS,
-    KITTY_FLAG_REPORT_TEXT, MouseEncoding, MouseMode, MouseProtocol, PromptMark, PromptMarkKind,
-    SecurityFlags, Term,
+    KITTY_FLAG_REPORT_TEXT, MouseEncoding, MouseMode, MouseProtocol, PlaceholderRun, PromptMark,
+    PromptMarkKind, SecurityFlags, Term,
 };
 pub use viewport::{Smoothing, Viewport};
 
@@ -60,7 +60,10 @@ pub use toastty_config::CursorShape;
 /// Re-exports for the image protocol layer so the renderer can refer
 /// to graphics types via `toastty_term` instead of taking a direct dep
 /// on `toastty-graphics`.
-pub use toastty_graphics::{ImageData, ImageGrid, ImageRegistry, Placement, SrcRect};
+pub use toastty_graphics::{
+    ImageData, ImageGrid, ImageRegistry, PlaceholderSlice, Placement, SrcRect, VirtualPlacement,
+    VirtualPlacements, placeholder_slice,
+};
 
 /// Re-export the Unicode placeholder base codepoint (`U+10EEEE`) so the
 /// renderer can suppress glyph emission for cells that hold it without
