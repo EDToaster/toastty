@@ -1,15 +1,20 @@
 //! GPU vertex layout for an image-instance draw, plus the CPU-side
 //! [`build_image_instances`] that turns `ImageGrid` + `ImageRegistry`
-//! + [`super::atlas::ImageTextureCache`] into per-image instance vecs.
+//! into per-image instance vecs.
 //!
-//! We emit one instance per `(image, placement)`. The texture is
+//! We emit one instance per `(image, placement)`, with its texture left
+//! [`UNRESOLVED_TEXTURE`];
+//! [`super::pipeline::ImagePipeline::resolve_kitty_textures`] then
+//! uploads what's needed and fills `texture_index`. The texture is
 //! selected per draw call (rebind between draws); see
 //! [`super::pipeline::ImagePipeline::render`].
 
 use bytemuck::{Pod, Zeroable};
 use toastty_term::{ImageGrid, ImageRegistry};
 
-use super::atlas::ImageTextureCache;
+/// `ImageInstance::texture_index` before the pipeline binds the
+/// instance's image to a texture. Never drawn.
+pub const UNRESOLVED_TEXTURE: u32 = u32::MAX;
 
 /// One instance pushed to the image pipeline. Mirrors `ImageInstance`
 /// in `shaders/image.wgsl`.
@@ -24,7 +29,7 @@ pub struct ImageInstance {
     pub uv_min: [f32; 2],
     pub uv_max: [f32; 2],
     /// Which texture slot this instance binds to. Drives the host's
-    /// per-draw rebind loop.
+    /// per-draw rebind loop. [`UNRESOLVED_TEXTURE`] until resolved.
     pub texture_index: u32,
     /// Z order. The host splits below/above text using sign.
     pub z: i32,
@@ -107,11 +112,11 @@ impl ImageInstance {
     }
 }
 
-/// Build per-instance draw data from `grid` + `registry` + `cache`.
+/// Build per-instance draw data from `grid` + `registry`.
 ///
 /// The output is sorted by `(z, insertion-order)` already — same-z
 /// placements draw in insertion order. The caller splits below/above
-/// text via the sign of `z`.
+/// text via the sign of `z`. Textures are left [`UNRESOLVED_TEXTURE`].
 ///
 /// `cell_size` is `(w, h)` in pixels.
 #[allow(clippy::cast_precision_loss)] // image dims fit comfortably in 23-bit mantissa.
@@ -119,7 +124,6 @@ pub fn build_image_instances(
     out: &mut Vec<ImageInstance>,
     grid: &ImageGrid,
     registry: &ImageRegistry,
-    cache: &ImageTextureCache,
     cell_size: (f32, f32),
 ) {
     // Two-pass: collect with stable insertion order, then sort by z
@@ -128,9 +132,6 @@ pub fn build_image_instances(
     let len_before = out.len();
     for placement in grid.iter() {
         let Some(image) = registry.get(placement.image_id) else {
-            continue;
-        };
-        let Some(entry) = cache.get(placement.image_id) else {
             continue;
         };
         let cols = placement
@@ -168,7 +169,7 @@ pub fn build_image_instances(
             size: [size_x, size_y],
             uv_min,
             uv_max,
-            texture_index: entry.texture_index as u32,
+            texture_index: UNRESOLVED_TEXTURE,
             z: placement.z,
             image_id: placement.image_id,
             _pad: [0; 1],
@@ -242,21 +243,18 @@ mod tests {
     fn empty_grid_emits_no_instances() {
         let grid = ImageGrid::new();
         let reg = ImageRegistry::new(1024);
-        let cache = ImageTextureCache::new(4);
         let mut out = Vec::new();
-        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 20.0));
+        build_image_instances(&mut out, &grid, &reg, (10.0, 20.0));
         assert!(out.is_empty());
     }
 
     #[test]
-    fn placement_without_cache_entry_is_skipped() {
+    fn placement_without_registry_image_is_skipped() {
         let mut grid = ImageGrid::new();
         grid.add(place(1, 0..2, 0..4, 0));
-        let mut reg = ImageRegistry::new(4096);
-        reg.insert(1, red_pixel(2, 2)).unwrap();
-        let cache = ImageTextureCache::new(4); // no insert.
+        let reg = ImageRegistry::new(4096);
         let mut out = Vec::new();
-        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 20.0));
+        build_image_instances(&mut out, &grid, &reg, (10.0, 20.0));
         assert!(out.is_empty());
     }
 
@@ -266,25 +264,16 @@ mod tests {
         grid.add(place(1, 0..2, 0..4, 0));
         let mut reg = ImageRegistry::new(4096);
         reg.insert(1, red_pixel(2, 2)).unwrap();
-        let mut cache = ImageTextureCache::new(4);
-        cache.insert(
-            1,
-            crate::image::atlas::ImageTexEntry {
-                texture_index: 7,
-                width: 2,
-                height: 2,
-                content_hash: 0,
-            },
-        );
         let mut out = Vec::new();
-        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 20.0));
+        build_image_instances(&mut out, &grid, &reg, (10.0, 20.0));
         assert_eq!(out.len(), 1);
         let i = out[0];
         assert_eq!(i.pos, [0.0, 0.0]);
         assert_eq!(i.size, [40.0, 40.0]);
         assert_eq!(i.uv_min, [0.0, 0.0]);
         assert_eq!(i.uv_max, [1.0, 1.0]);
-        assert_eq!(i.texture_index, 7);
+        assert_eq!(i.texture_index, UNRESOLVED_TEXTURE);
+        assert_eq!(i.image_id, 1);
         assert_eq!(i.z, 0);
     }
 
@@ -296,18 +285,8 @@ mod tests {
         grid.add(place(1, 0..1, 2..3, 0));
         let mut reg = ImageRegistry::new(4096);
         reg.insert(1, red_pixel(1, 1)).unwrap();
-        let mut cache = ImageTextureCache::new(4);
-        cache.insert(
-            1,
-            crate::image::atlas::ImageTexEntry {
-                texture_index: 0,
-                width: 1,
-                height: 1,
-                content_hash: 0,
-            },
-        );
         let mut out = Vec::new();
-        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 10.0));
+        build_image_instances(&mut out, &grid, &reg, (10.0, 10.0));
         let zs: Vec<i32> = out.iter().map(|i| i.z).collect();
         assert_eq!(zs, vec![-5, 0, 10]);
     }
@@ -322,18 +301,8 @@ mod tests {
         grid.add(place(1, 0..1, 4..5, i32::MIN));
         let mut reg = ImageRegistry::new(4096);
         reg.insert(1, red_pixel(1, 1)).unwrap();
-        let mut cache = ImageTextureCache::new(4);
-        cache.insert(
-            1,
-            crate::image::atlas::ImageTexEntry {
-                texture_index: 0,
-                width: 1,
-                height: 1,
-                content_hash: 0,
-            },
-        );
         let mut out = Vec::new();
-        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 10.0));
+        build_image_instances(&mut out, &grid, &reg, (10.0, 10.0));
         let (below_bg, below_text, above) = split_layers(&out);
         assert_eq!(below_bg.len(), 1);
         assert_eq!(below_text.len(), 2);
@@ -372,18 +341,8 @@ mod tests {
         });
         let mut reg = ImageRegistry::new(4096);
         reg.insert(1, red_pixel(4, 4)).unwrap();
-        let mut cache = ImageTextureCache::new(4);
-        cache.insert(
-            1,
-            crate::image::atlas::ImageTexEntry {
-                texture_index: 0,
-                width: 4,
-                height: 4,
-                content_hash: 0,
-            },
-        );
         let mut out = Vec::new();
-        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 10.0));
+        build_image_instances(&mut out, &grid, &reg, (10.0, 10.0));
         assert_eq!(out[0].uv_min, [0.25, 0.25]);
         assert_eq!(out[0].uv_max, [0.75, 0.75]);
     }
@@ -432,21 +391,11 @@ mod minor_render_tests {
         grid.add(place(10, 7));
         grid.add(place(20, 7));
         let mut reg = ImageRegistry::new(8192);
-        let mut cache = ImageTextureCache::new(8);
         for id in [10u32, 20, 30] {
             reg.insert(id, red_pixel(1, 1)).unwrap();
-            cache.insert(
-                id,
-                crate::image::atlas::ImageTexEntry {
-                    texture_index: id as usize,
-                    width: 1,
-                    height: 1,
-                    content_hash: 0,
-                },
-            );
         }
         let mut out = Vec::new();
-        build_image_instances(&mut out, &grid, &reg, &cache, (10.0, 10.0));
+        build_image_instances(&mut out, &grid, &reg, (10.0, 10.0));
         let ids: Vec<u32> = out.iter().map(|i| i.image_id).collect();
         assert_eq!(ids, vec![10, 20, 30]);
     }
