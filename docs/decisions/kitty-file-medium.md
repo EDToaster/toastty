@@ -163,18 +163,23 @@ Two checks stricter than kitty:
 
 ## In-flight uploads (SEC-6)
 
-- `MAX_PENDING_UPLOADS = 8`. The spec says a client must finish one
-  upload before it starts another, so the slots only have to absorb
-  abandoned uploads.
-- `DEFAULT_PENDING_TOTAL_CAP = 128 MiB`. This is twice the per-upload
-  cap, so one upload always fits.
-- Starting an upload, or growing one past either cap, evicts the least
-  recently active *other* upload. Order comes from a chunk counter, not
-  the clock.
-- `PENDING_UPLOAD_TTL = 60 s` after the last chunk. Expiry runs at the
-  start of every graphics command.
-- Eviction and expiry send no reply. The client that abandoned the upload
-  isn't listening, and replies that nobody reads end up as typed text in
-  the shell.
+Superseded by B3 (#44), which follows kitty's loading model:
 
-How later chunks for an evicted upload are routed is WIRE-9's job (PR B3).
+- There is **one** loading slot, as in kitty. While it is busy, every
+  direct transmit is a continuation of it (WIRE-9), so the "many
+  abandoned uploads" attack can only ever grow one buffer.
+- That buffer holds **decoded** bytes (chunks are base64-decoded on
+  arrival), and is capped at kitty's own buffer size: `s*v*bpp` plus 10
+  bytes (plus about 1 KiB for `o=z`), or the image quota for PNG. Past
+  it, the upload is dropped with `EFBIG:Too much data`. Memory in flight
+  is therefore at most one image's worth, bounded by the registry cap.
+- `PENDING_UPLOAD_TTL = 60 s` after the last chunk still applies: an
+  abandoned upload is dropped silently, so it can't capture later images
+  forever. Expiry runs at the start of every graphics command and after
+  each batch of PTY input, so a quota-sized abandoned upload doesn't stay
+  resident when no further graphics command comes. (kitty has no expiry.)
+- A chunk's decoded size is bounded from its base64 length before it is
+  decoded, so one 256 MiB APC can't make us allocate its decoded size
+  just to find it's too big.
+- B1's count cap, global byte cap and LRU eviction are gone; with one
+  slot they no longer mean anything.

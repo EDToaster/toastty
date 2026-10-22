@@ -850,11 +850,16 @@ remaining gaps:
       `d=f`.
   - Fix: the new `Term::delete_image_frames` does this. Stack E's
     animation-frame work hooks in there. Fixed in #35.
-- [ ] **P2 — DEL-3. A delete during a chunked upload doesn't abort it.**
+- [x] **P2 — DEL-3. A delete during a chunked upload doesn't abort it.**
   - Expected (spec): the upload is aborted. kitty replies ENOENT to the
     remaining chunks.
   - Actual: the upload completes and displays.
   - Cause: `handler.rs:704`.
+  - Fixed in #44. Any delete aborts the upload in progress, whatever it
+    deletes. Correction: kitty 0.49.2 does **not** reply ENOENT to the
+    remaining chunks. They get no reply at all: a bare continuation has
+    no dimensions, so it fails the first-chunk check, anonymously. (The
+    ENOENT seen in the original probe came from a later `a=p`.)
 
 ## 7. Security and robustness
 
@@ -967,9 +972,12 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
   - Cause: `pending` (`handler.rs:418-425`) has a per-upload cap
     (`DEFAULT_PENDING_CAP`, `handler.rs:30`) but no total cap, no count cap
     and no expiry.
-  - Fixed in #30. At most 8 uploads and 128 MiB in flight, with the
-    least recently active other upload evicted silently. An upload with
-    no chunk for 60 s is freed on the next graphics command.
+  - Fixed in #30 with count/byte caps and LRU eviction; superseded in
+    #44 by kitty's single loading slot: everything during a load is
+    appended to it, so memory in flight is one upload's decoded buffer,
+    capped at kitty's buffer size (bounded from the base64 length before
+    decoding). An upload with no chunk for 60 s is freed on the next
+    graphics command or batch of PTY input.
 - [x] **P2 — SEC-7. Oversized PNGs are fully decoded before being rejected.**
   - Repro: a 12000×12000 PNG.
   - Actual: toastty peaks at 1.28 GB RSS, then replies EFBIG. kitty replies
@@ -1013,13 +1021,19 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
     frame and nothing reaches the shell. Divergence until then: kitty
     answers `a=f` without `q=` with `i=N,r=<frame>;OK`, and `a=c` with
     frame-composition errors.
-- [ ] **P2 — WIRE-4. Base64 is decoded over the joined buffer, not per
+- [x] **P2 — WIRE-4. Base64 is decoded over the joined buffer, not per
   chunk.**
   - Repro: chunks each padded with `=` (`…m=1;AQIDBA==` then `m=0;BQY=`).
   - Actual: toastty replies `EINVAL:bad base64`; kitty accepts it.
   - In the other direction, toastty is more lenient than kitty about
     embedded whitespace and chunks that aren't a multiple of 4. Keep that.
   - Cause: `decode_base64` (`handler.rs:733-744`).
+  - Fixed in #44. Each chunk is base64-decoded on arrival with its own
+    padding, as kitty does. toastty additionally carries an unpadded
+    partial quantum into the next chunk and skips whitespace (kitty:
+    `ENODATA` for both), and keeps decoding after a `=` inside a chunk
+    (kitty stops there). As in kitty, decoding a chunk stops at its first
+    junk byte and keeps what came before (`/wAA*w==` gives 3 bytes).
 - [x] **P2 — WIRE-5. An 8-bit `0x9C` byte inside an APC ends it.**
   - Repro: a non-G APC whose UTF-8 text contains `U+041C` (`\xd0\x9c`).
   - Actual: the rest of the payload is printed to the screen. kitty
@@ -1097,7 +1111,7 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
   - Fixed in #37. A non-zero `q=` on any continuation chunk applies to
     the upload (the latest wins; `q=0` can't lower it), matching kitty on
     all seven measured cases.
-- [ ] **P2 — WIRE-9. Abandoned-upload state corrupts later commands.**
+- [x] **P2 — WIRE-9. Abandoned-upload state corrupts later commands.**
   - Cases:
     - A bare `m=0` after an abandoned upload completes it with EINVAL.
     - A later `a=t,i=57` was appended to a leftover upload and failed.
@@ -1106,10 +1120,27 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
   - Cause: `handler.rs:352-366, 418`.
   - Drop pending state on any new first chunk without `m=`, and expire old
     uploads (see SEC-6).
-- [ ] **P2 — WIRE-10. Chunked `a=q` handles only the first chunk.**
+  - Fixed in #44, by matching kitty rather than isolating uploads:
+    kitty has one loading slot and treats every direct transmit during a
+    load as its continuation, whatever its `i=`. All three cases above
+    behave exactly like kitty now: the bare `m=0` completes the leftover
+    upload; `a=t,i=57` is appended and answered under the leftover's id;
+    the stale anonymous upload swallows `a=T,I=965` silently.
+  - Deliberate divergence: toastty drops an upload idle for 60 s (on the
+    next graphics command or PTY input); kitty has no expiry and still
+    appends to it after 65 s. The expiry is what keeps an abandoned upload
+    from capturing later images, and its memory, forever. A file transmit or any delete aborts the load; `a=p` on the
+    loading image replies `ENOENT:Put command refers to image with id: N
+    that could not load its data`.
+- [x] **P2 — WIRE-10. Chunked `a=q` handles only the first chunk.**
   - Actual: the rest of the chunks route to a different pending upload.
   - Cause: `handle_query` (`handler.rs:271`).
-- [ ] **P2 — WIRE-11. Valid transmissions are rejected by `S=` or the pending
+  - Fixed in #44, matching kitty: a chunked `a=q` is checked up front
+    (format and dimensions), then consumes the next chunk and ends with
+    no reply; nothing is stored. A chunked `a=q` during a transmit gets
+    `EILSEQ:More payload loading refers to non-existent image` for that
+    upload, which is dropped.
+- [x] **P2 — WIRE-11. Valid transmissions are rejected by `S=` or the pending
   cap.**
   - Cases:
     - `S=999999999` on a direct 1×1 transmission: `EFBIG:declared size >
@@ -1118,6 +1149,10 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
       `EFBIG:pending overflow`.
     - kitty accepts both.
   - Cause: `handler.rs:383-388, 403-405`. The cap counts base64 bytes.
+  - Fixed in #44. `S=` is ignored for `t=d`. The upload cap counts
+    decoded bytes and is kitty's buffer size: `s*v*bpp` + 10 (+1 KiB for
+    `o=z`), or the image quota for PNG. A 4096² RGBA upload succeeds, as
+    in kitty.
 - [x] **P2 — WIRE-12. Animation and composition reply ENOTSUP even for ids
   that don't exist.**
   - Expected: kitty replies ENOENT.
