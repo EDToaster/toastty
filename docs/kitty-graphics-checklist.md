@@ -211,11 +211,22 @@ UVs at draw time. Don't patch each item separately.
     image stays over different text.
   - Cause: `term.rs:1975-1981, 2042-2046` return before touching
     `image_grid`.
-- [ ] **P2 — SCR-12. Alt screen modes 47 and 1047 clear text and images on
+- [x] **P2 — SCR-12. Alt screen modes 47 and 1047 clear text and images on
   re-entry; kitty keeps them.**
   - The spec requires clearing only for 1049.
   - toastty is consistent between text and images, so the impact is low.
   - Code: `term.rs:3795-3850`.
+  - Fix: matches kitty 0.49.2, checked live with CPR probes and
+    screenshots.
+    - 47 / 1047 keep the alt text and images between visits. Entry homes
+      the cursor and resets the pen. Exit doesn't restore the cursor.
+    - 1049 saves the cursor and clears the alt screen (text and images) on
+      entry, and restores the cursor on exit.
+    - xterm differs: it doesn't home on 47 / 1047, and 1047 reset clears
+      the alt screen before leaving.
+    - Divergence kept on purpose: kitty 0.49.2 ignores `CSI ? 1048 l`, so
+      the cursor isn't restored. toastty keeps xterm's save / restore.
+    - Fixed in #27.
 
 ## 2. Sizing, scaling and rendering
 
