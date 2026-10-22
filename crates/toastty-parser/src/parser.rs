@@ -1307,6 +1307,35 @@ mod tests {
     }
 
     #[test]
+    fn csi_param_digits_with_non_ascii_input() {
+        // Merge train (#43 x #52): a non-ASCII byte anywhere in the read
+        // sends CSIs through `step_seq` instead of the ASCII fast path; the
+        // digit mask must be the same, and an aborted CSI reports nothing.
+        #[derive(Default)]
+        struct Rec(Vec<(u32, char)>, Option<u32>);
+        impl Perform for Rec {
+            fn csi_param_digits(&mut self, mask: u32) {
+                self.1 = Some(mask);
+            }
+            fn csi_dispatch(&mut self, _: &Params, _: &[u8], _: bool, action: char) {
+                self.0
+                    .push((self.1.take().expect("hook before dispatch"), action));
+            }
+        }
+        let input = "\u{e9}\x1b[<u\x1b[<0u\x1b[5;0u\x1b[3\u{e9}1m\x1b[=5;u".as_bytes();
+        let want = vec![(0b0, 'u'), (0b1, 'u'), (0b11, 'u'), (0b1, 'u')];
+        let mut r = Rec::default();
+        Parser::new().advance(&mut r, input);
+        assert_eq!(r.0, want);
+        let mut r = Rec::default();
+        let mut p = Parser::new();
+        for b in input {
+            p.advance(&mut r, std::slice::from_ref(b));
+        }
+        assert_eq!(r.0, want, "byte by byte");
+    }
+
+    #[test]
     fn esc_dispatch_for_keypad_mode() {
         let r = parse(b"\x1b=");
         assert_eq!(r.esc, vec![(vec![], b'=')]);
