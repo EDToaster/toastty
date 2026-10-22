@@ -492,12 +492,19 @@ UVs at draw time. Don't patch each item separately.
     110×55 at 11 px cells (kitty: 120×60 at 12 px).
   - The reserved cells are recomputed on zoom too, as on kitty-ref, so
     cell hit-tests (`d=p/c/x/y`, eviction) follow the drawn image.
-- [ ] **P2 — SIZE-12. Downscaling aliases badly.**
+- [x] **P2 — SIZE-12. Downscaling aliases badly.**
   - Repro: a 1500×900 grid image with `c=30`.
   - Actual: the 10 px grid's vertical lines vanish. kitty also aliases, but
     the grid stays visible.
   - Cause: `pipeline.rs:161-163` uses linear filtering with no mipmaps.
   - Consider mipmaps, or a box prefilter on upload.
+  - Fix: a texture gets a GPU-built, alpha-weighted mip chain the first
+    time it is drawn downscaled, and the sampler is trilinear. Images drawn
+    at 1:1 or larger stay single-level and render pixel-identically to
+    before. Fixed in #34.
+  - Divergence: at `c=30` the true grid pitch is about 1.8 px, so toastty
+    now draws an even tint. kitty's visible grid there is itself aliasing:
+    it shows every 5th line at a 9 px pitch.
 - [x] **P2 — SIZE-13. `TIOCGWINSZ` pixel size includes the leftover sub-cell
   strip.**
   - Measured: toastty reports 1000×600 for 100×31 cells (19.35 px rows),
