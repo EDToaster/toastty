@@ -320,6 +320,27 @@ impl Term {
         }
         if dropped {
             self.image_revision = self.image_revision.wrapping_add(1);
+            self.refresh_virtual_parents();
+        }
+    }
+
+    /// Hand the image grid the current origin of every virtual
+    /// placement (REL-5: min line / min col over the placeholder cells
+    /// drawing it), so relative children of virtual parents resolve, and
+    /// drop the children whose virtual parent is gone.
+    pub(super) fn refresh_virtual_parents(&mut self) {
+        let top = self.image_top_line();
+        let mut map = std::collections::HashMap::new();
+        for vp in self.virtual_placements.iter() {
+            if let Some((row, col)) = self.placeholder_origin(vp.image_id, vp.placement_id) {
+                let origin = (top + i64::from(row), i32::from(col));
+                map.insert((vp.image_id, vp.placement_id), origin);
+                map.entry((vp.image_id, 0)).or_insert(origin);
+            }
+        }
+        let dropped = self.image_grid.set_virtual_parents(map);
+        if !dropped.is_empty() {
+            self.image_revision = self.image_revision.wrapping_add(1);
         }
     }
 

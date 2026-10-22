@@ -188,7 +188,8 @@ pub fn build_image_instances(
         // Top-left of the reserved cell box. Rows are relative to the
         // live screen (negative = in scrollback).
         let row = (placement.line - view.top_line) as f32;
-        let box_x = f32::from(placement.col) * cw;
+        #[allow(clippy::cast_precision_loss)] // columns are far below 2^24.
+        let box_x = placement.col as f32 * cw;
         let box_y = row * ch + view.scroll_px;
         // Destination rect, at the current cell size (SIZE-1/2/3/10/11):
         // native pixels unless `c=`/`r=` were given. Its origin is snapped
@@ -302,7 +303,7 @@ mod tests {
             cols.end - cols.start,
         );
         p.line = rows.start;
-        p.col = cols.start;
+        p.col = i32::from(cols.start);
         p.z = z;
         p
     }
@@ -351,6 +352,23 @@ mod tests {
         assert_near(i.pos, [0.0, 0.0], "");
         assert_near(i.size, [200.0, 140.0], "7 rows on screen at full scale");
         assert_near(i.uv_min, [0.0, 0.3], "");
+        assert_near(i.uv_max, [1.0, 1.0], "");
+    }
+
+    #[test]
+    fn left_of_column_zero_is_cropped() {
+        // REL-6: a relative child at column -2 (negative H=) keeps its
+        // box and shows only its right half.
+        let mut grid = ImageGrid::new();
+        let mut p = place(1, 0..2, 0..4, 0);
+        p.col = -2;
+        grid.add(p);
+        let v = ImageView::live(0, (400.0, 400.0));
+        let out = build(&grid, 4, 4, (10.0, 20.0), &v);
+        let i = out[0];
+        assert_near(i.pos, [0.0, 0.0], "");
+        assert_near(i.size, [20.0, 40.0], "");
+        assert_near(i.uv_min, [0.5, 0.0], "");
         assert_near(i.uv_max, [1.0, 1.0], "");
     }
 

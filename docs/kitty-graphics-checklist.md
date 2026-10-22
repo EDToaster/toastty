@@ -202,7 +202,7 @@ UVs at draw time. Don't patch each item separately.
     row while the text rewraps under it. toastty follows the text on width
     changes too, as the PM decided (a deliberate divergence; see
     [`decisions/image-placement-model.md`](decisions/image-placement-model.md)).
-- [ ] **P1 — SCR-8. Relative placements drift once their parent scrolls off
+- [x] **P1 — SCR-8. Relative placements drift once their parent scrolls off
   the top.**
   - Repro: a child placed at `V=6` under a parent, then output that scrolls
     the parent partly or fully off the top.
@@ -216,6 +216,9 @@ UVs at draw time. Don't patch each item separately.
     resolve as `parent.line + V` with no clamp, so a child keeps its offset
     while the parent scrolls off the top. Left open for A4 to verify against
     kitty and cover the remaining cases.
+  - Fixed in #40. Checked on kitty-ref with a small scrollback: a
+    parent leaving the history takes its children with it, even when their
+    own rows are still retained.
 - [x] **P1 — SCR-9 (text bug found while testing scrolling). SD and RI at
   the top pull scrollback back onto the screen.**
   - Repro: `seq 1 100`, then `K raw '\x1b[3T'`.
@@ -593,36 +596,55 @@ Done in #28. See
 
 ## 4. Relative placements
 
-- [ ] **P1 — REL-1. A rejected relative re-placement deletes the existing
+- [x] **P1 — REL-1. A rejected relative re-placement deletes the existing
   placement.**
   - Repro: re-send a child's `i`/`p` with a `P`/`Q` that causes ECYCLE or
     points at itself.
   - Actual: the old placement is already gone, so later children of it get
     ENOPARENT. kitty keeps everything.
   - Cause: `term.rs:4760-4769` removes before validating.
-- [ ] **P1 — REL-2. Deleting a parent leaves its descendants on screen.**
+  - Fixed in #40.
+- [x] **P1 — REL-2. Deleting a parent leaves its descendants on screen.**
   - Expected (kitty, per spec): children and grandchildren are deleted, and
     images left with no placements are freed even on lowercase `d=i`.
   - Cause: `delete_image` doesn't cascade; `image_grid.rs:194-200` keeps
     orphans in place.
-- [ ] **P1 — REL-3. Children don't follow a parent moved by re-sending the
+  - Fixed in #40. Every removal path cascades, including history
+    eviction and ED 2. Children deleted directly keep their image, as in
+    kitty.
+  - Whether a cascaded child's image is freed depends on the delete, as on
+    kitty-ref 0.49.2:
+    - freed on `d=i/I`, `n/N`, `r/R`, `z/Z`, `q/Q` (lowercase too), and on
+      every uppercase delete;
+    - kept on lowercase `d=a`, `p`, `x`, `y`, `c`, and when the parent
+      leaves the history.
+    The "freed even on lowercase `d=i`" above is that rule's id-like
+    half.
+- [x] **P1 — REL-3. Children don't follow a parent moved by re-sending the
   same `i`+`p`.**
   - Cause: `place_image` (`term.rs:4729-4743`) never calls
     `resolve_relative_positions`.
-- [ ] **P1 — REL-4. `a=T` ignores `P`/`Q`/`H`/`V`.**
+  - Fixed in #40.
+- [x] **P1 — REL-4. `a=T` ignores `P`/`Q`/`H`/`V`.**
   - Actual: the image goes to the cursor and moves it.
   - Cause: `handler.rs:596-615`. Only `handle_place` has the relative
     branch.
-- [ ] **P1 — REL-5. A child of a virtual (`U=1`) parent anchors to the last
+  - Fixed in #40.
+- [x] **P1 — REL-5. A child of a virtual (`U=1`) parent anchors to the last
   placeholder cell.**
   - Expected (spec): anchor to the minimum x/y of the placeholder cells.
     kitty puts the children at (5,27)/(9,20); toastty at (7,32)/(11,25).
   - Cause: `ImageGrid::find` (`image_grid.rs:139-145`) returns the most
     recent tile.
-- [ ] **P2 — REL-6. Negative `H`/`V` offsets are clamped to column/row 0.**
+  - Fixed in #40 against the placeholder tiles still on this stack.
+    Once #28 lands, the origin comes from `Term::placeholder_origin` (a
+    `TODO(#28)` marks the spot).
+- [x] **P2 — REL-6. Negative `H`/`V` offsets are clamped to column/row 0.**
   - Expected: kitty lets the child go partly off-screen and clips it.
   - Cause: `offset_origin` (`image_grid.rs:538-545`).
-- [ ] **P2 — REL-7. Error codes differ from kitty.**
+  - Fixed in #40. `Placement::col` is signed, and the renderer crops
+    the part left of column 0.
+- [x] **P2 — REL-7. Error codes differ from kitty.**
 
   | Case | toastty | kitty |
   |---|---|---|
@@ -630,6 +652,14 @@ Done in #28. See
   | Self-reference to a non-existent placement | ECYCLE | ENOPARENT |
   | `U=1` with `P`/`Q` (spec requires EINVAL) | OK | EINVAL |
   | `P` without `Q`, or `Q` without `P` | EINVAL | OK |
+
+  - Fixed in #40. All four rows now match kitty. `P` without `Q` is
+    bound once, at creation, to the parent image's oldest placement, so
+    a P-only cycle is ECYCLE, a P-only self-reference is EINVAL, and
+    deleting that placement deletes the child. `Q` without `P`
+    is an ordinary placement.
+  - kitty accepts `a=T,U=1` with `P=`/`Q=` (it makes the virtual
+    placement), unlike `a=p`. toastty does the same.
 
 ## 5. Placement, cursor and image lifetime
 

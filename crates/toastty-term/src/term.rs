@@ -33,6 +33,8 @@ use toastty_parser::{Params, Perform};
 pub use toastty_protocols::clipboard::{ClipboardTarget, ClipboardTargets};
 
 mod placeholder;
+#[cfg(test)]
+mod relative_tests;
 mod rich_term;
 mod vt;
 
@@ -4718,6 +4720,26 @@ impl Term {
         }
     }
 
+    /// REL-2: free the image of each relative child that went because its
+    /// parent went (`cascaded`), once the image has no placement left.
+    /// kitty 0.49.2 does this for the id-like deletes (`i`/`I`, `n`/`N`,
+    /// `r`/`R`, `z`/`Z`, `q`/`Q`) even in lowercase; a lowercase
+    /// positional delete (`a`, `p`, `x`, `y`, `c`) keeps the child's image,
+    /// and uppercase ones free it through the usual survivor sweep. A
+    /// parent leaving the history keeps it too (all checked on kitty-ref).
+    fn free_cascaded_child_images(&mut self, cascaded: &[Placement]) {
+        let mut seen: Vec<u32> = Vec::new();
+        for p in cascaded {
+            if seen.contains(&p.image_id) {
+                continue;
+            }
+            seen.push(p.image_id);
+            if !self.image_grid.iter().any(|q| q.image_id == p.image_id) {
+                self.remove_image_bytes(p.image_id);
+            }
+        }
+    }
+
     /// Register a decoded sixel image and place it at the cursor, then
     /// advance the cursor per the active sixel cursor mode (DECSET 8452).
     ///
@@ -4906,27 +4928,28 @@ impl KittySink for Term {
         // In the pending-wrap state (`col == cols`) kitty puts the image
         // past the right edge, where it is cropped away (kitty-ref), and
         // the cursor then wraps (`advance_cursor_after_placement`).
-        placement.col = self.cursor.col.min(self.cols);
+        placement.col = i32::from(self.cursor.col.min(self.cols));
         placement.clip_rows = 0..placement.rows;
         // M5: re-emitting the same `(image_id, placement_id)` must
         // REPLACE the prior placement, not stack on top of it. Per spec:
         // "If you send two placements with the same image id and
         // placement id the second one will replace the first." Only
         // applies when BOTH ids are non-zero (a named placement);
-        // unnamed (`p=0`) placements always accumulate.
-        if placement.image_id != 0 && placement.placement_id != 0 {
-            let img = placement.image_id;
-            let pid = placement.placement_id;
-            for old in self
+        // unnamed (`p=0`) placements always accumulate. `upsert`
+        // replaces in place, so the placement's relative children stay
+        // attached and follow it to its new position (REL-3).
+        if placement.image_id != 0
+            && placement.placement_id != 0
+            && let Some(old) = self
                 .image_grid
-                .remove_where(|p| p.image_id == img && p.placement_id == pid)
-            {
-                mark_placement_dirty(self, &old);
-            }
+                .find(placement.image_id, placement.placement_id)
+                .cloned()
+        {
+            mark_placement_dirty(self, &old);
         }
         // Mark dirty BEFORE consuming `placement` into the grid.
         mark_placement_dirty(self, &placement);
-        self.image_grid.add(placement);
+        self.image_grid.upsert(placement);
         self.image_revision = self.image_revision.wrapping_add(1);
     }
 
@@ -4943,22 +4966,25 @@ impl KittySink for Term {
             "kitty: place_relative",
         );
         // M5 replace rule: a named (image_id, placement_id) re-emission
-        // replaces the prior placement of the same pair.
-        if placement.image_id != 0 && placement.placement_id != 0 {
-            let img = placement.image_id;
-            let pid = placement.placement_id;
-            for old in self
-                .image_grid
-                .remove_where(|p| p.image_id == img && p.placement_id == pid)
-            {
-                mark_placement_dirty(self, &old);
-            }
-        }
-        // `add_relative` validates the parent ref and rebases the child's
-        // cell ranges onto the parent origin + (H, V). On error nothing is
-        // inserted.
+        // replaces the prior placement of the same pair. `add_relative`
+        // validates the parent reference *first* and only then replaces
+        // in place, so a rejected re-placement keeps the old placement
+        // and its children (REL-1). It rebases the child onto the parent
+        // origin + (H, V).
+        let old = (placement.image_id != 0 && placement.placement_id != 0)
+            .then(|| {
+                self.image_grid
+                    .find(placement.image_id, placement.placement_id)
+                    .cloned()
+            })
+            .flatten();
+        // REL-5: a virtual parent's origin comes from its placeholder cells.
+        self.refresh_virtual_parents();
         match self.image_grid.add_relative(placement) {
             Ok(handle) => {
+                if let Some(old) = old {
+                    mark_placement_dirty(self, &old);
+                }
                 // The placement was rebased inside `add_relative`; re-read
                 // it to mark the resolved cells dirty.
                 let resolved = self
@@ -4994,6 +5020,8 @@ impl KittySink for Term {
         // Treat empty / unknown specs the same as `a` (all).
         let spec_byte = if delete.byte == 0 { b'a' } else { delete.byte };
         let mut dropped_placements = Vec::new();
+        // Children that went because their parent did (REL-2).
+        let mut cascaded: Vec<Placement> = Vec::new();
         let drop_bytes = delete.free_bytes();
         let spec_char = (spec_byte as char).to_string();
         tracing::info!(
@@ -5033,10 +5061,14 @@ impl KittySink for Term {
             // surviving placement (survivor sweep below).
             b'a' | b'A' => {
                 let rows = i64::from(self.rows);
-                dropped_placements.extend(self.image_grid.remove_where(|p| {
-                    let r = p.screen_rows(top_line);
-                    r.start < rows && r.end > 0
-                }));
+                take_split(
+                    &mut dropped_placements,
+                    &mut cascaded,
+                    self.image_grid.remove_where_split(|p| {
+                        let r = p.screen_rows(top_line);
+                        r.start < rows && r.end > 0
+                    }),
+                );
             }
             // `i` / `I` — by image id (provided via `i=`). When `p=` is
             // also given (non-zero), scope to that single placement;
@@ -5046,15 +5078,21 @@ impl KittySink for Term {
                     let img = header.image_id;
                     let pid = header.placement_id;
                     if pid != 0 {
-                        dropped_placements.extend(
+                        take_split(
+                            &mut dropped_placements,
+                            &mut cascaded,
                             self.image_grid
-                                .remove_where(|p| p.image_id == img && p.placement_id == pid),
+                                .remove_where_split(|p| p.image_id == img && p.placement_id == pid),
                         );
                         virtual_dropped |= self
                             .virtual_placements
                             .remove_where(|v| v.image_id == img && v.placement_id == pid);
                     } else {
-                        dropped_placements.extend(self.image_grid.remove_image(img));
+                        take_split(
+                            &mut dropped_placements,
+                            &mut cascaded,
+                            self.image_grid.remove_where_split(|p| p.image_id == img),
+                        );
                         virtual_dropped |= self.virtual_placements.remove_image(img);
                     }
                     // Uppercase frees the bytes, but only when no
@@ -5075,7 +5113,11 @@ impl KittySink for Term {
             b'n' | b'N' => {
                 if header.image_number != 0 {
                     if let Some(img) = self.newest_image_for_number(header.image_number) {
-                        dropped_placements.extend(self.image_grid.remove_image(img));
+                        take_split(
+                            &mut dropped_placements,
+                            &mut cascaded,
+                            self.image_grid.remove_where_split(|p| p.image_id == img),
+                        );
                         virtual_dropped |= self.virtual_placements.remove_image(img);
                         if drop_bytes && !self.image_grid.iter().any(|p| p.image_id == img) {
                             self.remove_image_bytes(img);
@@ -5090,9 +5132,11 @@ impl KittySink for Term {
             // cell"). Internal screen rows / columns are 0-based, so
             // convert by subtracting 1. (B6)
             b'p' | b'P' => {
-                dropped_placements.extend(
+                take_split(
+                    &mut dropped_placements,
+                    &mut cascaded,
                     self.image_grid
-                        .remove_where(|p| p.covers(top_line, sel_row, sel_col)),
+                        .remove_where_split(|p| p.covers(top_line, sel_row, sel_col)),
                 );
                 // Uppercase `P` frees bytes for any image that lost its
                 // last placement. (B6, same rule as B5) — handled by the
@@ -5107,9 +5151,11 @@ impl KittySink for Term {
                 let lo = header.src_x;
                 let hi = header.src_y;
                 if lo <= hi {
-                    dropped_placements.extend(
+                    take_split(
+                        &mut dropped_placements,
+                        &mut cascaded,
                         self.image_grid
-                            .remove_where(|p| (lo..=hi).contains(&p.image_id)),
+                            .remove_where_split(|p| (lo..=hi).contains(&p.image_id)),
                     );
                     virtual_dropped |= self
                         .virtual_placements
@@ -5131,37 +5177,50 @@ impl KittySink for Term {
             b'c' | b'C' => {
                 let row = self.cursor.row;
                 let col = self.cursor.col.min(self.cols.saturating_sub(1));
-                dropped_placements.extend(
+                take_split(
+                    &mut dropped_placements,
+                    &mut cascaded,
                     self.image_grid
-                        .remove_where(|p| p.covers(top_line, row, col)),
+                        .remove_where_split(|p| p.covers(top_line, row, col)),
                 );
             }
             // `q` / `Q` — placements intersecting cell (sel_col, sel_row)
             // AND having z-index == `z=`.
             b'q' | b'Q' => {
-                dropped_placements.extend(
-                    self.image_grid
-                        .remove_where(|p| p.covers(top_line, sel_row, sel_col) && p.z == sel_z),
+                take_split(
+                    &mut dropped_placements,
+                    &mut cascaded,
+                    self.image_grid.remove_where_split(|p| {
+                        p.covers(top_line, sel_row, sel_col) && p.z == sel_z
+                    }),
                 );
             }
             // `x` / `X` — placements intersecting COLUMN sel_col.
             b'x' | b'X' => {
-                dropped_placements.extend(
+                take_split(
+                    &mut dropped_placements,
+                    &mut cascaded,
                     self.image_grid
-                        .remove_where(|p| p.col_range().contains(&sel_col)),
+                        .remove_where_split(|p| p.col_range().contains(&sel_col)),
                 );
             }
             // `y` / `Y` — placements intersecting ROW sel_row. The real
             // "delete by row" selector (B7 moved `r/R` to id-range).
             b'y' | b'Y' => {
-                dropped_placements.extend(
+                take_split(
+                    &mut dropped_placements,
+                    &mut cascaded,
                     self.image_grid
-                        .remove_where(|p| p.on_row(top_line, sel_row)),
+                        .remove_where_split(|p| p.on_row(top_line, sel_row)),
                 );
             }
             // `z` / `Z` — placements with z-index == `z=`.
             b'z' | b'Z' => {
-                dropped_placements.extend(self.image_grid.remove_where(|p| p.z == sel_z));
+                take_split(
+                    &mut dropped_placements,
+                    &mut cascaded,
+                    self.image_grid.remove_where_split(|p| p.z == sel_z),
+                );
             }
             // `f` / `F` — delete animation frames (DEL-2); see
             // [`Term::delete_image_frames`].
@@ -5176,6 +5235,12 @@ impl KittySink for Term {
         // placement after the removals above (mirrors the B5 rule).
         if needs_survivor_sweep {
             self.free_orphaned_image_bytes(&dropped_placements);
+        }
+        if matches!(
+            spec_byte.to_ascii_lowercase(),
+            b'i' | b'n' | b'r' | b'z' | b'q'
+        ) {
+            self.free_cascaded_child_images(&cascaded);
         }
         tracing::info!(
             target: "kitty",
@@ -5432,6 +5497,19 @@ impl RgpSink for Term {
     fn queue_reply(&mut self, bytes: &[u8]) {
         self.pty_replies.extend_from_slice(bytes);
     }
+}
+
+/// Collect a split removal: everything into `dropped` (for dirty marking
+/// and the survivor sweep), the cascaded children also into `cascaded`.
+fn take_split(
+    dropped: &mut Vec<Placement>,
+    cascaded: &mut Vec<Placement>,
+    removed: (Vec<Placement>, Vec<Placement>),
+) {
+    let (direct, children) = removed;
+    dropped.extend(direct);
+    dropped.extend(children.iter().cloned());
+    cascaded.extend(children);
 }
 
 /// Mark the on-screen cells under `p`'s shown part dirty.

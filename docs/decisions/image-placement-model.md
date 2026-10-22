@@ -168,10 +168,69 @@ an `ImageView { top_line, scroll_px, clip }`:
   unmerged `prompt-aware-resize` branch) must also produce a `LineRemap`
   (with `ReflowMap` positions) and feed it to `Term::remap_primary_images`,
   or images will stop following their text when resizing at a prompt.
-- **A4 (relative placements).** Relative children resolve
-  as `parent.line + V` with no clamp at screen row 0, so a child keeps its
-  offset while its parent scrolls into history (most of SCR-8). The column
-  still clamps at 0.
+- **A4 (relative placements), done in #40.** Every rule below was
+  checked on kitty-ref (kitty 0.49.2):
+  - **Position.** Children resolve as `parent.line + V` and
+    `parent.col + H`, with no clamp on either axis. `Placement::col` is
+    signed, so a negative `H=` puts the child partly left of the screen,
+    where the renderer crops it (REL-6).
+  - **Validation before change.** `ImageGrid::add_relative` checks the
+    whole parent reference before it touches anything, so a rejected
+    re-placement leaves the old one alone (REL-1).
+  - **Replace in place.** A named `(i, p)` is replaced in place by
+    `ImageGrid::upsert`, for relative and absolute placements alike. It
+    keeps its draw order, and its children stay attached and are
+    re-resolved, so they follow it (REL-3).
+  - **Lifetime.** A relative placement lives as long as its parent. Every
+    `ImageGrid` removal (`remove_where` and everything built on it:
+    deletes, ED 2, history eviction, margin scrolls) also drops orphaned
+    descendants, recursively. That includes a parent scrolling out of
+    the history while the child's rows are still retained (SCR-8; kitty
+    does the same).
+  - **Binding.** `add_relative` resolves the parent reference to one
+    concrete placement when the child is created, and stores its handle
+    in `Placement::parent_ref`. From then on, positions, the self and
+    cycle checks, the depth cap and the delete cascade all follow
+    handles, never the ids.
+    - This matters for `P=` without `Q=`. kitty binds that to the parent
+      image's oldest placement *at that moment*, so a later delete of
+      that placement takes the child with it, instead of re-anchoring
+      the child on another placement of the image.
+    - Replacing a placement in place (`upsert`) keeps its handle, so its
+      children stay bound.
+    - A child of a Unicode-placeholder parent (a group of tiles) is still
+      found by ids, until #28.
+    - The orphan sweep builds a set of live handles once per pass and
+      removes with one drain, so it is O(n) per pass.
+  - **Freeing child images.** The cascaded children are returned
+    separately (`ImageGrid::remove_where_split`). Whether a child removed
+    *because its parent was* also loses its image depends on the delete,
+    as on kitty-ref 0.49.2:
+    - **Image freed** once it has no placement left: `d=i/I`, `d=n/N`,
+      `d=r/R`, `d=z/Z` and `d=q/Q` (lowercase too), plus every uppercase
+      delete.
+    - **Image kept:** lowercase `d=a`, `d=p`, `d=x`, `d=y` and `d=c`, and a
+      parent leaving the history.
+    - A child deleted directly keeps its image on a lowercase delete
+      (REL-2).
+  - **Margin scrolls.** Relative children don't scroll on their own. They
+    follow their parent through the resolve (#31), and they take on the
+    rows their parent lost to a margin (`inherited_clip`). kitty-ref:
+    - a child inside the region whose parent is outside stays whole;
+    - with both inside, two LFs cut the parent's top row at the margin,
+      and the child loses its top row too.
+  - **Parent references.** `P=` without `Q=` is bound to the parent
+    image's oldest placement (see "Binding"), and `Q=` without `P=` is an
+    ordinary placement. Self-reference gives EINVAL if the placement exists and
+    ENOPARENT if not. `a=p,U=1` with `P=` gives EINVAL, while
+    `a=T,U=1,P=…` is accepted and makes the virtual placement (REL-7).
+    `a=T` with `P=` is relative like `a=p` and never moves the cursor
+    (REL-4).
+  - **Placeholder parents.** A child of a Unicode-placeholder parent
+    measures from the minimum line and the minimum column over the
+    parent's placeholder images (`ImageGrid::parent_origin`, REL-5).
+    This uses placeholder tiles until #28 lands; after that it asks
+    `Term::placeholder_origin`.
 - **Unicode placeholders (stack F).** Per-cell placeholder placements are
   still created in `finalize_placeholder_run`, now via `Placement::new` and
   anchored at `top_line + cell.row`. They are left for stack F to move to
