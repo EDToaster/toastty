@@ -59,10 +59,15 @@ fn trailing_blank_run(cells: &[Cell]) -> usize {
 /// the offset is a count of content cells (columns), computed against the
 /// cursor row's length *before* final-row trimming so a cursor parked in
 /// trailing whitespace maps to the line end rather than into trimmed cells.
+///
+/// `row_starts` receives, for every input row, the `(line_index,
+/// content_offset)` its first cell lands at, so callers can follow a row
+/// (e.g. an image anchor) through the rewrap.
 fn build_logical_lines(
     rows: &[Row],
     cursor_idx: usize,
     cursor_col: u16,
+    row_starts: &mut Vec<(usize, usize)>,
 ) -> (Vec<Vec<Cell>>, (usize, usize)) {
     let mut lines: Vec<Vec<Cell>> = Vec::new();
     let mut cursor_line = 0usize;
@@ -80,6 +85,7 @@ fn build_logical_lines(
                 trailing_blank_run(&row.cells).min(1)
             };
             let keep = row.cells.len() - trim;
+            row_starts.push((lines.len(), content.len()));
 
             if i == cursor_idx {
                 cursor_line = lines.len();
@@ -115,15 +121,21 @@ fn build_logical_lines(
 /// the cursor maps to. An offset at or past `content.len()` returns the
 /// pending-wrap form — `col` may equal `cols` (the sentinel
 /// `Term::clamp_cursor` accepts) when the last row is exactly full.
+///
+/// `out_starts` receives the content offset each output row starts at
+/// (ascending; the first is always 0).
 fn wrap_line(
     content: &[Cell],
     cols: u16,
     cursor_offset: Option<usize>,
+    out_starts: &mut Vec<usize>,
 ) -> (Vec<Row>, Option<(usize, u16)>) {
     let cols_usize = cols as usize;
     let mut rows: Vec<Row> = Vec::new();
     let mut cur: Vec<Cell> = Vec::new();
     let mut cursor_pos: Option<(usize, u16)> = None;
+    out_starts.clear();
+    out_starts.push(0);
 
     let finish_row = |rows: &mut Vec<Row>, cur: &mut Vec<Cell>, soft_wrap: bool| {
         cur.resize(cols_usize, Cell::BLANK);
@@ -140,6 +152,7 @@ fn wrap_line(
         let cluster_len = w as usize; // width-2 cluster spans 2 cells, width-1 spans 1.
         if cur.len() + w as usize > cols_usize {
             finish_row(&mut rows, &mut cur, true);
+            out_starts.push(i);
         }
         if let Some(off) = cursor_offset
             && cursor_pos.is_none()
@@ -179,27 +192,58 @@ fn wrap_line(
 /// `(row_in_output, col)`. `cursor_idx` / `cursor_col` locate the cursor
 /// within `rows`. The output is never empty (a degenerate all-blank input
 /// yields a single blank row with the cursor at `(0, 0)`).
+#[cfg(test)]
 pub(crate) fn reflow_rows(
     rows: &[Row],
     cols: u16,
     cursor_idx: usize,
     cursor_col: u16,
 ) -> (Vec<Row>, (usize, u16)) {
-    let (lines, (cursor_line, cursor_offset)) = build_logical_lines(rows, cursor_idx, cursor_col);
+    let mut row_map = Vec::new();
+    reflow_rows_mapped(rows, cols, cursor_idx, cursor_col, &mut row_map)
+}
+
+/// [`reflow_rows`], also filling `row_map` with the output row each input
+/// row's first cell lands on (`row_map[i]` for input row `i`; ascending).
+/// Image placements anchored to a row follow it through the rewrap this
+/// way.
+pub(crate) fn reflow_rows_mapped(
+    rows: &[Row],
+    cols: u16,
+    cursor_idx: usize,
+    cursor_col: u16,
+    row_map: &mut Vec<usize>,
+) -> (Vec<Row>, (usize, u16)) {
+    let mut row_starts = Vec::with_capacity(rows.len());
+    let (lines, (cursor_line, cursor_offset)) =
+        build_logical_lines(rows, cursor_idx, cursor_col, &mut row_starts);
 
     let mut out: Vec<Row> = Vec::new();
     let mut cur_idx = 0usize;
     let mut cur_col = 0u16;
+    let mut out_starts = Vec::new();
+    let mut starts = row_starts.iter().peekable();
+    row_map.clear();
     for (li, line) in lines.iter().enumerate() {
         let want = if li == cursor_line {
             Some(cursor_offset)
         } else {
             None
         };
-        let (wrapped, cpos) = wrap_line(line, cols, want);
+        let (wrapped, cpos) = wrap_line(line, cols, want, &mut out_starts);
         if let Some((r, c)) = cpos {
             cur_idx = out.len() + r;
             cur_col = c;
+        }
+        // Input rows of this line, in order: each lands on the last
+        // output row that starts at or before its content offset.
+        while let Some(&&(l, off)) = starts.peek() {
+            if l != li {
+                break;
+            }
+            let r = out_starts.partition_point(|&s| s <= off).saturating_sub(1);
+            row_map.push(out.len() + r);
+            starts.next();
         }
         out.extend(wrapped);
     }
@@ -209,6 +253,8 @@ pub(crate) fn reflow_rows(
         cur_idx = 0;
         cur_col = 0;
     }
+    // Defensive: every input row gets an entry.
+    row_map.resize(rows.len(), out.len() - 1);
 
     (out, (cur_idx, cur_col))
 }
@@ -278,7 +324,7 @@ mod tests {
     fn wrap_line_narrow_then_widen_roundtrip() {
         let content: Vec<Cell> = "hello world".chars().map(cell).collect();
         // Narrow to 4: "hell" / "o wo" / "rld".
-        let (narrow, _) = wrap_line(&content, 4, None);
+        let (narrow, _) = wrap_line(&content, 4, None, &mut Vec::new());
         assert_eq!(narrow.len(), 3);
         assert!(narrow[0].soft_wrap && narrow[1].soft_wrap);
         assert!(!narrow[2].soft_wrap);
@@ -292,7 +338,7 @@ mod tests {
             };
             rejoined.extend_from_slice(&r.cells[..r.cells.len() - trim]);
         }
-        let (wide_again, _) = wrap_line(&rejoined, 11, None);
+        let (wide_again, _) = wrap_line(&rejoined, 11, None, &mut Vec::new());
         assert_eq!(wide_again.len(), 1);
         assert_eq!(text(&wide_again[0].cells).trim_end(), "hello world");
     }
@@ -304,7 +350,7 @@ mod tests {
         // is left blank.
         let mut content = vec![cell('a'), cell('b'), cell('c')];
         content.extend_from_slice(&wide('世'));
-        let (rows, _) = wrap_line(&content, 4, None);
+        let (rows, _) = wrap_line(&content, 4, None, &mut Vec::new());
         assert_eq!(rows.len(), 2);
         assert!(rows[0].soft_wrap);
         assert_eq!(
@@ -321,7 +367,7 @@ mod tests {
         // Content exactly fills a width-4 row; cursor at the end (pending
         // wrap) maps to (last_row, cols).
         let content: Vec<Cell> = "abcd".chars().map(cell).collect();
-        let (rows, cpos) = wrap_line(&content, 4, Some(content.len()));
+        let (rows, cpos) = wrap_line(&content, 4, Some(content.len()), &mut Vec::new());
         assert_eq!(rows.len(), 1);
         assert_eq!(cpos, Some((0, 4)));
     }
@@ -330,7 +376,7 @@ mod tests {
     fn wrap_line_cursor_in_middle() {
         let content: Vec<Cell> = "hello".chars().map(cell).collect();
         // cols 3: "hel" / "lo"; cursor at offset 4 ('o') → row 1, col 1.
-        let (_rows, cpos) = wrap_line(&content, 3, Some(4));
+        let (_rows, cpos) = wrap_line(&content, 3, Some(4), &mut Vec::new());
         assert_eq!(cpos, Some((1, 1)));
     }
 
@@ -341,7 +387,7 @@ mod tests {
         cells.push(Cell::BLANK);
         cells.push(Cell::BLANK);
         let rows = vec![row(cells, false)];
-        let (lines, _) = build_logical_lines(&rows, 0, 0);
+        let (lines, _) = build_logical_lines(&rows, 0, 0, &mut Vec::new());
         assert_eq!(lines.len(), 1);
         // Default trailing blanks dropped; the red-bg blank survives.
         assert_eq!(lines[0].len(), 3);
@@ -353,7 +399,7 @@ mod tests {
         // A soft-wrapped row ending in two default blanks drops exactly one.
         let cells = vec![cell('a'), cell('b'), Cell::BLANK, Cell::BLANK];
         let rows = vec![row(cells, true), row(vec![cell('c')], false)];
-        let (lines, _) = build_logical_lines(&rows, 0, 0);
+        let (lines, _) = build_logical_lines(&rows, 0, 0, &mut Vec::new());
         assert_eq!(lines.len(), 1);
         // "ab" + one surviving blank (the second was dropped) + "c" = 4 cells.
         assert_eq!(lines[0].len(), 4);
@@ -368,7 +414,7 @@ mod tests {
             row(vec![cell('c'), cell('d')], true),
             row(vec![cell('e')], false),
         ];
-        let (lines, _) = build_logical_lines(&rows, 0, 0);
+        let (lines, _) = build_logical_lines(&rows, 0, 0, &mut Vec::new());
         assert_eq!(lines.len(), 1);
         assert_eq!(text(&lines[0]), "abcde");
     }
@@ -392,5 +438,38 @@ mod tests {
         let (widened, _) = reflow_rows(&narrow, 11, 0, 0);
         assert_eq!(widened.len(), 1);
         assert_eq!(text(&widened[0].cells).trim_end(), "hello world");
+    }
+
+    #[test]
+    fn row_map_follows_rows_through_a_rewrap() {
+        // "AAAAAA" (one 6-col row), a blank row, then "B": at 3 cols the
+        // A line takes two rows, so the blank row moves to 2 and B to 3.
+        let rows = vec![
+            row((0..6).map(|_| cell('A')).collect(), false),
+            row(vec![Cell::BLANK; 6], false),
+            row(vec![cell('B')], false),
+        ];
+        let mut map = Vec::new();
+        let (out, _) = reflow_rows_mapped(&rows, 3, 0, 0, &mut map);
+        assert_eq!(out.len(), 4);
+        assert_eq!(map, vec![0, 2, 3]);
+        // Widening back maps the rewrapped rows onto the first again.
+        let (wide, _) = reflow_rows_mapped(&out, 6, 0, 0, &mut map);
+        assert_eq!(wide.len(), 3);
+        assert_eq!(map, vec![0, 0, 1, 2]);
+    }
+
+    #[test]
+    fn row_map_tracks_soft_wrapped_continuation_rows() {
+        // "abcd" soft-wrapped onto "ef": at 2 cols the second input row
+        // ("ef", content offset 4) lands on output row 2.
+        let rows = vec![
+            row(vec![cell('a'), cell('b'), cell('c'), cell('d')], true),
+            row(vec![cell('e'), cell('f'), Cell::BLANK, Cell::BLANK], false),
+        ];
+        let mut map = Vec::new();
+        let (out, _) = reflow_rows_mapped(&rows, 2, 0, 0, &mut map);
+        assert_eq!(out.len(), 3);
+        assert_eq!(map, vec![0, 2]);
     }
 }

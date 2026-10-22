@@ -407,6 +407,21 @@ impl ImageGrid {
         }
     }
 
+    /// Re-anchor every placement through `f` (old line id → new line id).
+    /// Used when a reflow renumbers the lines, so each placement follows
+    /// the row its text moved to. Relative children are re-resolved from
+    /// their (mapped) parents afterwards.
+    pub fn map_lines(&mut self, f: impl Fn(i64) -> i64) {
+        if self.placements.is_empty() {
+            return;
+        }
+        self.bounds = None;
+        for (_, p) in &mut self.placements {
+            p.line = f(p.line);
+        }
+        self.resolve_relative_positions();
+    }
+
     /// Move every placement whose shown part reaches screen row
     /// `from_row` or below (`end > from_row`) by `delta` lines, untrimmed,
     /// then re-resolve relative children. Used for a full-screen scroll
