@@ -214,7 +214,8 @@ pub struct Term {
     /// an alt-screen app's flags never leak to the shell, even if it dies
     /// without popping them. Like kitty 0.49.2, a screen switch only
     /// selects the other stack: the alt stack survives between visits
-    /// (all of 47 / 1047 / 1049), and only RIS clears both.
+    /// (all of 47 / 1047 / 1049). Only RIS and DECSTR clear them, both
+    /// at once (see [`Term::reset_kitty_keyboard_stacks`]).
     ///
     /// The active flags are the top of the stack; empty stack == legacy
     /// behaviour. Capped at 8 entries (kitty's limit too), evicting the
@@ -1100,6 +1101,12 @@ impl Term {
     #[must_use]
     pub fn kitty_stack(&self) -> &[u8] {
         &self.kitty_keyboard_stacks[usize::from(self.alt_active)]
+    }
+
+    /// Empty both screens' kitty flag stacks (legacy keys everywhere).
+    /// Shared by RIS and DECSTR; kitty clears both stacks on either.
+    pub(super) fn reset_kitty_keyboard_stacks(&mut self) {
+        self.kitty_keyboard_stacks = [Vec::new(), Vec::new()];
     }
 
     /// The active screen's kitty flag stack.
@@ -3948,8 +3955,7 @@ impl Term {
         self.mouse_mode = MouseMode::default();
         self.grapheme_cluster_mode = false;
         self.inband_resize_mode = false;
-        // Both screens' stacks (kitty does the same).
-        self.kitty_keyboard_stacks = [Vec::new(), Vec::new()];
+        self.reset_kitty_keyboard_stacks();
         self.modify_other_keys = 0;
         // REP char, tab stops, IRM / DECCKM / DECKPAM / DECOM / DECAWM /
         // DECSCNM / DECLRMM + margins, ...
@@ -6537,6 +6543,28 @@ mod tests {
         assert!(t.kitty_stack().is_empty());
         feed(&mut t, b"\x1b[?1049h");
         assert!(t.kitty_stack().is_empty());
+    }
+
+    #[test]
+    fn decstr_clears_both_kitty_stacks() {
+        // `tput init` sends DECSTR to recover a terminal; kitty 0.49.2
+        // empties both stacks on it, from either screen (checked live).
+        for on_alt in [false, true] {
+            let mut t = Term::new(2, 4, 0);
+            feed(&mut t, b"\x1b[>1u\x1b[?1049h\x1b[>2u");
+            if !on_alt {
+                feed(&mut t, b"\x1b[?1049l");
+            }
+            feed(&mut t, b"\x1b[!p");
+            assert!(t.kitty_stack().is_empty(), "on_alt={on_alt}");
+            let switch: &[u8] = if on_alt {
+                b"\x1b[?1049l"
+            } else {
+                b"\x1b[?1049h"
+            };
+            feed(&mut t, switch);
+            assert!(t.kitty_stack().is_empty(), "other screen, on_alt={on_alt}");
+        }
     }
 
     #[test]

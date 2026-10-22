@@ -513,6 +513,8 @@ impl Term {
         self.vt.decsc_origin = false;
         self.vt.decsc_autowrap = true;
         self.reset_tab_stops();
+        // Both screens' kitty keyboard flag stacks, as kitty does.
+        self.reset_kitty_keyboard_stacks();
     }
 
     /// Reset everything in [`VtModes`] to power-on defaults (RIS).
