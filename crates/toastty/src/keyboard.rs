@@ -460,18 +460,20 @@ fn encode_key_kitty(
     let code = match logical {
         LogicalKey::Named(named @ (NamedKey::Enter | NamedKey::Tab | NamedKey::Backspace)) => {
             let code = kitty_named_keycode(*named)?;
-            if !report_all {
+            // Unmodified: legacy bytes, and no release (spec). Modified:
+            // an escape code, release included.
+            if !report_all && !any_mods {
                 if released {
                     return None;
                 }
-                if !any_mods {
-                    return legacy();
-                }
+                return legacy();
             }
             return Some(format_kitty(code, m, event_suffix, None, None));
         }
         LogicalKey::Named(NamedKey::Escape) => {
-            if !disambiguate && !report_all && !released {
+            // Report-events alone keeps only a plain Esc press legacy;
+            // a modified Esc, a repeat and a release are escape codes.
+            if !disambiguate && !report_all && !released && !repeat && !any_mods {
                 return legacy();
             }
             return Some(format_kitty(27, m, event_suffix, None, None));
@@ -483,7 +485,12 @@ fn encode_key_kitty(
             // spec mandates and what every other terminal does. crossterm's
             // parser also expects this; sending PUA `CSI 57352 u` for Up
             // would be interpreted as a literal U+E008 character.
-            let (code, final_byte) = kitty_legacy_form(*named)?;
+            let (code, final_byte) = match kitty_legacy_form(*named)? {
+                // F3 is `CSI 13 ~` under the kitty flags: its legacy
+                // `CSI R` / `CSI 1;mR` collides with a CPR reply.
+                (1, b'R') => (13, b'~'),
+                form => form,
+            };
             return Some(format_kitty_legacy(code, m, event_suffix, final_byte));
         }
         LogicalKey::Character(s) => {
@@ -506,16 +513,38 @@ fn encode_key_kitty(
     };
     // The key's printable text, if any (control characters don't count).
     let printable = text.filter(|t| !t.is_empty() && !t.chars().any(char::is_control));
+    // Report-alternates (4): the shifted key, on every event that is an
+    // escape code (not only under report-all): ctrl+shift+a is
+    // `CSI 97:65;6u` under 1|4.
+    let shifted = if report_alternates && modifiers.contains(Modifiers::SHIFT) {
+        let single = |t: &str| {
+            let mut chars = t.chars();
+            let ch = chars.next()?;
+            chars.next().is_none().then_some(u32::from(ch))
+        };
+        // The shifted logical key (winit gives `A` for shift+a), else
+        // the typed text when it is a single printable character.
+        let from_logical = match logical {
+            LogicalKey::Character(s) => single(s),
+            _ => None,
+        };
+        from_logical
+            .filter(|&ch| ch != code)
+            .or_else(|| printable.and_then(single).filter(|&ch| ch != code))
+    } else {
+        None
+    };
     if !report_all {
         if csi_mods {
-            if disambiguate || released {
-                return Some(format_kitty(code, m, event_suffix, None, None));
+            // Report-events alone: a first press keeps its legacy
+            // bytes; repeats and releases are escape codes (kitty).
+            if disambiguate || released || repeat {
+                return Some(format_kitty(code, m, event_suffix, shifted, None));
             }
-            // Report-events alone: the press keeps its legacy bytes.
             return legacy();
         }
         if released {
-            return Some(format_kitty(code, m, event_suffix, None, None));
+            return Some(format_kitty(code, m, event_suffix, shifted, None));
         }
         // Plain / shifted text key: just the text.
         if let Some(t) = printable {
@@ -527,17 +556,6 @@ fn encode_key_kitty(
         return Some(format_kitty(code, m, event_suffix, None, None));
     }
     // Report-all: always an escape code.
-    let shifted = if report_alternates && modifiers.contains(Modifiers::SHIFT) {
-        printable
-            .and_then(|t| {
-                let mut chars = t.chars();
-                let ch = chars.next()?;
-                chars.next().is_none().then_some(u32::from(ch))
-            })
-            .filter(|&ch| ch != code)
-    } else {
-        None
-    };
     // Text is only attached when the key typed it: not with Ctrl / Alt /
     // Super held (kitty: alt+a is `CSI 97;3u`).
     let text_field = if report_text && !released && !csi_mods {
@@ -1159,6 +1177,11 @@ mod tests {
             false,
         );
         assert_eq!(rel.as_deref(), Some(&b"\x1b[32;1:3u"[..]));
+    }
+
+    #[test]
+    fn kitty_report_all_text_and_alternates() {
+        let sp = named(NamedKey::Space);
         // Report-all, plain and with associated text (16) and the
         // shifted alternate (4).
         let got = enc_kitty(
@@ -1260,6 +1283,92 @@ mod tests {
         assert_eq!(
             p(&named(NamedKey::F(1)), None, Modifiers::empty()).as_deref(),
             Some(&b"\x1b[P"[..])
+        );
+    }
+
+    /// #43 review: F3, report-alternates without report-all, releases
+    /// of modified Enter / Tab / Backspace, and report-events repeats.
+    #[test]
+    fn kitty_review_43_cases() {
+        let p = KeyState::Pressed;
+        let r = KeyState::Released;
+        let f3 = named(NamedKey::F(3));
+        let enc =
+            |k: &LogicalKey, t: Option<&str>, m: Modifiers, f: u8, st: KeyState, rep: bool| {
+                encode_key(k, t, m, f, st, rep)
+            };
+        // F3 is `CSI 13 ~` under the kitty flags (`CSI R` is a CPR);
+        // legacy mode keeps xterm's SS3 / `CSI 1;mR`.
+        assert_eq!(
+            enc(&f3, None, Modifiers::empty(), 1, p, false).as_deref(),
+            Some(&b"\x1b[13~"[..])
+        );
+        assert_eq!(
+            enc(&f3, None, Modifiers::CONTROL, 1, p, false).as_deref(),
+            Some(&b"\x1b[13;5~"[..])
+        );
+        assert_eq!(
+            enc(&f3, None, Modifiers::empty(), 0, p, false).as_deref(),
+            Some(&b"\x1bOR"[..])
+        );
+        assert_eq!(
+            enc(&f3, None, Modifiers::CONTROL, 0, p, false).as_deref(),
+            Some(&b"\x1b[1;5R"[..])
+        );
+        // Report-alternates applies to every escape-coded event.
+        let a = char_key("A");
+        let cs = Modifiers::CONTROL | Modifiers::SHIFT;
+        assert_eq!(
+            enc(&a, Some("\x01"), cs, 5, p, false).as_deref(),
+            Some(&b"\x1b[97:65;6u"[..])
+        );
+        let als = Modifiers::ALT | Modifiers::SHIFT;
+        assert_eq!(
+            enc(&a, Some("A"), als, 7, p, false).as_deref(),
+            Some(&b"\x1b[97:65;4u"[..])
+        );
+        assert_eq!(
+            enc(&a, Some("A"), Modifiers::SHIFT, 7, r, false).as_deref(),
+            Some(&b"\x1b[97:65;2:3u"[..])
+        );
+        // Modified Enter / Tab / Backspace report their release.
+        for (k, code) in [
+            (NamedKey::Enter, 13),
+            (NamedKey::Tab, 9),
+            (NamedKey::Backspace, 127),
+        ] {
+            let want = format!("\x1b[{code};2:3u");
+            let got = enc(&named(k), None, Modifiers::SHIFT, 2, r, false);
+            assert_eq!(got.as_deref(), Some(want.as_bytes()), "{k:?}");
+            assert_eq!(
+                enc(&named(k), None, Modifiers::empty(), 2, r, false),
+                None,
+                "{k:?}"
+            );
+        }
+        // Report-events alone: Ctrl / Alt repeats and modified Esc are
+        // escape codes; a plain Esc press stays legacy.
+        let ca = char_key("a");
+        assert_eq!(
+            enc(&ca, Some("\x01"), Modifiers::CONTROL, 2, p, true).as_deref(),
+            Some(&b"\x1b[97;5:2u"[..])
+        );
+        assert_eq!(
+            enc(&ca, Some("a"), Modifiers::ALT, 2, p, true).as_deref(),
+            Some(&b"\x1b[97;3:2u"[..])
+        );
+        assert_eq!(
+            enc(&ca, Some("\x01"), Modifiers::CONTROL, 2, p, false).as_deref(),
+            Some(&b"\x01"[..])
+        );
+        let esc = named(NamedKey::Escape);
+        assert_eq!(
+            enc(&esc, None, Modifiers::CONTROL, 2, p, false).as_deref(),
+            Some(&b"\x1b[27;5u"[..])
+        );
+        assert_eq!(
+            enc(&esc, None, Modifiers::empty(), 2, p, false).as_deref(),
+            Some(&b"\x1b"[..])
         );
     }
 

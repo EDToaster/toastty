@@ -245,11 +245,11 @@ pub struct Term {
     /// behaviour. Capped at 8 entries (kitty's limit too), evicting the
     /// oldest.
     kitty_keyboard_stacks: [Vec<u8>; 2],
-    /// Whether the CSI being dispatched had any parameter digit, from
-    /// [`Perform::csi_params_explicit`]. vte gives `CSI < u` and
-    /// `CSI < 0 u` the same params; kitty pops one for the first and
-    /// none for the second. Reset after every CSI.
-    csi_params_explicit: bool,
+    /// Which parameters of the CSI being dispatched held a digit, from
+    /// [`Perform::csi_param_digits`]. vte gives `CSI < u` and `CSI < 0 u`
+    /// (or `CSI = 5 ; u` and `CSI = 5 ; 0 u`) the same params; kitty
+    /// treats them differently. Reset after every CSI.
+    csi_param_digits: u32,
     /// DECSET 2026 — synchronized output (BSU/ESU) state.
     sync_output: SyncOutput,
     /// DECSET 2027 — grapheme cluster processing opt-in.
@@ -577,7 +577,7 @@ impl Term {
             report_focus: false,
             mouse_mode: MouseMode::default(),
             kitty_keyboard_stacks: [Vec::new(), Vec::new()],
-            csi_params_explicit: false,
+            csi_param_digits: 0,
             sync_output: SyncOutput::default(),
             grapheme_cluster_mode: false,
             inband_resize_mode: false,
@@ -3000,22 +3000,29 @@ impl Term {
             //   CSI < n u       — pop n (default 1)
             //   CSI = flags ; mode u — set/clear without push
             //   CSI ? u         — query active flags
-            // Flags are masked to 7 bits, as kitty does (`CSI > 255 u`
-            // pushes 127). An explicit `CSI < 0 u` pops nothing (kitty);
-            // `CSI < u` pops one. An explicit mode 0 in `CSI = f ; 0 u`
-            // is ignored (kitty).
-            'u' if priv_marker == Some(b'>') => {
+            // All as kitty 0.49.2 (checked live):
+            // - flags are masked to 7 bits (`CSI > 255 u` pushes 127);
+            // - `CSI < u` pops one, but any parameter, even `0` or an
+            //   empty one (`CSI < ; u`), is the count: none popped;
+            // - `CSI = f ; 0 u` (explicit mode 0) is ignored, while an
+            //   empty mode (`CSI = f ; u`) means the default, 1;
+            // - an extra intermediate (`CSI < SP u`) isn't this command.
+            'u' if priv_marker == Some(b'>') && intermediates.len() == 1 => {
                 let f = first_param(params, 0);
                 self.kitty_push((f & 0x7f) as u8);
             }
-            'u' if priv_marker == Some(b'<') => {
-                let raw = nth_param_raw(params, 0);
-                let n = if self.csi_params_explicit { raw } else { 1 };
+            'u' if priv_marker == Some(b'<') && intermediates.len() == 1 => {
+                let explicit = params.len() > 1 || self.csi_param_digits & 1 != 0;
+                let n = if explicit {
+                    nth_param_raw(params, 0)
+                } else {
+                    1
+                };
                 self.kitty_pop(usize::from(n));
             }
-            'u' if priv_marker == Some(b'=') => {
+            'u' if priv_marker == Some(b'=') && intermediates.len() == 1 => {
                 let f = first_param(params, 0);
-                let mode = if params.len() > 1 {
+                let mode = if self.csi_param_digits & 0b10 != 0 {
                     nth_param_raw(params, 1)
                 } else {
                     1
@@ -4315,11 +4322,11 @@ impl Perform for Term {
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         self.handle_csi(params, intermediates, action);
-        self.csi_params_explicit = false;
+        self.csi_param_digits = 0;
     }
 
-    fn csi_params_explicit(&mut self, any_digit: bool) {
-        self.csi_params_explicit = any_digit;
+    fn csi_param_digits(&mut self, mask: u32) {
+        self.csi_param_digits = mask;
     }
 
     /// ESC + final-byte dispatch. Covers the handful of single-byte
@@ -7246,11 +7253,21 @@ mod tests {
         assert_eq!(t.kitty_flags(), 0);
         feed(&mut t, b"\x1b[>300u");
         assert_eq!(t.kitty_flags(), 44, "300 & 0x7f");
-        // An explicit mode 0 is ignored; a missing mode means 1.
+        // An explicit mode 0 is ignored; a missing or empty mode means 1.
         feed(&mut t, b"\x1b[=5;0u");
         assert_eq!(t.kitty_flags(), 44, "300 & 0x7f");
         feed(&mut t, b"\x1b[=5u");
         assert_eq!(t.kitty_flags(), 5);
+        feed(&mut t, b"\x1b[=6;u");
+        assert_eq!(t.kitty_flags(), 6, "empty mode is mode 1");
+        // `CSI < ; u` has a (empty) count: nothing popped.
+        let depth = t.kitty_stack().len();
+        feed(&mut t, b"\x1b[<;u");
+        assert_eq!(t.kitty_stack().len(), depth);
+        // An extra intermediate isn't a kitty stack command.
+        feed(&mut t, b"\x1b[< u\x1b[> 9u\x1b[= 9u");
+        assert_eq!(t.kitty_stack().len(), depth);
+        assert_eq!(t.kitty_flags(), 6);
     }
 
     #[test]
