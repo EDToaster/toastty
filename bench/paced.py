@@ -12,6 +12,8 @@ Modes:
 - `text`: every frame is new text (seeded random words, a 256-colour fg
   per word, a few coloured bg runs). Worst case for row shaping: no row
   repeats between frames.
+- `cjk`: like `text`, with CJK words and emoji mixed in, so every row
+  needs cosmic-text (the shaper's slow path).
 - `tui`: an htop/btop-like screen. The layout and most of the text stay
   put; colours cycle and a few numbers change every frame, so every row
   is rewritten (and dirty) but most rows' text is unchanged.
@@ -36,19 +38,30 @@ WORDS = (
 ).split()
 
 
-def text_frame(rng: random.Random, cols: int, rows: int) -> str:
+CJK_WORDS = "你好 世界 日本語 テキスト 한글 漢字 中文 进度 🚀 👍 café naïve".split()
+
+
+def width(word: str) -> int:
+    # Every non-Latin char in CJK_WORDS is a wide (2-cell) char.
+    return sum(2 if ord(ch) > 0x2FFF else 1 for ch in word)
+
+
+def text_frame(rng: random.Random, cols: int, rows: int, cjk: bool = False) -> str:
     out = []
     for r in range(rows):
         out.append(f"\x1b[{r + 1};1H")
         w = 0
         while w < cols:
-            word = rng.choice(WORDS)[: cols - w]
+            word = rng.choice(CJK_WORDS if cjk and rng.random() < 0.3 else WORDS)
+            if width(word) > cols - w:
+                # Truncate (ASCII) or pad out (a wide word that won't fit).
+                word = word[: cols - w] if word.isascii() else "x" * (cols - w)
             fg = rng.randrange(256)
             if rng.random() < 0.1:
                 out.append(f"\x1b[38;5;{fg};48;5;{rng.randrange(256)}m{word}\x1b[49m")
             else:
                 out.append(f"\x1b[38;5;{fg}m{word}")
-            w += len(word)
+            w += width(word)
             if w < cols:
                 out.append(" ")
                 w += 1
@@ -87,7 +100,7 @@ def tui_frame(rng: random.Random, cols: int, rows: int, f: int) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=("text", "tui"), default="text")
+    ap.add_argument("--mode", choices=("text", "cjk", "tui"), default="text")
     ap.add_argument("--frames", type=int, default=300)
     ap.add_argument("--interval-ms", type=float, default=20.0)
     ap.add_argument("--seed", type=int, default=1)
@@ -102,7 +115,10 @@ def main() -> int:
     time.sleep(0.5)
     t0 = time.monotonic()
     for f in range(args.frames):
-        body = text_frame(rng, cols, rows) if args.mode == "text" else tui_frame(rng, cols, rows, f)
+        if args.mode == "tui":
+            body = tui_frame(rng, cols, rows, f)
+        else:
+            body = text_frame(rng, cols, rows, cjk=args.mode == "cjk")
         w.write(("\x1b[?2026h\x1b[H" + body + "\x1b[?2026l").encode())
         w.flush()
         next_t = t0 + (f + 1) * args.interval_ms / 1000

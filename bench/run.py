@@ -551,6 +551,9 @@ class Bench:
     def paced_text_big(self):
         return self._paced("text", width=2560, height=1400)
 
+    def paced_cjk(self):
+        return self._paced("cjk")
+
     def paced_tui(self):
         return self._paced("tui")
 
@@ -577,6 +580,7 @@ SCENARIOS = [
     "scroll_wheel_big",
     "paced_text",
     "paced_text_big",
+    "paced_cjk",
     "paced_tui",
     "paced_tui_big",
 ]

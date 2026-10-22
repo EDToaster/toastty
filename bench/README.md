@@ -28,7 +28,7 @@ which the binary writes when `TOASTTY_STATS=<path>` is set
 | `scrollback_memory` | 30k full-width coloured lines (fills the 10k scrollback) | RSS after |
 | `key_latency` | types into `cat` at 25 keys/s | key → frame ms |
 | `scroll_wheel` / `_big` | wheel-scrolls 20k lines of history | frame ms p50/p99 |
-| `paced_text` / `_tui` (+ `_big`) | `bench/paced.py` inside toastty: one full-screen synchronized-output frame every 20 ms. `text` is new random coloured words each frame, `tui` an htop-like screen whose text mostly stays put while colours and a few numbers change | frame ms p50/p99/mean, CPU s |
+| `paced_text` / `_cjk` / `_tui` (+ `_big`) | `bench/paced.py` inside toastty: one full-screen synchronized-output frame every 20 ms. `text` is new random coloured words each frame, `cjk` the same with CJK words and emoji mixed in (every row needs cosmic-text), `tui` an htop-like screen whose text mostly stays put while colours and a few numbers change | frame ms p50/p99/mean, CPU s |
 
 "Frame ms" is the CPU time of `Renderer::render_term`, including the
 present. Output → frame is measured from the first PTY batch after a frame

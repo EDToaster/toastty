@@ -630,6 +630,20 @@ fn bench_scroll_unicode(c: &mut Criterion) {
     bench_scroll(c, "scroll_unicode_200x60", true);
 }
 
+/// Wide (2-cell) words for the `newtext_cjk` min-time scenario.
+const CJK_WORDS: [&str; 10] = [
+    "你好",
+    "世界",
+    "日本語",
+    "テキスト",
+    "한글",
+    "漢字",
+    "中文",
+    "进度",
+    "🚀",
+    "👍",
+];
+
 /// Low-noise CPU numbers — runs when `TOASTTY_BENCH_MIN=1` is set,
 /// otherwise a no-op. Each scenario renders 400 frames CPU-only
 /// (shaping + instance building, no GPU) and prints the minimum and
@@ -668,27 +682,36 @@ fn bench_min_times(c: &mut Criterion) {
             term.clear_damage();
         }
         report(&format!("repaint_{cols}x{rows}"), t);
-        // Every row new text every frame (no memo hits), coloured words
-        // (256-colour, then truecolor).
-        for truecolor in [false, true] {
+        // Every row new text every frame (no memo hits), coloured words:
+        // 256-colour, truecolor, and 256-colour with CJK / emoji words
+        // mixed in (every row needs cosmic-text; fewer frames, it's slow).
+        for kind in ["256", "rgb", "cjk"] {
+            let truecolor = kind == "rgb";
+            let frames = if kind == "cjk" { FRAMES / 4 } else { FRAMES };
             let mut parser = Parser::new();
             let mut seed = 1u32;
-            let mut t = Vec::with_capacity(FRAMES);
-            for f in 0..FRAMES {
+            let mut t = Vec::with_capacity(frames);
+            for f in 0..frames {
                 let mut screen = String::from("\x1b[H");
                 for r in 0..rows {
                     screen.push_str(&format!("\x1b[{};1H", r + 1));
                     let mut w = 0usize;
                     while w + 12 < usize::from(cols) {
                         seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
-                        let word = lorem[(seed >> 16) as usize % lorem.len()];
+                        let (word, word_w) = if kind == "cjk" && (seed >> 20) % 10 < 3 {
+                            let w = CJK_WORDS[(seed >> 16) as usize % CJK_WORDS.len()];
+                            (w, 2 * w.chars().count())
+                        } else {
+                            let w = lorem[(seed >> 16) as usize % lorem.len()];
+                            (w, w.len())
+                        };
                         if truecolor {
                             let (r, g, b) = (seed >> 8 & 255, seed >> 12 & 255, seed >> 4 & 255);
                             screen.push_str(&format!("\x1b[38;2;{r};{g};{b}m{word} "));
                         } else {
                             screen.push_str(&format!("\x1b[38;5;{}m{word} ", (seed >> 8) % 256));
                         }
-                        w += word.len() + 1;
+                        w += word_w + 1;
                     }
                     screen.push_str(&format!("{f}\x1b[K"));
                 }
@@ -698,7 +721,6 @@ fn bench_min_times(c: &mut Criterion) {
                 t.push(t0.elapsed().as_secs_f64() * 1e6);
                 term.clear_damage();
             }
-            let kind = if truecolor { "rgb" } else { "256" };
             report(&format!("newtext_{kind}_{cols}x{rows}"), t);
         }
     }
