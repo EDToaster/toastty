@@ -230,7 +230,7 @@ fn mark_blinking_cells_dirty(term: &mut Term, row_blink: &[bool]) {
         cols.clear();
         cols.extend(
             term.view_row(r)
-                .cells
+                .cells()
                 .iter()
                 .enumerate()
                 .filter(|(_, c)| c.style.flags.blink())
@@ -2509,7 +2509,7 @@ impl Renderer {
                 // instead of its text glyphs (the cells keep the text
                 // for selection / copy / the evicted fallback).
                 let suppress = rich_suppress.get(r as usize).copied().unwrap_or(false);
-                for c in &row.cells {
+                for c in row.cells() {
                     if c.is_continuation {
                         continue;
                     }
@@ -2615,7 +2615,7 @@ impl Renderer {
                 #[allow(clippy::needless_range_loop)]
                 for c in 0..cols as usize {
                     let filled = row
-                        .cells
+                        .cells()
                         .get(c)
                         .is_some_and(crate::text::instance::cell_fills_bg);
                     if !filled {

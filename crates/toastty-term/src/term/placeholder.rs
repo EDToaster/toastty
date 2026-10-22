@@ -215,7 +215,7 @@ impl Term {
         let Some(col) = cur.checked_sub(1) else {
             return false;
         };
-        let Some(&cell) = self.active_grid().row(row).cells.get(usize::from(col)) else {
+        let Some(&cell) = self.active_grid().row(row).cells().get(usize::from(col)) else {
             return false;
         };
         if cell.ch != crate::PLACEHOLDER || cell.is_continuation {
@@ -259,7 +259,7 @@ impl Term {
         let mut seen = vec![false; crate::extra::MAX_ENTRIES + 1];
         let mut count = 0usize;
         let mut note = |row: &Row, count: &mut usize| {
-            for c in &row.cells {
+            for c in row.cells() {
                 if let Some(id) = c.extra
                     && !seen[usize::from(id.get())]
                     && is_placeholder(id)
@@ -295,7 +295,7 @@ impl Term {
             let Some(row) = self.primary.scrollback_row_mut(n) else {
                 continue;
             };
-            for c in &mut row.cells {
+            for c in row.cells_mut() {
                 if c.extra.is_some_and(|id| {
                     matches!(self.extras.get(id), Some(CellExtra::Placeholder(_)))
                 }) {
@@ -366,7 +366,7 @@ impl Term {
     /// Append the placeholder runs of `row` (any row: live grid,
     /// scrollback, or [`Term::view_row`]'s result) to `out`.
     pub fn placeholder_runs(&self, row: &Row, out: &mut Vec<PlaceholderRun>) {
-        resolve_runs(&row.cells, &self.extras, out);
+        resolve_runs(row.cells(), &self.extras, out);
     }
 
     /// The virtual placement `run` draws, if it exists right now.

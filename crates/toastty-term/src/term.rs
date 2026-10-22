@@ -1053,7 +1053,7 @@ impl Term {
             .chain(self.alt.ring_rows())
             .chain(std::iter::once(&self.blank_row));
         for row in rows {
-            for c in &row.cells {
+            for c in row.cells() {
                 if let Some(id) = c.extra {
                     live[usize::from(id.get())] = true;
                 }
@@ -1649,7 +1649,7 @@ impl Term {
     pub fn mark_cell_dirty(&mut self, r: u16, c: u16) {
         let is_continuation = self
             .row(r)
-            .cells
+            .cells()
             .get(c as usize)
             .is_some_and(|cell| cell.is_continuation);
         if is_continuation && c > 0 {
@@ -1958,12 +1958,12 @@ impl Term {
             let pad_col = if join_soft
                 && self
                     .row_by_line_id(line_id + 1)
-                    .is_some_and(|next| next.cells.get(1).is_some_and(|c| c.is_continuation))
+                    .is_some_and(|next| next.cells().get(1).is_some_and(|c| c.is_continuation))
             {
-                row.cells
+                row.cells()
                     .len()
                     .checked_sub(1)
-                    .filter(|&i| matches!(row.cells[i].ch, ' ' | '\0'))
+                    .filter(|&i| matches!(row.cells()[i].ch, ' ' | '\0'))
             } else {
                 None
             };
@@ -1975,7 +1975,7 @@ impl Term {
                 let col = u16::try_from(i).unwrap_or(u16::MAX);
                 sel.contains(line_id, col) || wide_partner_selected(sel, row, line_id, col)
             };
-            let len = row.cells.len();
+            let len = row.cells().len();
             if let (Some(lo), Some(hi)) = (
                 (0..len).find(|&i| selected(i)),
                 (0..len).rev().find(|&i| selected(i)),
@@ -1986,7 +1986,7 @@ impl Term {
                         col += 1;
                         continue;
                     }
-                    col = self.append_cell_text(&row.cells, col, hi + 1, &mut line_buf);
+                    col = self.append_cell_text(row.cells(), col, hi + 1, &mut line_buf);
                 }
             }
             if !join_soft {
@@ -2047,9 +2047,9 @@ impl Term {
         use crate::selection::Pos;
         let char_at = |p: Pos| -> Option<char> {
             let row = self.row_by_line_id(p.line_id)?;
-            let cell = row.cells.get(usize::from(p.col))?;
+            let cell = row.cells().get(usize::from(p.col))?;
             if cell.is_continuation && p.col > 0 {
-                return row.cells.get(usize::from(p.col) - 1).map(|c| c.ch);
+                return row.cells().get(usize::from(p.col) - 1).map(|c| c.ch);
             }
             Some(cell.ch)
         };
@@ -2327,9 +2327,7 @@ impl Term {
         };
         let row = grid.row_mut(bot);
         row.resize_cols(cols);
-        for c in &mut row.cells {
-            *c = blank;
-        }
+        row.fill(blank);
         row.soft_wrap = false;
         row.rich = None;
         for r in top..=bot {
@@ -2396,9 +2394,7 @@ impl Term {
         };
         let row = grid.row_mut(top);
         row.resize_cols(cols);
-        for c in &mut row.cells {
-            *c = blank;
-        }
+        row.fill(blank);
         row.soft_wrap = false;
         row.rich = None;
         for r in top..=bot {
@@ -2599,7 +2595,7 @@ impl Term {
         if to <= from {
             return;
         }
-        let cells = &self.active_grid().row(row).cells;
+        let cells = &self.active_grid().row(row).cells();
         let (a, b) = (usize::from(from), usize::from(to));
         let Some(run) = cells.get(a..b) else {
             return;
@@ -2674,7 +2670,7 @@ impl Term {
             return false;
         }
         let mut col = cur - 1;
-        let cells = &self.active_grid().row(row).cells;
+        let cells = &self.active_grid().row(row).cells();
         if cells
             .get(usize::from(col))
             .is_some_and(|c| c.is_continuation)
@@ -2743,7 +2739,7 @@ impl Term {
         let was_wide = self
             .active_grid()
             .row(row)
-            .cells
+            .cells()
             .get(usize::from(col) + 1)
             .is_some_and(|c| c.is_continuation);
         let grows = !was_wide
@@ -2791,7 +2787,7 @@ impl Term {
             hyperlink_id: None,
             extra: None,
         };
-        let cells = &self.active_grid().row(row).cells;
+        let cells = &self.active_grid().row(row).cells();
         let left_orphan = col > 0 && cells.get(col as usize).is_some_and(|c| c.is_continuation);
         let right_orphan = cells
             .get(last as usize + 1)
@@ -3429,12 +3425,12 @@ impl Term {
         let cols_u = cols as usize;
         let col_u = cur_col as usize;
         let n_u = n as usize;
-        if row.cells.len() < cols_u {
+        if row.cells().len() < cols_u {
             row.resize_cols(cols);
         }
         // Shift left. `cells` are `Copy`, so a plain copy_within is
         // both correct and overlap-safe.
-        row.cells.copy_within((col_u + n_u)..cols_u, col_u);
+        row.cells_mut().copy_within((col_u + n_u)..cols_u, col_u);
         // Blank the vacated tail under the current SGR (matches xterm /
         // ECMA-48 — the deleted-from-the-right slots use the active
         // attribute set, not Style::RESET).
@@ -3445,7 +3441,7 @@ impl Term {
             hyperlink_id: None,
             extra: None,
         };
-        for c in &mut row.cells[(cols_u - n_u)..cols_u] {
+        for c in &mut row.cells_mut()[(cols_u - n_u)..cols_u] {
             *c = blank;
         }
         self.mark_cells(cur_row, cur_col, cols);
@@ -3475,12 +3471,13 @@ impl Term {
         let cols_u = cols as usize;
         let col_u = cur_col as usize;
         let n_u = n as usize;
-        if row.cells.len() < cols_u {
+        if row.cells().len() < cols_u {
             row.resize_cols(cols);
         }
         // Shift right. copy_within handles overlap correctly even
         // when src/dst overlap.
-        row.cells.copy_within(col_u..(cols_u - n_u), col_u + n_u);
+        row.cells_mut()
+            .copy_within(col_u..(cols_u - n_u), col_u + n_u);
         let blank = Cell {
             ch: ' ',
             style,
@@ -3488,7 +3485,7 @@ impl Term {
             hyperlink_id: None,
             extra: None,
         };
-        for c in &mut row.cells[col_u..(col_u + n_u)] {
+        for c in &mut row.cells_mut()[col_u..(col_u + n_u)] {
             *c = blank;
         }
         self.mark_cells(cur_row, cur_col, cols);
@@ -3570,9 +3567,7 @@ impl Term {
         for r in cur_row..(cur_row + n) {
             let row = grid.row_mut(r);
             row.resize_cols(cols);
-            for c in &mut row.cells {
-                *c = blank;
-            }
+            row.fill(blank);
             row.soft_wrap = false;
             row.rich = None;
         }
@@ -3638,9 +3633,7 @@ impl Term {
         for r in (region_end - n)..region_end {
             let row = grid.row_mut(r);
             row.resize_cols(cols);
-            for c in &mut row.cells {
-                *c = blank;
-            }
+            row.fill(blank);
             row.soft_wrap = false;
             row.rich = None;
         }
@@ -6024,13 +6017,13 @@ fn wide_partner_selected(
     line_id: u64,
     col: u16,
 ) -> bool {
-    let Some(cell) = row.cells.get(usize::from(col)) else {
+    let Some(cell) = row.cells().get(usize::from(col)) else {
         return false;
     };
     if cell.is_continuation {
         col > 0 && sel.contains(line_id, col - 1)
     } else {
-        row.cells
+        row.cells()
             .get(usize::from(col) + 1)
             .is_some_and(|c| c.is_continuation)
             && sel.contains(line_id, col + 1)
@@ -6044,7 +6037,7 @@ fn wide_partner_selected(
 fn row_fingerprint(row: &crate::grid::Row) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    for c in &row.cells {
+    for c in row.cells() {
         c.ch.hash(&mut h);
         c.is_continuation.hash(&mut h);
     }
@@ -6074,7 +6067,7 @@ mod tests {
 
     /// Stringify a row, trimming trailing blanks.
     fn row_text(t: &Term, r: u16) -> String {
-        let mut s: String = t.row(r).cells.iter().map(|c| c.ch).collect();
+        let mut s: String = t.row(r).cells().iter().map(|c| c.ch).collect();
         while s.ends_with(' ') {
             s.pop();
         }
@@ -6129,7 +6122,7 @@ mod tests {
         // LF does not move to col 0 — that's CR's job. Cursor stayed at col 1.
         assert_eq!(t.cursor().col, 2);
         assert_eq!(t.cursor().row, 1);
-        assert_eq!(t.row(1).cells[1].ch, 'b');
+        assert_eq!(t.row(1).cells()[1].ch, 'b');
     }
 
     #[test]
@@ -6199,7 +6192,7 @@ mod tests {
             .primary
             .scrollback_row(n)
             .expect("scrollback row retained")
-            .cells
+            .cells()
             .iter()
             .map(|c| c.ch)
             .collect();
@@ -6283,7 +6276,7 @@ mod tests {
         t.scroll_view_by(3, 0.0, 16.0);
         t.force_snap_view();
         assert_eq!(t.view_offset_lines(), 3);
-        let top = |t: &Term| -> String { t.view_row(0).cells.iter().map(|c| c.ch).collect() };
+        let top = |t: &Term| -> String { t.view_row(0).cells().iter().map(|c| c.ch).collect() };
         let before = top(&t);
         assert!(before.starts_with('4'), "view top = {before:?}");
         feed(&mut t, b"\x1b[T");
@@ -6318,7 +6311,7 @@ mod tests {
         let t = run(3, 4, b"a\x0bb\x0cc");
         assert_eq!(row_text(&t, 0), "a");
         assert_eq!(row_text(&t, 1).trim_end(), " b");
-        assert_eq!(t.row(2).cells[2].ch, 'c');
+        assert_eq!(t.row(2).cells()[2].ch, 'c');
     }
 
     #[test]
@@ -6425,7 +6418,7 @@ mod tests {
         // `clear`'s full sequence, then new output builds fresh history.
         feed(&mut t, b"\x1b[H\x1b[2J\x1b[3Jnew\r\n\r\n\r\n\r\nx");
         assert_eq!(t.history_lines(), 1);
-        let first: String = t.view_row(0).cells.iter().map(|c| c.ch).collect();
+        let first: String = t.view_row(0).cells().iter().map(|c| c.ch).collect();
         assert!(first.trim_end().is_empty(), "{first:?}");
     }
 
@@ -6510,7 +6503,7 @@ mod tests {
         assert_eq!(row_text(&t, 0), "1mX");
         assert_eq!(row_text(&t, 1), "\u{FFFD}\u{FFFD}A");
         assert_eq!(row_text(&t, 2), "\u{FFFD}1mY");
-        let x = &t.row(0).cells[2];
+        let x = &t.row(0).cells()[2];
         assert_eq!(x.ch, 'X');
         assert_eq!(x.style.fg, crate::Color::Default, "SGR 31 was aborted");
     }
@@ -6583,14 +6576,14 @@ mod tests {
     fn sgr_single_param_sets_fg_color() {
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[31mr");
-        assert_eq!(t.row(0).cells[0].style.fg, Color::Red);
+        assert_eq!(t.row(0).cells()[0].style.fg, Color::Red);
     }
 
     #[test]
     fn sgr_multi_param_applies_in_order() {
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[1;3;31;44mx");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.fg, Color::Red);
         assert_eq!(s.bg, Color::Blue);
         assert!(s.flags.bold());
@@ -6601,29 +6594,29 @@ mod tests {
     fn sgr_reset_clears_everything() {
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[1;31mA\x1b[0mB");
-        assert!(t.row(0).cells[0].style.flags.bold());
-        assert_eq!(t.row(0).cells[1].style, Style::RESET);
+        assert!(t.row(0).cells()[0].style.flags.bold());
+        assert_eq!(t.row(0).cells()[1].style, Style::RESET);
     }
 
     #[test]
     fn sgr_empty_means_reset() {
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[1;31mA\x1b[mB");
-        assert_eq!(t.row(0).cells[1].style, Style::RESET);
+        assert_eq!(t.row(0).cells()[1].style, Style::RESET);
     }
 
     #[test]
     fn sgr_attribute_reset_codes() {
         let mut t = Term::new(1, 8, 0);
         feed(&mut t, b"\x1b[1;3;4;7mA\x1b[22;23;24;27mB");
-        let a = t.row(0).cells[0].style.flags;
+        let a = t.row(0).cells()[0].style.flags;
         assert_eq!(
             a,
             StyleFlags::EMPTY
                 .with(StyleFlags::BOLD | StyleFlags::ITALIC | StyleFlags::REVERSE)
                 .with_underline(UnderlineStyle::Single)
         );
-        let b = t.row(0).cells[1].style.flags;
+        let b = t.row(0).cells()[1].style.flags;
         assert_eq!(b, StyleFlags::default());
     }
 
@@ -6632,7 +6625,7 @@ mod tests {
     fn sgr_flags_after(bytes: &[u8], col: usize) -> StyleFlags {
         let mut t = Term::new(1, 16, 0);
         feed(&mut t, bytes);
-        t.row(0).cells[col].style.flags
+        t.row(0).cells()[col].style.flags
     }
 
     #[test]
@@ -6778,10 +6771,10 @@ mod tests {
             v.extend_from_slice(reset);
             v.push(b'B');
             feed(&mut t, &v);
-            let a = t.row(0).cells[0].style.flags;
+            let a = t.row(0).cells()[0].style.flags;
             assert_eq!(a.bits(), 0xFF, "every rendition bit set");
             assert_eq!(a.underline, UnderlineStyle::Double);
-            assert_eq!(t.row(0).cells[1].style, Style::RESET);
+            assert_eq!(t.row(0).cells()[1].style, Style::RESET);
         }
         // Reset mid-sequence, then set again.
         let f = sgr_flags_after(b"\x1b[2;9;0;53mx", 0);
@@ -6795,8 +6788,8 @@ mod tests {
         let mut t = Term::new(1, 8, 0);
         feed(&mut t, b"\x1b[8msecret\x1b[28m!");
         assert_eq!(row_text(&t, 0), "secret!");
-        assert!(t.row(0).cells[0].style.flags.hidden());
-        assert!(!t.row(0).cells[6].style.flags.hidden());
+        assert!(t.row(0).cells()[0].style.flags.hidden());
+        assert!(!t.row(0).cells()[6].style.flags.hidden());
     }
 
     #[test]
@@ -6808,7 +6801,7 @@ mod tests {
         // happened to land on.
         let mut t = Term::new(1, 20, 0);
         feed(&mut t, b"Internal\x1b[15Ginfra");
-        let cells = &t.row(0).cells;
+        let cells = &t.row(0).cells();
         assert_eq!(cells[0].ch, 'I');
         assert_eq!(cells[7].ch, 'l');
         // CHA jumped to column 15 (1-based) = index 14.
@@ -6816,7 +6809,7 @@ mod tests {
         assert_eq!(cells[18].ch, 'a');
         // Defaults: empty Ps and Ps=1 both mean column 1.
         feed(&mut t, b"\x1b[GX");
-        assert_eq!(t.row(0).cells[0].ch, 'X');
+        assert_eq!(t.row(0).cells()[0].ch, 'X');
     }
 
     #[test]
@@ -6827,7 +6820,7 @@ mod tests {
         // subsequent cell rendered with underline + dim.
         let mut t = Term::new(1, 2, 0);
         feed(&mut t, b"\x1b[>4;2mA");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.flags, StyleFlags::default());
     }
 
@@ -6835,11 +6828,11 @@ mod tests {
     fn sgr_bright_and_default_colors() {
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[91;104mA");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.fg, Color::BrightRed);
         assert_eq!(s.bg, Color::BrightBlue);
         feed(&mut t, b"\x1b[39;49mB");
-        let s = t.row(0).cells[1].style;
+        let s = t.row(0).cells()[1].style;
         assert_eq!(s.fg, Color::Default);
         assert_eq!(s.bg, Color::Default);
     }
@@ -6868,11 +6861,11 @@ mod tests {
         for (code, want) in pairs.iter().copied() {
             let mut t = Term::new(1, 1, 0);
             feed(&mut t, format!("\x1b[{code}mX").as_bytes());
-            assert_eq!(t.row(0).cells[0].style.fg, want, "fg code {code}");
+            assert_eq!(t.row(0).cells()[0].style.fg, want, "fg code {code}");
             let bg_code = code + 10;
             let mut t = Term::new(1, 1, 0);
             feed(&mut t, format!("\x1b[{bg_code}mX").as_bytes());
-            assert_eq!(t.row(0).cells[0].style.bg, want, "bg code {bg_code}");
+            assert_eq!(t.row(0).cells()[0].style.bg, want, "bg code {bg_code}");
         }
     }
 
@@ -6882,7 +6875,7 @@ mod tests {
         // it must not silently apply garbage to the style.
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[123mX");
-        assert_eq!(t.row(0).cells[0].style, Style::RESET);
+        assert_eq!(t.row(0).cells()[0].style, Style::RESET);
     }
 
     #[test]
@@ -6928,10 +6921,10 @@ mod tests {
         assert!(t.is_alt_active());
         feed(&mut t, b"TOP\r\n\r\nBOT"); // distinct top + bottom content
         let (rows, _) = t.size();
-        let top: String = t.view_row(0).cells.iter().map(|c| c.ch).collect();
+        let top: String = t.view_row(0).cells().iter().map(|c| c.ch).collect();
         assert!(top.starts_with("TOP"), "row 0 should hold the top text");
         // The row one past the bottom must NOT be a wrapped copy of row 0.
-        let past: String = t.view_row(rows).cells.iter().map(|c| c.ch).collect();
+        let past: String = t.view_row(rows).cells().iter().map(|c| c.ch).collect();
         assert!(
             past.trim_end().is_empty(),
             "view_row(rows) in alt mode must be blank, got {past:?}"
@@ -6953,7 +6946,7 @@ mod tests {
     fn unknown_decset_param_is_a_noop() {
         let mut t = Term::new(2, 4, 0);
         feed(&mut t, b"\x1b[?25hX");
-        assert_eq!(t.row(0).cells[0].ch, 'X');
+        assert_eq!(t.row(0).cells()[0].ch, 'X');
     }
 
     #[test]
@@ -7073,7 +7066,7 @@ mod tests {
         assert_eq!(t.cursor().col, 3);
         feed(&mut t, b"d");
         assert!(t.row(0).soft_wrap);
-        assert_eq!(t.row(1).cells[0].ch, 'd');
+        assert_eq!(t.row(1).cells()[0].ch, 'd');
     }
 
     #[test]
@@ -7501,7 +7494,7 @@ mod tests {
         // SGR after consuming it as the palette index.
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[38;5;42mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.fg, Color::Indexed256(42));
         // Critical: bg must still be Default. Under the broken parser bg
         // would be `Color::Green` because `42 - 40 = 2` triggers the 40..=47
@@ -7518,7 +7511,7 @@ mod tests {
         // would also set bg=BrightBlack. Neither must happen.
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[38;2;200;32;100mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.fg, Color::Rgb(200, 32, 100));
         assert_eq!(s.bg, Color::Default);
         // Sanity: even if a future bug made these flags persist, this
@@ -7530,7 +7523,7 @@ mod tests {
     fn sgr_256_bg_basic() {
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[48;5;1mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.bg, Color::Indexed256(1));
         assert_eq!(s.fg, Color::Default);
     }
@@ -7539,7 +7532,7 @@ mod tests {
     fn sgr_truecolor_bg_basic() {
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[48;2;10;20;30mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.bg, Color::Rgb(10, 20, 30));
         assert_eq!(s.fg, Color::Default);
     }
@@ -7552,7 +7545,7 @@ mod tests {
         let mut t = Term::new(1, 4, 0);
         // Start with a known fg so we can detect an accidental change.
         feed(&mut t, b"\x1b[31m\x1b[38;5mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         // fg is whatever the introducer left it as — either kept Red (good)
         // or reset to Default. Under the broken parser, `5` would land in
         // `apply_sgr_param(5)` (a no-op currently) but a future bug could
@@ -7571,7 +7564,7 @@ mod tests {
         // Establish a baseline: bold + red.
         feed(&mut t, b"\x1b[1;31m");
         feed(&mut t, b"\x1b[38;2;200;32mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         // Fg was Red; the truecolor sequence is incomplete — fg either
         // stays Red or becomes whatever the partial parse returned. In
         // our implementation it stays Red (Option::unwrap_or current fg).
@@ -7589,7 +7582,7 @@ mod tests {
         // bg = Default.
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[31;38;5;42;1mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.fg, Color::Indexed256(42));
         assert_eq!(s.bg, Color::Default);
         assert!(s.flags.bold());
@@ -7602,7 +7595,7 @@ mod tests {
         // parser must handle both.
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[38:5:42mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.fg, Color::Indexed256(42));
         assert_eq!(s.bg, Color::Default);
     }
@@ -7613,7 +7606,7 @@ mod tests {
         // must not leak.
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[38:2:200:32:100mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.fg, Color::Rgb(200, 32, 100));
         assert_eq!(s.bg, Color::Default);
     }
@@ -7624,7 +7617,7 @@ mod tests {
         // color-space identifier (here `1` — sRGB) must be skipped.
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[38:2:1:200:32:100mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.fg, Color::Rgb(200, 32, 100));
         assert_eq!(s.bg, Color::Default);
     }
@@ -7636,7 +7629,7 @@ mod tests {
         // SGR. Currently 9 is unhandled but we test the principle.
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[1;38;9;31mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         // Bold from before the introducer should stick.
         assert!(s.flags.bold());
         // The trailing `31` (red fg) must apply — the parser must have
@@ -7649,7 +7642,7 @@ mod tests {
         // `\x1b[39m` resets fg but leaves bg/flags alone.
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[1;31;44mA\x1b[39mB");
-        let s = t.row(0).cells[1].style;
+        let s = t.row(0).cells()[1].style;
         assert_eq!(s.fg, Color::Default);
         assert_eq!(s.bg, Color::Blue);
         assert!(s.flags.bold());
@@ -7662,7 +7655,7 @@ mod tests {
         // index 42 should NOT end up setting bg=Green or anything else.
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[58;5;42mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.fg, Color::Default);
         assert_eq!(s.bg, Color::Default);
         assert_eq!(s.flags, StyleFlags::default());
@@ -7672,7 +7665,7 @@ mod tests {
     fn sgr_underline_color_truecolor_is_consumed_and_ignored() {
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[58;2;200;32;100mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.fg, Color::Default);
         assert_eq!(s.bg, Color::Default);
         assert_eq!(s.flags, StyleFlags::default());
@@ -7683,7 +7676,7 @@ mod tests {
         // Mode 59 = default underline color. Must not panic / leak.
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[31;59mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.fg, Color::Red);
     }
 
@@ -7707,13 +7700,13 @@ mod tests {
             (7, Color::Default),
         ] {
             assert_eq!(
-                t.row(0).cells[i].style.fg,
+                t.row(0).cells()[i].style.fg,
                 want_fg,
                 "cell {i} fg differs (helix leak regression)",
             );
             // bg must always be Default in this scenario.
             assert_eq!(
-                t.row(0).cells[i].style.bg,
+                t.row(0).cells()[i].style.bg,
                 Color::Default,
                 "cell {i} bg accidentally non-default",
             );
@@ -7726,7 +7719,7 @@ mod tests {
         // state in the iterator).
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[38;2;1;2;3m\x1b[33mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.fg, Color::Yellow);
     }
 
@@ -7764,7 +7757,7 @@ mod tests {
         // Cover the colon-form `48` branch (top-level `bg = ...`).
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[48:5:1mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.bg, Color::Indexed256(1));
         assert_eq!(s.fg, Color::Default);
     }
@@ -7774,7 +7767,7 @@ mod tests {
         // Cover the colon-form `58` branch (top-level discard).
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[58:5:42mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.fg, Color::Default);
         assert_eq!(s.bg, Color::Default);
     }
@@ -7788,7 +7781,7 @@ mod tests {
         // codes back into the SGR walker.
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, b"\x1b[44m\x1b[48;9mX");
-        let s = t.row(0).cells[0].style;
+        let s = t.row(0).cells()[0].style;
         assert_eq!(s.bg, Color::Blue);
     }
 
@@ -8111,12 +8104,12 @@ mod tests {
         let mut t = Term::new(2, 8, 0);
         feed(&mut t, "你".as_bytes());
         let row = t.row(0);
-        assert_eq!(row.cells[0].ch, '你');
-        assert!(!row.cells[0].is_continuation);
-        assert!(row.cells[1].is_continuation);
-        assert_eq!(row.cells[1].ch, '\0');
+        assert_eq!(row.cells()[0].ch, '你');
+        assert!(!row.cells()[0].is_continuation);
+        assert!(row.cells()[1].is_continuation);
+        assert_eq!(row.cells()[1].ch, '\0');
         // Continuation inherits the style of the cluster's primary.
-        assert_eq!(row.cells[1].style, row.cells[0].style);
+        assert_eq!(row.cells()[1].style, row.cells()[0].style);
         assert_eq!(t.cursor().col, 2);
     }
 
@@ -8130,8 +8123,8 @@ mod tests {
         assert_eq!(t.cursor().col, 2);
         feed(&mut t, "你".as_bytes());
         // Wrap took effect: the wide cluster lands on row 1.
-        assert_eq!(t.row(1).cells[0].ch, '你');
-        assert!(t.row(1).cells[1].is_continuation);
+        assert_eq!(t.row(1).cells()[0].ch, '你');
+        assert!(t.row(1).cells()[1].is_continuation);
         // Row 0 marked soft-wrap.
         assert!(t.row(0).soft_wrap);
     }
@@ -8142,10 +8135,10 @@ mod tests {
         let mut t = Term::new(1, 4, 0);
         feed(&mut t, "你好".as_bytes());
         let row = t.row(0);
-        assert_eq!(row.cells[0].ch, '你');
-        assert!(row.cells[1].is_continuation);
-        assert_eq!(row.cells[2].ch, '好');
-        assert!(row.cells[3].is_continuation);
+        assert_eq!(row.cells()[0].ch, '你');
+        assert!(row.cells()[1].is_continuation);
+        assert_eq!(row.cells()[2].ch, '好');
+        assert!(row.cells()[3].is_continuation);
         // Cursor sits one past the last column (pending-wrap).
         assert_eq!(t.cursor().col, 4);
     }
@@ -8199,7 +8192,7 @@ mod tests {
             &mut t,
             b"\x08\x08\x1b[27m\xe4\xbd\xa0\x1b[27m\x1b[7m\xe4\xbd\xa0\x1b[27m\x1b[7m\x1b[27m",
         );
-        let cells = &t.view_row(0).cells;
+        let cells = &t.view_row(0).cells();
         // Prompt intact, 你你 at cols 2..6, never overwriting col 0/1.
         assert_eq!(cells[0].ch, '>');
         assert_eq!(cells[1].ch, ' ', "prompt space must not be clobbered");
@@ -8219,7 +8212,7 @@ mod tests {
         feed(&mut t, "你你".as_bytes());
         feed(&mut t, b"\x1b[1G"); // CHA col 1 (1-based) -> col 0
         feed(&mut t, b"x");
-        let cells = &t.view_row(0).cells;
+        let cells = &t.view_row(0).cells();
         assert_eq!(cells[0].ch, 'x');
         assert!(
             !cells[1].is_continuation,
@@ -8236,7 +8229,7 @@ mod tests {
         feed(&mut t2, "你".as_bytes());
         feed(&mut t2, b"\x1b[2G"); // CHA col 2 (1-based) -> col 1
         feed(&mut t2, b"x");
-        let cells2 = &t2.view_row(0).cells;
+        let cells2 = &t2.view_row(0).cells();
         assert_eq!(cells2[0].ch, ' ', "orphaned wide primary must be cleared");
         assert!(!cells2[0].is_continuation);
         assert_eq!(cells2[1].ch, 'x');
@@ -8744,7 +8737,7 @@ mod tests {
         assert!(parts[2].starts_with("\x1bP1+r73657472676266="));
         assert!(parts[3].starts_with("\x1bP1+r73657472676262="));
         // Nothing printed to the grid.
-        assert_eq!(t.row(0).cells[0].ch, ' ');
+        assert_eq!(t.row(0).cells()[0].ch, ' ');
     }
 
     #[test]
@@ -8759,7 +8752,7 @@ mod tests {
         assert!(reply.starts_with(b"\x1bP1$r"), "{reply:?}");
         // PM / SOS bodies ending in BEL print nothing.
         feed(&mut t, b"\x1b^hidden\x07\x1bXhidden\x07ok");
-        let row: String = t.row(0).cells.iter().map(|c| c.ch).collect();
+        let row: String = t.row(0).cells().iter().map(|c| c.ch).collect();
         assert_eq!(row.trim_end(), "ok");
     }
 
@@ -8821,7 +8814,7 @@ mod tests {
         assert_eq!(t.drain_pty_replies(), b"\x1bP0+r\x1b\\");
         // The terminal is back to normal afterwards.
         feed(&mut t, b"ok");
-        assert_eq!(t.row(0).cells[0].ch, 'o');
+        assert_eq!(t.row(0).cells()[0].ch, 'o');
         feed(&mut t, b"\x1bP+q5463\x1b\\");
         assert_eq!(t.drain_pty_replies(), b"\x1bP1+r5463\x1b\\");
     }
@@ -8881,7 +8874,7 @@ mod tests {
             b"\x1bP1;1|17/ab\x1b\\\x1bPtmux:x\x1b\\\x1bPtmuxx\x1b\\",
         );
         assert_eq!(t.drain_pty_replies(), b"");
-        assert_eq!(t.row(0).cells[0].ch, ' ');
+        assert_eq!(t.row(0).cells()[0].ch, ' ');
     }
 
     // ----- Sixel (DCS) ------------------------------------------------------
@@ -9254,10 +9247,10 @@ mod tests {
         let mut t = Term::new(2, 16, 0);
         feed(&mut t, b"\x1b]8;;https://example.com\x1b\\link");
         // First 4 cells must share the same non-None hyperlink id.
-        let id0 = t.row(0).cells[0].hyperlink_id;
+        let id0 = t.row(0).cells()[0].hyperlink_id;
         assert!(id0.is_some());
         for c in 0..4 {
-            assert_eq!(t.row(0).cells[c].hyperlink_id, id0);
+            assert_eq!(t.row(0).cells()[c].hyperlink_id, id0);
         }
         // Resolves back to the URL.
         let url = t.hyperlink_url(id0.unwrap()).unwrap();
@@ -9271,8 +9264,8 @@ mod tests {
             &mut t,
             b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\after",
         );
-        assert!(t.row(0).cells[0].hyperlink_id.is_some());
-        assert!(t.row(0).cells[4].hyperlink_id.is_none(), "after closer");
+        assert!(t.row(0).cells()[0].hyperlink_id.is_some());
+        assert!(t.row(0).cells()[4].hyperlink_id.is_none(), "after closer");
     }
 
     #[test]
@@ -9282,8 +9275,8 @@ mod tests {
         feed(&mut t, b"\x1b]8;;https://example.com\x1b\\b\x1b]8;;\x1b\\");
         // Both cells reference the same intern id (interning dedupes).
         assert_eq!(
-            t.row(0).cells[0].hyperlink_id,
-            t.row(0).cells[1].hyperlink_id,
+            t.row(0).cells()[0].hyperlink_id,
+            t.row(0).cells()[1].hyperlink_id,
         );
     }
 
@@ -9296,8 +9289,8 @@ mod tests {
         feed(&mut t, b"\x1b]8;id=a;https://x.com\x1b\\X\x1b]8;;\x1b\\");
         feed(&mut t, b"\x1b]8;id=b;https://x.com\x1b\\Y\x1b]8;;\x1b\\");
         assert_eq!(
-            t.row(0).cells[0].hyperlink_id,
-            t.row(0).cells[1].hyperlink_id,
+            t.row(0).cells()[0].hyperlink_id,
+            t.row(0).cells()[1].hyperlink_id,
         );
     }
 
@@ -9517,7 +9510,7 @@ mod tests {
             bytes.extend_from_slice("hello \u{41c} world".as_bytes());
             bytes.extend_from_slice(b"\x1b\\]");
             feed(&mut t, &bytes);
-            let row: String = t.row(0).cells.iter().map(|c| c.ch).collect();
+            let row: String = t.row(0).cells().iter().map(|c| c.ch).collect();
             assert_eq!(row.trim_end(), "[]", "intro {intro:x?}");
         }
         // A KGP command after a 0x9C-bearing non-G APC still works.
@@ -9966,8 +9959,8 @@ mod tests {
         assert_eq!(t.view_offset_lines(), 1);
         // view_row(0) is now scrollback row 0 ('a'); view_row(1) is
         // logical 0 ('b').
-        let r0: String = t.view_row(0).cells.iter().map(|c| c.ch).collect();
-        let r1: String = t.view_row(1).cells.iter().map(|c| c.ch).collect();
+        let r0: String = t.view_row(0).cells().iter().map(|c| c.ch).collect();
+        let r1: String = t.view_row(1).cells().iter().map(|c| c.ch).collect();
         assert!(r0.starts_with('a'));
         assert!(r1.starts_with('b'));
     }
@@ -9998,12 +9991,12 @@ mod tests {
         let offset_before = t.view_offset_lines();
         assert_eq!(offset_before, 1);
         // Capture what view_row(0) shows.
-        let before: String = t.view_row(0).cells.iter().map(|c| c.ch).collect();
+        let before: String = t.view_row(0).cells().iter().map(|c| c.ch).collect();
         // Now generate new output — view_offset should bump so the
         // user keeps seeing the same content.
         feed(&mut t, b"e\r\n");
         assert!(t.view_offset_lines() >= 2);
-        let after: String = t.view_row(0).cells.iter().map(|c| c.ch).collect();
+        let after: String = t.view_row(0).cells().iter().map(|c| c.ch).collect();
         assert_eq!(before, after);
     }
 
@@ -11308,7 +11301,7 @@ mod major_screen_tests {
         assert_eq!(t.cursor().style, Style::RESET);
         let row0 = t.view_row(0);
         assert!(
-            row0.cells.iter().all(|c| c.ch == ' '),
+            row0.cells().iter().all(|c| c.ch == ' '),
             "RIS must clear the screen"
         );
         assert_eq!(t.scroll_top, 0);
@@ -11341,7 +11334,7 @@ mod major_screen_tests {
         feed(&mut t, b"\x1b[2S"); // SU 2
 
         assert_eq!(first_row_range(&t), 1..3, "SU must shift placement up by 2");
-        let row3: String = t.view_row(3).cells.iter().map(|c| c.ch).collect();
+        let row3: String = t.view_row(3).cells().iter().map(|c| c.ch).collect();
         assert!(
             row3.starts_with("MARK"),
             "SU must scroll text up; row3={row3:?}"
@@ -11363,7 +11356,7 @@ mod major_screen_tests {
             3..5,
             "SD must shift placement down by 2"
         );
-        let row2: String = t.view_row(2).cells.iter().map(|c| c.ch).collect();
+        let row2: String = t.view_row(2).cells().iter().map(|c| c.ch).collect();
         assert!(
             row2.starts_with("TOP"),
             "SD must scroll text down; row2={row2:?}"
@@ -11463,7 +11456,7 @@ mod major_screen_tests {
         assert_eq!(first_row_range(&t), 4..6);
         feed(&mut t, b"\x1b[3;1H\x1b[2L"); // IL 2 at row 2
         assert_eq!(first_row_range(&t), 4..6, "image stays put");
-        assert_eq!(t.row(6).cells[2].ch, 'x', "text moved down by 2");
+        assert_eq!(t.row(6).cells()[2].ch, 'x', "text moved down by 2");
         assert_eq!(only_clip(&t), 0..2, "and is not clipped");
     }
 
@@ -11771,7 +11764,7 @@ mod minor_term_tests {
     /// Visible text of an alt- or primary-screen row, trailing blanks
     /// trimmed.
     fn screen_row(t: &Term, r: u16) -> String {
-        let s: String = t.row(r).cells.iter().map(|c| c.ch).collect();
+        let s: String = t.row(r).cells().iter().map(|c| c.ch).collect();
         s.trim_end().to_string()
     }
 
@@ -11998,7 +11991,7 @@ mod placement_model_tests {
     }
 
     fn row_text(t: &Term, r: u16) -> String {
-        let s: String = t.row(r).cells.iter().map(|c| c.ch).collect();
+        let s: String = t.row(r).cells().iter().map(|c| c.ch).collect();
         s.trim_end().to_string()
     }
 
@@ -12462,7 +12455,8 @@ mod placement_resize_tests {
             #[allow(clippy::cast_sign_loss)]
             let row = t.primary_row_by_line_id(p.line as u64).expect("retained");
             assert_eq!(
-                row.cells[10].ch, 'M',
+                row.cells()[10].ch,
+                'M',
                 "image still on its text ({new_rows} rows)"
             );
         }
@@ -12708,7 +12702,7 @@ mod placement_size_tests {
         place_px(&mut t, 200, 100, "");
         assert_eq!((t.cursor().row, t.cursor().col), (5 + 6 - 1 + 1, 0));
         feed(&mut t, b"Z");
-        assert_eq!(t.row(11).cells[0].ch, 'Z');
+        assert_eq!(t.row(11).cells()[0].ch, 'Z');
         // Not at the edge: one past the image, on its last row.
         let mut t = Term::new(24, 80, 0);
         t.set_cell_pixel_size(10, 19);

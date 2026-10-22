@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut out = std::io::stdout().lock();
     writeln!(out, "--- toastty-term grid ({rows}x{cols}) ---")?;
     for r in 0..rows {
-        let line: String = term.row(r).cells.iter().map(|c| c.ch).collect();
+        let line: String = term.row(r).cells().iter().map(|c| c.ch).collect();
         // Trim trailing blanks for legibility.
         writeln!(out, "{}", line.trim_end())?;
     }

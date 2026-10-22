@@ -246,7 +246,7 @@ pub fn cell_fills_bg(cell: &Cell) -> bool {
 #[inline]
 #[must_use]
 pub fn row_has_blink(row: &Row) -> bool {
-    row.cells
+    row.cells()
         .iter()
         .any(|c| c.style.flags.blink() && !c.style.flags.hidden())
 }
@@ -257,7 +257,7 @@ pub fn row_has_blink(row: &Row) -> bool {
 #[inline]
 #[must_use]
 fn row_is_solid(row: &Row, cols: u16) -> bool {
-    (0..cols as usize).all(|c| row.cells.get(c).is_some_and(cell_fills_bg))
+    (0..cols as usize).all(|c| row.cells().get(c).is_some_and(cell_fills_bg))
 }
 
 /// Slack (px) below which a sub-pixel uncovered strip at the content
@@ -1057,7 +1057,7 @@ pub fn build_instances_into_opts<F, S>(
                 ExtendCondition::SolidLine => row_is_solid(row, cols),
             };
         for c in 0..cols {
-            let Some(cell) = row.cells.get(c as usize) else {
+            let Some(cell) = row.cells().get(c as usize) else {
                 continue;
             };
 
@@ -1083,7 +1083,7 @@ pub fn build_instances_into_opts<F, S>(
             // columns so the continuation half isn't left showing the
             // previous frame / default bg.
             let is_wide = row
-                .cells
+                .cells()
                 .get(c as usize + 1)
                 .is_some_and(|next| next.is_continuation);
             let bg_w = if is_wide { 2.0 * cell_w } else { cell_w };
@@ -1332,7 +1332,7 @@ pub fn build_dirty_instances_into_opts<F, S>(
         };
 
         for c in dirty_cells {
-            let Some(cell) = row.cells.get(c as usize) else {
+            let Some(cell) = row.cells().get(c as usize) else {
                 continue;
             };
             // Continuation cells: the cluster's primary at c-1 already
@@ -1352,7 +1352,7 @@ pub fn build_dirty_instances_into_opts<F, S>(
             // columns so the continuation half isn't left showing the
             // previous frame / default bg.
             let is_wide = row
-                .cells
+                .cells()
                 .get(c as usize + 1)
                 .is_some_and(|next| next.is_continuation);
             let bg_w = if is_wide { 2.0 * cell_w } else { cell_w };

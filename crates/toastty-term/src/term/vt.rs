@@ -472,9 +472,7 @@ impl Term {
             row.resize_cols(cols);
             row.rich = None;
             row.soft_wrap = false;
-            for c in &mut row.cells {
-                *c = e;
-            }
+            row.fill(e);
         }
         self.scroll_top = 0;
         self.scroll_bot = rows.saturating_sub(1);
@@ -579,13 +577,13 @@ impl Term {
             let src: Vec<Cell> = {
                 let next = grid.row_mut(row + 1);
                 next.resize_cols(cols);
-                next.cells[usize::from(l)..=usize::from(r)].to_vec()
+                next.cells()[usize::from(l)..=usize::from(r)].to_vec()
             };
             let dst = grid.row_mut(row);
             dst.resize_cols(cols);
             dst.rich = None;
             dst.soft_wrap = false;
-            dst.cells[usize::from(l)..=usize::from(r)].copy_from_slice(&src);
+            dst.cells_mut()[usize::from(l)..=usize::from(r)].copy_from_slice(&src);
         }
         let last = grid.row_mut(bot);
         last.resize_cols(cols);
@@ -607,13 +605,13 @@ impl Term {
             let src: Vec<Cell> = {
                 let prev = grid.row_mut(row - 1);
                 prev.resize_cols(cols);
-                prev.cells[usize::from(l)..=usize::from(r)].to_vec()
+                prev.cells()[usize::from(l)..=usize::from(r)].to_vec()
             };
             let dst = grid.row_mut(row);
             dst.resize_cols(cols);
             dst.rich = None;
             dst.soft_wrap = false;
-            dst.cells[usize::from(l)..=usize::from(r)].copy_from_slice(&src);
+            dst.cells_mut()[usize::from(l)..=usize::from(r)].copy_from_slice(&src);
         }
         let first = grid.row_mut(top);
         first.resize_cols(cols);
@@ -645,7 +643,7 @@ mod tests {
     fn row_text(t: &Term, r: u16) -> String {
         let s: String = t
             .row(r)
-            .cells
+            .cells()
             .iter()
             .filter(|c| !c.is_continuation)
             .map(|c| c.ch)
@@ -983,7 +981,7 @@ mod tests {
     #[test]
     fn decawm_off_combining_mark_attaches_to_last_column() {
         let t = run(2, 3, "\x1b[?7labc\u{301}".as_bytes());
-        let cell = t.row(0).cells[2];
+        let cell = t.row(0).cells()[2];
         assert_eq!(cell.ch, 'c');
         assert!(cell.extra.is_some(), "accent joined the last cell");
     }

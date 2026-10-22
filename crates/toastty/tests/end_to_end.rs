@@ -57,7 +57,7 @@ fn pty_echo_drives_term_through_parser() {
     for r in 0..rows {
         let row = term.row(r);
         let s: String = row
-            .cells
+            .cells()
             .iter()
             .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
             .collect();

@@ -132,7 +132,7 @@ fn osc(md: &str) -> Vec<u8> {
 
 fn row_text(t: &Term, r: u16) -> String {
     t.row(r)
-        .cells
+        .cells()
         .iter()
         .filter(|c| !c.is_continuation)
         .map(|c| c.ch)
@@ -293,11 +293,11 @@ fn text_is_clipped_and_wide_chars_take_two_cells() {
     // third wide char doesn't fit in 4 columns and is clipped.
     feed(&mut t, &osc("日本語"));
     let r = t.row(0);
-    assert_eq!(r.cells[0].ch, '日');
-    assert!(r.cells[1].is_continuation);
-    assert_eq!(r.cells[2].ch, '本');
-    assert!(r.cells[3].is_continuation);
-    assert_eq!(r.cells.len(), 4);
+    assert_eq!(r.cells()[0].ch, '日');
+    assert!(r.cells()[1].is_continuation);
+    assert_eq!(r.cells()[2].ch, '本');
+    assert!(r.cells()[3].is_continuation);
+    assert_eq!(r.cells().len(), 4);
 }
 
 #[test]
@@ -432,13 +432,13 @@ fn links_become_hyperlinks() {
     feed(&mut t, b"\x1b]8;;https://first\x1b\\x\x1b]8;;\x1b\\\r\n");
     feed(&mut t, &osc("link:https://ex.com\nplain"));
     let r = t.row(1);
-    let id = r.cells[0].hyperlink_id.unwrap();
+    let id = r.cells()[0].hyperlink_id.unwrap();
     assert_eq!(t.hyperlink_url(id), Some("https://ex.com"));
-    assert!(r.cells[18].hyperlink_id.is_some());
-    assert!(r.cells[19].hyperlink_id.is_none());
-    assert!(t.row(2).cells[0].hyperlink_id.is_none());
+    assert!(r.cells()[18].hyperlink_id.is_some());
+    assert!(r.cells()[19].hyperlink_id.is_none());
+    assert!(t.row(2).cells()[0].hyperlink_id.is_none());
     // Shares the OSC 8 table (the earlier link keeps id 1).
-    let first = t.row(0).cells[0].hyperlink_id.unwrap();
+    let first = t.row(0).cells()[0].hyperlink_id.unwrap();
     assert_eq!(t.hyperlink_url(first), Some("https://first"));
     assert_ne!(first, id);
 }
@@ -465,7 +465,7 @@ fn all_lines(t: &Term) -> Vec<String> {
         .map(|id| {
             t.primary_row_by_line_id(id)
                 .unwrap()
-                .cells
+                .cells()
                 .iter()
                 .map(|c| c.ch)
                 .collect::<String>()
@@ -673,7 +673,7 @@ fn block_text_is_written_one_grapheme_cluster_per_cell() {
     let (mut t, _) = term(3, 20, 0);
     let line = "x\u{2764}\u{fe0f}y \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}z e\u{301}!\u{200b}.";
     feed(&mut t, &osc(line));
-    let cells = &t.row(0).cells;
+    let cells = &t.row(0).cells();
     let shape: Vec<(char, bool, &str)> = cells[..12]
         .iter()
         .map(|c| (c.ch, c.is_continuation, t.grapheme_tail(c)))
@@ -744,7 +744,7 @@ fn grapheme_tails_survive_resize_relayout() {
     feed(&mut t, &osc(line));
     let tails = |t: &Term, r: u16| -> Vec<String> {
         t.row(r)
-            .cells
+            .cells()
             .iter()
             .map(|c| t.grapheme_tail(c).to_owned())
             .filter(|s| !s.is_empty())
@@ -792,7 +792,7 @@ fn long_grapheme_tails_are_clipped_to_the_cap() {
     let text = format!("e{marks}x\u{2764}{}", "\u{fe0f}".repeat(30));
     let mut extras = crate::extra::ExtraTable::default();
     let rows = super::build_block_rows(&one_run(&text), 1, 10, &mut vec![], &mut extras);
-    let cells = &rows[0].cells;
+    let cells = &rows[0].cells();
     assert_eq!(cells[0].ch, 'e');
     let tail = extras.grapheme_tail(cells[0].extra);
     assert_eq!(tail.len(), crate::extra::MAX_GRAPHEME_EXTRA_BYTES);
@@ -815,7 +815,7 @@ fn wide_cluster_never_straddles_the_last_column() {
         &mut vec![],
         &mut extras,
     );
-    let cells = &rows[0].cells;
+    let cells = &rows[0].cells();
     assert_eq!(cells.len(), 10);
     assert_eq!(cells[8].ch, '9');
     assert_eq!(
@@ -831,7 +831,7 @@ fn wide_cluster_never_straddles_the_last_column() {
         &mut vec![],
         &mut extras,
     );
-    let cells = &rows[0].cells;
+    let cells = &rows[0].cells();
     assert_eq!(cells[8].ch, '\u{2764}');
     assert_eq!(extras.grapheme_tail(cells[8].extra), "\u{fe0f}");
     assert!(cells[9].is_continuation);

@@ -100,19 +100,19 @@ pub(crate) fn build_block_rows(
                     ))
                 };
                 // Don't leave half of a wide char behind.
-                if row.cells[col].is_continuation && col > 0 {
-                    row.cells[col - 1] = Cell::BLANK;
+                if row.cells()[col].is_continuation && col > 0 {
+                    row.cells_mut()[col - 1] = Cell::BLANK;
                 }
-                if w == 1 && row.cells.get(col + 1).is_some_and(|c| c.is_continuation) {
-                    row.cells[col + 1] = Cell::BLANK;
+                if w == 1 && row.cells().get(col + 1).is_some_and(|c| c.is_continuation) {
+                    row.cells_mut()[col + 1] = Cell::BLANK;
                 }
-                row.cells[col] = Cell {
+                row.cells_mut()[col] = Cell {
                     ch,
                     extra,
                     ..Cell::BLANK
                 };
                 if w == 2 {
-                    row.cells[col + 1] = Cell {
+                    row.cells_mut()[col + 1] = Cell {
                         ch: '\0',
                         is_continuation: true,
                         ..Cell::BLANK
@@ -134,7 +134,7 @@ pub(crate) fn build_block_rows(
         };
         let end = (link.cols.end as usize).min(width);
         for c in (link.cols.start as usize).min(end)..end {
-            row.cells[c].hyperlink_id = Some(id);
+            row.cells_mut()[c].hyperlink_id = Some(id);
         }
     }
     rows

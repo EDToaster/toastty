@@ -125,7 +125,7 @@ pub(crate) fn render_term_offscreen(term: &Term, width: u32, height: u32) -> Rgb
     for r in 0..rows {
         let row = term.row(r);
         let line_text: String = row
-            .cells
+            .cells()
             .iter()
             .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
             .collect();

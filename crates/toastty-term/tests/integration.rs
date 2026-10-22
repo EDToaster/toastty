@@ -13,7 +13,7 @@ fn run(rows: u16, cols: u16, bytes: &[u8]) -> Term {
 }
 
 fn row_text(t: &Term, r: u16) -> String {
-    let mut s: String = t.row(r).cells.iter().map(|c| c.ch).collect();
+    let mut s: String = t.row(r).cells().iter().map(|c| c.ch).collect();
     while s.ends_with(' ') {
         s.pop();
     }
@@ -44,7 +44,7 @@ fn cup_with_only_row_specified_homes_column() {
     // `CSI 3 H` — row 3 col 1 (column defaults).
     let bytes = b"...\x1b[3HZ";
     let t = run(5, 4, bytes);
-    assert_eq!(t.row(2).cells[0].ch, 'Z');
+    assert_eq!(t.row(2).cells()[0].ch, 'Z');
 }
 
 #[test]
@@ -410,12 +410,12 @@ mod selection {
         assert!(!t.is_cell_selected(pos_for(&t, 0, 0).line_id, 0));
         // Row lookup addresses the alt grid while it's active…
         let row = t.row_by_line_id(id).unwrap();
-        assert_eq!(row.cells[0].ch, 'a');
+        assert_eq!(row.cells()[0].ch, 'a');
         // …and the primary accessor still reaches the primary grid.
         assert_eq!(
             t.primary_row_by_line_id(pos_for(&t, 0, 0).line_id)
                 .unwrap()
-                .cells[0]
+                .cells()[0]
                 .ch,
             'p'
         );

@@ -165,7 +165,7 @@ impl Harness {
             }
             let row = term.row(r);
             let line_text: String = row
-                .cells
+                .cells()
                 .iter()
                 .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
                 .collect();
@@ -291,7 +291,7 @@ impl Harness {
             }
             let row = term.row(r);
             let line_text: String = row
-                .cells
+                .cells()
                 .iter()
                 .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
                 .collect();
