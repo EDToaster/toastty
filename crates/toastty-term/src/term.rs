@@ -8637,10 +8637,25 @@ mod tests {
             sixel.push(cancel);
             feed(&mut t, &sixel);
             assert_eq!(t.image_grid().iter().count(), 0, "{cancel:#x}: no image");
+            // CAN / SUB in a separate read (one parser across reads).
+            let mut p = Parser::new();
+            p.advance(&mut t, b"\x1bP$qm");
+            p.advance(&mut t, &[cancel]);
+            assert!(t.drain_pty_replies().is_empty(), "{cancel:#x}: split");
+            // tmux-wrapped, cut off by CAN / SUB in a separate read: the
+            // passthrough is cancelled too, so nothing is answered.
+            let mut p = Parser::new();
+            p.advance(&mut t, b"\x1bPtmux;\x1b\x1bP$qm");
+            p.advance(&mut t, &[cancel]);
+            assert!(t.drain_pty_replies().is_empty(), "{cancel:#x}: tmux");
             // The next DCS works normally.
             feed(&mut t, b"\x1bP$qm\x1b\\");
             let reply = t.drain_pty_replies();
             assert!(reply.starts_with(b"\x1bP1$r"), "{cancel:#x}");
+            // Control: the same tmux-wrapped query, finished, is answered.
+            feed(&mut t, b"\x1bPtmux;\x1b\x1bP$qm\x1b\x1b\\\x1b\\");
+            let reply = t.drain_pty_replies();
+            assert!(reply.starts_with(b"\x1bP1$r"), "{cancel:#x}: tmux control");
             feed(&mut t, SIXEL_3X6);
             assert_eq!(t.image_grid().iter().count(), 1, "{cancel:#x}");
         }

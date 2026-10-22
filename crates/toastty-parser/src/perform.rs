@@ -31,6 +31,11 @@ pub trait Perform {
     /// terminator), so a handler that acts on `unhook` (a query reply, a
     /// sixel) must drop what it buffered here. Called just before that
     /// `unhook`.
+    ///
+    /// It can also fire with no matching [`Self::hook`] / `unhook` at
+    /// all: a CAN before the DCS's final byte (`ESC P $ CAN`) cancels a
+    /// DCS vte never hooked. Treat it as "drop whatever DCS state you
+    /// have", which is a no-op when there is none.
     fn dcs_cancel(&mut self) {}
 
     /// Beginning of an APC payload (`ESC _`). The header parameters
