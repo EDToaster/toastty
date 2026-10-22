@@ -1448,10 +1448,10 @@ impl Toastty {
 
     /// Re-parse the watched config file and either apply it (clearing
     /// any banner) or surface the error in the banner without
-    /// touching live state.
-    fn reload_config(&mut self) {
+    /// touching live state. Returns whether the new config was applied.
+    fn reload_config(&mut self) -> bool {
         let Some(path) = self.config_path.clone() else {
-            return;
+            return false;
         };
         if !path.exists() {
             // File was deleted: keep running with current settings,
@@ -1461,7 +1461,7 @@ impl Toastty {
                 "config file missing: {}\n(continuing with previous settings; recreate or restart)",
                 path.display()
             )));
-            return;
+            return false;
         }
         match Config::load_from_path(&path) {
             Ok(cfg) => {
@@ -1477,10 +1477,12 @@ impl Toastty {
                 self.apply_config_to_runtime();
                 self.set_banner(None);
                 info!("config reloaded from {}", path.display());
+                true
             }
             Err(e) => {
                 warn!("config reload failed: {e}");
                 self.set_banner_from_error(&e);
+                false
             }
         }
     }
@@ -1538,7 +1540,9 @@ impl Toastty {
             .as_deref()
             .and_then(std::path::Path::parent);
         let paths = shader_files::resolve_paths(&self.config.shader.paths, base);
-        if paths != self.shader_paths {
+        // Also retry a watcher that couldn't be installed (e.g. the
+        // shader directory didn't exist yet).
+        if paths != self.shader_paths || (self.shader_watcher.is_none() && !paths.is_empty()) {
             self.shader_watcher = self
                 .event_proxy
                 .clone()
@@ -3354,12 +3358,10 @@ impl Toastty {
                 if let Some(r) = self.renderer.as_mut() {
                     r.set_focused(focused);
                 }
-                if self.post_frame_pending() {
-                    return ControlSignal::RedrawIn(Duration::ZERO);
-                }
                 // Modifier state is unreliable across a focus change
                 // (the release may go to another window).
-                if !focused && self.clear_link_hover() {
+                let hover_cleared = !focused && self.clear_link_hover();
+                if hover_cleared || self.post_frame_pending() {
                     return ControlSignal::RedrawIn(Duration::ZERO);
                 }
                 ControlSignal::Continue
@@ -3443,10 +3445,11 @@ impl Toastty {
                     .shader_watcher
                     .as_ref()
                     .is_some_and(ShaderWatcher::take_pending);
-                if should_reload {
-                    // Reloading the config re-reads the shaders too.
-                    self.reload_config();
-                } else if shaders_changed {
+                // An applied config reload re-reads the shaders too; a
+                // failed one doesn't, so the shader change still needs
+                // its own reload.
+                let applied = should_reload && self.reload_config();
+                if shaders_changed && !applied {
                     self.apply_shaders(true);
                 }
                 if should_reload || shaders_changed {
