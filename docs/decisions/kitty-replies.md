@@ -17,7 +17,8 @@ shell's input as typed text (APP-1).
   kitty:
   - `z`, `H` and `V` are signed. A signed key takes a magnitude that fits
     32 bits and wraps into `i32`, so `z=2147483648` is accepted.
-  - `m`, `q`, `a`, `t`, `o` and `d` are enums.
+  - `a`, `t`, `o` and `d` are enums. `q` and `m` are numbers: `q=2` and
+    above are silent, any non-zero `m=` means more chunks.
   - Every other key is an unsigned 32-bit number with decimal digits only.
 - **`C=` and `U=` are numbers.** `a=c` uses `C=` as its blend mode, so
   `C=2` must parse. `Header::cursor_no_move` means `C=1`.
