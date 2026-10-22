@@ -45,7 +45,9 @@ use raw_window_handle::{
 use thiserror::Error;
 use tracing::{debug, trace, warn};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, Ime, KeyEvent, MouseScrollDelta, TouchPhase, WindowEvent};
+use winit::event::{
+    ElementState, Ime, KeyEvent, MouseScrollDelta, StartCause, TouchPhase, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey as WNamedKey, PhysicalKey as WPhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
@@ -263,11 +265,87 @@ pub fn run<A: App>(options: WindowOptions, mut app: A) -> Result<(), WindowError
         proxy,
         app: &mut app,
         last_status: ControlSignal::Continue,
+        redraw_at: None,
     };
 
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop.run_app(&mut runner)?;
     Ok(())
+}
+
+/// The event-loop control flow [`schedule`] picks (winit's
+/// `ControlFlow`, plus exit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Wait,
+    WaitUntil(Instant),
+    Poll,
+    Exit,
+}
+
+/// What the loop does after an app callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Plan {
+    flow: Flow,
+    /// Request a redraw now.
+    redraw_now: bool,
+    /// The scheduled redraw still pending afterwards.
+    redraw_at: Option<Instant>,
+}
+
+/// Turn the app's answer to an event into a [`Plan`].
+///
+/// - `RedrawIn(0)` redraws at once.
+/// - `RedrawIn(d)` sleeps until `now + d`; `new_events` requests the
+///   redraw when the deadline passes. Requesting it now as well would
+///   redraw at once and, since the redraw handler schedules the next
+///   deadline, spin the loop for as long as a deadline is pending (a
+///   blinking cursor cost ~50% of a core).
+/// - The redraw handler's answer (`is_redraw`) sets the pending deadline,
+///   later or earlier. Other events can only bring it forward, and a
+///   `Continue` from them keeps it, so mouse motion or a key release
+///   doesn't cancel a pending cursor blink.
+fn schedule(sig: ControlSignal, is_redraw: bool, redraw_at: Option<Instant>, now: Instant) -> Plan {
+    match sig {
+        ControlSignal::Exit => Plan {
+            flow: Flow::Exit,
+            redraw_now: false,
+            redraw_at,
+        },
+        ControlSignal::Continue => {
+            let redraw_at = if is_redraw { None } else { redraw_at };
+            Plan {
+                flow: redraw_at.map_or(Flow::Wait, Flow::WaitUntil),
+                redraw_now: false,
+                redraw_at,
+            }
+        }
+        // Duration::ZERO means "wake immediately" — under
+        // ControlFlow::WaitUntil(now), winit's EventLoopWaker re-arms
+        // the CFRunLoopTimer every iteration because Instant::now()
+        // advances each call, defeating its deadline dedup. Profile
+        // showed ~20% of main-thread time in
+        // CFRunLoopTimerSetNextFireDate. ControlFlow::Poll dedups
+        // against a fixed past instant inside EventLoopWaker::start, so
+        // the arm happens once and subsequent iterations short-circuit.
+        ControlSignal::RedrawIn(d) if d.is_zero() => Plan {
+            flow: Flow::Poll,
+            redraw_now: true,
+            redraw_at,
+        },
+        ControlSignal::RedrawIn(d) => {
+            let at = now.checked_add(d).unwrap_or(now);
+            let at = match redraw_at {
+                Some(prev) if !is_redraw => prev.min(at),
+                _ => at,
+            };
+            Plan {
+                flow: Flow::WaitUntil(at),
+                redraw_now: false,
+                redraw_at: Some(at),
+            }
+        }
+    }
 }
 
 /// Internal driver — implements winit's `ApplicationHandler`.
@@ -279,39 +357,33 @@ struct Runner<'a, A: App> {
     proxy: EventLoopProxy<UserEvent>,
     app: &'a mut A,
     last_status: ControlSignal,
+    /// When the next scheduled redraw is due (from a
+    /// `ControlSignal::RedrawIn`), if any.
+    redraw_at: Option<Instant>,
 }
 
 impl<A: App> Runner<'_, A> {
     fn dispatch(&mut self, ev: Event, event_loop: &ActiveEventLoop) {
+        let is_redraw = matches!(ev, Event::Redraw);
         let sig = self.app.event(ev);
         self.last_status = sig;
-        self.apply_control(sig, event_loop);
+        self.apply_control(sig, is_redraw, event_loop);
     }
 
-    fn apply_control(&mut self, sig: ControlSignal, event_loop: &ActiveEventLoop) {
-        match sig {
-            ControlSignal::Continue => event_loop.set_control_flow(ControlFlow::Wait),
-            ControlSignal::Exit => event_loop.exit(),
-            ControlSignal::RedrawIn(d) => {
-                // Duration::ZERO means "wake immediately" — under
-                // ControlFlow::WaitUntil(now), winit's EventLoopWaker
-                // re-arms the CFRunLoopTimer every iteration because
-                // Instant::now() advances each call, defeating its
-                // deadline dedup. Profile showed ~20% of main-thread
-                // time in CFRunLoopTimerSetNextFireDate.
-                // ControlFlow::Poll dedups against a fixed past
-                // instant inside EventLoopWaker::start, so the arm
-                // happens once and subsequent iterations short-circuit.
-                if d.is_zero() {
-                    event_loop.set_control_flow(ControlFlow::Poll);
-                } else {
-                    let deadline = Instant::now().checked_add(d).unwrap_or_else(Instant::now);
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-                }
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
-            }
+    /// Apply the app's answer to an event (see [`schedule`]).
+    fn apply_control(&mut self, sig: ControlSignal, is_redraw: bool, event_loop: &ActiveEventLoop) {
+        let plan = schedule(sig, is_redraw, self.redraw_at, Instant::now());
+        self.redraw_at = plan.redraw_at;
+        match plan.flow {
+            Flow::Exit => event_loop.exit(),
+            Flow::Wait => event_loop.set_control_flow(ControlFlow::Wait),
+            Flow::WaitUntil(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            Flow::Poll => event_loop.set_control_flow(ControlFlow::Poll),
+        }
+        if plan.redraw_now
+            && let Some(w) = &self.window
+        {
+            w.request_redraw();
         }
     }
 
@@ -491,6 +563,18 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<'_, A> {
             UserEvent::PtyClosed => Event::PtyClosed,
         };
         self.dispatch(mapped, event_loop);
+    }
+
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        // A `RedrawIn` deadline passed: redraw now. The redraw handler
+        // schedules the next one.
+        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            self.redraw_at = None;
+            event_loop.set_control_flow(ControlFlow::Wait);
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
@@ -899,6 +983,70 @@ mod tests {
             PhysicalKey::Code(s) => assert_eq!(s, "KeyA"),
             PhysicalKey::Unidentified => panic!("expected Code, got Unidentified"),
         }
+    }
+
+    // ---- PERF-1: redraw deadlines --------------------------------------
+
+    fn ms(n: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(n)
+    }
+
+    #[test]
+    fn redraw_in_sleeps_until_the_deadline_without_redrawing_now() {
+        // The bug: RedrawIn(d) also redrew at once, so the redraw handler
+        // (which answers RedrawIn(next blink)) ran back to back.
+        let now = Instant::now();
+        let plan = schedule(ControlSignal::RedrawIn(ms(500)), true, None, now);
+        assert_eq!(
+            plan,
+            Plan {
+                flow: Flow::WaitUntil(now + ms(500)),
+                redraw_now: false,
+                redraw_at: Some(now + ms(500)),
+            }
+        );
+    }
+
+    #[test]
+    fn redraw_in_zero_redraws_at_once() {
+        let now = Instant::now();
+        let pending = Some(now + ms(300));
+        let plan = schedule(ControlSignal::RedrawIn(ms(0)), false, pending, now);
+        assert_eq!(plan.flow, Flow::Poll);
+        assert!(plan.redraw_now);
+        assert_eq!(plan.redraw_at, pending);
+    }
+
+    #[test]
+    fn other_events_keep_a_pending_deadline() {
+        // Mouse motion answers Continue: the blink deadline must survive.
+        let now = Instant::now();
+        let pending = Some(now + ms(300));
+        let plan = schedule(ControlSignal::Continue, false, pending, now);
+        assert_eq!(plan.flow, Flow::WaitUntil(now + ms(300)));
+        assert_eq!(plan.redraw_at, pending);
+        assert!(!plan.redraw_now);
+        // They can bring it forward, not push it back.
+        let plan = schedule(ControlSignal::RedrawIn(ms(100)), false, pending, now);
+        assert_eq!(plan.redraw_at, Some(now + ms(100)));
+        let plan = schedule(ControlSignal::RedrawIn(ms(900)), false, pending, now);
+        assert_eq!(plan.redraw_at, pending);
+    }
+
+    #[test]
+    fn the_redraw_handler_sets_or_clears_the_deadline() {
+        let now = Instant::now();
+        let pending = Some(now + ms(100));
+        // A later deadline from the redraw handler replaces the old one.
+        let plan = schedule(ControlSignal::RedrawIn(ms(500)), true, pending, now);
+        assert_eq!(plan.redraw_at, Some(now + ms(500)));
+        // Continue from the redraw handler: nothing scheduled, sleep.
+        let plan = schedule(ControlSignal::Continue, true, pending, now);
+        assert_eq!((plan.flow, plan.redraw_at), (Flow::Wait, None));
+        assert_eq!(
+            schedule(ControlSignal::Exit, false, pending, now).flow,
+            Flow::Exit
+        );
     }
 
     #[test]
