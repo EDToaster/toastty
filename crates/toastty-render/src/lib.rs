@@ -2957,7 +2957,6 @@ impl Renderer {
                 crate::image::placeholder::build_placeholder_instances(
                     &mut tmp,
                     term,
-                    &self.image_tex_cache,
                     cell_size,
                     crate::image::placeholder::RowLayout {
                         rows_rendered: crate::text::instance::rows_to_render(

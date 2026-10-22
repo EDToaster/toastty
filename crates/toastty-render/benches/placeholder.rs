@@ -16,7 +16,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use toastty_graphics::KittySink;
 use toastty_parser::Parser;
-use toastty_render::image::atlas::{ImageTexEntry, ImageTextureCache};
 use toastty_render::image::placeholder::{RowLayout, build_placeholder_instances};
 use toastty_term::{ImageData, Term, VirtualPlacement};
 
@@ -29,7 +28,7 @@ fn diacritic(i: usize) -> char {
     toastty_graphics::kitty::placeholder::index_to_diacritic(u16::try_from(i).unwrap()).unwrap()
 }
 
-fn setup(placements: u32) -> (Term, ImageTextureCache) {
+fn setup(placements: u32) -> Term {
     let mut t = Term::new(ROWS, COLS, 0);
     let data = ImageData {
         width: 400,
@@ -49,17 +48,7 @@ fn setup(placements: u32) -> (Term, ImageTextureCache) {
             },
         );
     }
-    let mut cache = ImageTextureCache::new(4);
-    cache.insert(
-        42,
-        ImageTexEntry {
-            texture_index: 0,
-            width: 400,
-            height: 240,
-            content_hash: 0,
-        },
-    );
-    (t, cache)
+    t
 }
 
 fn feed(t: &mut Term, s: &str) {
@@ -73,7 +62,7 @@ fn bench(c: &mut Criterion) {
     };
 
     // One full-screen image.
-    let (mut t, cache) = setup(1);
+    let mut t = setup(1);
     let mut s = String::from("\x1b[H\x1b[38;5;42m");
     for r in 0..usize::from(ROWS) {
         for col in 0..usize::from(COLS) {
@@ -87,14 +76,14 @@ fn bench(c: &mut Criterion) {
     c.bench_function("image_200x60", |b| {
         b.iter(|| {
             out.clear();
-            build_placeholder_instances(&mut out, &t, &cache, CELL, layout, None);
+            build_placeholder_instances(&mut out, &t, CELL, layout, None);
             assert_eq!(out.len(), 1);
         });
     });
 
     // Hostile: 4096 placements, every cell a separate run naming a
     // placement id (underline colour 58;2;1;0;0 = 65536) that does not exist.
-    let (mut t, cache) = setup(4096);
+    let mut t = setup(4096);
     let mut s = String::from("\x1b[H\x1b[38;5;42m\x1b[58;2;1;0;0m");
     for r in 0..usize::from(ROWS) {
         for _ in 0..COLS {
@@ -107,7 +96,7 @@ fn bench(c: &mut Criterion) {
     c.bench_function("hostile_runs_4096_placements", |b| {
         b.iter(|| {
             out.clear();
-            build_placeholder_instances(&mut out, &t, &cache, CELL, layout, None);
+            build_placeholder_instances(&mut out, &t, CELL, layout, None);
             assert!(out.is_empty());
         });
     });

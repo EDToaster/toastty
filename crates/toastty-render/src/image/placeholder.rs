@@ -19,8 +19,7 @@ use std::collections::HashMap;
 
 use toastty_term::{Damage, PlaceholderRun, Term, placeholder_slice};
 
-use super::atlas::ImageTextureCache;
-use super::instance::ImageInstance;
+use super::instance::{ImageInstance, UNRESOLVED_TEXTURE};
 
 /// Where the rendered rows sit, as the text builders lay them out.
 #[derive(Debug, Clone, Copy)]
@@ -45,7 +44,6 @@ pub struct RowLayout {
 pub fn build_placeholder_instances(
     out: &mut Vec<ImageInstance>,
     term: &Term,
-    cache: &ImageTextureCache,
     cell: (f32, f32),
     layout: RowLayout,
     damage: Option<&Damage>,
@@ -68,8 +66,7 @@ pub fn build_placeholder_instances(
             let Some(vp) = term.resolve_placeholder(run) else {
                 continue;
             };
-            let (Some(image), Some(entry)) = (registry.get(run.image_id), cache.get(run.image_id))
-            else {
+            let Some(image) = registry.get(run.image_id) else {
                 continue;
             };
             pieces.clear();
@@ -89,13 +86,13 @@ pub fn build_placeholder_instances(
                 ) else {
                     continue;
                 };
-                #[allow(clippy::cast_possible_truncation)]
                 let inst = ImageInstance {
                     pos: [f32::from(col) * cell.0 + s.dst_pos[0], row_y + s.dst_pos[1]],
                     size: s.dst_size,
                     uv_min: s.uv_min,
                     uv_max: s.uv_max,
-                    texture_index: entry.texture_index as u32,
+                    // Bound by `ImagePipeline::resolve_kitty_textures`.
+                    texture_index: UNRESOLVED_TEXTURE,
                     z: vp.z,
                     image_id: run.image_id,
                     _pad: [0; 1],
@@ -149,11 +146,10 @@ fn dirty_pieces(damage: &Damage, r: u16, col: u16, len: u16, out: &mut Vec<(u16,
 }
 
 /// Everything two vertically adjacent instances must share to merge:
-/// the same texture, z and id, and bit-identical x extent in both screen
-/// and image space (they come from the same columns of the same box).
+/// the same image and z, and bit-identical x extent in both screen and
+/// image space (they come from the same columns of the same box).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct MergeKey {
-    texture_index: u32,
     z: i32,
     image_id: u32,
     x: [u32; 4],
@@ -162,7 +158,6 @@ struct MergeKey {
 impl MergeKey {
     fn of(i: &ImageInstance) -> Self {
         Self {
-            texture_index: i.texture_index,
             z: i.z,
             image_id: i.image_id,
             x: [
@@ -187,7 +182,6 @@ fn extends(prev: &ImageInstance, next: &ImageInstance) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image::atlas::ImageTexEntry;
     use toastty_graphics::KittySink;
     use toastty_term::{ImageData, RowDamage, VirtualPlacement};
 
@@ -204,9 +198,9 @@ mod tests {
         p.advance(t, bytes);
     }
 
-    /// 8×12 term with a 200×100 image `id` (texture slot 3) behind a
-    /// `cols × rows` virtual placement.
-    fn setup(id: u32, cols: u32, rows: u32) -> (Term, ImageTextureCache) {
+    /// 8×12 term with a 200×100 image `id` behind a `cols × rows`
+    /// virtual placement.
+    fn setup(id: u32, cols: u32, rows: u32) -> Term {
         let mut t = Term::new(8, 12, 0);
         let data = ImageData {
             width: 200,
@@ -224,17 +218,7 @@ mod tests {
                 z: 0,
             },
         );
-        let mut cache = ImageTextureCache::new(4);
-        cache.insert(
-            id,
-            ImageTexEntry {
-                texture_index: 3,
-                width: 200,
-                height: 100,
-                content_hash: 0,
-            },
-        );
-        (t, cache)
+        t
     }
 
     /// Print a `rows × cols` block of image `id` (8-bit fg) at the top.
@@ -252,9 +236,9 @@ mod tests {
         feed(t, s.as_bytes());
     }
 
-    fn build(t: &Term, cache: &ImageTextureCache, damage: Option<&Damage>) -> Vec<ImageInstance> {
+    fn build(t: &Term, damage: Option<&Damage>) -> Vec<ImageInstance> {
         let mut out = Vec::new();
-        build_placeholder_instances(&mut out, t, cache, CELL, LAYOUT, damage);
+        build_placeholder_instances(&mut out, t, CELL, LAYOUT, damage);
         out
     }
 
@@ -276,24 +260,27 @@ mod tests {
         // PH-2 / PH-3: a 200×100 image in a 6×5-cell box (60×100 px)
         // fits to 60×30, centred at y = 35..65. The rows above and below
         // stay blank and the visible rows merge into one draw.
-        let (mut t, cache) = setup(42, 6, 5);
+        let mut t = setup(42, 6, 5);
         print_block(&mut t, 42, 5, 6);
-        let out = build(&t, &cache, None);
+        let out = build(&t, None);
         assert_eq!(out.len(), 1, "{out:?}");
         let i = out[0];
         assert!(approx(i.pos, [0.0, 35.0]), "{:?}", i.pos);
         assert!(approx(i.size, [60.0, 30.0]), "{:?}", i.size);
         assert!(approx(i.uv_min, [0.0, 0.0]) && approx(i.uv_max, [1.0, 1.0]));
-        assert_eq!(i.texture_index, 3);
+        assert_eq!(
+            i.texture_index, UNRESOLVED_TEXTURE,
+            "bound later, by resolve"
+        );
     }
 
     #[test]
     fn text_over_the_cells_cuts_the_image() {
         // PH-1: overwrite two cells of row 2; the image there is gone.
-        let (mut t, cache) = setup(42, 6, 5);
+        let mut t = setup(42, 6, 5);
         print_block(&mut t, 42, 5, 6);
         feed(&mut t, b"\x1b[3;3Hab");
-        let out = build(&t, &cache, None);
+        let out = build(&t, None);
         // Row 2 splits into cols 0..2 and 4..6; rows 1 and 3 merge with
         // neither (different x extent), so 4 instances.
         assert_eq!(out.len(), 4, "{out:?}");
@@ -305,20 +292,16 @@ mod tests {
     }
 
     #[test]
-    fn nothing_without_a_texture_or_placement() {
-        let (mut t, _) = setup(42, 6, 5);
-        print_block(&mut t, 42, 5, 6);
-        // The texture isn't resident yet.
-        assert!(build(&t, &ImageTextureCache::new(4), None).is_empty());
-        // Cells of another image with no virtual placement (PH-9).
-        let (mut t, cache) = setup(42, 6, 5);
+    fn nothing_without_a_virtual_placement() {
+        // Cells of an image with no virtual placement (PH-9).
+        let mut t = setup(42, 6, 5);
         print_block(&mut t, 43, 5, 6);
-        assert!(build(&t, &cache, None).is_empty());
+        assert!(build(&t, None).is_empty());
     }
 
     #[test]
     fn partial_frames_draw_only_dirty_cells() {
-        let (mut t, cache) = setup(42, 6, 5);
+        let mut t = setup(42, 6, 5);
         print_block(&mut t, 42, 5, 6);
         let mut d = Damage::new(8);
         d.clear();
@@ -326,31 +309,31 @@ mod tests {
         d.rows[2].mark(2);
         d.rows[2].mark(3);
         d.rows[2].mark(5);
-        let out = build(&t, &cache, Some(&d));
+        let out = build(&t, Some(&d));
         assert_eq!(out.len(), 2, "{out:?}");
         assert!(approx(out[0].pos, [20.0, 40.0]) && approx(out[0].size, [20.0, 20.0]));
         assert!(approx(out[1].pos, [50.0, 40.0]) && approx(out[1].size, [10.0, 20.0]));
         // A clean frame draws nothing.
         d.rows[2].clear();
-        assert!(build(&t, &cache, Some(&d)).is_empty());
+        assert!(build(&t, Some(&d)).is_empty());
     }
 
     #[test]
     fn rows_follow_the_view_translation() {
-        let (mut t, cache) = setup(42, 6, 5);
+        let mut t = setup(42, 6, 5);
         print_block(&mut t, 42, 5, 6);
         let mut out = Vec::new();
         let layout = RowLayout {
             rows_rendered: 8,
             y_translate: -7.0,
         };
-        build_placeholder_instances(&mut out, &t, &cache, CELL, layout, None);
+        build_placeholder_instances(&mut out, &t, CELL, layout, None);
         assert!(approx(out[0].pos, [0.0, 28.0]), "{:?}", out[0].pos);
     }
 
     #[test]
     fn instances_are_sorted_by_z_with_existing_ones() {
-        let (mut t, cache) = setup(42, 6, 5);
+        let mut t = setup(42, 6, 5);
         print_block(&mut t, 42, 5, 6);
         let other = ImageInstance {
             pos: [0.0; 2],
@@ -363,7 +346,7 @@ mod tests {
             _pad: [0],
         };
         let mut out = vec![other];
-        build_placeholder_instances(&mut out, &t, &cache, CELL, LAYOUT, None);
+        build_placeholder_instances(&mut out, &t, CELL, LAYOUT, None);
         assert_eq!(out.len(), 2);
         assert_eq!(
             (out[0].image_id, out[1].image_id),
