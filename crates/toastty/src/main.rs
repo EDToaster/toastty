@@ -1533,7 +1533,10 @@ impl Toastty {
     /// editors that save by rename briefly remove it, and the
     /// re-create fires another reload.
     fn apply_shaders(&mut self, from_watcher: bool) {
-        let base = self.config_path.as_deref().and_then(std::path::Path::parent);
+        let base = self
+            .config_path
+            .as_deref()
+            .and_then(std::path::Path::parent);
         let paths = shader_files::resolve_paths(&self.config.shader.paths, base);
         if paths != self.shader_paths {
             self.shader_watcher = self
