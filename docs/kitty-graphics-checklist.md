@@ -545,7 +545,7 @@ Done in #28. See
 
 ## 5. Placement, cursor and image lifetime
 
-- [ ] **P0 — PLC-1. `a=p` on an unknown or freed id replies OK.**
+- [x] **P0 — PLC-1. `a=p` on an unknown or freed id replies OK.**
   - Repro: `K send a=p,i=143999 --reply 0.5`.
   - Expected (spec): ENOENT. kitty replies
     `i=143999;ENOENT:Put command refers to non-existent image …`, and still
@@ -556,6 +556,10 @@ Done in #28. See
     it.
   - Cause: `handle_place` (`handler.rs:623-700`) never calls
     `sink.image_exists`.
+  - Fixed in #37. `a=p` resolves the image first and replies kitty's
+    `ENOENT:Put command refers to non-existent image with id: N and
+    number: M` (sent with `q=1`, silent with `q=2`), with no placement and
+    no cursor move. Same with `p=`, `U=1`, and after the image is freed.
 - [ ] **P1 — PLC-2. Re-transmitting an existing id keeps its placements,
   which then show the new pixels.**
   - Repro: `a=T,i=1` red, then `a=t,i=1` blue.
@@ -566,12 +570,16 @@ Done in #28. See
     shows two copies.
   - Cause: `register_image` (`term.rs:4591-4650`) replaces the registry entry
     without dropping that id's placements.
-- [ ] **P1 — PLC-3. `a=p,I=N` is rejected with EINVAL.**
+- [x] **P1 — PLC-3. `a=p,I=N` is rejected with EINVAL.**
   - Expected (spec): commands that use an image number act on the newest
     image with that number. kitty replies `i=2,I=144;OK`.
   - Actual: `I=144;EINVAL:place requires i=`.
   - Cause: `handler.rs:624-626`. `Term` already keeps an
     `image_number_to_id` map, but uses it only for `d=n`.
+  - Fixed in #37. `a=p,I=N` places the newest stored image numbered N
+    and replies `i=<id>,I=N;OK`. If that image is freed, the next newest
+    with the number takes over, as in kitty (`Term::image_number_to_id`
+    is now `HashMap<u32, Vec<u32>>`).
 - [ ] **P1 — PLC-4. Anonymous images get small ids other clients can
   address.**
   - Repro: an anonymous `a=T`, then another program sends `a=t,i=1` or
@@ -604,7 +612,7 @@ Every `d=` selector and its uppercase form removed the same placements as
 kitty, with the same keep/free behaviour and no leftover pixels. The
 remaining gaps:
 
-- [ ] **P1 — DEL-1. `a=d` sends a reply.**
+- [x] **P1 — DEL-1. `a=d` sends a reply.**
   - Repro: `K send a=d,d=i,i=148 --reply 0.5`. The same happens for ids that
     don't exist.
   - Expected: kitty never replies to deletes, even with `i=` and `q=0`.
@@ -612,6 +620,8 @@ remaining gaps:
   - Clients that don't read replies get those bytes on stdin, where readline
     turns them into garbage on the prompt.
   - Cause: `handle_delete` (`handler.rs:704-707`).
+  - Fixed in #37. `a=d` never replies. Both `i=` and `I=` is still
+    EINVAL, as in kitty.
 - [x] **P2 — DEL-2. `d=F` is a no-op.**
   - Expected: kitty deletes and frees a single-frame image. `d=f` is a no-op
     in both.
@@ -772,7 +782,7 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
   - Cause: `handler.rs:519-533`.
   - Implement it with `shm_open`/`mmap`/`shm_unlink` (rustix has these),
     after the SEC-1–SEC-3 fixes.
-- [ ] **P0 — WIRE-3 (= APP-1). Animation commands without `q=` get ENOTSUP
+- [x] **P0 — WIRE-3 (= APP-1). Animation commands without `q=` get ENOTSUP
   replies that get injected into the shell.**
   - Repro: `kitten icat anim.gif`, then type `echo hello` and press Enter.
   - What happens: icat sends `a=f` frames with `q=2`, but its three `a=a`
@@ -785,6 +795,11 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
   - Cause: `handler.rs:261-267`.
   - Short-term fix: accept `a=a`/`a=c` silently while showing the first
     frame. Long-term: implement animation (§9).
+  - Fixed in #37. Until animation lands (§9), `a=f`/`a=a`/`a=c` on a
+    stored image are silent no-ops; `kitten icat anim.gif` shows the first
+    frame and nothing reaches the shell. Divergence until then: kitty
+    answers `a=f` without `q=` with `i=N,r=<frame>;OK`, and `a=c` with
+    frame-composition errors.
 - [ ] **P2 — WIRE-4. Base64 is decoded over the joined buffer, not per
   chunk.**
   - Repro: chunks each padded with `=` (`…m=1;AQIDBA==` then `m=0;BQY=`).
@@ -821,15 +836,23 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
     kitty 0.49.2 treats CAN, SUB and an ESC not followed by `\` as data
     and keeps going to ST or BEL (checked live). toastty ends the string
     on them, as xterm and vte do.
-- [ ] **P2 — WIRE-6. Malformed headers get an EINVAL reply; kitty stays
+- [x] **P2 — WIRE-6. Malformed headers get an EINVAL reply; kitty stays
   silent.**
-  - Cases: `s=abc`, `s=`, `q=3`, `m=2`, `a=X`, `t=x`, `o=y`, `x=-5`,
-    `z=2147483648`.
+  - Cases: `s=abc`, `s=`, `a=X`, `t=x`, `o=y`, `x=-5`. (Re-measured for
+    #37: `q=3` and `m=2` are not malformed in kitty — `q=` and `m=` are
+    numbers, `q=3` stores the image silently and `m=2` means `m=1` — and
+    `z=2147483648` is accepted.)
   - The comment at `emit_bad_header_einval` (`handler.rs:922`) says kitty
     replies EINVAL here. kitty 0.49.2 doesn't.
   - Pick one and document it. Replying is defensible, but it is more
     injected stdin (DEL-1).
-- [ ] **P2 — WIRE-7. Error codes and validation differ from kitty.**
+  - Fixed in #37 (PM decision: match kitty). A malformed header gets no
+    reply. The parser is now kitty's: unknown keys, whitespace, empty or
+    trailing `,` pairs, `+`/hex/overflowing numbers and bad enum values
+    are malformed. Re-measured: kitty does accept `z=2147483648` (signed
+    keys take a 32-bit magnitude and wrap), and so do we now; an unknown
+    `f=` number is a reply-worthy `EINVAL:Unknown image format: N`.
+- [x] **P2 — WIRE-7. Error codes and validation differ from kitty.**
 
   | Case | toastty | kitty |
   |---|---|---|
@@ -841,11 +864,26 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
   | `a=q` with empty body | OK | `EINVAL:Zero width/height` |
   | `a=q` with only `I=` | `I=150;OK` | silent |
   | Failure with only `I=` | `I=156;EINVAL…` | `i=4,I=156;ENODATA…` (allocates an id) |
+  - Fixed in #37, byte-for-byte against kitty 0.49.2:
+    `ENODATA:Insufficient image data: GOT < EXPECTED`, `EFBIG:Too much
+    data` (more than 10 bytes past `s*v*bpp`; up to 10 extra is OK),
+    `EBADPNG:Not a PNG file` / `…truncated…`, `EINVAL:Zero width/height
+    not allowed`, `EINVAL:Failed to inflate image data with error:
+    Z_BUF_ERROR|Z_DATA_ERROR`, `EINVAL:Image data size post inflation does
+    not match expected size` (also for `f=100,o=z` without `S=`, which the
+    spec requires), `EINVAL:Must not specify both image id and image
+    number`. `a=q` replies only with `i=`; an empty `a=q` is validated like
+    any other. A failed `I=`-only transmit reports the id it would get
+    (`i=N,I=M;…`). Remaining divergence: kitty writes `I=`-only error
+    replies with a stray leading comma (`\x1b_G,I=999;…`); we omit it.
 
-- [ ] **P2 — WIRE-8. `q=` on continuation chunks is ignored.**
+- [x] **P2 — WIRE-8. `q=` on continuation chunks is ignored.**
   - Actual: toastty uses the first chunk's `q`, so a `q=2` sent only on the
     final chunk still gets `i=60;OK`. kitty stays silent.
   - Cause: `handler.rs:383-397`.
+  - Fixed in #37. A non-zero `q=` on any continuation chunk applies to
+    the upload (the latest wins; `q=0` can't lower it), matching kitty on
+    all seven measured cases.
 - [ ] **P2 — WIRE-9. Abandoned-upload state corrupts later commands.**
   - Cases:
     - A bare `m=0` after an abandoned upload completes it with EINVAL.
@@ -867,9 +905,12 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
       `EFBIG:pending overflow`.
     - kitty accepts both.
   - Cause: `handler.rs:383-388, 403-405`. The cap counts base64 bytes.
-- [ ] **P2 — WIRE-12. Animation and composition reply ENOTSUP even for ids
+- [x] **P2 — WIRE-12. Animation and composition reply ENOTSUP even for ids
   that don't exist.**
   - Expected: kitty replies ENOENT.
+  - Fixed in #37. `a=f`/`a=a`/`a=c` on an image that isn't stored reply
+    kitty's `ENOENT:Animation command refers to non-existent image with
+    id: N and number: M`; with neither `i=` nor `I=` they are silent.
 
 ## 9. Not implemented
 
@@ -882,8 +923,10 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
     doesn't need it.
   - Note `Header`'s key overloading for animation (`c`, `r`, `x`, `y`, `z`,
     `X`, `Y`, `s`, `v` mean different things under `a=f/a/c`).
-  - `a=c,C=2` currently fails header parsing (`C` is parsed as a bool),
-    giving EINVAL instead of ENOTSUP.
+  - `a=c,C=2` used to fail header parsing (`C` was parsed as a bool),
+    giving EINVAL instead of ENOTSUP. Fixed in #37: `C` is a number, and
+    `Header::frame()`, `Header::animation()` and `Header::composition()` give
+    the animation meaning of the overloaded keys.
 - [ ] **P1 — Shared-memory transmission** (`t=s`). See WIRE-2.
 - [ ] **P2 — Usage hints** (`N=1` transient).
   - The key is accepted and ignored, which the spec allows.

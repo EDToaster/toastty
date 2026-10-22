@@ -5162,6 +5162,15 @@ impl KittySink for Term {
         self.image_registry.contains(id)
     }
 
+    fn image_id_for_number(&self, number: u32) -> Option<u32> {
+        self.newest_image_for_number(number)
+            .filter(|id| self.image_registry.contains(*id))
+    }
+
+    fn next_image_id(&self) -> u32 {
+        self.image_registry.next_free_id()
+    }
+
     fn image_dimensions(&self, id: u32) -> Option<(u32, u32)> {
         self.image_registry
             .get(id)
@@ -8720,12 +8729,94 @@ mod tests {
     }
 
     #[test]
-    fn apc_kitty_animate_replies_enotsup() {
+    fn apc_kitty_animation_replies_like_kitty() {
         let mut t = Term::new(2, 4, 0);
+        // WIRE-12: unknown image → ENOENT.
         feed(&mut t, b"\x1b_Ga=a,i=1\x1b\\");
-        let replies = t.drain_pty_replies();
-        let s = String::from_utf8_lossy(&replies);
-        assert!(s.contains("ENOTSUP"), "got {s:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&t.drain_pty_replies()),
+            "\x1b_Gi=1;ENOENT:Animation command refers to non-existent image with id: 1 and number: 0\x1b\\"
+        );
+        // WIRE-3: stored image → silent no-op (kitten icat's `a=a`
+        // commands carry no `q=`).
+        let mut payload = b"\x1b_Ga=t,f=32,s=1,v=1,i=1,q=2;".to_vec();
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\\x1b_Ga=a,i=1,s=3,v=1\x1b\\\x1b_Ga=c,i=1,C=2\x1b\\");
+        feed(&mut t, &payload);
+        assert!(t.drain_pty_replies().is_empty());
+        assert!(t.image_registry().contains(1));
+    }
+
+    /// Review of #37: re-sending an image by `i=` keeps its number and its
+    /// age (kitty). `I=300` twice (ids 1, 2), re-send id 1, free the
+    /// newest with `d=N`: `a=p,I=300` still finds id 1.
+    #[test]
+    fn apc_kitty_resent_image_keeps_its_number() {
+        let mut t = Term::new(8, 20, 0);
+        let px = String::from_utf8(b64_red_1x1()).unwrap();
+        let mut payload = Vec::new();
+        for header in ["a=t,f=32,s=1,v=1,I=300,q=2", "a=t,f=32,s=1,v=1,I=300,q=2", "a=t,f=32,s=1,v=1,i=1,q=2"] {
+            payload.extend_from_slice(format!("\x1b_G{header};{px}\x1b\\").as_bytes());
+        }
+        payload.extend_from_slice(b"\x1b_Ga=d,d=N,I=300\x1b\\\x1b_Ga=p,I=300,C=1\x1b\\");
+        feed(&mut t, &payload);
+        assert_eq!(
+            String::from_utf8_lossy(&t.drain_pty_replies()),
+            "\x1b_Gi=1,I=300;OK\x1b\\"
+        );
+    }
+
+    /// PLC-1 / PLC-3 / DEL-1 round trip through `Term`.
+    #[test]
+    fn apc_kitty_place_and_delete_replies_like_kitty() {
+        let mut t = Term::new(8, 20, 0);
+        // PLC-1: unknown id → ENOENT, no placement, cursor stays.
+        feed(&mut t, b"\x1b_Ga=p,i=77,q=1\x1b\\");
+        assert_eq!(
+            String::from_utf8_lossy(&t.drain_pty_replies()),
+            "\x1b_Gi=77;ENOENT:Put command refers to non-existent image with id: 77 and number: 0\x1b\\"
+        );
+        assert_eq!((t.cursor().row, t.cursor().col), (0, 0));
+        assert_eq!(t.image_grid().len(), 0);
+        // PLC-3: two images numbered 144 → `a=p,I=144` places the newest.
+        let mut payload = Vec::new();
+        for _ in 0..2 {
+            payload.extend_from_slice(b"\x1b_Ga=t,f=32,s=1,v=1,I=144;");
+            payload.extend_from_slice(&b64_red_1x1());
+            payload.extend_from_slice(b"\x1b\\");
+        }
+        payload.extend_from_slice(b"\x1b_Ga=p,I=144,C=1\x1b\\");
+        feed(&mut t, &payload);
+        assert_eq!(
+            String::from_utf8_lossy(&t.drain_pty_replies()),
+            "\x1b_Gi=1,I=144;OK\x1b\\\x1b_Gi=2,I=144;OK\x1b\\\x1b_Gi=2,I=144;OK\x1b\\"
+        );
+        assert_eq!(t.image_grid().len(), 1);
+        // WIRE-7: an `I=`-only failure reports the id the registry would
+        // assign next (kitty: `i=3,I=156;ENODATA:…`).
+        let mut payload = b"\x1b_Ga=t,f=32,s=2,v=2,I=156;".to_vec();
+        payload.extend_from_slice(&b64_red_1x1());
+        payload.extend_from_slice(b"\x1b\\");
+        feed(&mut t, &payload);
+        assert_eq!(
+            String::from_utf8_lossy(&t.drain_pty_replies()),
+            "\x1b_Gi=3,I=156;ENODATA:Insufficient image data: 4 < 16\x1b\\"
+        );
+        // DEL-1: deletes never reply. Freeing the newest image numbered
+        // 144 makes the older one the target again (kitty: `i=1,I=990`).
+        feed(&mut t, b"\x1b_Ga=d,d=I,i=2\x1b\\\x1b_Ga=d,d=i,i=999\x1b\\");
+        assert!(t.drain_pty_replies().is_empty());
+        feed(&mut t, b"\x1b_Ga=p,I=144,C=1\x1b\\");
+        assert_eq!(
+            String::from_utf8_lossy(&t.drain_pty_replies()),
+            "\x1b_Gi=1,I=144;OK\x1b\\"
+        );
+        // Once both are freed, ENOENT.
+        feed(&mut t, b"\x1b_Ga=d,d=I,i=1\x1b\\\x1b_Ga=p,I=144\x1b\\");
+        assert_eq!(
+            String::from_utf8_lossy(&t.drain_pty_replies()),
+            "\x1b_GI=144;ENOENT:Put command refers to non-existent image with id: 0 and number: 144\x1b\\"
+        );
     }
 
     /// Regression: placing an image taller than the rows remaining
@@ -9925,7 +10016,7 @@ mod major_delete_tests {
     // ---- M11: d=n / d=N by image NUMBER ----
 
     #[test]
-    fn m11_delete_n_targets_newest_image_with_number() {
+    fn m11_delete_n_targets_newest_image_for_number() {
         // Two images share image-number I=7. Per the B8 rule a transmit
         // can't carry both `i=` and `I=`, so the terminal assigns ids:
         // auto-assign yields id 1 (older) then id 2 (newer).

@@ -15,7 +15,7 @@
 pub enum ErrorCode {
     /// Invalid input (bad parameter combo, dimension mismatch).
     Einval,
-    /// I/O failure (couldn't read file, bad PNG decode).
+    /// I/O failure (couldn't read a file).
     Ebadf,
     /// Referenced image doesn't exist.
     Enoent,
@@ -23,6 +23,11 @@ pub enum ErrorCode {
     Enotsup,
     /// Image too large to fit under the memory cap.
     Efbig,
+    /// Not enough image data for the declared size
+    /// (`ENODATA:Insufficient image data: GOT < EXPECTED`).
+    Enodata,
+    /// PNG data could not be decoded.
+    Ebadpng,
     /// Decoded image would exceed the image quota (kitty's reply to an
     /// oversized PNG, checked on the IHDR before decoding).
     Enomem,
@@ -46,6 +51,8 @@ impl ErrorCode {
             ErrorCode::Enotsup => "ENOTSUP",
             ErrorCode::Efbig => "EFBIG",
             ErrorCode::Enomem => "ENOMEM",
+            ErrorCode::Enodata => "ENODATA",
+            ErrorCode::Ebadpng => "EBADPNG",
             ErrorCode::Enoparent => "ENOPARENT",
             ErrorCode::Ecycle => "ECYCLE",
             ErrorCode::Etoodeep => "ETOODEEP",
