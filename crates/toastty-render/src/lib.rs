@@ -39,7 +39,7 @@ use thiserror::Error;
 use toastty_protocols::unicode_core::cluster_cell_width;
 use toastty_term::Term;
 use wgpu::{
-    BackendOptions, Backends, CompositeAlphaMode, Device, DeviceDescriptor, Instance,
+    Adapter, BackendOptions, Backends, CompositeAlphaMode, Device, DeviceDescriptor, Instance,
     InstanceDescriptor, InstanceFlags, MemoryBudgetThresholds, PowerPreference, PresentMode, Queue,
     RequestAdapterOptions, Surface, SurfaceConfiguration, TextureFormat, TextureUsages,
 };
@@ -235,6 +235,19 @@ fn normalize_preedit(text: Option<&str>) -> Option<String> {
 /// snapshot tests deterministic across machines.
 const BUNDLED_FONT: &[u8] = include_bytes!("../fonts/FiraMono-Medium.ttf");
 
+pub use crate::text::glyph_rasterizer::LoadedFonts;
+
+/// Load the font database [`Renderer::with_font_ex`] would build for
+/// `font_name` (system fonts plus the bundled fallback; `None` means the
+/// bundled Fira Mono).
+///
+/// Needs no window or device, so the binary calls it on a worker thread
+/// during startup and hands the result to [`Renderer::with_loaded_fonts`].
+#[must_use]
+pub fn load_fonts(font_name: Option<&str>) -> LoadedFonts {
+    LoadedFonts::load(Some(font_name.unwrap_or("Fira Mono")), Some(BUNDLED_FONT))
+}
+
 /// Default font pixel size for the demo and snapshot tests.
 pub const DEFAULT_FONT_SIZE_PX: f32 = 16.0;
 
@@ -308,6 +321,137 @@ pub fn instance_descriptor(flags: InstanceFlags) -> InstanceDescriptor {
         backend_options: BackendOptions::default(),
         memory_budget_thresholds: MemoryBudgetThresholds::default(),
         display: None,
+    }
+}
+
+/// Instance flags `Renderer` uses: validation in this crate's tests, off
+/// otherwise.
+fn renderer_instance_flags() -> InstanceFlags {
+    if cfg!(test) {
+        instance_flags_for_tests()
+    } else {
+        instance_flags_for_release()
+    }
+}
+
+fn log_adapter(adapter: &Adapter) {
+    let info = adapter.get_info();
+    tracing::info!(
+        target: "render_trace",
+        "wgpu adapter: name={:?} backend={:?} device_type={:?} vendor=0x{:04x} device=0x{:04x}",
+        info.name, info.backend, info.device_type, info.vendor, info.device,
+    );
+}
+
+/// Request the renderer's device from `adapter`. The limits depend only on
+/// the adapter, not on any surface.
+async fn request_device(adapter: &Adapter) -> Result<(Device, Queue), RenderError> {
+    Ok(adapter
+        .request_device(&DeviceDescriptor {
+            label: Some("toastty-render device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            memory_hints: wgpu::MemoryHints::Performance,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            trace: wgpu::Trace::Off,
+        })
+        .await?)
+}
+
+/// Pick an adapter that can present to `surface` and open its device.
+async fn open_for_surface(
+    instance: &Instance,
+    surface: &Surface<'_>,
+) -> Result<(Adapter, Device, Queue), RenderError> {
+    let adapter = instance
+        .request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::LowPower, // power-friendly
+            force_fallback_adapter: false,
+            compatible_surface: Some(surface),
+        })
+        .await
+        .map_err(|_| RenderError::NoAdapter)?;
+    log_adapter(&adapter);
+    let (device, queue) = request_device(&adapter).await?;
+    Ok((adapter, device, queue))
+}
+
+/// Create `window`'s surface and the device to render it with: `gpu`'s
+/// adapter and device when it can present to the surface, otherwise an
+/// adapter picked for the surface (see [`Renderer::with_gpu`]).
+async fn surface_and_device<W>(
+    gpu: Option<GpuContext>,
+    window: W,
+) -> Result<(Surface<'static>, Adapter, Device, Queue), RenderError>
+where
+    W: HasDisplayHandle + HasWindowHandle + Send + Sync + 'static,
+{
+    // create_surface takes `impl Into<SurfaceTarget>`. A `&'static W`
+    // that impls `HasDisplayHandle + HasWindowHandle + Send + Sync` is
+    // accepted via the blanket `From<T> for SurfaceTarget` impl.
+    let Some(gpu) = gpu else {
+        let instance = Instance::new(instance_descriptor(renderer_instance_flags()));
+        let surface = instance.create_surface(window)?;
+        let (adapter, device, queue) = open_for_surface(&instance, &surface).await?;
+        return Ok((surface, adapter, device, queue));
+    };
+    let surface = gpu.instance.create_surface(window)?;
+    if gpu.adapter.is_surface_supported(&surface) {
+        log_adapter(&gpu.adapter);
+        return Ok((surface, gpu.adapter, gpu.device, gpu.queue));
+    }
+    tracing::info!("pre-selected GPU adapter can't present to the window; selecting another");
+    let GpuContext {
+        instance,
+        adapter,
+        device,
+        queue,
+    } = gpu;
+    // Release the unusable device before opening another.
+    drop((adapter, device, queue));
+    let (adapter, device, queue) = open_for_surface(&instance, &surface).await?;
+    Ok((surface, adapter, device, queue))
+}
+
+/// The window-independent part of renderer setup: the wgpu instance, an
+/// adapter and its device.
+///
+/// Creating these is ~20 ms of startup (loading and initialising the
+/// Vulkan driver, mostly) and none of it needs the window, so the binary
+/// builds one on a worker thread while winit opens the display and the
+/// window, then passes it to [`Renderer::with_gpu`]. The adapter is chosen
+/// without a surface; `with_gpu` checks that it can present to the
+/// window's surface and re-selects one exactly as [`Renderer::new`] does
+/// when it can't (e.g. a multi-GPU machine whose low-power GPU doesn't
+/// drive the display).
+#[derive(Debug)]
+pub struct GpuContext {
+    instance: Instance,
+    adapter: Adapter,
+    device: Device,
+    queue: Queue,
+}
+
+impl GpuContext {
+    /// Create the instance, pick the adapter [`Renderer::new`] would prefer
+    /// (low power, no surface filter yet) and open its device.
+    pub async fn new() -> Result<Self, RenderError> {
+        let instance = Instance::new(instance_descriptor(renderer_instance_flags()));
+        let adapter = instance
+            .request_adapter(&RequestAdapterOptions {
+                power_preference: PowerPreference::LowPower,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .await
+            .map_err(|_| RenderError::NoAdapter)?;
+        let (device, queue) = request_device(&adapter).await?;
+        Ok(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+        })
     }
 }
 
@@ -955,45 +1099,26 @@ impl Renderer {
     where
         W: HasDisplayHandle + HasWindowHandle + Send + Sync + 'static,
     {
-        let flags = if cfg!(test) {
-            instance_flags_for_tests()
-        } else {
-            instance_flags_for_release()
-        };
+        Self::with_gpu(None, window, size, vsync, transparent).await
+    }
 
-        let instance = Instance::new(instance_descriptor(flags));
-
-        // create_surface takes `impl Into<SurfaceTarget>`. A `&'static W`
-        // that impls `HasDisplayHandle + HasWindowHandle + Send + Sync` is
-        // accepted via the blanket `From<T> for SurfaceTarget` impl.
-        let surface = instance.create_surface(window)?;
-
-        let adapter = instance
-            .request_adapter(&RequestAdapterOptions {
-                power_preference: PowerPreference::LowPower, // power-friendly
-                force_fallback_adapter: false,
-                compatible_surface: Some(&surface),
-            })
-            .await
-            .map_err(|_| RenderError::NoAdapter)?;
-        let info = adapter.get_info();
-        tracing::info!(
-            target: "render_trace",
-            "wgpu adapter: name={:?} backend={:?} device_type={:?} vendor=0x{:04x} device=0x{:04x}",
-            info.name, info.backend, info.device_type, info.vendor, info.device,
-        );
-
-        let (device, queue) = adapter
-            .request_device(&DeviceDescriptor {
-                label: Some("toastty-render device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults()
-                    .using_resolution(adapter.limits()),
-                memory_hints: wgpu::MemoryHints::Performance,
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                trace: wgpu::Trace::Off,
-            })
-            .await?;
+    /// [`Self::new`], reusing a [`GpuContext`] created ahead of the window
+    /// when `gpu` is `Some`.
+    ///
+    /// The context's adapter is kept only if it can present to `window`'s
+    /// surface. Otherwise an adapter is chosen for the surface the way
+    /// [`Self::new`] does, so the result never differs from `new`'s.
+    pub async fn with_gpu<W>(
+        gpu: Option<GpuContext>,
+        window: W,
+        size: (u32, u32),
+        vsync: bool,
+        transparent: bool,
+    ) -> Result<Self, RenderError>
+    where
+        W: HasDisplayHandle + HasWindowHandle + Send + Sync + 'static,
+    {
+        let (surface, adapter, device, queue) = surface_and_device(gpu, window).await?;
 
         let caps = surface.get_capabilities(&adapter);
         let format = surface_format::pick(&caps.formats).ok_or(RenderError::NoSurfaceFormat)?;
@@ -1147,16 +1272,16 @@ impl Renderer {
     /// [`DEFAULT_LINE_HEIGHT`]. Callers loading a `toastty_config::FontConfig`
     /// should pass `font.line_height` here.
     pub fn with_font_ex(&mut self, font_name: Option<&str>, font_size_px: f32, line_height: f32) {
-        // Resolve the font family. We always bundle FiraMono so the
-        // caller can pass `None` and still get text.
-        let family = font_name.unwrap_or("Fira Mono");
-        let rasterizer = GlyphRasterizer::new(
-            &self.device,
-            font_size_px,
-            line_height,
-            Some(family),
-            Some(BUNDLED_FONT),
-        );
+        // We always bundle FiraMono so the caller can pass `None` and
+        // still get text (see `load_fonts`).
+        self.with_loaded_fonts(load_fonts(font_name), font_size_px, line_height);
+    }
+
+    /// [`Self::with_font_ex`] with a font database loaded ahead of time by
+    /// [`load_fonts`] (the family is the one `fonts` was loaded for).
+    pub fn with_loaded_fonts(&mut self, fonts: LoadedFonts, font_size_px: f32, line_height: f32) {
+        let rasterizer =
+            GlyphRasterizer::with_fonts(&self.device, fonts, font_size_px, line_height);
         let pipeline = TextPipeline::new(&self.device, self.config.format);
 
         let mask_view = text::pipeline::default_view(rasterizer.mask_texture());

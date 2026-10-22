@@ -375,6 +375,85 @@ pub struct GlyphRasterizer {
     slot_failed: bool,
 }
 
+/// The GPU-independent, size-independent half of a [`GlyphRasterizer`]:
+/// the font database (every installed face plus the bundled fallback),
+/// the requested family, and the weight that family resolves to.
+///
+/// Loading it is most of the rasterizer's startup cost:
+/// [`FontSystem::new`] scans and parses every installed font, and the
+/// first shape with the primary family's `Attrs` makes cosmic-text rank
+/// every face against them. Neither needs a window, a device or the font
+/// size (which depends on the monitor's scale factor), so the binary
+/// builds one on a worker thread while the window and GPU come up and
+/// hands it to `Renderer::with_loaded_fonts`. It is `Send` for that.
+#[derive(Debug)]
+pub struct LoadedFonts {
+    font_system: FontSystem,
+    font_name: Option<String>,
+    primary_weight: Weight,
+    requested_family_available: bool,
+}
+
+impl LoadedFonts {
+    /// Scan the system fonts, add `bundled_font` (a guaranteed-present
+    /// monospace face), and resolve `font_name` (falls back to monospace
+    /// if absent or unloaded).
+    pub fn load(font_name: Option<&str>, bundled_font: Option<&'static [u8]>) -> Self {
+        let mut font_system = FontSystem::new();
+
+        if let Some(data) = bundled_font {
+            // Borrow the static bytes rather than copying them into a
+            // `Vec`: fontdb only needs `AsRef<[u8]>`, and the copy was a
+            // 170 KB heap allocation held for the life of the process.
+            font_system
+                .db_mut()
+                .load_font_source(cosmic_text::fontdb::Source::Binary(std::sync::Arc::new(
+                    data,
+                )));
+        }
+
+        let primary_weight = resolve_family_weight(&font_system, font_name);
+
+        // Check whether the requested family is actually present in
+        // the font database. `db().faces()` walks every loaded face;
+        // we report whether any face's `families` list contains a
+        // case-insensitive match. The bundled fallback TTF advertises
+        // its own family name (e.g. "Fira Mono"), so requesting that
+        // family will resolve even on a host with no system fonts of
+        // the same name. Used by the binary to log a warning when the
+        // user's `font.family` config doesn't match anything.
+        let requested_family_available = font_name.is_none_or(|requested| {
+            font_system.db().faces().any(|face| {
+                face.families
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(requested))
+            })
+        });
+
+        // Rank the faces for the primary family's `Attrs` now, while we
+        // may be off the main thread. These are exactly the `Attrs` the
+        // cell probe (`measure_cell`) and every primary-family line shape
+        // with (`family_attrs` for the primary family), so the ranking is
+        // cached by the time the rasterizer first shapes. It is ~10 ms
+        // with ~1000 system faces.
+        let family = font_name.unwrap_or("monospace");
+        font_system.get_font_matches(&family_attrs(family, family, primary_weight));
+
+        Self {
+            font_system,
+            font_name: font_name.map(str::to_owned),
+            primary_weight,
+            requested_family_available,
+        }
+    }
+
+    /// The family name passed to [`Self::load`].
+    #[must_use]
+    pub fn font_name(&self) -> Option<&str> {
+        self.font_name.as_deref()
+    }
+}
+
 impl GlyphRasterizer {
     /// Build a rasterizer with `font_size` in pixels, the
     /// line-height ratio (× `font_size`), and an optional font name
@@ -385,6 +464,9 @@ impl GlyphRasterizer {
     ///
     /// Pass [`DEFAULT_LINE_HEIGHT_RATIO`] for the value the M4b snapshots
     /// were captured at.
+    ///
+    /// Equivalent to [`Self::with_fonts`] on
+    /// `LoadedFonts::load(font_name, bundled_font)`.
     pub fn new(
         device: &Device,
         font_size: f32,
@@ -392,16 +474,30 @@ impl GlyphRasterizer {
         font_name: Option<&str>,
         bundled_font: Option<&'static [u8]>,
     ) -> Self {
-        let mut font_system = FontSystem::new();
+        Self::with_fonts(
+            device,
+            LoadedFonts::load(font_name, bundled_font),
+            font_size,
+            line_height_ratio,
+        )
+    }
 
-        if let Some(data) = bundled_font {
-            // Borrow the static bytes rather than copying them into a
-            // `Vec`: fontdb only needs `AsRef<[u8]>`, and the copy was a
-            // 170 KB heap allocation held for the life of the process.
-            font_system
-                .db_mut()
-                .load_font_source(cosmic_text::fontdb::Source::Binary(std::sync::Arc::new(data)));
-        }
+    /// Build a rasterizer from an already-loaded font database (see
+    /// [`LoadedFonts`]), at `font_size` pixels and the line-height ratio
+    /// (× `font_size`).
+    pub fn with_fonts(
+        device: &Device,
+        fonts: LoadedFonts,
+        font_size: f32,
+        line_height_ratio: f32,
+    ) -> Self {
+        let LoadedFonts {
+            mut font_system,
+            font_name,
+            primary_weight,
+            requested_family_available,
+        } = fonts;
+        let font_name = font_name.as_deref();
 
         // Line height = `font_size * line_height_ratio`, snapped to a
         // whole device pixel. Per-row origins are `row * cell_h`, so a
@@ -420,7 +516,6 @@ impl GlyphRasterizer {
         // same pixel-grid-alignment reason as the height above. The same
         // probe yields the constant baseline used for every glyph's
         // vertical placement (see [`Self::baseline_y`]).
-        let primary_weight = resolve_family_weight(&font_system, font_name);
         let (cell_w, cell_h, baseline_y) =
             measure_cell(&mut font_system, metrics, font_name, primary_weight);
         let cell_size = (cell_w, cell_h);
@@ -454,22 +549,6 @@ impl GlyphRasterizer {
             create_atlas_texture(device, TextureFormat::Bgra8Unorm, "toastty-color-atlas");
 
         let family_name = font_name.unwrap_or("monospace").to_string();
-
-        // Check whether the requested family is actually present in
-        // the font database. `db().faces()` walks every loaded face;
-        // we report whether any face's `families` list contains a
-        // case-insensitive match. The bundled fallback TTF advertises
-        // its own family name (e.g. "Fira Mono"), so requesting that
-        // family will resolve even on a host with no system fonts of
-        // the same name. Used by the binary to log a warning when the
-        // user's `font.family` config doesn't match anything.
-        let requested_family_available = font_name.is_none_or(|requested| {
-            font_system.db().faces().any(|face| {
-                face.families
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case(requested))
-            })
-        });
 
         Self {
             font_system,
@@ -1919,6 +1998,41 @@ mod tests {
             rasterizer.set_font_size(size, DEFAULT_LINE_HEIGHT_RATIO);
             let lg = rasterizer.shape_line(&queue, "The quick brown fox", false);
             assert!(lg.get(0, 'T').is_some(), "shaping failed at {size}");
+        }
+    }
+
+    /// Fonts loaded on another thread (the binary's startup path) give a
+    /// rasterizer identical to one that loads its own: same family, weight,
+    /// metrics and glyphs.
+    #[test]
+    // Same inputs, same code: the glyph geometry must match bit for bit.
+    #[allow(clippy::float_cmp)]
+    fn fonts_loaded_on_another_thread_match_inline_load() {
+        let (device, queue, mut inline) = make_rasterizer();
+        let mut fonts =
+            std::thread::spawn(|| LoadedFonts::load(Some("Fira Mono"), Some(TEST_FONT)))
+                .join()
+                .expect("font thread");
+        assert_eq!(fonts.font_name(), Some("Fira Mono"));
+        assert!(fonts.requested_family_available);
+        let attrs = family_attrs("Fira Mono", "Fira Mono", fonts.primary_weight);
+        assert!(!fonts.font_system.get_font_matches(&attrs).is_empty());
+        let mut loaded =
+            GlyphRasterizer::with_fonts(&device, fonts, 16.0, DEFAULT_LINE_HEIGHT_RATIO);
+        assert_eq!(loaded.family_name(), inline.family_name());
+        assert_eq!(loaded.primary_weight, inline.primary_weight);
+        assert_eq!(loaded.cell_size(), inline.cell_size());
+        assert!((loaded.baseline_y - inline.baseline_y).abs() < 1e-6);
+        assert_eq!(
+            loaded.requested_family_available(),
+            inline.requested_family_available()
+        );
+        let a = inline.shape_line(&queue, "Hello", false);
+        let b = loaded.shape_line(&queue, "Hello", false);
+        for (col, ch) in (0u16..).zip("Hello".chars()) {
+            let (x, y) = (a.get(col, ch).unwrap(), b.get(col, ch).unwrap());
+            assert_eq!(x.glyph_size, y.glyph_size, "{ch}");
+            assert_eq!(x.glyph_offset, y.glyph_offset, "{ch}");
         }
     }
 

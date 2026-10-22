@@ -50,6 +50,7 @@ use toastty::mouse::{
 };
 use toastty::paste::wrap_for_paste;
 use toastty::perf_stats::PerfStats;
+use toastty::preload::Preload;
 use toastty::pty_log::{Direction, PtyLogger};
 use toastty::shell::resolve_command;
 use toastty::theme_bridge::{
@@ -241,6 +242,9 @@ fn main() -> Result<()> {
     if let Some(ref e) = load_err {
         warn!("config load failed, using defaults: {e}");
     }
+    // GPU + font setup need no window: start them now so they overlap
+    // winit opening the display and the window (see `toastty::preload`).
+    let preload = Preload::spawn(&config.font.family);
 
     let initial_size = (config.window.width.max(1), config.window.height.max(1));
     let transparent = config.theme.bg.as_array()[3] < 1.0;
@@ -260,6 +264,7 @@ fn main() -> Result<()> {
         cli_working_dir,
         initial_size,
         load_err,
+        preload,
     );
     run(opts, app).context("window run")?;
     Ok(())
@@ -277,6 +282,9 @@ struct Toastty {
     cli_working_dir: Option<std::path::PathBuf>,
     window: Option<ToasttyWindow>,
     renderer: Option<Renderer>,
+    /// GPU context + fonts being built on worker threads since `main`;
+    /// consumed by `init_impl`.
+    preload: Preload,
     parser: Parser,
     term: Term,
     pty: Option<Pty>,
@@ -473,6 +481,7 @@ impl Toastty {
         cli_working_dir: Option<std::path::PathBuf>,
         initial_size: (u32, u32),
         load_err: Option<ConfigError>,
+        preload: Preload,
     ) -> Self {
         let scrollback = config.scrollback.lines.try_into().unwrap_or(u16::MAX);
         // Start at a tiny grid; init() resizes once we know cell dimensions.
@@ -493,6 +502,7 @@ impl Toastty {
             cli_working_dir,
             window: None,
             renderer: None,
+            preload,
             parser: Parser::new(),
             term,
             pty: None,
@@ -1115,6 +1125,37 @@ impl Toastty {
 }
 
 impl Toastty {
+    /// Create the renderer and load its font, from the GPU context and
+    /// fonts preloaded since `main` when they're ready (see
+    /// `toastty::preload`), else inline. `None` (logged) when no GPU
+    /// renderer can be created.
+    fn build_renderer(&mut self, window: &ToasttyWindow, size: (u32, u32)) -> Option<Renderer> {
+        // Transparency is logged once at startup in `run`; here we only
+        // need the flag for surface configuration.
+        let transparent = self.config.theme.bg.as_array()[3] < 1.0;
+        let mut renderer = match block_on(Renderer::with_gpu(
+            self.preload.take_gpu(),
+            window.clone(),
+            size,
+            self.config.window.vsync,
+            transparent,
+        )) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("renderer init failed: {e}");
+                return None;
+            }
+        };
+        let font_px = self.scaled_font_px();
+        let line_height = self.config.font.line_height;
+        if let Some(fonts) = self.preload.take_fonts(&self.config.font.family) {
+            renderer.with_loaded_fonts(fonts, font_px, line_height);
+        } else {
+            renderer.with_font_ex(Some(self.config.font.family.as_str()), font_px, line_height);
+        }
+        Some(renderer)
+    }
+
     fn init_impl(&mut self, window: ToasttyWindow, handle: &WindowHandle) {
         let size = window.physical_size();
         self.physical_size = size;
@@ -1124,26 +1165,9 @@ impl Toastty {
         // `Resize`). Fractional Wayland scales are included.
         self.scale_factor = window.scale_factor();
 
-        // Build the renderer. Transparency is logged once at startup in
-        // `run`; here we only need the flag for surface configuration.
-        let transparent = self.config.theme.bg.as_array()[3] < 1.0;
-        let mut renderer = match block_on(Renderer::new(
-            window.clone(),
-            size,
-            self.config.window.vsync,
-            transparent,
-        )) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("renderer init failed: {e}");
-                return;
-            }
+        let Some(mut renderer) = self.build_renderer(&window, size) else {
+            return;
         };
-        renderer.with_font_ex(
-            Some(self.config.font.family.as_str()),
-            self.scaled_font_px(),
-            self.config.font.line_height,
-        );
         if !renderer.font_family_available() {
             warn!(
                 "configured font {:?} not found on this system; falling back to the bundled / system default",

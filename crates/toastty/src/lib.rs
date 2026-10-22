@@ -25,6 +25,7 @@ pub mod md_cmd;
 pub mod mouse;
 pub mod paste;
 pub mod perf_stats;
+pub mod preload;
 pub mod pty_log;
 pub mod shell;
 pub mod theme_bridge;
