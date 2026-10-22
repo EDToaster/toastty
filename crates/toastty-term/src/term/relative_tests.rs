@@ -425,3 +425,25 @@ fn orphan_sweep_on_history_eviction_is_linear() {
     // seconds in release.
     assert!(start.elapsed() < std::time::Duration::from_secs(2));
 }
+
+#[test]
+fn rel5_child_goes_with_its_virtual_parent() {
+    // integration (#28 + #40): deleting the virtual placement drops the
+    // child, as for any parent.
+    let mut t = Term::new(20, 40, 100);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(vec![200u8; 4 * 4 * 4]);
+    feed(
+        &mut t,
+        format!("\x1b_Ga=T,f=32,s=4,v=4,i=7,p=3,U=1,c=2,r=2,q=2;{b64}\x1b\\").as_bytes(),
+    );
+    transmit(&mut t, 8);
+    let s = format!(
+        "\x1b[38;5;7m\x1b[58;5;3m\x1b[4;8H{}\u{0305}\u{0305}\x1b[m",
+        crate::PLACEHOLDER
+    );
+    feed(&mut t, s.as_bytes());
+    assert!(cmd(&mut t, "a=p,i=8,p=1,P=7,Q=3,c=1,r=1").contains("OK"));
+    assert!(at(&t, 8, 1).is_some());
+    cmd(&mut t, "a=d,d=i,i=7,p=3,q=2");
+    assert!(at(&t, 8, 1).is_none());
+}

@@ -5254,6 +5254,10 @@ impl KittySink for Term {
         if !dropped_placements.is_empty() || drop_bytes || virtual_dropped {
             self.image_revision = self.image_revision.wrapping_add(1);
         }
+        // REL-2 + REL-5: children of a deleted virtual parent go with it.
+        if virtual_dropped {
+            self.refresh_virtual_parents();
+        }
     }
 
     fn queue_reply(&mut self, bytes: &[u8]) {
