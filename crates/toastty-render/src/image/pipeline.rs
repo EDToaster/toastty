@@ -1,16 +1,16 @@
 //! wgpu pipeline + texture storage for the image-drawing pass.
 //!
-//! Strategy: ONE bind group, swap the bound texture per draw call.
-//! Each draw covers exactly one image (the cache holds up to ~14
-//! textures simultaneously, well within the downlevel limit).
+//! Strategy: one bind group per texture slot (built once at upload),
+//! swapped between draws. Each draw covers a run of consecutive
+//! instances that share a texture, so only one texture is ever bound at
+//! a time and the resident count is not limited by binding limits.
 
 use bytemuck::{Pod, Zeroable};
-use std::collections::HashMap;
 use std::num::NonZeroU64;
 use toastty_term::{ImageData, ImageRegistry};
 
 use super::atlas::{ImageTexEntry, ImageTextureCache};
-use super::instance::ImageInstance;
+use super::instance::{ImageInstance, UNRESOLVED_TEXTURE};
 
 /// Uniform buffer matching the WGSL `Globals` struct.
 #[repr(C)]
@@ -38,13 +38,29 @@ pub struct ImagePipeline {
     extra_bufs: Vec<(wgpu::Buffer, u64)>,
     calls_this_frame: usize,
     sampler: wgpu::Sampler,
-    /// Texture storage: each entry's index matches
-    /// `ImageTexEntry::texture_index`.
-    textures: Vec<wgpu::Texture>,
-    /// Free indices we can reuse when an entry is evicted.
+    /// Texture storage: each slot's index matches
+    /// `ImageTexEntry::texture_index` / `ImageInstance::texture_index`.
+    /// `None` is a freed slot (its texture already dropped).
+    slots: Vec<Option<TexSlot>>,
+    /// Indices of `None` slots, reused by the next upload.
     free_indices: Vec<usize>,
-    /// Cached views (rebuilt on insert / replace).
-    views: Vec<wgpu::TextureView>,
+}
+
+/// One uploaded texture plus the bind group that samples it.
+#[derive(Debug)]
+struct TexSlot {
+    // Held so the texture lives as long as its bind group.
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+}
+
+/// What [`ImagePipeline::resolve_kitty_textures`] did this frame.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ResolveStats {
+    /// Textures uploaded (cache misses).
+    pub uploaded: usize,
+    /// Textures dropped to get back under the byte budget.
+    pub evicted: usize,
 }
 
 impl ImagePipeline {
@@ -176,101 +192,89 @@ impl ImagePipeline {
             extra_bufs: Vec::new(),
             calls_this_frame: 0,
             sampler,
-            textures: Vec::new(),
+            slots: Vec::new(),
             free_indices: Vec::new(),
-            views: Vec::new(),
         }
     }
 
-    /// Sync `cache` with `registry`: insert any missing entries (with a
-    /// fresh GPU texture); replace any entries whose `content_hash`
-    /// changed; drop entries the cache evicted.
+    /// Drop cached textures the registry no longer backs: images that
+    /// were deleted, and images replaced in place (their content hash
+    /// changed). Uploads nothing; textures are uploaded on demand by
+    /// [`Self::resolve_kitty_textures`] when a placement is drawn.
+    /// Call when the term's image revision advances.
     ///
-    /// Returns true iff anything changed (the caller flips
-    /// `needs_full_clear` based on this).
+    /// Returns true iff anything was dropped.
     pub fn sync_registry(
+        &mut self,
+        registry: &ImageRegistry,
+        cache: &mut ImageTextureCache,
+    ) -> bool {
+        let stale: Vec<u32> = cache
+            .iter()
+            .filter(|(id, e)| {
+                registry
+                    .get(*id)
+                    .is_none_or(|d| hash_image(d) != e.content_hash)
+            })
+            .map(|(id, _)| id)
+            .collect();
+        for id in &stale {
+            if let Some(entry) = cache.remove(*id) {
+                self.release_texture(entry.texture_index);
+            }
+        }
+        !stale.is_empty()
+    }
+
+    /// Bind kitty-image `instances` to GPU textures for this frame.
+    ///
+    /// Each instance's `image_id` is looked up in `cache`; misses are
+    /// uploaded from `registry`. Instances whose image is gone from the
+    /// registry are dropped (order is kept). Afterwards textures not
+    /// drawn this frame are evicted, least recently drawn first, while
+    /// the cache is over its byte budget. Call once per frame, even
+    /// with no instances, so stale textures can still be evicted.
+    pub fn resolve_kitty_textures(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         registry: &ImageRegistry,
         cache: &mut ImageTextureCache,
-    ) -> bool {
-        let mut changed = false;
-
-        // Drop entries the host removed.
-        let resident_ids: Vec<u32> = cache.iter().map(|(id, _)| id).collect();
-        for id in resident_ids {
-            if !registry.contains(id)
-                && let Some(entry) = cache.remove(id)
-            {
-                self.release_texture(entry.texture_index);
-                changed = true;
-            }
+        instances: &mut Vec<ImageInstance>,
+    ) -> ResolveStats {
+        cache.begin_frame();
+        let mut stats = ResolveStats::default();
+        instances.retain_mut(|inst| {
+            let entry = if let Some(e) = cache.get_touch(inst.image_id) {
+                e
+            } else {
+                let Some(data) = registry.get(inst.image_id) else {
+                    return false;
+                };
+                let entry = ImageTexEntry {
+                    texture_index: self.allocate_texture(device, queue, data),
+                    width: data.width,
+                    height: data.height,
+                    content_hash: hash_image(data),
+                };
+                cache.insert(inst.image_id, entry);
+                stats.uploaded += 1;
+                entry
+            };
+            inst.texture_index = entry.texture_index as u32;
+            true
+        });
+        for (_, entry) in cache.evict_over_budget() {
+            self.release_texture(entry.texture_index);
+            stats.evicted += 1;
         }
-
-        // Upload anything new or changed.
-        for (id, data) in registry.iter() {
-            let hash = hash_image(data);
-            match cache.get(id) {
-                Some(entry) if entry.content_hash == hash => {
-                    // Up to date.
-                }
-                _ => {
-                    // Insert (or replace).
-                    //
-                    // Two leak paths to plug:
-                    //   1. Replace: if `id` already had an entry, its
-                    //      old texture_index is about to be orphaned
-                    //      by the new one. Free the slot first.
-                    //   2. Evict: `cache.insert` may pop the LRU
-                    //      victim(s). Predict them via
-                    //      `peek_evictions_for_insert`, free their
-                    //      slots, *then* allocate so the new texture
-                    //      can reuse the just-freed slot. This keeps
-                    //      `self.textures` bounded at `max_active`.
-                    let prior_idx = cache.get(id).map(|e| e.texture_index);
-                    if let Some(old) = prior_idx {
-                        self.release_texture(old);
-                    }
-                    let predicted_evict = cache.peek_evictions_for_insert(id);
-                    if !predicted_evict.is_empty() {
-                        let pre_state: HashMap<u32, usize> =
-                            cache.iter().map(|(id, e)| (id, e.texture_index)).collect();
-                        for victim in &predicted_evict {
-                            if let Some(&slot) = pre_state.get(victim) {
-                                self.release_texture(slot);
-                            }
-                        }
-                    }
-                    let idx = self.allocate_texture(device, queue, data);
-                    let entry = ImageTexEntry {
-                        texture_index: idx,
-                        width: data.width,
-                        height: data.height,
-                        content_hash: hash,
-                    };
-                    let actual_evicted = cache.insert(id, entry);
-                    debug_assert_eq!(
-                        actual_evicted, predicted_evict,
-                        "peek_evictions_for_insert disagreed with actual insert"
-                    );
-                    changed = true;
-                }
-            }
-        }
-
-        if changed {
-            // The viewport size hasn't necessarily changed but the
-            // globals buf was just allocated and never written. Write
-            // a placeholder; `render` re-writes per-frame anyway.
-        }
-
-        changed
+        stats
     }
 
     /// Encode draws for `instances`. The caller has already filtered
     /// to a contiguous slice (e.g. below-text or above-text). One draw
-    /// per instance (we rebind the texture between draws).
+    /// per run of consecutive instances sharing a texture (we rebind
+    /// the texture between runs).
     ///
     /// `viewport` is `(width, height)` in pixels (full surface).
     /// `content_origin` is `(origin_x_px, origin_y_px)` — the window-padding
@@ -331,32 +335,22 @@ impl ImagePipeline {
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, buf.slice(..));
 
-        // One draw per instance, rebinding the texture between draws.
-        for (i, inst) in instances.iter().enumerate() {
-            let Some(view) = self.views.get(inst.texture_index as usize) else {
-                continue;
-            };
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("toastty-image bg per-draw"),
-                layout: &self.bind_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.globals_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
-            pass.set_bind_group(0, &bg, &[]);
-            let start = i as u32;
-            pass.draw(0..6, start..start + 1);
+        // One draw per run of same-texture instances, rebinding the
+        // texture between runs. Runs keep the caller's (z) order.
+        let mut start = 0usize;
+        while start < instances.len() {
+            let tex = instances[start].texture_index;
+            let end = instances[start..]
+                .iter()
+                .position(|i| i.texture_index != tex)
+                .map_or(instances.len(), |n| start + n);
+            if tex != UNRESOLVED_TEXTURE
+                && let Some(Some(slot)) = self.slots.get(tex as usize)
+            {
+                pass.set_bind_group(0, &slot.bind_group, &[]);
+                pass.draw(0..6, start as u32..end as u32);
+            }
+            start = end;
         }
     }
 
@@ -424,15 +418,35 @@ impl ImagePipeline {
             );
         }
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("toastty-image bg"),
+            layout: &self.bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.globals_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        let slot = Some(TexSlot {
+            _texture: texture,
+            bind_group,
+        });
 
         if let Some(idx) = self.free_indices.pop() {
-            self.textures[idx] = texture;
-            self.views[idx] = view;
+            self.slots[idx] = slot;
             idx
         } else {
-            self.textures.push(texture);
-            self.views.push(view);
-            self.textures.len() - 1
+            self.slots.push(slot);
+            self.slots.len() - 1
         }
     }
 
@@ -442,10 +456,20 @@ impl ImagePipeline {
     }
 
     fn release_texture(&mut self, index: usize) {
-        // We don't actually deallocate the wgpu::Texture (just mark the
-        // slot as free for the next allocation). The texture is dropped
-        // when overwritten.
-        self.free_indices.push(index);
+        // Dropping the slot drops the texture and bind group, so evicted
+        // images really give their GPU memory back. The `take` guard
+        // keeps a double free from handing one index out twice.
+        if let Some(slot) = self.slots.get_mut(index)
+            && slot.take().is_some()
+        {
+            self.free_indices.push(index);
+        }
+    }
+
+    /// Number of live (uploaded, not freed) texture slots.
+    #[cfg(test)]
+    fn live_slots(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_some()).count()
     }
 }
 
@@ -508,67 +532,150 @@ mod tests {
         assert_ne!(hash_image(&a), hash_image(&b));
     }
 
-    /// Drives `ImagePipeline::sync_registry` past a tiny cache cap and
-    /// asserts that the pipeline's slot bookkeeping stays bounded (no
-    /// per-eviction texture leak).
-    ///
-    /// Without C1's fix, `textures.len()` grows monotonically because
-    /// the cache evicts ids while the pipeline never recycles their
-    /// slots into `free_indices`.
-    #[test]
-    fn sync_registry_does_not_leak_textures_past_cap() {
-        use toastty_term::ImageRegistry;
+    fn inst(image_id: u32) -> ImageInstance {
+        ImageInstance {
+            pos: [0.0, 0.0],
+            size: [1.0, 1.0],
+            uv_min: [0.0, 0.0],
+            uv_max: [1.0, 1.0],
+            texture_index: UNRESOLVED_TEXTURE,
+            z: 0,
+            image_id,
+            _pad: [0],
+        }
+    }
 
+    /// SIZE-8: 500 placed images all resolve to distinct live textures
+    /// (the old cache capped residency at 14), and a second frame with
+    /// the same placements uploads nothing.
+    #[test]
+    fn resolve_uploads_every_placed_image_once() {
         let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
-            // No GPU available in CI sandbox — skip.
+            return; // No GPU available in CI sandbox — skip.
+        };
+        let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let mut cache = ImageTextureCache::default();
+        let mut registry = ImageRegistry::new(64 * 1024 * 1024);
+        for id in 1u32..=500 {
+            registry.insert(id, img(2, 2, id as u8)).unwrap();
+        }
+        let placed: Vec<ImageInstance> = (1u32..=500).map(inst).collect();
+
+        let mut frame = placed.clone();
+        let stats =
+            pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
+        assert_eq!(stats.uploaded, 500);
+        assert_eq!(frame.len(), 500);
+        let mut idx: Vec<u32> = frame.iter().map(|i| i.texture_index).collect();
+        idx.sort_unstable();
+        idx.dedup();
+        assert_eq!(idx.len(), 500, "each image has its own texture");
+        assert!(idx.iter().all(|i| *i != UNRESOLVED_TEXTURE));
+        assert_eq!(pipeline.live_slots(), 500);
+
+        let mut frame = placed;
+        let stats =
+            pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
+        assert_eq!(stats, ResolveStats::default(), "no per-frame re-upload");
+    }
+
+    /// Transmitted-but-unplaced images never reach the GPU, and a
+    /// placement whose image is gone is dropped.
+    #[test]
+    fn resolve_uploads_only_placed_images() {
+        let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
             return;
         };
-
         let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let cap = 2usize;
-        let mut cache = ImageTextureCache::new(cap);
-        let mut registry = ImageRegistry::new(1024 * 1024);
+        let mut cache = ImageTextureCache::default();
+        let mut registry = ImageRegistry::new(64 * 1024 * 1024);
+        for id in 1u32..=100 {
+            registry.insert(id, img(2, 2, id as u8)).unwrap();
+        }
+        assert!(!pipeline.sync_registry(&registry, &mut cache));
+        assert!(cache.is_empty(), "sync must not upload unplaced images");
 
-        // Insert 6 images one at a time, syncing after each. The live
-        // slot count (textures.len() - free_indices.len()) must equal
-        // cache.len() and stay <= cap. Without C1's fix, free_indices
-        // never grows on eviction and textures grows unboundedly.
+        let mut frame = vec![inst(7), inst(999), inst(42)];
+        let stats =
+            pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
+        assert_eq!(stats.uploaded, 2);
+        let ids: Vec<u32> = frame.iter().map(|i| i.image_id).collect();
+        assert_eq!(ids, vec![7, 42], "missing image dropped, order kept");
+        assert_eq!(cache.len(), 2);
+        assert_eq!(pipeline.live_slots(), 2);
+    }
+
+    /// Over budget, textures not drawn this frame are freed (GPU memory
+    /// actually released) and their slots reused; drawn ones stay.
+    #[test]
+    fn resolve_evicts_undrawn_textures_over_budget() {
+        let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
+            return;
+        };
+        let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        // 4x4 RGBA = 64 bytes per image; the budget fits two.
+        let mut cache = ImageTextureCache::new(128);
+        let mut registry = ImageRegistry::new(1024 * 1024);
         for id in 1u32..=6 {
             registry.insert(id, img(4, 4, id as u8)).unwrap();
-            pipeline.sync_registry(&device, &queue, &registry, &mut cache);
-            let live = pipeline.textures.len() - pipeline.free_indices.len();
-            assert_eq!(
-                live,
-                cache.len(),
-                "live slot count must match cache size after id={id} \
-                 (textures={}, free_indices={}, cache={})",
-                pipeline.textures.len(),
-                pipeline.free_indices.len(),
-                cache.len()
-            );
-            assert!(cache.len() <= cap);
-            // `textures.len()` is also bounded by the cap once we've
-            // hit steady state — eviction must recycle slots, not
-            // grow the vec.
-            assert!(
-                pipeline.textures.len() <= cap,
-                "textures vec grew past cap={cap} (id={id}): len={}, free={}",
-                pipeline.textures.len(),
-                pipeline.free_indices.len()
-            );
         }
+        // Frame 1 draws all six: over budget, but nothing evictable.
+        let mut frame: Vec<ImageInstance> = (1u32..=6).map(inst).collect();
+        let stats =
+            pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
+        assert_eq!((stats.uploaded, stats.evicted), (6, 0));
+        assert_eq!(pipeline.live_slots(), 6);
 
-        // Replace path: re-insert id=6 with a different content hash;
-        // the pipeline should release the old slot and reuse it.
-        registry.insert(6, img(4, 4, 99)).unwrap();
-        let len_before = pipeline.textures.len();
-        pipeline.sync_registry(&device, &queue, &registry, &mut cache);
-        let live = pipeline.textures.len() - pipeline.free_indices.len();
-        assert_eq!(live, cache.len());
+        // Frame 2 draws only 1 and 2: the other four are freed.
+        let mut frame = vec![inst(1), inst(2)];
+        let stats =
+            pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
+        assert_eq!((stats.uploaded, stats.evicted), (0, 4));
+        assert_eq!(pipeline.live_slots(), 2);
+        assert_eq!(cache.total_bytes(), 128);
+
+        // Frame 3 brings 5 back: re-uploaded into a recycled slot, and
+        // the least recently drawn of the others goes.
+        let slots_before = pipeline.slots.len();
+        let mut frame = vec![inst(5)];
+        let stats =
+            pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
+        assert_eq!((stats.uploaded, stats.evicted), (1, 1));
+        assert_eq!(pipeline.slots.len(), slots_before, "slot reused");
+        assert_eq!(cache.len(), 2, "back under budget");
+        assert!(cache.get(5).is_some());
+    }
+
+    /// Deleting or replacing an image drops its texture on the next
+    /// registry sync; the replacement uploads on its next draw.
+    #[test]
+    fn sync_registry_drops_deleted_and_replaced_images() {
+        let Some((device, queue)) = crate::test_gpu::try_device_and_queue() else {
+            return;
+        };
+        let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let mut cache = ImageTextureCache::default();
+        let mut registry = ImageRegistry::new(1024 * 1024);
+        registry.insert(1, img(4, 4, 1)).unwrap();
+        registry.insert(2, img(4, 4, 2)).unwrap();
+        let mut frame = vec![inst(1), inst(2)];
+        pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
+        assert_eq!(pipeline.live_slots(), 2);
+
+        registry.remove(1);
+        registry.insert(2, img(4, 4, 99)).unwrap();
+        assert!(pipeline.sync_registry(&registry, &mut cache));
+        assert!(cache.is_empty());
+        assert_eq!(pipeline.live_slots(), 0);
+        assert!(!pipeline.sync_registry(&registry, &mut cache));
+
+        let mut frame = vec![inst(2)];
+        let stats =
+            pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
+        assert_eq!(stats.uploaded, 1);
         assert_eq!(
-            pipeline.textures.len(),
-            len_before,
-            "replace must not grow the textures vec"
+            cache.get(2).unwrap().content_hash,
+            hash_image(&img(4, 4, 99))
         );
     }
 }
