@@ -220,6 +220,9 @@ struct Lay<'a> {
     /// Lowest text descent drawn: a last line whose descenders hang
     /// below the block gets a row more, so they aren't cut off.
     ink_bottom: f32,
+    /// Vertical offset of the next rule from its default spot (see
+    /// [`Lay::blocks`]).
+    rule_shift: f32,
     /// Every laid-out line, for the grid-snapping tests.
     #[cfg(test)]
     boxes: Vec<LineBox>,
@@ -239,6 +242,8 @@ pub(crate) struct LineBox {
     /// "text", "code", "cell" (table) or "atom" (display maths, diagram).
     pub kind: &'static str,
     pub group: usize,
+    /// Table column + 1 (0 outside tables).
+    pub cell: usize,
 }
 
 /// A laid-out block: everything but pixels. Paint any band of it with
@@ -313,6 +318,7 @@ pub(crate) fn layout(
         scale: f / 16.0,
         y_limit: f32::from(row_cap) * ch + ch,
         ink_bottom: 0.0,
+        rule_shift: 0.0,
         #[cfg(test)]
         boxes: vec![],
         #[cfg(test)]
@@ -327,7 +333,7 @@ pub(crate) fn layout(
         tight: false,
     };
     let end = lay.blocks(&doc.blocks, x0, inner, 0.0, ctx);
-    let end = if lay.ink_bottom > end + 0.5 {
+    let end = if lay.ink_bottom > end + INK_SLACK * ch {
         end + ch
     } else {
         end
@@ -398,6 +404,11 @@ pub(crate) fn layout(
         boxes: lay.boxes,
     }
 }
+
+/// How far (in rows) the last line's font descent may hang below the
+/// block before it gets an extra row. The font box's descent is deeper
+/// than real descender ink, so a small overhang only clips empty space.
+const INK_SLACK: f32 = 0.1;
 
 /// Extra rows painted (and cropped) around a band; see [`paint_band`].
 const BAND_MARGIN: u32 = 8;
@@ -505,6 +516,15 @@ fn heading_scale(level: u8) -> f32 {
     }
 }
 
+/// Whether the padding row at a block's top / bottom edge holds a panel
+/// edge (code, table, diagram) drawn through its middle, rather than
+/// blank space (rules, the H1/H2 underline row).
+fn panel_edge(b: &Block, bottom: bool) -> bool {
+    let (lead, trail) = space(b);
+    let rows = if bottom { trail } else { lead };
+    rows > 0.0 && !matches!(b, Block::Rule | Block::Heading(..))
+}
+
 /// Rows of blank space at the (top, bottom) of a block's own box: the
 /// padding rows code panels, tables and diagrams draw into, the
 /// underline row of H1/H2 and the rows around a rule. They count
@@ -556,20 +576,30 @@ impl Lay<'_> {
     fn blocks(&mut self, blocks: &[Block], x: f32, w: f32, y: f32, ctx: Ctx) -> f32 {
         let mut y = y;
         let mut prev: Option<(f32, f32, &Block)> = None;
-        for b in blocks {
+        for (i, b) in blocks.iter().enumerate() {
             if y > self.y_limit {
                 break;
             }
             let (top, bottom) = Self::margins(b, ctx);
             let (lead, trail) = space(b);
-            if let Some((pb, pt, pblock)) = prev {
-                let panel = !matches!(pblock, Block::Rule | Block::Heading(..));
-                let pt = if panel && matches!(b, Block::Heading(..)) {
+            let after_panel = prev.is_some_and(|p| panel_edge(p.2, true));
+            if let Some((pb, pt, _)) = prev {
+                let pt = if after_panel && matches!(b, Block::Heading(..)) {
                     0.0
                 } else {
                     pt
                 };
                 y += (pb.max(top) - pt - lead).max(0.0) * self.ch;
+            }
+            if matches!(b, Block::Rule) {
+                // A panel edge sits half way into its padding row, so
+                // nudge the rule a quarter row away from it to keep the
+                // space on both sides equal.
+                let before_panel = blocks.get(i + 1).is_some_and(|n| panel_edge(n, false));
+                self.rule_shift = (f32::from(u8::from(before_panel))
+                    - f32::from(u8::from(after_panel)))
+                    * self.ch
+                    / 4.0;
             }
             #[cfg(test)]
             {
@@ -609,7 +639,7 @@ impl Lay<'_> {
                 let h = (self.f * 0.25).round().max(2.0);
                 self.ops.push(Op::Rect {
                     x,
-                    y: (y + self.ch - h / 2.0).round(),
+                    y: (y + self.ch + self.rule_shift - h / 2.0).round(),
                     w,
                     h,
                     r: 0.0,
@@ -939,6 +969,7 @@ impl Lay<'_> {
             y,
             &texts,
             if lctx.preserve_ws { "code" } else { "text" },
+            0,
         );
         self.frags.extend(texts.into_iter().map(|t| Frag {
             x: t.x,
@@ -949,7 +980,14 @@ impl Lay<'_> {
     }
 
     #[cfg(test)]
-    fn record(&mut self, lines: &[Line], y: f32, texts: &[inline::LineText], kind: &'static str) {
+    fn record(
+        &mut self,
+        lines: &[Line],
+        y: f32,
+        texts: &[inline::LineText],
+        kind: &'static str,
+        cell: usize,
+    ) {
         let mut top = y;
         for l in lines {
             let base = top + l.base;
@@ -965,6 +1003,7 @@ impl Lay<'_> {
                 text,
                 kind,
                 group: self.group,
+                cell,
             });
             top += l.h;
         }
@@ -1338,6 +1377,7 @@ impl Lay<'_> {
                     text: String::new(),
                     kind: "code",
                     group: self.group,
+                    cell: 0,
                 });
                 cy += self.ch;
                 continue;
@@ -1398,6 +1438,7 @@ impl Lay<'_> {
             text: text.clone(),
             kind: "atom",
             group: self.group,
+            cell: 0,
         });
         self.frags.push(Frag {
             x,
@@ -1453,6 +1494,17 @@ impl Lay<'_> {
             w: dw,
             h: dh,
         });
+        // The diagram's rows, so tests can check the raster stays in them.
+        #[cfg(test)]
+        self.boxes.push(LineBox {
+            top: y,
+            h: rows as f32 * ch,
+            base: y + ch * 0.75,
+            text: String::new(),
+            kind: "diagram",
+            group: self.group,
+            cell: 0,
+        });
         let lines: Vec<&str> = src.lines().filter(|l| !l.trim().is_empty()).collect();
         for (i, l) in lines.iter().enumerate().take(rows) {
             let text = if i + 1 == rows && lines.len() > rows {
@@ -1472,6 +1524,7 @@ impl Lay<'_> {
                 text: text.clone(),
                 kind: "atom",
                 group: self.group,
+                cell: 0,
             });
             self.frags.push(Frag {
                 x,
@@ -1507,8 +1560,9 @@ impl Lay<'_> {
         }
         let pad_x = (self.f * 0.75).round();
         let bw = self.scale.round().max(1.0);
-        // Rows of cell text are separated (and preceded / followed) by
-        // one row each, with the border line through its middle.
+        // A padding row above and below the table and one after the
+        // header, each with a border line through its middle. Body rows
+        // sit on consecutive rows, told apart by stripes.
         let border_at = |sep_top: f32| sep_top + ((ch - bw) / 2.0).round();
         let empty: Vec<Inline> = vec![];
         let all: Vec<(bool, &[Vec<Inline>])> = std::iter::once((true, head))
@@ -1590,7 +1644,20 @@ impl Lay<'_> {
                 .map(|(c, s)| s.break_lines((widths[c] - 2.0 * pad_x).max(1.0), &lctx_of(self, c)))
                 .collect();
             let rh = lines.iter().map(|l| inline::height(l)).fold(ch, f32::max);
-            let (bg_top, bg_bottom) = (borders[borders.len() - 1] + bw, border_at(ry + rh));
+            let last = ri + 1 == shaped.len();
+            // The first row's background starts at the border above it,
+            // the last one's ends at the border below.
+            let first = ri == 0 || body_i == 0;
+            let bg_top = if first {
+                borders[borders.len() - 1] + bw
+            } else {
+                ry
+            };
+            let bg_bottom = if last || ri == 0 {
+                border_at(ry + rh)
+            } else {
+                ry + rh
+            };
             let bg = if ri == 0 {
                 Some(self.pal.table_head_bg)
             } else {
@@ -1622,7 +1689,7 @@ impl Lay<'_> {
                     self.fonts,
                 );
                 #[cfg(test)]
-                self.record(&lines[c], ry, &texts, "cell");
+                self.record(&lines[c], ry, &texts, "cell", c + 1);
                 self.push_links(links);
                 // Line k of every cell shares a baseline (top-aligned).
                 let mut top = ry;
@@ -1657,10 +1724,15 @@ impl Lay<'_> {
                     });
                 }
             }
-            borders.push(border_at(ry + rh));
-            ry += rh + ch;
+            if ri == 0 && !last {
+                borders.push(border_at(ry + rh));
+                ry += rh + ch;
+            } else {
+                ry += rh;
+            }
         }
-        let end = ry;
+        borders.push(border_at(ry));
+        let end = ry + ch;
         // Borders: outer frame plus inner lines.
         let bc = self.pal.border;
         for &by in &borders {

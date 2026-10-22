@@ -985,9 +985,34 @@ thread_local! {
 }
 
 fn grid_layout(md: &str, p: &LayoutParams) -> super::Laid {
+    grid_layout_with(blob_math, md, p)
+}
+
+fn grid_layout_with(math: super::MathFn, md: &str, p: &LayoutParams) -> super::Laid {
     GRID_RENDERER.with(|r| {
         let r = &mut *r.borrow_mut();
-        super::layout(&mut r.fonts, &mut r.cache, md, p)
+        r.cache.math = math;
+        let laid = super::layout(&mut r.fonts, &mut r.cache, md, p);
+        r.cache.math = blob_math;
+        laid
+    })
+}
+
+/// Vertical ink extent of a glyph op whose baseline is `y` (`None` for
+/// a blank glyph).
+fn glyph_ink(key: cosmic_text::CacheKey, y: i32) -> Option<(f32, f32)> {
+    GRID_RENDERER.with(|r| {
+        let r = &mut *r.borrow_mut();
+        let p = r
+            .cache
+            .swash
+            .get_image(&mut r.fonts, key)
+            .as_ref()?
+            .placement;
+        (p.height > 0).then(|| {
+            let top = (y - p.top) as f32;
+            (top, top + p.height as f32)
+        })
     })
 }
 
@@ -1031,12 +1056,15 @@ fn check_grid(laid: &super::Laid, p: &LayoutParams) -> Vec<super::LineBox> {
                 laid.text[r]
             );
         }
-        // No row is shared by two lines (cells of one table row excepted).
+        // No row is shared by two lines, except lines of different
+        // cells of one table row, and a diagram with its source lines.
         for (row, o) in owner.iter_mut().enumerate().take(r1).skip(r0) {
             if let Some(j) = *o {
                 let other = &boxes[j];
+                let cells = b.kind == "cell" && other.kind == "cell" && b.cell != other.cell;
+                let diagram = b.kind == "diagram" || other.kind == "diagram";
                 assert!(
-                    b.kind == "cell" && other.kind == "cell" && b.group == other.group,
+                    b.group == other.group && (cells || diagram),
                     "row {row} shared by {other:?} and {what}"
                 );
             }
@@ -1065,14 +1093,54 @@ fn check_grid(laid: &super::Laid, p: &LayoutParams) -> Vec<super::LineBox> {
             assert_eq!(w[1].top, w[0].top + ch, "{ctx}: gap in code {w:?}");
         }
     }
-    // Every glyph is drawn inside a line box.
+    // Ink: every glyph's baseline is in a line, and its ink stays in the
+    // block and (but for a little descender / accent overhang) in that
+    // line's rows. Rasters and inline code boxes stay inside their line
+    // exactly.
+    let height = laid.height as f32;
+    let line_of = |y: f32| {
+        laid.boxes
+            .iter()
+            .find(|b| b.kind != "diagram" && b.top <= y && y <= b.top + b.h)
+    };
+    let code_bg = Palette::new(&p.theme).inline_code_bg;
+    let slop = 0.2 * ch;
     for op in &laid.ops {
-        if let super::paint::Op::Glyph { y, .. } = op {
-            let y = *y as f32;
-            assert!(
-                y >= text_rows || laid.boxes.iter().any(|b| b.top <= y && y < b.top + b.h),
-                "{ctx}: glyph at y {y} outside every line"
-            );
+        match op {
+            // Rows from `text_rows` down are cleared (truncation).
+            super::paint::Op::Glyph { y, .. } if *y as f32 >= text_rows => {}
+            super::paint::Op::Glyph { key, y, .. } => {
+                let b = line_of(*y as f32)
+                    .unwrap_or_else(|| panic!("{ctx}: glyph at y {y} outside every line"));
+                if let Some((t, btm)) = glyph_ink(*key, *y) {
+                    assert!(
+                        t >= 0.0 && btm <= height,
+                        "{ctx}: glyph ink {t}..{btm} outside the block (0..{height})"
+                    );
+                    assert!(
+                        t >= b.top - slop && btm <= b.top + b.h + slop,
+                        "{ctx}: glyph ink {t}..{btm} spills out of {b:?}"
+                    );
+                }
+            }
+            super::paint::Op::Image { y, h, .. } => {
+                assert!(
+                    *y >= 0.0 && y + h <= height,
+                    "{ctx}: raster {y}+{h} outside the block (0..{height})"
+                );
+                assert!(
+                    boxes.iter().any(|b| b.top <= *y && y + h <= b.top + b.h),
+                    "{ctx}: raster {y}+{h} not inside a line"
+                );
+            }
+            super::paint::Op::Rect { y, h, color, .. } if *color == code_bg => {
+                let b = line_of(y + h / 2.0).expect("inline code box in a line");
+                assert!(
+                    *y >= b.top && y + h <= b.top + b.h,
+                    "{ctx}: inline code box {y}+{h} outside {b:?}"
+                );
+            }
+            _ => {}
         }
     }
     boxes
@@ -1216,7 +1284,7 @@ fn headings_take_whole_rows_and_spacing_is_whole_rows() {
     };
     // para; blank; H1 (2 rows); underline row; para; blank; H2 (2 rows);
     // underline row; H3 (2 rows); blank; H4 (1 row); blank; para; rule (2
-    // rows); para; a row for the last line's descenders.
+    // rows); para.
     assert_eq!(row("One"), (2, 2));
     let paras: Vec<usize> = boxes
         .iter()
@@ -1227,8 +1295,7 @@ fn headings_take_whole_rows_and_spacing_is_whole_rows() {
     assert_eq!(row("Two"), (7, 2));
     assert_eq!(row("Three"), (10, 2));
     assert_eq!(row("Four"), (13, 1));
-    assert_eq!(laid.rows, 20);
-    assert_eq!(laid.text[19], vec![]);
+    assert_eq!(laid.rows, 19);
     // The underlines sit in their own rows; the rule on the line between
     // its two rows.
     let rects: Vec<(f32, Rgba)> = laid
@@ -1267,23 +1334,15 @@ fn tall_inline_rasters_add_whole_rows() {
     for f in [13.0, 16.0, 26.0] {
         let p = term_params(80, f);
         let ch = p.cell_h as f32;
-        let laid = with_backends(tall, odd_mermaid, |r| {
-            super::layout(
-                &mut r.fonts,
-                &mut r.cache,
-                "before\n\nab $x$ cd\n\nafter",
-                &p,
-            )
-        });
+        let laid = grid_layout_with(tall, "before\n\nab $x$ cd\n\nafter", &p);
         let boxes = check_grid(&laid, &p);
         let line = boxes.iter().find(|b| b.text.contains("$x$")).unwrap();
         assert!(line.h >= 3.0 * ch, "{line:?}");
-        // The text is on the line's middle row, where a body line would put it.
-        let tb = line.base - line.top - (line.h / ch / 2.0).floor() * ch;
+        // The text sits in its row where a body line would put it.
+        let tb = (line.base - line.top) % ch;
         let plain = boxes.iter().find(|b| b.text == "before").unwrap();
         assert_eq!(tb, plain.base - plain.top);
-        // The raster is inside the line (it may overhang a little, as
-        // the font's own ascent / descent box does).
+        // The raster is inside the line.
         let img = laid
             .ops
             .iter()
@@ -1292,10 +1351,149 @@ fn tall_inline_rasters_add_whole_rows() {
                 _ => None,
             })
             .unwrap();
-        let slop = 0.25 * ch;
         assert!(
-            img.0 >= line.top - slop && img.0 + img.1 <= line.top + line.h + slop,
+            img.0 >= line.top && img.0 + img.1 <= line.top + line.h,
             "{img:?} {line:?}"
         );
+    }
+}
+
+#[test]
+fn rasters_on_the_first_line_are_not_clipped() {
+    // Images just taller than the text's ascent, on the block's first
+    // line (they used to reach above y = 0) and on later lines.
+    for (f, cw, ch) in [
+        (16.0, 10, 19),
+        (13.0, 8, 16),
+        (16.0, 10, 22),
+        (26.0, 16, 31),
+    ] {
+        let p = LayoutParams {
+            cell_w: cw,
+            cell_h: ch,
+            font_px: f,
+            ..params(60)
+        };
+        for h in 10..=40 {
+            let img = data_png(30, h, [200, 40, 40, 255]);
+            let md = format!("![a]({img}) text\n\nmore ![b]({img}) text and more text\n");
+            check_grid(&grid_layout(&md, &p), &p);
+        }
+    }
+}
+
+#[test]
+fn body_text_has_no_trailing_row_at_terminal_cell_sizes() {
+    for f in 10..=40 {
+        let p = term_params(60, f as f32);
+        let ctx = format!("f {f} cell {}", p.cell_h);
+        assert_eq!(grid_layout("para", &p).rows, 1, "{ctx}");
+        assert_eq!(grid_layout("- a\n- b", &p).rows, 2, "{ctx}");
+        assert_eq!(grid_layout("one\n\ntwo `code`", &p).rows, 3, "{ctx}");
+    }
+}
+
+#[test]
+fn table_body_rows_are_one_row_each() {
+    let pal = Palette::new(&Theme::default());
+    for f in [13.0, 16.0, 26.0] {
+        let p = term_params(60, f);
+        let ch = p.cell_h as f32;
+        let laid = grid_layout(
+            "| a | b |\n|--|--|\n| 1 | 2 |\n| 3 | 4 |\n| 5 | 6 |\n| 7 | 8 |\n",
+            &p,
+        );
+        check_grid(&laid, &p);
+        // Padding row, header, border row, 4 body rows, padding row.
+        assert_eq!(laid.rows, 8);
+        let rows: Vec<&str> = laid
+            .text
+            .iter()
+            .map(|r| r.first().map_or("", |t| t.text.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            ["", "a | b", "", "1 | 2", "3 | 4", "5 | 6", "7 | 8", ""]
+        );
+        // Three horizontal borders, each through the middle of its row.
+        let borders: Vec<f32> = laid
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                super::paint::Op::Rect { y, w, color, .. } if *color == pal.border && *w > 20.0 => {
+                    Some(*y)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(borders.len(), 3, "{borders:?}");
+        for (by, row) in borders.iter().zip([0.0, 2.0, 7.0]) {
+            assert!((by - (row + 0.5) * ch).abs() <= 1.0, "{borders:?}");
+        }
+        // Stripes on the 2nd and 4th body rows, the last reaching the
+        // bottom border.
+        let stripes: Vec<(f32, f32)> = laid
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                super::paint::Op::Rect { y, h, color, .. } if *color == pal.table_stripe_bg => {
+                    Some((*y, *h))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stripes.len(), 2);
+        assert_eq!(stripes[0], (4.0 * ch, ch));
+        assert_eq!(stripes[1].0, 6.0 * ch);
+        assert!((stripes[1].0 + stripes[1].1 - borders[2]).abs() < 0.5);
+    }
+}
+
+#[test]
+fn rules_next_to_panels_are_centred() {
+    let pal = Palette::new(&Theme::default());
+    for f in [13.0, 16.0, 26.0] {
+        let p = term_params(60, f);
+        let ch = p.cell_h as f32;
+        for md in [
+            "para\n\n---\n\npara",
+            "| a |\n|--|\n| b |\n\n---\n\npara",
+            "para\n\n---\n\n```\nx\n```",
+            "```\nx\n```\n\n---\n\n```\ny\n```",
+        ] {
+            let laid = grid_layout(md, &p);
+            check_grid(&laid, &p);
+            let rects: Vec<(f32, f32, Rgba)> = laid
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    super::paint::Op::Rect { y, h, color, .. } => Some((*y, *h, *color)),
+                    _ => None,
+                })
+                .collect();
+            let rule = rects.iter().find(|r| r.2 == pal.rule).unwrap();
+            let mid = rule.0 + rule.1 / 2.0;
+            // The nearest visible edge above / below: a panel edge or
+            // border line, else the neighbouring text line's row edge.
+            let edges: Vec<f32> = rects
+                .iter()
+                .filter(|r| r.2 == pal.code_bg || r.2 == pal.border)
+                .flat_map(|r| [r.0, r.0 + r.1])
+                .chain(laid.boxes.iter().flat_map(|b| [b.top, b.top + b.h]))
+                .collect();
+            let above = edges
+                .iter()
+                .filter(|&&e| e < mid)
+                .fold(f32::MIN, |a, &e| a.max(e));
+            let below = edges
+                .iter()
+                .filter(|&&e| e > mid)
+                .fold(f32::MAX, |a, &e| a.min(e));
+            let (up, down) = (mid - above, below - mid);
+            assert!(
+                (up - down).abs() <= 2.0 && up >= ch,
+                "{md:?} f {f}: {up} px to the edge above, {down} px below"
+            );
+        }
     }
 }

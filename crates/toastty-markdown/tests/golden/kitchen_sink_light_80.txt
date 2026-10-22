@@ -1,4 +1,4 @@
-rows 46
+rows 45
   0
   1 @1:"Toastty Markdown"
   2
@@ -36,14 +36,13 @@ rows 46
  34 @2:"Element | Status | Notes"
  35
  36 @2:"Tables | done | aligned columns"
- 37
- 38 @2:"Images | partial | data: URIs only"
+ 37 @2:"Images | partial | data: URIs only"
+ 38
  39
  40
- 41
- 42 @1:"Smaller heading"
+ 41 @1:"Smaller heading"
+ 42
  43
- 44
- 45 @1:"Text after a rule, with an image placeholder: logo and an embedded image: gradient"
+ 44 @1:"Text after a rule, with an image placeholder: logo and an embedded image: gradient"
 link row 4 cols 14..18 https://example.com/docs
 link row 9 cols 34..38 https://example.com

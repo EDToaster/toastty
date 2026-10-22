@@ -151,14 +151,21 @@ impl LineCtx {
     }
 
     /// Baseline offset from the top of a plain text line: the font's
-    /// ascent + descent box centred in the line, like the terminal
-    /// places its own baseline in a cell. Clamped so the baseline always
-    /// falls in the line's own rows (`grid::row_of`).
+    /// ascent + descent box centred in the line. Code rounds it, like
+    /// the terminal places its own baseline in a cell; proportional text
+    /// rounds down, which centres its caps better and keeps descenders
+    /// inside the row (the font box's descent is deeper than real ink).
+    /// Clamped so the baseline always falls in the line's own rows
+    /// (`grid::row_of`).
     pub(crate) fn text_base(&self) -> f32 {
         let h = self.text_h();
-        ((h - (self.asc + self.desc)) / 2.0 + self.asc)
-            .round()
-            .clamp(1.0, h)
+        let b = (h - (self.asc + self.desc)) / 2.0 + self.asc;
+        let b = if self.preserve_ws {
+            b.round()
+        } else {
+            b.floor()
+        };
+        b.clamp(1.0, h)
     }
 }
 
@@ -536,16 +543,13 @@ impl Shaped {
         }
         // Vertical metrics, in whole rows. Plain text takes `ctx.rows`
         // rows with the baseline at `ctx.text_base()`. An inline raster
-        // may reach as far past those rows as the font's own ascent /
-        // descent box does, plus a tenth of a row; past that, the line
-        // grows by whole rows above / below so later lines stay on the
-        // grid. A display atom gets a line of its own, centred in the
-        // rows it needs.
+        // must fit inside its line's rows (it would otherwise be cut off
+        // at the block edge or run into the neighbouring line's text), so
+        // the line grows by whole rows above / below as needed. A display
+        // atom gets a line of its own, centred in the rows it needs.
         let row_h = ctx.row_h;
         let text_h = ctx.text_h();
         let tb = ctx.text_base();
-        let spill_top = (ctx.asc - tb).max(0.0);
-        let spill_bot = (ctx.desc - (text_h - tb)).max(0.0);
         for l in &mut lines {
             if l.center
                 && let Some(PlacedKind::Atom(a)) = l.items.first().map(|p| p.kind)
@@ -556,17 +560,14 @@ impl Shaped {
                 l.base = (top + at.asc).clamp(1.0, l.h);
                 continue;
             }
-            let (mut asc, mut desc) = (ctx.asc, ctx.desc);
+            let (mut above, mut below) = (0.0f32, 0.0f32);
             for p in &l.items {
                 if let PlacedKind::Atom(a) = p.kind {
                     let at = &self.atoms[a];
-                    asc = asc.max(at.asc);
-                    desc = desc.max(at.h - at.asc);
+                    above = above.max(rows_for(at.asc - tb, row_h, 0.5));
+                    below = below.max(rows_for(at.h - at.asc - (text_h - tb), row_h, 0.5));
                 }
             }
-            let slack = (row_h * 0.1).max(0.5);
-            let above = rows_for(asc - tb - spill_top, row_h, slack);
-            let below = rows_for(desc - (text_h - tb) - spill_bot, row_h, slack);
             l.h = text_h + (above + below) * row_h;
             l.base = above * row_h + tb;
         }
@@ -602,6 +603,7 @@ impl Shaped {
         let mut links = vec![];
         let mut top = y;
         for line in lines {
+            let bottom = top + line.h;
             let ox = x + Self::line_offset(line, width, ctx.align);
             let base = top + line.base;
             // Boxes first so glyphs draw over them.
@@ -629,7 +631,10 @@ impl Shaped {
                 };
                 let a = (m.ascent * info.size).max(info.size * 0.9);
                 let d = (m.descent * info.size).max(info.size * 0.22);
-                let (bx, by, bw, bh) = (ox + x0, base - a - 1.0, x1 - x0, a + d + 2.0);
+                // Kept inside the line's rows, so the boxes of wrapped
+                // lines never overlap.
+                let by = (base - a - 1.0).max(top);
+                let (bx, bw, bh) = (ox + x0, x1 - x0, (base + d + 1.0).min(bottom) - by);
                 match info.boxed {
                     Boxed::Code => ops.push(Op::Rect {
                         x: bx,
