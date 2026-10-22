@@ -67,6 +67,20 @@ impl Preload {
     }
 }
 
+impl Drop for Preload {
+    /// Join workers whose results were never taken (startup failed before
+    /// `init_impl` got to them), so the process never exits while a
+    /// worker is still inside the GPU driver's or fontconfig's setup.
+    fn drop(&mut self) {
+        if let Some(gpu) = self.gpu.take() {
+            let _ = gpu.join();
+        }
+        if let Some(fonts) = self.fonts.take() {
+            let _ = fonts.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
