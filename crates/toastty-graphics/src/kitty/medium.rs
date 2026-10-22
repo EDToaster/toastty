@@ -201,24 +201,55 @@ fn open_dir_chain(
             canonical.display()
         )));
     };
+    // `O_PATH` (Linux, FreeBSD) opens a directory for lookups only, so a
+    // search-only (`--x`) directory on the path works, as it does for a
+    // plain `open()` (review of #30). Elsewhere (macOS: rustix has no
+    // `O_SEARCH`) intermediate directories need read permission; a
+    // search-only one fails the read with the usual EBADF. Documented in
+    // `docs/decisions/kitty-file-medium.md`.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    let dir_flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
     let dir_flags = OFlags::RDONLY
         | OFlags::DIRECTORY
         | OFlags::CLOEXEC
         | OFlags::NOFOLLOW
         | OFlags::NONBLOCK
         | OFlags::NOCTTY;
+    // Each step must land on a real directory. `O_DIRECTORY | O_NOFOLLOW`
+    // already refuses a symlink; the `fstat` makes that explicit for
+    // `O_PATH`, whose flag handling differs.
+    let checked =
+        |fd: std::os::fd::OwnedFd, what: &dyn std::fmt::Display| match rustix::fs::fstat(&fd) {
+            Ok(st)
+                if rustix::fs::FileType::from_raw_mode(st.st_mode)
+                    == rustix::fs::FileType::Directory =>
+            {
+                Ok(fd)
+            }
+            Ok(_) => Err(FileError(format!(
+                "{}: {what} is not a directory",
+                canonical.display()
+            ))),
+            Err(e) => Err(FileError(format!(
+                "{}: {what}: fstat: {e}",
+                canonical.display()
+            ))),
+        };
     // Open "/" itself. The root is a trusted mount point; swapping it
     // needs privilege we're already inside.
-    let mut dir = rustix::fs::open("/", dir_flags, Mode::empty())
+    let root = rustix::fs::open("/", dir_flags, Mode::empty())
         .map_err(|e| FileError(format!("/: open: {e}")))?;
+    let mut dir = checked(root, &"/")?;
     for comp in dirs {
-        dir = rustix::fs::openat(&dir, *comp, dir_flags, Mode::empty()).map_err(|e| {
+        let what = Path::new(comp).display();
+        let next = rustix::fs::openat(&dir, *comp, dir_flags, Mode::empty()).map_err(|e| {
             FileError(format!(
-                "{}: component {} not a real directory ({e})",
-                canonical.display(),
-                Path::new(comp).display()
+                "{}: component {what} not a real directory ({e})",
+                canonical.display()
             ))
         })?;
+        dir = checked(next, &what)?;
     }
     Ok((dir, (*leaf).to_os_string()))
 }
@@ -231,10 +262,11 @@ fn open_dir_chain(
 /// and `/dev/shm`, which we must keep readable. A char/block device under
 /// `/dev` is already refused as "not a regular file", and the path check
 /// in [`is_sensitive_path`] refuses a regular file directly under `/dev`.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn reject_pseudo_fs(fd: &impl std::os::fd::AsFd, canonical: &Path) -> Result<(), FileError> {
-    // Magic numbers from `linux/magic.h`.
-    const REJECT: &[(i64, &str)] = &[
+    // Magic numbers from `linux/magic.h` (configfs and fusectl from their
+    // kernel sources).
+    const REJECT: &[(u32, &str)] = &[
         (0x0000_9fa0, "proc"),
         (0x6265_6572, "sysfs"),
         (0x6462_6720, "debugfs"),
@@ -242,11 +274,23 @@ fn reject_pseudo_fs(fd: &impl std::os::fd::AsFd, canonical: &Path) -> Result<(),
         (0x7363_6673, "securityfs"),
         (0x6367_7270, "cgroup2"),
         (0x0027_e0eb, "cgroup"),
-        (-0x3501_b5ef, "bpf"), // 0xcafe4a11 as i64
+        (0xcafe_4a11, "bpf"),
+        (0x6265_6570, "configfs"),
+        (0xde5e_81e4, "efivarfs"),
+        (0x6165_676c, "pstore"),
+        (0xf97c_ff8c, "selinuxfs"),
+        (0x4341_5d53, "smackfs"),
+        (0x4249_4e4d, "binfmt_misc"),
+        (0x6573_5543, "fusectl"),
+        (0x6e73_6673, "nsfs"),
     ];
     let statfs = rustix::fs::fstatfs(fd)
         .map_err(|e| FileError(format!("{}: fstatfs: {e}", canonical.display())))?;
-    let magic = statfs.f_type as i64;
+    // `f_type` is a signed word on 64-bit Linux, so a magic with the top
+    // bit set (bpf, efivarfs, selinuxfs) arrives sign-extended. Compare
+    // the low 32 bits only (review of #30).
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let magic = statfs.f_type as u64 as u32;
     if let Some((_, name)) = REJECT.iter().find(|(m, _)| *m == magic) {
         return Err(FileError(format!(
             "{}: refusing a file on {name}",
@@ -256,7 +300,9 @@ fn reject_pseudo_fs(fd: &impl std::os::fd::AsFd, canonical: &Path) -> Result<(),
     Ok(())
 }
 
-#[cfg(not(unix))]
+/// The magic numbers are Linux-specific; elsewhere only the path
+/// pre-check and the regular-file check apply.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 fn reject_pseudo_fs(_fd: &impl std::os::fd::AsFd, _canonical: &Path) -> Result<(), FileError> {
     Ok(())
 }
@@ -628,6 +674,45 @@ mod tests {
         let p = fifo.clone();
         let err = within(5, move || open_regular_file(&p)).unwrap_err();
         assert!(err.0.contains("not a regular file"), "{err}");
+    }
+
+    /// Review of #30: a search-only (`--x`, 0311) directory on the path
+    /// must not break reads (Linux `O_PATH` walk), nor `t=t` deletion.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    #[test]
+    fn search_only_directory_on_the_path_works() {
+        use std::os::unix::fs::PermissionsExt;
+        let sb = Sandbox::new("search-only");
+        let d = sb.tmp.join("tty-graphics-protocol-x-only");
+        let f = write_file(&d.join("img.rgba"), &[5, 6, 7, 8]);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let read = read_image_file_with_roots(&req(&f, 0, 0, false), &sb.roots());
+        let took = sb.take(&f);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(read.unwrap(), vec![5, 6, 7, 8]);
+        assert_eq!(took.unwrap(), vec![5, 6, 7, 8]);
+        assert!(!exists(&f), "t=t deletes through a search-only parent");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn pseudo_fs_magics_compare_low_32_bits() {
+        // The magics with the top bit set must be in the table as u32 so
+        // the low-32-bit compare can match them.
+        for p in ["/proc/self/status", "/sys/kernel/hostname"] {
+            let p = Path::new(p);
+            if !exists(p) {
+                continue;
+            }
+            // Bypass the path pre-check: open the file directly.
+            let fd =
+                rustix::fs::open(p, rustix::fs::OFlags::RDONLY, rustix::fs::Mode::empty()).unwrap();
+            let err = reject_pseudo_fs(&fd, p).unwrap_err();
+            assert!(err.0.contains("refusing a file on"), "{err}");
+        }
+        // A sign-extended 0xcafe4a11 (as a negative i64) maps to bpf.
+        let sign_extended: i64 = 0xcafe_4a11_u32 as i32 as i64;
+        assert_eq!(sign_extended as u64 as u32, 0xcafe_4a11);
     }
 
     /// Reviewer item 1: between the temp-dir check and the unlink, the
