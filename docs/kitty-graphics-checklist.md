@@ -472,6 +472,12 @@ UVs at draw time. Don't patch each item separately.
     and fitted inside `c`/`r` (`X=5,c=6` → 49×25 on kitty, 55×28 on
     toastty's 10 px cells). The offset also widens the reservation, as in
     kitty.
+  - Review of #39: as kitty does, an offset widens only a natural-size
+    reservation. With a single `c=`/`r=`, the derived side is the given
+    span plus its own offset at the aspect ratio, and the other offset
+    doesn't count. At 10×19, `c=10,Y=19` now leaves the cursor at 8;31
+    (was 9;31) and `r=3,X=9` at 8;33 (was 8;34), both matching kitty's
+    rule.
 - [x] **P2 — SIZE-11. Font zoom rescales natural-size images.**
   - Expected: kitty keeps a natural-size image (no `c=`/`r=`) at its pixel
     size. For placements with explicit `c=`/`r=` it keeps the cell span and
@@ -481,6 +487,8 @@ UVs at draw time. Don't patch each item separately.
   - Fixed in #39. The size is computed at render time: after zooming,
     205×105 stays 205×105 (was 231×132), and `c=10` on 400×200 rescales to
     110×55 at 11 px cells (kitty: 120×60 at 12 px).
+  - The reserved cells are recomputed on zoom too, as on kitty-ref, so
+    cell hit-tests (`d=p/c/x/y`, eviction) follow the drawn image.
 - [ ] **P2 — SIZE-12. Downscaling aliases badly.**
   - Repro: a 1500×900 grid image with `c=30`.
   - Actual: the 10 px grid's vertical lines vanish. kitty also aliases, but

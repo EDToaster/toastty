@@ -196,6 +196,61 @@ impl Placement {
         };
         ((ox, oy), size)
     }
+
+    /// The `(cols, rows)` cell box kitty 0.49.2 reserves for this
+    /// placement (and moves the cursor by), for a `src` source size
+    /// (after [`SrcRect::resolve`]) at `cell` pixels per cell. Measured on
+    /// kitty-ref (9x20 cells) with the cursor position after `a=T`:
+    /// - Neither `c=` nor `r=`: `ceil((w + X) / cell_w)` x
+    ///   `ceil((h + Y) / cell_h)`, so both offsets widen it (`X=8,Y=19`
+    ///   on 200x100 reserves 24x6).
+    /// - Only `c=`: `c` columns, and the rows the given span *plus its
+    ///   own offset* `X` takes at the source aspect ratio:
+    ///   `ceil((c*cell_w + X) * h / w / cell_h)`. `Y` doesn't count, so
+    ///   `c=10,Y=19` on 400x200 reserves 10x3, and `c=4,X=8` reserves 4x2
+    ///   although it draws only 28x14.
+    /// - Only `r=`: likewise, `ceil((r*cell_h + Y) * w / h / cell_w)` x
+    ///   `r`; `X` doesn't count (`r=3,X=9` reserves 14x3, `r=3,Y=19`
+    ///   18x3).
+    /// - Both: `c` x `r`.
+    ///
+    /// No rounding before the ceiling (`c=10` on 1000x449 reserves 3 rows
+    /// for 40.41 px). Offsets are clamped to the cell as in
+    /// [`Self::draw_rect`]. An unknown or empty source reserves the given
+    /// sides, or one cell.
+    #[must_use]
+    pub fn reserved_cells(&self, src: (u32, u32), cell: (u32, u32)) -> (u16, u16) {
+        let (cw, ch) = (u64::from(cell.0.max(1)), u64::from(cell.1.max(1)));
+        let ox = u64::from(self.pix_offset.0).min(cw - 1);
+        let oy = u64::from(self.pix_offset.1).min(ch - 1);
+        let (sw, sh) = (u64::from(src.0), u64::from(src.1));
+        let clamp = |n: u64| u16::try_from(n.max(1)).unwrap_or(u16::MAX);
+        let (c, r) = (u64::from(self.fit_cols), u64::from(self.fit_rows));
+        if sw == 0 || sh == 0 {
+            return (clamp(c), clamp(r));
+        }
+        match (c, r) {
+            (0, 0) => (clamp((sw + ox).div_ceil(cw)), clamp((sh + oy).div_ceil(ch))),
+            (c, 0) => (clamp(c), clamp(((c * cw + ox) * sh).div_ceil(sw * ch))),
+            (0, r) => (clamp(((r * ch + oy) * sw).div_ceil(sh * cw)), clamp(r)),
+            (c, r) => (clamp(c), clamp(r)),
+        }
+    }
+
+    /// Set [`Self::cols`]/[`Self::rows`] to [`Self::reserved_cells`].
+    /// An unclipped `clip_rows` follows the new height; a margin clip is
+    /// kept, cut to the new box.
+    pub fn reserve(&mut self, src: (u32, u32), cell: (u32, u32)) {
+        let (cols, rows) = self.reserved_cells(src, cell);
+        let unclipped = self.clip_rows == (0..self.rows);
+        self.cols = cols;
+        self.rows = rows;
+        self.clip_rows = if unclipped {
+            0..rows
+        } else {
+            self.clip_rows.start.min(rows)..self.clip_rows.end.min(rows)
+        };
+    }
 }
 
 /// Pixel rectangle on the source image, in image pixels, as the client
@@ -476,6 +531,26 @@ impl ImageGrid {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.placements.is_empty()
+    }
+
+    /// Recompute every placement's reserved cell box for a new cell size
+    /// (font zoom), as kitty does: the drawn size is computed at render
+    /// time anyway, and this keeps cell hit-tests (`d=p/c/x/y`, `covers`,
+    /// eviction bounds) on the cells the image actually covers. `src_of`
+    /// gives a placement's resolved source size, `None` if its image is
+    /// unknown (left as is). Placements with both `c=` and `r=` (and the
+    /// placeholder tiles) don't change.
+    pub fn reserve_all(
+        &mut self,
+        mut src_of: impl FnMut(&Placement) -> Option<(u32, u32)>,
+        cell: (u32, u32),
+    ) {
+        self.bounds = None;
+        for (_, p) in &mut self.placements {
+            if let Some(src) = src_of(p) {
+                p.reserve(src, cell);
+            }
+        }
     }
 
     /// Move every placement by `delta` line ids. Used when the line-id
@@ -1119,5 +1194,78 @@ mod tests {
         g.add_relative(rel(2, 20, (1, 10), (-5, -2))).unwrap();
         let child = g.find(2, 20).unwrap();
         assert_eq!((child.line, child.col), (3, 0));
+    }
+
+    /// `reserved_cells` for `fit = (c, r)` and `off = (X, Y)` on a
+    /// `src` image at `cell` pixels.
+    fn reserved(fit: (u16, u16), off: (u32, u32), src: (u32, u32), cell: (u32, u32)) -> (u16, u16) {
+        let mut p = Placement::new(1, 1, 1);
+        (p.fit_cols, p.fit_rows) = fit;
+        p.pix_offset = off;
+        p.reserved_cells(src, cell)
+    }
+
+    /// `(fit, offset, src, reserved)`: one kitty-ref measurement.
+    type Case = ((u16, u16), (u32, u32), (u32, u32), (u16, u16));
+
+    /// Every value measured on kitty 0.49.2 (9x20 cells): the cursor
+    /// after `a=T` at 6;21 gives `(cols, rows)` reserved. Review of #39:
+    /// offsets only widen a natural-size box; a single given side derives
+    /// the other from its own span plus its own offset.
+    #[test]
+    fn reserved_cells_match_kitty_ref() {
+        let k = (9, 20);
+        let (w4, w2) = ((400, 200), (200, 100));
+        // (fit, offset, src) -> kitty's cursor-derived box.
+        let cases: &[Case] = &[
+            ((10, 0), (0, 19), w4, (10, 3)), // 8;31
+            ((0, 3), (9, 0), w4, (14, 3)),   // 8;35
+            ((10, 0), (0, 0), w4, (10, 3)),  // 8;31
+            ((0, 3), (0, 0), w4, (14, 3)),   // 8;35
+            ((0, 0), (8, 19), w2, (24, 6)),  // 11;45
+            ((6, 3), (5, 7), w2, (6, 3)),    // 8;27
+            ((10, 0), (9, 0), w4, (10, 3)),  // 8;31
+            ((0, 3), (0, 19), w4, (18, 3)),  // 8;39
+            ((4, 0), (0, 0), w4, (4, 1)),    // 6;25
+            ((4, 0), (8, 0), w4, (4, 2)),    // 7;25: X counts on its own axis
+            ((4, 0), (0, 19), w4, (4, 1)),   // 6;25: Y doesn't
+            ((0, 3), (0, 10), w4, (16, 3)),  // 8;37
+            ((0, 1), (0, 0), w4, (5, 1)),    // 6;26
+            ((0, 1), (0, 19), w4, (9, 1)),   // 6;30
+            ((0, 1), (8, 0), w4, (5, 1)),    // 6;26
+            ((2, 0), (8, 0), w2, (2, 1)),    // 6;23
+            // No rounding before the ceiling: 40.41 px -> 3 rows (8;31),
+            // 8.96 px -> 1 col (6;22), 17.92 px -> 2 cols (7;23).
+            ((10, 0), (0, 0), (1000, 449), (10, 3)),
+            ((0, 1), (0, 0), (224, 500), (1, 1)),
+            ((0, 2), (0, 0), (224, 500), (2, 2)),
+        ];
+        for &(fit, off, src, want) in cases {
+            assert_eq!(
+                reserved(fit, off, src, k),
+                want,
+                "fit={fit:?} off={off:?} src={src:?}"
+            );
+        }
+        // The same rule at toastty's 10x19 cells (the review's values):
+        // c=10,Y=19 -> 3 rows (cursor 8;31), r=3,X=9 -> 12 cols (8;33).
+        assert_eq!(reserved((10, 0), (0, 19), w4, (10, 19)), (10, 3));
+        assert_eq!(reserved((0, 3), (9, 0), w4, (10, 19)), (12, 3));
+        // Unknown image: the given sides, or one cell.
+        assert_eq!(reserved((0, 0), (5, 5), (0, 0), k), (1, 1));
+        assert_eq!(reserved((7, 0), (0, 0), (0, 0), k), (7, 1));
+    }
+
+    #[test]
+    fn reserve_keeps_a_margin_clip_and_follows_an_unclipped_one() {
+        let mut p = Placement::new(1, 6, 21);
+        (p.fit_cols, p.fit_rows) = (0, 0);
+        p.reserve((205, 105), (12, 28));
+        assert_eq!((p.cols, p.rows, p.clip_rows.clone()), (18, 4, 0..4));
+        p.reserve((205, 105), (6, 13));
+        assert_eq!((p.cols, p.rows, p.clip_rows.clone()), (35, 9, 0..9));
+        p.clip_rows = 2..9;
+        p.reserve((205, 105), (12, 28));
+        assert_eq!((p.rows, p.clip_rows.clone()), (4, 2..4));
     }
 }
