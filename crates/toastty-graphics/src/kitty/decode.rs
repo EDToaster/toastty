@@ -11,6 +11,8 @@
 //! Errors map to Kitty's standard reply codes:
 //! - `Einval` — dimension/length mismatch, missing dims for raw formats.
 //! - `Ebadf` — PNG could not be decoded.
+//! - `Enomem` — the PNG's IHDR declares an image larger than the caller's
+//!   quota. Checked before any pixel data is decoded (SEC-7).
 //! - `Efbig` — the caller's responsibility (we just decode here).
 
 use thiserror::Error;
@@ -37,17 +39,27 @@ pub enum DecodeError {
     /// PNG decode failed.
     #[error("PNG decode failed: {0}")]
     BadPng(String),
+    /// The PNG header declares more than `max_bytes` of RGBA8 pixels.
+    /// The message matches kitty's `ENOMEM:PNG image is too large`.
+    #[error("PNG image is too large")]
+    PngTooLarge { width: u32, height: u32 },
 }
 
 /// Decode `body` according to `format`. `decl_w` / `decl_h` are the
 /// declared source dimensions from the header; for PNG they are
 /// ignored (the PNG carries its own size) but for raw formats they are
 /// mandatory.
+///
+/// `max_bytes` bounds the decoded RGBA8 size of a PNG: its IHDR is read
+/// first and an image over the limit is rejected with
+/// [`DecodeError::PngTooLarge`] before anything is decoded. (Raw formats
+/// are already bounded by the size of `body`.)
 pub fn decode(
     format: Format,
     body: &[u8],
     decl_w: u32,
     decl_h: u32,
+    max_bytes: u64,
 ) -> Result<ImageData, DecodeError> {
     match format {
         Format::Rgba32 => decode_raw(body, decl_w, decl_h, 4, "RGBA"),
@@ -64,7 +76,7 @@ pub fn decode(
                 pixels: rgba,
             })
         }
-        Format::Png => decode_png(body),
+        Format::Png => decode_png(body, max_bytes),
     }
 }
 
@@ -118,9 +130,18 @@ fn decode_raw_passthrough<'a>(
     Ok(body)
 }
 
-fn decode_png(body: &[u8]) -> Result<ImageData, DecodeError> {
+fn decode_png(body: &[u8], max_bytes: u64) -> Result<ImageData, DecodeError> {
     use std::io::Cursor;
-    let reader = image::ImageReader::with_format(Cursor::new(body), image::ImageFormat::Png);
+    let reader = || image::ImageReader::with_format(Cursor::new(body), image::ImageFormat::Png);
+    // Header-only pass: a 12000x12000 PNG would otherwise be decoded
+    // (~1.3 GB peak) before the registry rejected it.
+    let (width, height) = reader()
+        .into_dimensions()
+        .map_err(|e| DecodeError::BadPng(e.to_string()))?;
+    if u64::from(width) * u64::from(height) * 4 > max_bytes {
+        return Err(DecodeError::PngTooLarge { width, height });
+    }
+    let reader = reader();
     let img = reader
         .decode()
         .map_err(|e| DecodeError::BadPng(e.to_string()))?;
@@ -131,6 +152,29 @@ fn decode_png(body: &[u8]) -> Result<ImageData, DecodeError> {
         height: h,
         pixels: rgba.into_raw(),
     })
+}
+
+/// Hand-made PNGs shared by the decode and handler tests.
+#[cfg(test)]
+pub(crate) mod test_png {
+    /// A PNG whose IHDR claims `w`x`h` but carries one pixel of data: a
+    /// real 1x1 PNG with its IHDR patched (and the CRC recomputed). Only
+    /// a header-first check can tell it is too large; decoding it would
+    /// fail on the short image data instead.
+    pub(crate) fn claiming(w: u32, h: u32) -> Vec<u8> {
+        use image::ImageEncoder;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[0, 0, 0, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        // 8-byte signature, then IHDR: len(4) "IHDR"(4) data(13) crc(4).
+        png[16..20].copy_from_slice(&w.to_be_bytes());
+        png[20..24].copy_from_slice(&h.to_be_bytes());
+        let mut crc = flate2::Crc::new();
+        crc.update(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.sum().to_be_bytes());
+        png
+    }
 }
 
 #[cfg(test)]
@@ -160,7 +204,7 @@ mod tests {
     #[test]
     fn decode_rgba32_round_trips() {
         let buf = rgba_2x2();
-        let img = decode(Format::Rgba32, &buf, 2, 2).unwrap();
+        let img = decode(Format::Rgba32, &buf, 2, 2, u64::MAX).unwrap();
         assert_eq!(img.width, 2);
         assert_eq!(img.height, 2);
         assert_eq!(img.pixels, buf);
@@ -169,7 +213,7 @@ mod tests {
     #[test]
     fn decode_rgb24_expands_to_rgba() {
         let buf = vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 128, 128, 128];
-        let img = decode(Format::Rgb24, &buf, 2, 2).unwrap();
+        let img = decode(Format::Rgb24, &buf, 2, 2, u64::MAX).unwrap();
         assert_eq!(img.width, 2);
         assert_eq!(img.height, 2);
         assert_eq!(img.pixels.len(), 2 * 2 * 4);
@@ -182,23 +226,23 @@ mod tests {
     #[test]
     fn decode_rgba32_length_mismatch_is_einval() {
         let buf = vec![0u8; 7]; // Should be 16.
-        let err = decode(Format::Rgba32, &buf, 2, 2).unwrap_err();
+        let err = decode(Format::Rgba32, &buf, 2, 2, u64::MAX).unwrap_err();
         assert!(matches!(err, DecodeError::LengthMismatch { .. }));
     }
 
     #[test]
     fn decode_rgba32_missing_dims_is_einval() {
         let buf = vec![0u8; 16];
-        let err = decode(Format::Rgba32, &buf, 0, 2).unwrap_err();
+        let err = decode(Format::Rgba32, &buf, 0, 2, u64::MAX).unwrap_err();
         assert!(matches!(err, DecodeError::MissingDims { .. }));
-        let err = decode(Format::Rgba32, &buf, 2, 0).unwrap_err();
+        let err = decode(Format::Rgba32, &buf, 2, 0, u64::MAX).unwrap_err();
         assert!(matches!(err, DecodeError::MissingDims { .. }));
     }
 
     #[test]
     fn decode_png_round_trips() {
         let buf = png_2x2();
-        let img = decode(Format::Png, &buf, 0, 0).unwrap();
+        let img = decode(Format::Png, &buf, 0, 0, u64::MAX).unwrap();
         assert_eq!(img.width, 2);
         assert_eq!(img.height, 2);
         assert_eq!(img.pixels.len(), 2 * 2 * 4);
@@ -207,7 +251,7 @@ mod tests {
     #[test]
     fn decode_png_garbage_is_ebadf() {
         let buf = vec![0xFFu8; 32]; // not a PNG.
-        let err = decode(Format::Png, &buf, 0, 0).unwrap_err();
+        let err = decode(Format::Png, &buf, 0, 0, u64::MAX).unwrap_err();
         assert!(matches!(err, DecodeError::BadPng(_)));
     }
 
@@ -215,7 +259,37 @@ mod tests {
     fn decode_rgb24_length_mismatch() {
         // 2x2 RGB = 12 bytes; pass 11.
         let buf = vec![0u8; 11];
-        let err = decode(Format::Rgb24, &buf, 2, 2).unwrap_err();
+        let err = decode(Format::Rgb24, &buf, 2, 2, u64::MAX).unwrap_err();
         assert!(matches!(err, DecodeError::LengthMismatch { .. }));
+    }
+
+    #[test]
+    fn decode_png_over_quota_is_rejected_from_the_header() {
+        let err = decode(
+            Format::Png,
+            &test_png::claiming(12000, 12000),
+            0,
+            0,
+            320 << 20,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::PngTooLarge {
+                width: 12000,
+                height: 12000
+            }
+        );
+        assert_eq!(err.to_string(), "PNG image is too large");
+    }
+
+    #[test]
+    fn decode_png_quota_boundary() {
+        let buf = png_2x2();
+        assert!(decode(Format::Png, &buf, 0, 0, 16).is_ok());
+        assert!(matches!(
+            decode(Format::Png, &buf, 0, 0, 15),
+            Err(DecodeError::PngTooLarge { .. })
+        ));
     }
 }

@@ -5011,6 +5011,12 @@ impl KittySink for Term {
             .saturating_sub(used_buf)
     }
 
+    fn max_image_bytes(&self) -> u64 {
+        // The registry evicts to make room, so its whole cap is what a
+        // single image may use.
+        self.image_registry.cap_bytes()
+    }
+
     fn advance_cursor_after_placement(&mut self, rows: u16, cols: u16, start_col: u16) {
         // Kitty spec / reference C impl: after a cursor-moving
         // placement, `c->x += cols; c->y += rows - 1;` — the cursor
@@ -8575,6 +8581,63 @@ mod tests {
         let replies = t.drain_pty_replies();
         let s = String::from_utf8_lossy(&replies);
         assert!(s.contains("EFBIG"), "expected EFBIG, got {s:?}");
+    }
+
+    /// SEC-7: the PNG quota is the registry cap. This PNG's IHDR claims
+    /// 64x64 (16 KiB of RGBA) over a 1 KiB cap, so it is refused from
+    /// the header with kitty's ENOMEM, before any decoding.
+    #[test]
+    fn apc_kitty_png_over_registry_cap_replies_enomem() {
+        let mut t = Term::new(2, 4, 0);
+        t.set_image_cap(1024);
+        feed(
+            &mut t,
+            b"\x1b_Ga=t,f=100,i=5;iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAADUlEQVR4nGNgYGD4DwABBAEAX+XDSwAAAABJRU5ErkJggg==\x1b\\",
+        );
+        let replies = t.drain_pty_replies();
+        assert_eq!(
+            String::from_utf8_lossy(&replies),
+            "\x1b_Gi=5;ENOMEM:PNG image is too large\x1b\\"
+        );
+        assert!(!t.image_registry().contains(5));
+    }
+
+    /// SEC-2 / SEC-4 round trip: `t=f` on a FIFO replies the uniform
+    /// EBADF at once instead of freezing the terminal in `open()`.
+    #[cfg(unix)]
+    #[test]
+    fn apc_kitty_t_f_fifo_replies_ebadf_without_blocking() {
+        use base64::Engine;
+        let fifo = std::env::temp_dir().join(format!("toastty-term-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_file(&fifo);
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut payload = b"\x1b_Ga=t,t=f,f=32,s=2,v=2,i=3;".to_vec();
+        payload.extend_from_slice(
+            base64::engine::general_purpose::STANDARD
+                .encode(fifo.to_str().unwrap())
+                .as_bytes(),
+        );
+        payload.extend_from_slice(b"\x1b\\");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut t = Term::new(2, 4, 0);
+            feed(&mut t, &payload);
+            let _ = tx.send(t.drain_pty_replies());
+        });
+        let replies = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("t=f on a FIFO blocked the terminal");
+        let _ = std::fs::remove_file(&fifo);
+        assert_eq!(
+            String::from_utf8_lossy(&replies),
+            "\x1b_Gi=3;EBADF:Failed to read image file\x1b\\"
+        );
     }
 
     #[test]

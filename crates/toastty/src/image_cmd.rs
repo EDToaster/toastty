@@ -366,7 +366,7 @@ mod tests {
         use toastty_graphics::kitty::{decode::decode as kdecode, header::Format};
         let img = pattern(7, 5);
         let payload = reassemble(&encode_kitty(&png(&img)).unwrap());
-        let data = kdecode(Format::Png, &payload, 0, 0).unwrap();
+        let data = kdecode(Format::Png, &payload, 0, 0, u64::MAX).unwrap();
         assert_eq!((data.width, data.height), (7, 5));
         assert_eq!(data.pixels, img.into_raw());
     }

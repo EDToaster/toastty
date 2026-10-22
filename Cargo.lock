@@ -4901,9 +4901,11 @@ dependencies = [
  "icy_sixel",
  "image",
  "proptest",
+ "rustix 1.1.4",
  "thiserror 2.0.18",
  "toastty-parser",
  "tobj",
+ "tracing",
 ]
 
 [[package]]

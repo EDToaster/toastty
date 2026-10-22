@@ -7,9 +7,12 @@
 //! - [`decode`] — decoded image bytes from PNG / raw RGB / raw RGBA.
 //! - [`handler`] — stateful dispatcher that owns chunked-upload
 //!   reassembly and calls back into a [`handler::KittySink`].
+//! - `medium` — `t=f` / `t=t` file reads: path policy, bounded reads,
+//!   temp-file deletion.
 
 pub mod decode;
 pub mod handler;
 pub mod header;
+mod medium;
 pub mod placeholder;
 pub mod reply;
