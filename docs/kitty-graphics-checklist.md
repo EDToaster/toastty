@@ -190,6 +190,9 @@ UVs at draw time. Don't patch each item separately.
     their text, including the stashed primary grid while on the alt screen.
     Alt placements keep their rows. Boxes are never trimmed or dropped for
     hanging off the edge, so shrinking then growing restores the image.
+    This covers images in scrollback too: a height change keeps them on
+    their history text instead of their screen row, so growing (which
+    reveals history) no longer evicts one near the oldest line.
   - Correction to "Expected", from kitty-ref: kitty follows the text only on
     height changes. On a width change kitty leaves the image at its screen
     row while the text rewraps under it. toastty follows the text on width
