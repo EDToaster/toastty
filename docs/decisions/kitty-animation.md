@@ -15,6 +15,12 @@ measured live against the reference with a conformance probe (below).
   (`toastty-graphics/src/frames.rs`, an `Animation` attached to the
   registry entry). They are stored LZ4-compressed, in their own budget of
   twice the image quota.
+- Since #42 each screen has its own `ImageStore`, so frames, their budget
+  and playback are per screen too. The registry is keyed by `ImageKey`;
+  `Term` maps the client's `i=` to the key (`ImageStore::key_of`) and
+  gives kitty's error messages the client id. Only the active screen's
+  images play, those placed there (real or virtual, `ScreenImages::
+  placed_keys`), and only they are protected from frame eviction.
 - What `ImageRegistry::get(id)` returns is the frame on display, composed.
   So every placement and every Unicode placeholder draws the current
   frame, and the renderer needs no knowledge of animation.

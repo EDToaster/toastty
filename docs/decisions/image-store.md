@@ -174,7 +174,10 @@ Each store holds:
   is public, for `next_image_id`.
 - **E1 (animation frames).** Frames belong to the stored image, so store
   them per key in `ImageStore`, next to the registry entry. They then
-  follow the same replace, evict and screen rules.
+  follow the same replace, evict and screen rules. Done in the merge
+  train: the frames sit in the registry entry, reached through
+  `ImageStore::frames_mut`, and `ImageStore::forget_evicted` settles the
+  ids of images a frame command evicted.
 
 ## PLC-7
 
