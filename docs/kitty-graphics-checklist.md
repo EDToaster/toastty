@@ -988,12 +988,22 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
 
 ## 8. Wire format and replies
 
-- [ ] **P1 — WIRE-1. `a=q` with `t=f`, `t=t` or `t=s` replies ENOTSUP.**
+- [x] **P1 — WIRE-1. `a=q` with `t=f`, `t=t` or `t=s` replies ENOTSUP.**
   - Expected: kitty replies OK. For `t=t` it deletes the file; for a missing
     file it replies EBADF.
   - Effect: `kitten icat --detect-support` reports `stream` in toastty
     (kitty: `memory`), so icat never auto-selects file transfer.
   - Cause: `handler.rs:278-279`.
+  - Fixed in #49 for `t=f` and `t=t`, through the hardened
+    `medium::read_image_file` path; `t=t` deletes under the SEC-1 rule. All
+    16 measured cases match kitty, including two found on the way:
+    - kitty checks `f=` and the dimensions before it touches the file
+      (`EINVAL:Zero width/height not allowed`, file kept), for `a=t` too;
+    - a file shorter than `S=` is read to its end (icat's probe sends a
+      3-byte file with `S=47`); B1 had refused it.
+  - `kitten icat --detect-support` now reports `files` (kitty: `memory`).
+    `a=q,t=s` keeps its ENOTSUP until shared memory lands (WIRE-2, separate
+    PR); then detection should report `memory`.
 - [ ] **P1 — WIRE-2. Shared memory (`t=s`) is unsupported, and the shm object
   isn't unlinked.**
   - Actual: `kitten icat --transfer-mode=memory` shows nothing and exits 0,
@@ -1176,9 +1186,14 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
     `Header::frame()`, `Header::animation()` and `Header::composition()` give
     the animation meaning of the overloaded keys.
 - [ ] **P1 — Shared-memory transmission** (`t=s`). See WIRE-2.
-- [ ] **P2 — Usage hints** (`N=1` transient).
+- [x] **P2 — Usage hints** (`N=1` transient).
   - The key is accepted and ignored, which the spec allows.
   - It could feed eviction priority.
+  - Fixed in #49. `N` is a bitmask; bit 0 marks the stored image transient
+    (`KittySink::mark_transient`, `ImageRegistry::set_transient`). Under
+    storage pressure the oldest unplaced transient image is evicted first,
+    then other unplaced images, then placed ones. A re-send without the hint
+    clears it.
 
 ## 10. Real-world client matrix
 
