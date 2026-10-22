@@ -639,3 +639,52 @@ fn graphemes_keep_their_reserve() {
             .would_reject(&CellExtra::Grapheme("\u{302}".into()))
     );
 }
+
+#[test]
+fn low_yield_sweeps_back_off_exponentially() {
+    // #28 re-review: a stream could force a full scan every few thousand
+    // extras. Fill the table with ids that scrollback cells really use,
+    // so every sweep frees nothing, and check the back-off doubles.
+    let mut t = Term::new(4, 20, 4000);
+    feed(&mut t, "\n".repeat(4100).as_bytes());
+    let mut k: u16 = 0;
+    'fill: for n in 0..t.primary.history_lines() {
+        let row = t.primary.scrollback_row_mut(n).unwrap();
+        for c in &mut row.cells {
+            let Some(id) = t.extras.intern(CellExtra::Tab(k)) else {
+                break 'fill;
+            };
+            c.extra = Some(id);
+            k = k.wrapping_add(1);
+        }
+    }
+    assert_eq!(t.extras.len(), crate::extra::MAX_ENTRIES);
+    let g = |i: u32| CellExtra::Grapheme(format!("x{i}").into());
+    assert!(t.intern_extra(g(0)).is_none());
+    assert_eq!(
+        (t.extras_gc_cooldown, t.extras_gc_streak),
+        (super::super::EXTRAS_GC_BACKOFF_BASE, 1)
+    );
+    for i in 0..super::super::EXTRAS_GC_BACKOFF_BASE {
+        assert!(
+            t.intern_extra(g(i + 1)).is_none(),
+            "refused while backing off"
+        );
+    }
+    assert_eq!(t.extras_gc_cooldown, 0);
+    // The next refusal sweeps again (still nothing to free): twice as long.
+    assert!(t.intern_extra(g(u32::MAX)).is_none());
+    assert_eq!(
+        (t.extras_gc_cooldown, t.extras_gc_streak),
+        (super::super::EXTRAS_GC_BACKOFF_BASE * 2, 2)
+    );
+    // Once the cells go away, a sweep frees plenty and the streak resets.
+    t.extras_gc_cooldown = 0;
+    for n in 0..t.primary.history_lines() {
+        for c in &mut t.primary.scrollback_row_mut(n).unwrap().cells {
+            c.extra = None;
+        }
+    }
+    assert!(t.intern_extra(g(7)).is_some());
+    assert_eq!(t.extras_gc_streak, 0);
+}
