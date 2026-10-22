@@ -220,6 +220,30 @@ fn ground_text<P: Perform + ?Sized>(
     }
 }
 
+/// Length of the leading run of printable ASCII (`0x20..=0x7E`) in
+/// `bytes`, 8 bytes at a time: a byte is flagged if its high bit is set,
+/// if adding 1 sets it (0x7F), or if subtracting 0x20 borrows (< 0x20).
+/// Carries and borrows only cross into bytes above a flagged one, so the
+/// lowest flag is exact.
+#[inline]
+fn printable_run_len(bytes: &[u8]) -> usize {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let mut i = 0;
+    while let Some(w) = bytes.get(i..i + 8) {
+        let x = u64::from_le_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]);
+        let t = (x | x.wrapping_add(ONES) | (x.wrapping_sub(0x20 * ONES) & !x)) & HIGH;
+        if t != 0 {
+            return i + (t.trailing_zeros() / 8) as usize;
+        }
+        i += 8;
+    }
+    while i < bytes.len() && (0x20..0x7F).contains(&bytes[i]) {
+        i += 1;
+    }
+    i
+}
+
 /// Deliver ground text exactly as vte 0.15's `ground_dispatch` would
 /// (`print` / `execute` per character, C0 and C1 controls executed),
 /// except that each run of printable ASCII goes to the handler in one
@@ -241,10 +265,7 @@ fn dispatch_ground<P: Perform + ?Sized>(
         let b = text[i];
         if (0x20..0x7F).contains(&b) {
             let start = i;
-            i += 1;
-            while i < n && (0x20..0x7F).contains(&text[i]) {
-                i += 1;
-            }
+            i += printable_run_len(&text[i..]); // >= 1: `b` is printable.
             perform.print_ascii(&text[start..i]);
         } else if b < 0x20 {
             perform.execute(b);
@@ -1971,6 +1992,37 @@ mod tests {
         assert_eq!(r.apc.len(), 1);
         assert_eq!(r.apc[0].len(), body.len());
         assert_eq!(r.apc[0], body);
+    }
+
+    #[test]
+    fn printable_run_len_stops_at_the_first_other_byte() {
+        // Every byte value, at every offset of a 20-byte run (covers the
+        // word loop, its carries / borrows, and the byte tail).
+        for b in 0..=255u8 {
+            for at in 0..20 {
+                let mut v = vec![b'a'; 20];
+                v[at] = b;
+                v.push(0xFF);
+                let want = if (0x20..0x7F).contains(&b) { 20 } else { at };
+                assert_eq!(printable_run_len(&v), want, "byte {b:#x} at {at}");
+                // Something nasty right after the stop.
+                if at + 1 < 20 {
+                    v[at + 1] = 0x00;
+                    let want = if (0x20..0x7F).contains(&b) {
+                        at + 1
+                    } else {
+                        at
+                    };
+                    assert_eq!(
+                        printable_run_len(&v),
+                        want,
+                        "byte {b:#x} at {at}, NUL after"
+                    );
+                }
+            }
+        }
+        assert_eq!(printable_run_len(b""), 0);
+        assert_eq!(printable_run_len(b"~ ~ ~ ~ ~ ~ ~ ~ ~"), 17);
     }
 
     #[test]
