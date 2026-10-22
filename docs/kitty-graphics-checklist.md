@@ -773,11 +773,21 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
 
 Seen during app testing, not a graphics bug:
 
-- [ ] **P2 — Keyboard-protocol flags leak to the main screen after a
+- [x] **P2 — Keyboard-protocol flags leak to the main screen after a
   full-screen app is killed.**
   - Repro: `timeout -s KILL yazi`, then `printf '\e[?1049l'`.
   - Actual: space arrives as `u` and Enter doesn't submit, until a
     `CSI < u`. kitty keeps keyboard flags per screen.
+  - Fix: toastty keeps one flag stack per screen, as the spec requires.
+    Checked against kitty 0.49.2 with a `CSI ? u` probe; the output is
+    identical.
+    - A screen switch only selects the other stack.
+    - The alt stack survives between visits for 47, 1047 and 1049 alike.
+    - Each stack holds 8 entries and evicts the oldest when full.
+    - `CSI = u` modes 1, 2 and 3 behave the same as in kitty, including
+      on an empty stack.
+    - RIS clears both stacks.
+    - Fixed in #33.
 
 Performance notes (Xvfb, software present; not conclusive):
 
