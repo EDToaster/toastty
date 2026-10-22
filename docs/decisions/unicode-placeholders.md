@@ -76,7 +76,49 @@ for `U=1` on `a=T` and `a=p`.
 - **Scope.** There is one table per screen, stashed with the image grid
   on alt-screen switches. In kitty, main's virtual placements don't show
   on alt and alt's are gone after exit. The image *registry* is still
-  shared between screens (a separate item).
+  shared between screens (a separate item). So whenever an image's bytes
+  are replaced or freed (re-transmit, eviction, a byte-freeing delete),
+  its virtual placements are dropped from *both* tables. Otherwise a
+  stashed placement's old `c`/`r` would apply to whatever image later
+  reuses the id. Invariant: every virtual placement names a registered
+  image.
+- **Copy.** A placeholder cell copies as `U+10EEEE` followed by the
+  diacritics it was printed with, as kitty does, so pasting reproduces
+  the image cell.
+
+## Extras-table budget
+
+Each distinct `(placement id, row, col, MSB)` is one `ExtraTable` entry,
+and `kitten icat` uses a random 32-bit id with three diacritics per cell.
+The table is capped at 65,535 ids and is shared with grapheme tails and
+tab markers, so a long session used to fill it: after about 100 icat
+runs, new images stayed blank and combining marks were dropped.
+
+The table now recycles ids, and placeholders get a quota:
+
+- **Reserve.** Placeholder entries are capped at 3/4 of the table
+  (`MAX_PLACEHOLDER_ENTRIES`). Grapheme tails and tab markers always keep
+  the remaining quarter, so images can't starve combining marks.
+- **Reclamation.** When an intern would be refused, `Term::intern_extra`
+  first runs a mark pass over every ring slot of both grids, plus the
+  spare blank row. `ExtraTable::retain` frees every id no cell refers to
+  onto a free list, and later interns reuse those ids. Images that have
+  scrolled out of history cost nothing after that.
+- **Pressure.** Scrollback can hold more distinct live placeholder
+  cells than the quota, for example a long `icat *.png` session.
+  `Term::drop_old_placeholder_extras` then drops the placeholder data
+  of the oldest scrollback rows until half the quota is in use, and
+  reclaims again. Those cells stay `U+10EEEE` text but draw nothing,
+  much like images evicted by kitty's storage quota. New images, the
+  visible screen and the alt grid always keep theirs.
+- **Throttle.** If a pass frees less than 1/16 of the table, what's
+  there is live, and the next 4,096 refused interns skip the scan. A
+  full table therefore doesn't cost a scan per printed character.
+
+All print-path callers (graphemes, tab markers, placeholders) write the
+returned id straight into the grid. The rich-block layout still interns
+directly and never triggers a scan, because it holds ids in rows it
+hasn't written yet.
 
 ## Rendering and cost
 
@@ -84,6 +126,15 @@ for `U=1` on `a=T` and `a=p`.
   immediately, so terminals that never use placeholders pay nothing.
   Otherwise it scans the rendered rows (≤ rows + 2), which is a linear
   pass over the cells.
+- **Lookups.** `VirtualPlacements` is indexed. Each image has its
+  placements in creation order, so `p=0` takes the first, and a map
+  covers named `(image, p)` pairs. Each run then costs one or two hash
+  lookups, however many placements an image has.
+  - `cargo bench -p toastty-render --bench placeholder` measures a
+    hostile frame: 4,096 placements of one image, and 200×60 one-cell
+    runs naming a placement id that doesn't exist.
+  - That frame takes ~0.5 ms. The earlier linear scan took ~75 ms.
+  - A full-screen image takes ~55 µs.
 - **Draw calls.** The image pipeline issues one draw per instance.
   Each run is one instance, and runs that stack exactly on consecutive
   rows (same texture, z, x extent in screen and image space, and
