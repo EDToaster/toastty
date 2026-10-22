@@ -102,9 +102,9 @@ of the placement-named fields:
 
 - **The leading comma.** kitty writes `I=`-only error replies with a
   stray leading comma (`\x1b_G,I=999;ENOENT…`). We omit it.
-- **Animation on a stored image.** kitty replies `i=N,r=<frame>;OK` to
-  `a=f` and frame errors to `a=c`. We stay silent until stack E implements
-  animation.
+- **Animation on a stored image.** Implemented since (see
+  `kitty-animation.md`): `a=f` replies `i=N,r=<frame>;OK` and `a=c`
+  replies OK or its frame errors, as in kitty.
 - **`t=s`** still replies ENOTSUP; that is B4's job.
 - **Other PNG errors** carry the `image` crate's message after `EBADPNG:`
   rather than libpng's.

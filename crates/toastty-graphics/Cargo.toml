@@ -10,6 +10,10 @@ thiserror.workspace = true
 icy_sixel = "0.5"
 base64 = "0.22"
 flate2 = "1"
+# Kitty animation frames are kept LZ4-compressed in memory and
+# decompressed when a frame is composed (see `frames.rs`). Pure Rust, safe
+# mode only.
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 # `gltf` for the RGP `.glb` loader. We disable `import` (which pulls
 # in image/urlencoding for file-IO and data-URI handling we don't

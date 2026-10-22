@@ -29,7 +29,8 @@ use toastty_graphics::rgp::path_resolver::resolve as resolve_rgp_path;
 use toastty_graphics::rgp::scene::{RgpAsset, RgpScene};
 use toastty_graphics::sixel::{SIXEL_MAX_COLORS, SixelDcs, SixelHandler};
 use toastty_graphics::{
-    ImageData, ImageGrid, ImageKey, ImageRegistry, ImageStore, Placement, VirtualPlacements,
+    FrameDelete, ImageData, ImageGrid, ImageKey, ImageRegistry, ImageStore, Placement,
+    VirtualPlacements,
 };
 
 /// m7: default per-screen image quota, 320 MiB (kitty's default storage
@@ -39,6 +40,8 @@ const DEFAULT_IMAGE_CAP: u64 = 320 * 1024 * 1024;
 use toastty_parser::{Params, Perform};
 pub use toastty_protocols::clipboard::{ClipboardTarget, ClipboardTargets};
 
+#[cfg(test)]
+mod animation_tests;
 mod placeholder;
 #[cfg(test)]
 mod relative_tests;
@@ -358,6 +361,9 @@ pub struct Term {
     /// The renderer compares against its cached value to decide when
     /// to re-sync GPU textures (and force a full clear of the frame).
     image_revision: u32,
+    /// When the next kitty animation frame is due (from the last
+    /// [`Term::tick_animations`]).
+    next_animation_frame: Option<Instant>,
     /// SGR 58 underline color. Stored but not yet rendered as an
     /// underline color; a Unicode placeholder cell printed with it
     /// records it as its placement id (see [`placeholder`]).
@@ -610,6 +616,7 @@ impl Term {
             #[cfg(test)]
             region_scrolls: 0,
             image_revision: 0,
+            next_animation_frame: None,
             cursor_underline_color: None,
             // Reasonable defaults until the binary plumbs the real
             // values from the renderer.
@@ -4822,12 +4829,107 @@ impl Term {
         let Some(img) = target else {
             return;
         };
-        // Single-frame rule: every placement (virtual ones too) and the
-        // bytes, like `d=I` with no survivor.
+        // An animated image loses frame `r=` (0 = the root, past the end
+        // = the last), as in kitty 0.49.2 (#47).
+        if let Some(key) = self.images.store.key_of(img)
+            && let FrameDelete::Deleted { display_changed } = self
+                .images
+                .store
+                .frames_mut()
+                .delete_frame(key, header.rows)
+        {
+            if display_changed {
+                self.image_display_changed(key);
+            }
+            return;
+        }
+        // Single-frame rule (checked live): `d=F` deletes and frees the
+        // image, every placement (virtual ones too) included, like `d=I`
+        // with no survivor; `d=f` does nothing.
         if !uppercase {
             return;
         }
         self.delete_by_image(img, 0, true, dropped, cascaded);
+    }
+
+    /// The store key of client image `id` for an animation command, or
+    /// kitty's ENOENT.
+    fn animation_key(&self, id: u32) -> Result<ImageKey, toastty_graphics::FrameError> {
+        self.images
+            .store
+            .key_of(id)
+            .ok_or_else(|| toastty_graphics::FrameError {
+                code: toastty_graphics::kitty::reply::ErrorCode::Enoent,
+                detail: format!(
+                    "Animation command refers to non-existent image with id: {id} and number: 0"
+                ),
+            })
+    }
+
+    /// The image stored under `key` shows new pixels (an animation
+    /// frame): redraw its placements. Placeholder cells redraw through
+    /// the image revision.
+    fn image_display_changed(&mut self, key: ImageKey) {
+        let placements: Vec<Placement> = self
+            .images
+            .grid
+            .iter()
+            .filter(|p| p.key == key)
+            .cloned()
+            .collect();
+        for p in &placements {
+            mark_placement_dirty(self, p);
+        }
+        self.image_revision = self.image_revision.wrapping_add(1);
+    }
+
+    /// Drop the placements of images a frame command just evicted from
+    /// the active screen's store, and the store's id bookkeeping for them.
+    fn forget_evicted_images(&mut self, evicted: &[ImageKey]) {
+        if evicted.is_empty() {
+            return;
+        }
+        for &key in evicted {
+            let dropped = self.images.grid.remove_image_key(key);
+            for p in &dropped {
+                mark_placement_dirty(self, p);
+            }
+        }
+        self.images.store.forget_evicted(evicted);
+        self.prune_virtual_placements();
+        self.image_revision = self.image_revision.wrapping_add(1);
+    }
+
+    /// Advance running kitty animations to `now`; call before rendering.
+    /// Only images with a placement on the active screen (real or
+    /// virtual) play, as in kitty, which animates only what it draws.
+    /// Returns true if any displayed frame changed (the placements are
+    /// marked dirty and [`Term::image_revision`] bumps). When nothing is
+    /// running this is a cheap no-op, so an idle terminal stays idle.
+    pub fn tick_animations(&mut self, now: Instant) -> bool {
+        if !self.images.store.registry().has_running_animation() {
+            self.next_animation_frame = None;
+            return false;
+        }
+        let drawn = self.images.placed_keys();
+        let (changed, next) = self
+            .images
+            .store
+            .frames_mut()
+            .tick_animations(now, |key| drawn.contains(&key));
+        self.next_animation_frame = next;
+        for &key in &changed {
+            self.image_display_changed(key);
+        }
+        !changed.is_empty()
+    }
+
+    /// When the next animation frame is due, as of the last
+    /// [`Term::tick_animations`]; `None` when no animation is running.
+    /// The event loop sleeps until then.
+    #[must_use]
+    pub fn next_animation_frame(&self) -> Option<Instant> {
+        self.next_animation_frame
     }
 
     /// `d=i`/`d=I` (and `d=n`/`d=N` once the number is resolved): remove
@@ -5492,6 +5594,67 @@ impl KittySink for Term {
 
     fn cell_pixel_size(&self) -> (u16, u16) {
         self.cell_pixel_size
+    }
+
+    fn frame_count(&self, id: u32) -> u32 {
+        let store = &self.images.store;
+        store
+            .key_of(id)
+            .and_then(|key| store.registry().frame_count(key))
+            .unwrap_or(1)
+    }
+
+    fn add_frame(
+        &mut self,
+        id: u32,
+        keys: &toastty_graphics::kitty::header::FrameKeys,
+        data: ImageData,
+    ) -> Result<u32, toastty_graphics::FrameError> {
+        // Frames live with the image in this screen's store (#42).
+        let key = self.animation_key(id)?;
+        // Frames may evict images without placements, never placed ones.
+        let pinned = self.images.placed_keys();
+        let change = self
+            .images
+            .store
+            .frames_mut()
+            .add_frame(key, keys, data, &pinned)?;
+        self.forget_evicted_images(&change.evicted);
+        if change.display_changed {
+            self.image_display_changed(key);
+        }
+        Ok(change.frame)
+    }
+
+    fn control_animation(
+        &mut self,
+        id: u32,
+        keys: &toastty_graphics::kitty::header::AnimationKeys,
+    ) {
+        if let Some(key) = self.images.store.key_of(id)
+            && self.images.store.frames_mut().control_animation(key, keys)
+        {
+            self.image_display_changed(key);
+        }
+    }
+
+    fn compose_frames(
+        &mut self,
+        id: u32,
+        keys: &toastty_graphics::kitty::header::CompositionKeys,
+    ) -> Result<(), toastty_graphics::FrameError> {
+        let key = self.animation_key(id)?;
+        let pinned = self.images.placed_keys();
+        let change = self
+            .images
+            .store
+            .frames_mut()
+            .compose_frames(key, id, keys, &pinned)?;
+        self.forget_evicted_images(&change.evicted);
+        if change.display_changed {
+            self.image_display_changed(key);
+        }
+        Ok(())
     }
 }
 
@@ -6340,7 +6503,10 @@ mod tests {
         // the rest; the SGR must not apply. WIRE-18: ESC + a non-ASCII
         // byte is dropped, the rest printed. Checked with get-text.
         let mut t = Term::new(3, 40, 0);
-        feed(&mut t, b"\x1b[3\x9c1mX\r\n\x1b\xe2\x82\xacA\r\n\x1b[3\xc3\xa91mY");
+        feed(
+            &mut t,
+            b"\x1b[3\x9c1mX\r\n\x1b\xe2\x82\xacA\r\n\x1b[3\xc3\xa91mY",
+        );
         assert_eq!(row_text(&t, 0), "1mX");
         assert_eq!(row_text(&t, 1), "\u{FFFD}\u{FFFD}A");
         assert_eq!(row_text(&t, 2), "\u{FFFD}1mY");
@@ -9524,13 +9690,18 @@ mod tests {
             String::from_utf8_lossy(&t.drain_pty_replies()),
             "\x1b_Gi=1;ENOENT:Animation command refers to non-existent image with id: 1 and number: 0\x1b\\"
         );
-        // WIRE-3: stored image → silent no-op (kitten icat's `a=a`
-        // commands carry no `q=`).
+        // WIRE-3: `a=a` on a stored image never replies (kitten icat's
+        // `a=a` commands carry no `q=`); `a=c` gets kitty's frame errors.
         let mut payload = b"\x1b_Ga=t,f=32,s=1,v=1,i=1,q=2;".to_vec();
         payload.extend_from_slice(&b64_red_1x1());
-        payload.extend_from_slice(b"\x1b\\\x1b_Ga=a,i=1,s=3,v=1\x1b\\\x1b_Ga=c,i=1,C=2\x1b\\");
+        payload.extend_from_slice(b"\x1b\\\x1b_Ga=a,i=1,s=3,v=1\x1b\\");
         feed(&mut t, &payload);
         assert!(t.drain_pty_replies().is_empty());
+        feed(&mut t, b"\x1b_Ga=c,i=1,C=2\x1b\\");
+        assert_eq!(
+            String::from_utf8_lossy(&t.drain_pty_replies()),
+            "\x1b_Gi=1;ENOENT:No source frame number 0 exists in image id: 1\n\x1b\\"
+        );
         assert!(t.image_store().contains(1));
     }
 

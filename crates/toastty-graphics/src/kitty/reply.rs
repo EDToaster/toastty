@@ -23,6 +23,9 @@ pub enum ErrorCode {
     Enotsup,
     /// Image too large to fit under the memory cap.
     Efbig,
+    /// No room for more animation frame data (kitty: `ENOSPC:Cache size
+    /// exceeded cannot add new frames`).
+    Enospc,
     /// Not enough image data for the declared size
     /// (`ENODATA:Insufficient image data: GOT < EXPECTED`).
     Enodata,
@@ -53,6 +56,7 @@ impl ErrorCode {
             ErrorCode::Enoent => "ENOENT",
             ErrorCode::Enotsup => "ENOTSUP",
             ErrorCode::Efbig => "EFBIG",
+            ErrorCode::Enospc => "ENOSPC",
             ErrorCode::Enomem => "ENOMEM",
             ErrorCode::Enodata => "ENODATA",
             ErrorCode::Ebadpng => "EBADPNG",
@@ -99,30 +103,66 @@ pub fn encode_error(
     encode(image_id, image_number, placement_id, &body)
 }
 
+/// Encode an `OK` reply to an animation-frame command (`a=f`). kitty
+/// tags it with the frame that was created or edited: `i=1,r=2;OK`.
+#[must_use]
+pub fn encode_frame_ok(image_id: u32, image_number: u32, placement_id: u32, frame: u32) -> Vec<u8> {
+    encode_keys(image_id, image_number, placement_id, frame, "OK")
+}
+
+/// Encode an error reply to an `a=f` command. Like [`encode_frame_ok`]
+/// it carries `r=<frame>`, the frame the command was aimed at:
+/// `i=1,r=2;EINVAL:No frame with number: 3 found`.
+#[must_use]
+pub fn encode_frame_error(
+    image_id: u32,
+    image_number: u32,
+    placement_id: u32,
+    frame: u32,
+    code: ErrorCode,
+    detail: &str,
+) -> Vec<u8> {
+    let body = if detail.is_empty() {
+        code.as_str().to_string()
+    } else {
+        format!("{}:{}", code.as_str(), detail)
+    };
+    encode_keys(image_id, image_number, placement_id, frame, &body)
+}
+
 /// Lower-level common encoder for `OK` and error bodies.
-///
-/// Field order mirrors reference kitty: `i`, `I`, then `p`.
 fn encode(image_id: u32, image_number: u32, placement_id: u32, body: &str) -> Vec<u8> {
+    encode_keys(image_id, image_number, placement_id, 0, body)
+}
+
+/// Keys in kitty's order: `i`, `I`, `p`, then `r` (frame replies only).
+///
+/// kitty 0.49.2 writes every key after `i=` with a leading comma, so its
+/// reply to an `I=`-only command starts with a stray one (`,I=7;…`). We
+/// leave that comma out (see `docs/decisions/kitty-replies.md`).
+fn encode_keys(
+    image_id: u32,
+    image_number: u32,
+    placement_id: u32,
+    frame: u32,
+    body: &str,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 + body.len());
     out.extend_from_slice(b"\x1b_G");
-    let mut first = true;
+    let mut keys = Vec::with_capacity(4);
     if image_id != 0 {
-        out.extend_from_slice(format!("i={image_id}").as_bytes());
-        first = false;
+        keys.push(format!("i={image_id}"));
     }
     if image_number != 0 {
-        if !first {
-            out.push(b',');
-        }
-        out.extend_from_slice(format!("I={image_number}").as_bytes());
-        first = false;
+        keys.push(format!("I={image_number}"));
     }
     if placement_id != 0 {
-        if !first {
-            out.push(b',');
-        }
-        out.extend_from_slice(format!("p={placement_id}").as_bytes());
+        keys.push(format!("p={placement_id}"));
     }
+    if frame != 0 {
+        keys.push(format!("r={frame}"));
+    }
+    out.extend_from_slice(keys.join(",").as_bytes());
     out.push(b';');
     out.extend_from_slice(body.as_bytes());
     out.extend_from_slice(b"\x1b\\");
@@ -143,6 +183,24 @@ mod tests {
     fn ok_reply_with_image_number_only() {
         let bytes = encode_ok(0, 7, 0);
         assert_eq!(bytes, b"\x1b_GI=7;OK\x1b\\");
+    }
+
+    #[test]
+    fn frame_replies_carry_r() {
+        assert_eq!(encode_frame_ok(1, 0, 0, 2), b"\x1b_Gi=1,r=2;OK\x1b\\");
+        assert_eq!(encode_frame_ok(0, 7, 0, 2), b"\x1b_GI=7,r=2;OK\x1b\\");
+        assert_eq!(encode_frame_ok(1, 0, 5, 2), b"\x1b_Gi=1,p=5,r=2;OK\x1b\\");
+        assert_eq!(
+            encode_frame_error(
+                1,
+                0,
+                0,
+                3,
+                ErrorCode::Einval,
+                "No frame with number: 9 found"
+            ),
+            b"\x1b_Gi=1,r=3;EINVAL:No frame with number: 9 found\x1b\\"
+        );
     }
 
     #[test]

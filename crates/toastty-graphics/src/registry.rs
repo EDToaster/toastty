@@ -5,15 +5,27 @@
 //! registry tracks the *decoded CPU bytes*; the renderer's
 //! `ImageTextureCache` mirrors entries onto the GPU.
 //!
-//! Storage: `HashMap<id, ImageData>` keyed by Kitty image id, plus an
-//! LRU `VecDeque<u32>` for eviction order. The cap is in bytes (configured
-//! by the binary based on free memory / a fixed budget).
+//! Storage: `HashMap<key, Entry>`, plus an LRU `VecDeque` for eviction
+//! order. A screen's `ImageStore` keys it by [`ImageKey`]; a plain `u32`
+//! works too (tests, standalone use). The cap is in bytes (configured by
+//! the binary based on free memory / a fixed budget).
+//!
+//! Animated images (kitty `a=f` / `a=a` / `a=c`) also hold their frames
+//! ([`crate::frames::Animation`]), in their own budget. For those, the
+//! [`ImageData`] that [`ImageRegistry::get`] returns is the frame on
+//! display, so every placement and placeholder draws the current frame
+//! without knowing about animation.
 //!
 //! Identifier policy:
-//! - Caller supplies an explicit id (Kitty `i=`).
+//! - Caller supplies an explicit id (Kitty `i=`, or a store key).
 //! - If `0`, the registry assigns the lowest unused 1-based id.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
+
+use crate::frames::{Animation, FrameError, Playback, PreparedFrame};
+use crate::kitty::header::{AnimationKeys, CompositionKeys, FrameKeys};
+use crate::kitty::reply::ErrorCode;
 
 /// Decoded image payload, fully resident in memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,13 +81,47 @@ pub trait RegistryKey:
 
 impl<K: Copy + Eq + std::hash::Hash + std::fmt::Debug + From<u32> + Into<u32>> RegistryKey for K {}
 
+/// One resident image.
+#[derive(Debug)]
+struct Entry {
+    /// The image as displayed: the transmitted pixels, or for an
+    /// animated image the current frame, composed.
+    image: ImageData,
+    /// Frames and playback state, once the image has frames (or an
+    /// `a=c`).
+    anim: Option<Box<Animation>>,
+    /// `a=a` settings given while the image had no frames yet.
+    playback: Playback,
+    /// Unique stamp of `image`'s content; see
+    /// [`ImageRegistry::generation`].
+    generation: u64,
+}
+
+impl Entry {
+    /// Bytes counted against the frame budget: the stored frames.
+    fn frame_bytes(&self) -> u64 {
+        self.anim.as_ref().map_or(0, |a| a.byte_size())
+    }
+}
+
+/// Frames of different animations due within this long of each other are
+/// shown together, so N animations don't cost N redraws per period
+/// (kitty batches repaints the same way, `repaint_delay`).
+pub const ANIMATION_SLACK: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Animation frames get their own budget, this many times the image cap
+/// (kitty: a disk cache of 5×). Frames are stored LZ4-compressed, so the
+/// budget holds several times its size in frames.
+pub const FRAME_BUDGET_FACTOR: u64 = 2;
+
 /// LRU-bounded cache of decoded images.
 #[derive(Debug)]
 pub struct ImageRegistry<K: RegistryKey = u32> {
-    entries: HashMap<K, ImageData>,
+    entries: HashMap<K, Entry>,
     /// Eviction order. Most recently used at the back.
     lru: VecDeque<K>,
-    /// Sum of each entry's cost (`byte_size() + overhead`).
+    /// Sum of each entry's cost (displayed pixels plus `overhead`; frames
+    /// not included).
     total_bytes: u64,
     /// Soft cap. Insertions evict until `total_bytes + new <= cap_bytes`.
     cap_bytes: u64,
@@ -83,21 +129,47 @@ pub struct ImageRegistry<K: RegistryKey = u32> {
     /// images can't fit a quota that only counts pixels (each entry costs
     /// real memory in the maps and the LRU). `0` unless set.
     overhead: u64,
+    /// Sum of [`Entry::frame_bytes`] across `entries`.
+    frame_bytes: u64,
+    /// Cap on `frame_bytes`: [`FRAME_BUDGET_FACTOR`] × `cap_bytes`.
+    frame_cap_bytes: u64,
     /// Monotonic content version. Bumps on every successful insert /
-    /// remove. The renderer compares this to its cached value to decide
-    /// when to re-sync GPU textures.
+    /// remove, and whenever an animated image's displayed frame changes.
+    /// The renderer compares this to its cached value to decide when to
+    /// re-sync GPU textures.
     revision: u32,
-    /// Per-image generation, stamped on every insert (including an
-    /// in-place replace under the same id) from `next_generation`. The
-    /// renderer keys its GPU textures on it, so any re-transmit is seen
-    /// as new content regardless of size or pixels.
-    generations: HashMap<K, u64>,
-    /// Next generation to hand out. Starts at 1, never reused.
+    /// Next [`Entry::generation`] to hand out. Starts at 1, never reused.
     next_generation: u64,
     /// Ids sent with the transient usage hint (`N=1`). Under storage
     /// pressure they are evicted before other images without placements
     /// (spec "Usage hints"; §9).
     transient: HashSet<K>,
+}
+
+/// What [`ImageRegistry::add_frame`] and [`ImageRegistry::compose_frames`]
+/// did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameChange<K = u32> {
+    /// 1-based frame created or edited (the reply's `r=`).
+    pub frame: u32,
+    /// True if the displayed frame's pixels changed.
+    pub display_changed: bool,
+    /// Ids evicted to make room (oldest first).
+    pub evicted: Vec<K>,
+}
+
+/// Outcome of [`ImageRegistry::delete_frame`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameDelete {
+    /// No such image.
+    NotFound,
+    /// The image has only its root frame; nothing was deleted.
+    OnlyFrame,
+    /// A frame was deleted.
+    Deleted {
+        /// True if the displayed frame's pixels changed.
+        display_changed: bool,
+    },
 }
 
 impl<K: RegistryKey> ImageRegistry<K> {
@@ -117,8 +189,9 @@ impl<K: RegistryKey> ImageRegistry<K> {
             total_bytes: 0,
             cap_bytes,
             overhead,
+            frame_bytes: 0,
+            frame_cap_bytes: cap_bytes.saturating_mul(FRAME_BUDGET_FACTOR),
             revision: 0,
-            generations: HashMap::new(),
             next_generation: 1,
             transient: HashSet::new(),
         }
@@ -137,10 +210,31 @@ impl<K: RegistryKey> ImageRegistry<K> {
         self.cap_bytes
     }
 
-    /// Total bytes charged (pixels plus per-image overhead).
+    /// Total bytes charged for resident images: displayed pixels plus
+    /// per-image overhead (frames not included).
     #[must_use]
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes
+    }
+
+    /// Bytes of stored animation frames (compressed), root copies
+    /// included.
+    #[must_use]
+    pub fn frame_bytes(&self) -> u64 {
+        self.frame_bytes
+    }
+
+    /// Cap on [`Self::frame_bytes`].
+    #[must_use]
+    pub fn frame_cap_bytes(&self) -> u64 {
+        self.frame_cap_bytes
+    }
+
+    /// Drop `id` and `e`'s bytes from the totals (it left the registry).
+    fn forget_bytes(&mut self, id: K, e: &Entry) {
+        self.total_bytes -= self.cost(&e.image);
+        self.frame_bytes -= e.frame_bytes();
+        self.transient.remove(&id);
     }
 
     /// Bytes still free under `cap_bytes`. Saturates at 0.
@@ -162,7 +256,7 @@ impl<K: RegistryKey> ImageRegistry<K> {
     }
 
     /// Monotonic content revision counter. Bumps on every insert /
-    /// remove.
+    /// remove, and when an animated image shows a new frame.
     #[must_use]
     pub fn revision(&self) -> u32 {
         self.revision
@@ -174,18 +268,21 @@ impl<K: RegistryKey> ImageRegistry<K> {
         self.entries.contains_key(&id)
     }
 
-    /// Borrow an image by id. Does NOT touch the LRU.
+    /// Borrow an image by id: for an animated image, its current frame.
+    /// Does NOT touch the LRU.
     #[must_use]
     pub fn get(&self, id: K) -> Option<&ImageData> {
-        self.entries.get(&id)
+        self.entries.get(&id).map(|e| &e.image)
     }
 
-    /// The generation `id`'s current data was stored under: unique per
-    /// insert, so a re-transmit under the same id (same size, same
-    /// pixels or not) always yields a new value. `None` if not resident.
+    /// A stamp of what [`Self::get`] returns for `id`: unique per insert
+    /// (a re-transmit under the same id, same size and pixels or not,
+    /// gets a new one) and per change of the displayed frame of an
+    /// animated image. `None` if not resident. The renderer keys GPU
+    /// textures on it.
     #[must_use]
     pub fn generation(&self, id: K) -> Option<u64> {
-        self.generations.get(&id).copied()
+        self.entries.get(&id).map(|e| e.generation)
     }
 
     /// Borrow an image by id and mark it MRU.
@@ -194,7 +291,7 @@ impl<K: RegistryKey> ImageRegistry<K> {
             return None;
         }
         self.bump_to_back(id);
-        self.entries.get(&id)
+        self.entries.get(&id).map(|e| &e.image)
     }
 
     /// Iterate (id, image) in MRU order (oldest first).
@@ -202,7 +299,7 @@ impl<K: RegistryKey> ImageRegistry<K> {
         self.lru
             .iter()
             .copied()
-            .filter_map(|id| self.entries.get(&id).map(|d| (id, d)))
+            .filter_map(|id| self.entries.get(&id).map(|e| (id, &e.image)))
     }
 
     /// Insert `data` under `id`. If `id` is 0 the registry assigns the
@@ -225,6 +322,7 @@ impl<K: RegistryKey> ImageRegistry<K> {
     /// go first. Every pass respects LRU order (oldest first).
     ///
     /// The new entry starts out non-transient; mark it after inserting.
+    /// Replacing an animated image drops its frames, as in kitty.
     pub fn insert_with_pinned(
         &mut self,
         id: K,
@@ -245,13 +343,13 @@ impl<K: RegistryKey> ImageRegistry<K> {
         };
 
         // Replace path: free the old bytes first so eviction calculus
-        // uses post-replace totals.
+        // uses post-replace totals. A usage hint belongs to the data it
+        // was sent with, so it goes too.
         if let Some(old) = self.entries.remove(&final_id) {
-            self.total_bytes -= self.cost(&old);
+            self.forget_bytes(final_id, &old);
             // Drop the stale LRU entry; we'll push the fresh one below.
             self.lru.retain(|x| *x != final_id);
         }
-        // A usage hint belongs to the data it was sent with.
         self.transient.remove(&final_id);
 
         // Evict until we have room. Don't ever evict the id we're about
@@ -261,45 +359,85 @@ impl<K: RegistryKey> ImageRegistry<K> {
         // even when an unplaced one is available. Instead pick the LRU
         // victim from the *unpinned* images first; only when none remain
         // fall back to the strict LRU front (which may be pinned).
+        let evicted = self.evict_for(Budget::Images, need, None, pinned, true);
+
+        self.total_bytes += need;
+        self.lru.push_back(final_id);
+        let generation = self.stamp();
+        self.entries.insert(
+            final_id,
+            Entry {
+                image: data,
+                anim: None,
+                playback: Playback::default(),
+                generation,
+            },
+        );
+        self.revision = self.revision.wrapping_add(1);
+        Ok(Inserted {
+            id: final_id,
+            evicted,
+        })
+    }
+
+    /// Whether `need` more bytes fit in `budget`.
+    fn fits(&self, budget: Budget, need: u64) -> bool {
+        match budget {
+            Budget::Images => self.total_bytes + need <= self.cap_bytes,
+            Budget::Frames => self.frame_bytes + need <= self.frame_cap_bytes,
+        }
+    }
+
+    /// Evict LRU entries other than `keep` until `need` more bytes fit
+    /// in `budget`: unpinned transient images first (`N=1`), then other
+    /// unpinned ones. With `allow_pinned` false, pinned images are never
+    /// evicted (and the cap may stay exceeded). For the frame budget only
+    /// animated images are candidates. Returns the evicted ids, oldest
+    /// first.
+    fn evict_for(
+        &mut self,
+        budget: Budget,
+        need: u64,
+        keep: Option<K>,
+        pinned: &HashSet<K>,
+        allow_pinned: bool,
+    ) -> Vec<K> {
         let mut evicted = Vec::new();
-        while self.total_bytes + need > self.cap_bytes {
-            // Prefer the oldest unpinned transient image, then the oldest
-            // unpinned one.
+        let frees = |r: &Self, id: K| {
+            budget == Budget::Images || r.entries.get(&id).is_some_and(|e| e.frame_bytes() > 0)
+        };
+        while !self.fits(budget, need) {
+            let candidate = |r: &Self, x: K| Some(x) != keep && !pinned.contains(&x) && frees(r, x);
             let victim = self
                 .lru
                 .iter()
-                .position(|x| !pinned.contains(x) && self.transient.contains(x))
-                .or_else(|| self.lru.iter().position(|x| !pinned.contains(x)))
+                .position(|x| candidate(self, *x) && self.transient.contains(x))
+                .or_else(|| self.lru.iter().position(|x| candidate(self, *x)))
                 // Fall back to the strict LRU front if everything left is
                 // pinned (we must still free space to honor the cap).
-                .or_else(|| (!self.lru.is_empty()).then_some(0));
+                .or_else(|| {
+                    allow_pinned
+                        .then(|| self.lru.iter().position(|x| Some(*x) != keep))
+                        .flatten()
+                });
             let Some(at) = victim else {
-                // Empty LRU; the cap check above guarantees the insert
-                // fits, so this is purely defensive.
+                // Nothing (left) to evict; for an insert the cap check
+                // guarantees the new image fits, so this is defensive.
                 break;
             };
             // O(1) for the usual case, the front.
             let Some(victim) = self.lru.remove(at) else {
                 break;
             };
-            self.transient.remove(&victim);
             if let Some(victim_data) = self.entries.remove(&victim) {
-                self.total_bytes -= self.cost(&victim_data);
-                self.generations.remove(&victim);
+                self.forget_bytes(victim, &victim_data);
                 evicted.push(victim);
             }
         }
-
-        self.total_bytes += need;
-        self.lru.push_back(final_id);
-        self.entries.insert(final_id, data);
-        self.generations.insert(final_id, self.next_generation);
-        self.next_generation += 1;
-        self.revision = self.revision.wrapping_add(1);
-        Ok(Inserted {
-            id: final_id,
-            evicted,
-        })
+        if !evicted.is_empty() {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        evicted
     }
 
     /// Mark `id` as transient (`N=1`) or not. No-op for an unknown id.
@@ -320,12 +458,11 @@ impl<K: RegistryKey> ImageRegistry<K> {
     /// Remove `id`. Returns the freed image if it was present.
     pub fn remove(&mut self, id: K) -> Option<ImageData> {
         self.transient.remove(&id);
-        let data = self.entries.remove(&id)?;
-        self.total_bytes -= self.cost(&data);
-        self.generations.remove(&id);
+        let entry = self.entries.remove(&id)?;
+        self.forget_bytes(id, &entry);
         self.lru.retain(|x| *x != id);
         self.revision = self.revision.wrapping_add(1);
-        Some(data)
+        Some(entry.image)
     }
 
     /// Iterate every resident id.
@@ -333,23 +470,24 @@ impl<K: RegistryKey> ImageRegistry<K> {
         self.entries.keys().copied()
     }
 
-    /// Resize the byte cap. If `new_cap < total_bytes`, evicts LRU
-    /// entries until the budget is satisfied. Returns the evicted ids.
+    /// Resize the byte cap (and the frame budget with it). If either is
+    /// exceeded, evicts LRU entries until both are satisfied. Returns the
+    /// evicted ids.
     pub fn set_cap(&mut self, new_cap: u64) -> Vec<K> {
         self.cap_bytes = new_cap;
+        self.frame_cap_bytes = new_cap.saturating_mul(FRAME_BUDGET_FACTOR);
         let mut evicted = Vec::new();
         while self.total_bytes > self.cap_bytes {
             let Some(victim) = self.lru.pop_front() else {
                 break;
             };
-            self.transient.remove(&victim);
             if let Some(data) = self.entries.remove(&victim) {
-                self.total_bytes -= self.cost(&data);
-                self.generations.remove(&victim);
+                self.forget_bytes(victim, &data);
                 evicted.push(victim);
                 self.revision = self.revision.wrapping_add(1);
             }
         }
+        evicted.extend(self.evict_for(Budget::Frames, 0, None, &HashSet::new(), true));
         evicted
     }
 
@@ -370,6 +508,254 @@ impl<K: RegistryKey> ImageRegistry<K> {
             }
             candidate += 1;
         }
+    }
+
+    fn stamp(&mut self) -> u64 {
+        let g = self.next_generation;
+        self.next_generation += 1;
+        g
+    }
+
+    /// Record that `id`'s displayed pixels changed.
+    fn display_changed(&mut self, id: K) {
+        let generation = self.stamp();
+        if let Some(e) = self.entries.get_mut(&id) {
+            e.generation = generation;
+        }
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Re-sum `id`'s frame bytes after its frames changed (they were
+    /// `before`). Frame commands never change the displayed image's size.
+    fn reaccount(&mut self, id: K, before: u64) {
+        if let Some(e) = self.entries.get(&id) {
+            self.frame_bytes = self.frame_bytes - before + e.frame_bytes();
+        }
+    }
+
+    /// Give `id` an animation, if it has none yet: its root frame is a
+    /// (compressed) copy of the stored image, charged to the frame budget
+    /// like any frame, evicting as [`Self::add_frame`] does. Fails with
+    /// ENOSPC (`enospc`) when the copy doesn't fit.
+    fn ensure_animation(
+        &mut self,
+        id: K,
+        pinned: &HashSet<K>,
+        enospc: &str,
+    ) -> Result<Vec<K>, FrameError> {
+        let Some(e) = self.entries.get(&id) else {
+            return Err(not_found(id.into()));
+        };
+        if e.anim.is_some() {
+            return Ok(Vec::new());
+        }
+        let anim = Animation::new(&e.image, &e.playback);
+        let cost = anim.byte_size();
+        let evicted = self.evict_for(Budget::Frames, cost, Some(id), pinned, false);
+        if !self.fits(Budget::Frames, cost) {
+            return Err(FrameError {
+                code: ErrorCode::Enospc,
+                detail: enospc.to_string(),
+            });
+        }
+        self.frame_bytes += cost;
+        self.entries.get_mut(&id).expect("resident").anim = Some(Box::new(anim));
+        Ok(evicted)
+    }
+
+    /// Number of frames of `id`, root included (1 for a still image).
+    /// `None` if not resident.
+    #[must_use]
+    pub fn frame_count(&self, id: K) -> Option<u32> {
+        let e = self.entries.get(&id)?;
+        Some(e.anim.as_ref().map_or(1, |a| a.frame_count()))
+    }
+
+    /// The animation state of `id`, if it has had an animation command.
+    #[must_use]
+    pub fn animation(&self, id: K) -> Option<&Animation> {
+        self.entries.get(&id)?.anim.as_deref()
+    }
+
+    /// `a=f`: add or edit a frame of `id` from the decoded `data`. The
+    /// frame's bytes count against the cap: room is made by evicting
+    /// images not in `pinned` (never `id` itself or a pinned image), and
+    /// failing that the command fails with kitty's ENOSPC.
+    pub fn add_frame(
+        &mut self,
+        id: K,
+        keys: &FrameKeys,
+        data: ImageData,
+        pinned: &HashSet<K>,
+    ) -> Result<FrameChange<K>, FrameError> {
+        let count = self.frame_count(id).ok_or_else(|| not_found(id.into()))?;
+        let enospc = if keys.edit_frame == 0 || keys.edit_frame > count {
+            "Cache size exceeded cannot add new frames"
+        } else {
+            "Failed to cache data for image frame"
+        };
+        let mut evicted = self.ensure_animation(id, pinned, enospc)?;
+        let anim = self.entries[&id].anim.as_ref().expect("just created");
+        let prepared = anim.prepare_frame(keys, data)?;
+        let mut change = self.commit_prepared(id, prepared, pinned, enospc)?;
+        evicted.append(&mut change.evicted);
+        change.evicted = evicted;
+        Ok(change)
+    }
+
+    /// `a=c`: compose a rectangle of one frame of `id` onto another.
+    /// `client_id` is the image's id as the client knows it, for kitty's
+    /// error messages.
+    pub fn compose_frames(
+        &mut self,
+        id: K,
+        client_id: u32,
+        keys: &CompositionKeys,
+        pinned: &HashSet<K>,
+    ) -> Result<FrameChange<K>, FrameError> {
+        let enospc = "Failed to cache data for image frame";
+        let mut evicted = self.ensure_animation(id, pinned, enospc)?;
+        let anim = self.entries[&id].anim.as_ref().expect("just created");
+        let prepared = anim.prepare_compose(keys, client_id)?;
+        let mut change = self.commit_prepared(id, prepared, pinned, enospc)?;
+        evicted.append(&mut change.evicted);
+        change.evicted = evicted;
+        Ok(change)
+    }
+
+    fn commit_prepared(
+        &mut self,
+        id: K,
+        prepared: PreparedFrame,
+        pinned: &HashSet<K>,
+        enospc: &str,
+    ) -> Result<FrameChange<K>, FrameError> {
+        let entry = &self.entries[&id];
+        let before = entry.frame_bytes();
+        let growth = entry.anim.as_ref().expect("animated").growth(&prepared);
+        let mut evicted = Vec::new();
+        if growth > 0 {
+            let growth = growth as u64;
+            evicted = self.evict_for(Budget::Frames, growth, Some(id), pinned, false);
+            if !self.fits(Budget::Frames, growth) {
+                return Err(FrameError {
+                    code: ErrorCode::Enospc,
+                    detail: enospc.to_string(),
+                });
+            }
+        }
+        let frame = prepared.number;
+        let entry = self.entries.get_mut(&id).expect("resident");
+        let anim = entry.anim.as_mut().expect("animated");
+        let display_changed = anim.commit(prepared, &mut entry.image);
+        self.reaccount(id, before);
+        if display_changed {
+            self.display_changed(id);
+        }
+        Ok(FrameChange {
+            frame,
+            display_changed,
+            evicted,
+        })
+    }
+
+    /// `a=a`: control `id`'s animation. Returns true if the displayed
+    /// frame changed. A no-op for an image that isn't resident. On a
+    /// still image only the settings are kept; nothing is allocated.
+    pub fn control_animation(&mut self, id: K, keys: &AnimationKeys) -> bool {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return false;
+        };
+        let Some(anim) = entry.anim.as_mut() else {
+            entry.playback.apply(keys);
+            return false;
+        };
+        let before = anim.byte_size();
+        let changed = anim.control(keys, &mut entry.image);
+        self.reaccount(id, before);
+        if changed {
+            self.display_changed(id);
+        }
+        changed
+    }
+
+    /// `d=f` / `d=F`: delete frame `number` of `id` (see
+    /// [`Animation::delete_frame`]). An image with only its root frame is
+    /// left alone; the caller decides what that means.
+    pub fn delete_frame(&mut self, id: K, number: u32) -> FrameDelete {
+        let Some(e) = self.entries.get_mut(&id) else {
+            return FrameDelete::NotFound;
+        };
+        let before = e.frame_bytes();
+        let Some(anim) = e.anim.as_mut().filter(|a| a.frame_count() > 1) else {
+            return FrameDelete::OnlyFrame;
+        };
+        let display_changed = anim.delete_frame(number, &mut e.image);
+        self.reaccount(id, before);
+        if display_changed {
+            self.display_changed(id);
+        }
+        FrameDelete::Deleted { display_changed }
+    }
+
+    /// Advance every running animation whose image `is_drawn` to `now`.
+    /// Returns the ids whose displayed frame changed, and when the next
+    /// frame of any of them is due (`None`: nothing is running).
+    pub fn tick_animations(
+        &mut self,
+        now: Instant,
+        is_drawn: impl Fn(K) -> bool,
+    ) -> (Vec<K>, Option<Instant>) {
+        let mut changed = Vec::new();
+        let mut next: Option<Instant> = None;
+        for (&id, e) in &mut self.entries {
+            let Some(anim) = e.anim.as_mut() else {
+                continue;
+            };
+            if !anim.is_running() || !is_drawn(id) {
+                continue;
+            }
+            let (c, due) = anim.tick(now, ANIMATION_SLACK, &mut e.image);
+            if c {
+                changed.push(id);
+            }
+            if let Some(due) = due {
+                next = Some(next.map_or(due, |n| n.min(due)));
+            }
+        }
+        for &id in &changed {
+            self.display_changed(id);
+        }
+        (changed, next)
+    }
+
+    /// True if any image has a running animation (whether drawn or not).
+    #[must_use]
+    pub fn has_running_animation(&self) -> bool {
+        self.entries
+            .values()
+            .any(|e| e.anim.as_ref().is_some_and(|a| a.is_running()))
+    }
+}
+
+/// Which cap [`ImageRegistry::evict_for`] makes room under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Budget {
+    /// Displayed images, against `cap_bytes`.
+    Images,
+    /// Stored animation frames, against `frame_cap_bytes`.
+    Frames,
+}
+
+/// ENOENT for an animation command on an image that isn't resident. The
+/// registry only sees its own key; callers that know the client id check
+/// residency first and answer with it.
+fn not_found(id: u32) -> FrameError {
+    FrameError {
+        code: ErrorCode::Enoent,
+        detail: format!(
+            "Animation command refers to non-existent image with id: {id} and number: 0"
+        ),
     }
 }
 
@@ -736,5 +1122,228 @@ mod tests {
         r.set_cap(16);
         assert_eq!(r.generation(2), None);
         assert!(r.generation(3).is_some());
+    }
+
+    // ---- §9 animation frames ----------------------------------------
+
+    use crate::frames::FRAME_OVERHEAD;
+
+    fn frame_keys() -> FrameKeys {
+        FrameKeys {
+            x: 0,
+            y: 0,
+            base_frame: 0,
+            edit_frame: 0,
+            gap_ms: 0,
+            blend_mode: 0,
+            background: 0,
+        }
+    }
+
+    fn show(n: u32) -> AnimationKeys {
+        AnimationKeys {
+            state: 0,
+            frame: 0,
+            gap_ms: 0,
+            current_frame: n,
+            loops: 0,
+        }
+    }
+
+    #[test]
+    fn frames_are_counted_and_get_returns_the_current_frame() {
+        // Every frame is charged its pixels plus FRAME_OVERHEAD.
+        let f = 16 + FRAME_OVERHEAD;
+        let mut r = ImageRegistry::<u32>::new(64 * 1024);
+        assert_eq!(r.frame_cap_bytes(), 64 * 1024 * FRAME_BUDGET_FACTOR);
+        r.insert(1, img(2, 2, 1)).unwrap();
+        assert_eq!(r.frame_count(1), Some(1));
+        assert_eq!((r.total_bytes(), r.frame_bytes()), (16, 0));
+        let change = r
+            .add_frame(1, &frame_keys(), img(2, 2, 2), &HashSet::new())
+            .unwrap();
+        assert_eq!((change.frame, change.display_changed), (2, false));
+        // The display stays under the image cap; root copy + frame 2 go
+        // to the frame budget.
+        assert_eq!((r.total_bytes(), r.frame_bytes()), (16, 2 * f));
+        assert_eq!(r.get(1).unwrap().pixels[0], 1);
+        let (rev, generation) = (r.revision(), r.generation(1));
+        assert!(r.control_animation(1, &show(2)));
+        assert_eq!(r.get(1).unwrap().pixels[0], 2);
+        assert_ne!(r.revision(), rev);
+        assert_ne!(r.generation(1), generation);
+        // Deleting a frame gives its bytes back; replacing the image
+        // drops all of them.
+        assert_eq!(
+            r.delete_frame(1, 2),
+            FrameDelete::Deleted {
+                display_changed: true
+            }
+        );
+        assert_eq!(r.frame_bytes(), f);
+        assert_eq!(r.delete_frame(1, 1), FrameDelete::OnlyFrame);
+        r.insert(1, img(2, 2, 3)).unwrap();
+        assert_eq!(r.frame_count(1), Some(1));
+        assert_eq!((r.total_bytes(), r.frame_bytes()), (16, 0));
+        assert_eq!(r.delete_frame(9, 1), FrameDelete::NotFound);
+    }
+
+    #[test]
+    fn control_on_a_still_image_allocates_nothing_but_sticks() {
+        // #47 review 8: a=a on a still image used to copy the root into
+        // the frame budget without a fit check.
+        let mut r = ImageRegistry::<u32>::new(64 * 1024);
+        for id in 1..=50 {
+            r.insert(id, img(2, 2, 1)).unwrap();
+            let run = AnimationKeys {
+                state: 3,
+                frame: 1,
+                gap_ms: 120,
+                loops: 2,
+                ..show(0)
+            };
+            assert!(!r.control_animation(id, &run));
+        }
+        assert_eq!(r.frame_bytes(), 0);
+        assert!(r.animation(1).is_none());
+        // The settings apply once frames arrive.
+        r.add_frame(1, &frame_keys(), img(2, 2, 2), &HashSet::new())
+            .unwrap();
+        let a = r.animation(1).unwrap();
+        assert_eq!(a.gap_ms(1), Some(120));
+        assert_eq!(a.state(), crate::frames::AnimationState::Running);
+        assert!(a.is_running());
+    }
+
+    #[test]
+    fn the_root_copy_must_fit_the_frame_budget() {
+        // A root copy (32 bytes + overhead) and one 1-pixel frame fit the
+        // budget once, not twice.
+        let per = (32 + FRAME_OVERHEAD) + (4 + FRAME_OVERHEAD);
+        let mut r = ImageRegistry::<u32>::new(per * 3 / 2 / FRAME_BUDGET_FACTOR);
+        r.insert(1, img(4, 2, 1)).unwrap();
+        r.insert(2, img(4, 2, 2)).unwrap();
+        let pinned: HashSet<u32> = [1, 2].into();
+        let budget = r.frame_cap_bytes();
+        assert!(r.add_frame(1, &frame_keys(), img(1, 1, 0), &pinned).is_ok());
+        let err = r
+            .add_frame(2, &frame_keys(), img(1, 1, 0), &pinned)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Enospc);
+        assert!(r.animation(2).is_none(), "no half-made animation");
+        assert!(r.frame_bytes() <= budget, "{} > {budget}", r.frame_bytes());
+    }
+
+    #[test]
+    fn frames_evict_unplaced_animations_but_never_placed_ones() {
+        // Room for exactly four animations of root copy + one frame.
+        let per = 2 * (16 + FRAME_OVERHEAD);
+        let mut r = ImageRegistry::<u32>::new(4 * per / FRAME_BUDGET_FACTOR);
+        assert_eq!(r.frame_cap_bytes(), 4 * per);
+        for id in 1..=4 {
+            r.insert(id, img(2, 2, 0)).unwrap();
+            r.add_frame(id, &frame_keys(), img(2, 2, 1), &HashSet::new())
+                .unwrap();
+        }
+        assert_eq!(r.frame_bytes(), 4 * per);
+        // 1 and 3 are placed. A frame for 4 evicts the oldest unplaced
+        // animation, 2; still images never count as frame victims.
+        let pinned: HashSet<u32> = [1, 3].into();
+        let change = r
+            .add_frame(4, &frame_keys(), img(2, 2, 1), &pinned)
+            .unwrap();
+        assert_eq!(change.evicted, vec![2]);
+        assert!(r.contains(1) && r.contains(3));
+        // Fill what's left, then only placed animations remain: ENOSPC,
+        // nothing changes.
+        r.add_frame(4, &frame_keys(), img(2, 2, 1), &pinned)
+            .unwrap();
+        let before = r.frame_bytes();
+        let err = r
+            .add_frame(4, &frame_keys(), img(4, 2, 1), &pinned)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Einval, "4x2 is wider than the image");
+        let err = r
+            .add_frame(4, &frame_keys(), img(2, 2, 1), &pinned)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Enospc);
+        assert_eq!(err.detail, "Cache size exceeded cannot add new frames");
+        assert_eq!(r.frame_bytes(), before);
+        assert_eq!(r.frame_count(4), Some(4));
+        assert!(r.contains(1) && r.contains(3));
+        // Frames never push out images: the image budget is untouched.
+        assert_eq!(r.total_bytes(), 3 * 16);
+    }
+
+    #[test]
+    fn tiny_frames_are_charged_their_overhead() {
+        // #47 review 3: a flood of 1-pixel frames is bounded by the
+        // budget through the per-frame charge, not by its 4 bytes each.
+        let mut r = ImageRegistry::<u32>::new(10_000);
+        r.insert(1, img(1, 1, 0)).unwrap();
+        let tiny = img(1, 1, 1);
+        let mut added = 0u64;
+        while r
+            .add_frame(1, &frame_keys(), tiny.clone(), &HashSet::new())
+            .is_ok()
+        {
+            added += 1;
+            assert!(added < 1000, "the budget must stop this flood");
+        }
+        let per = 4 + FRAME_OVERHEAD;
+        assert_eq!(added, r.frame_cap_bytes() / per - 1, "root copy + frames");
+        assert!(r.frame_bytes() <= r.frame_cap_bytes());
+    }
+
+    #[test]
+    fn set_cap_shrinks_the_frame_budget_too() {
+        let f = 16 + FRAME_OVERHEAD;
+        let mut r = ImageRegistry::<u32>::new(64 * 1024);
+        r.insert(1, img(2, 2, 0)).unwrap();
+        for _ in 0..4 {
+            r.add_frame(1, &frame_keys(), img(2, 2, 1), &HashSet::new())
+                .unwrap();
+        }
+        r.insert(2, img(2, 2, 0)).unwrap();
+        // Root copy + 4 frames. A cap that still holds both images but
+        // whose frame budget doesn't hold the frames evicts the animated
+        // image.
+        assert_eq!(r.frame_bytes(), 5 * f);
+        let cap = (4 * f / FRAME_BUDGET_FACTOR).max(32);
+        let evicted = r.set_cap(cap);
+        assert_eq!(evicted, vec![1]);
+        assert_eq!((r.total_bytes(), r.frame_bytes()), (16, 0));
+    }
+
+    #[test]
+    fn tick_skips_images_that_are_not_drawn_and_batches_near_frames() {
+        let mut r = ImageRegistry::<u32>::new(64 * 1024);
+        r.insert(1, img(2, 2, 1)).unwrap();
+        r.add_frame(1, &frame_keys(), img(2, 2, 2), &HashSet::new())
+            .unwrap();
+        let run = AnimationKeys {
+            state: 3,
+            frame: 1,
+            gap_ms: 50,
+            ..show(0)
+        };
+        r.control_animation(1, &run);
+        assert!(r.has_running_animation());
+        let now = Instant::now();
+        assert_eq!(r.tick_animations(now, |_| false), (vec![], None));
+        let (changed, next) = r.tick_animations(now, |_| true);
+        assert!(changed.is_empty());
+        assert_eq!(next, Some(now + std::time::Duration::from_millis(50)));
+        // Due within ANIMATION_SLACK: shown now, with the next frame
+        // scheduled from when this one was due (no drift).
+        let early = now + std::time::Duration::from_millis(45);
+        assert_eq!(r.tick_animations(early, |_| true).0, vec![1]);
+        assert_eq!(r.get(1).unwrap().pixels[0], 2);
+        let (_, next) = r.tick_animations(early, |_| true);
+        assert_eq!(
+            next,
+            Some(now + std::time::Duration::from_millis(50 + 40)),
+            "frame 2 has the default 40 ms gap"
+        );
     }
 }
