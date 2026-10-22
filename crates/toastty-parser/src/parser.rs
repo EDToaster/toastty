@@ -10,6 +10,9 @@ enum ApcState {
     /// this is APC (`ESC _`) or some other escape (forwarded to vte).
     AfterEsc,
     /// Inside an APC payload; bytes flow to [`Perform::apc_chunk`].
+    /// It ends at `ESC \\` or BEL. 8-bit ST (0x9C) is data: in a UTF-8
+    /// stream it's a continuation byte (`М` is `\xd0\x9c`), and kitty
+    /// only ends an APC on `ESC \\` / BEL (WIRE-5).
     Apc,
     /// Inside APC and the last byte was 0x1B; if next is `\\` we end
     /// the APC, otherwise the ESC was data.
@@ -25,6 +28,12 @@ enum ApcState {
     /// `matched` bytes of [`TMUX_PREFIX`]; deciding between a tmux
     /// passthrough and an ordinary DCS.
     DcsIntro { matched: usize },
+    /// Inside an ordinary DCS that vte is parsing. Bytes flow to vte
+    /// except 8-bit ST (0x9C), which is dropped: vte ends a DCS on it,
+    /// but in a UTF-8 stream it's just a byte (the tail of `М`,
+    /// `\xd0\x9c`), and kitty only ends strings on `ESC \\` / BEL.
+    /// vte ignores bytes >= 0x80 in a DCS anyway, so nothing is lost.
+    Dcs,
 }
 
 /// Upper bound on one OSC string's payload, in bytes.
@@ -65,6 +74,14 @@ impl vte::Perform for NullPerform {}
 /// ESC (vte terminates on any ESC; `ESC \\` is the ST form).
 fn osc_terminator(bytes: &[u8]) -> Option<usize> {
     let a = memchr::memchr3(0x07, 0x18, 0x1B, bytes);
+    let b = memchr::memchr(0x1A, &bytes[..a.unwrap_or(bytes.len())]);
+    b.or(a)
+}
+
+/// First byte in a DCS body the scanner must act on: ESC (maybe ST),
+/// CAN / SUB (cancel), or 0x9C (dropped, see [`ApcState::Dcs`]).
+fn dcs_special(bytes: &[u8]) -> Option<usize> {
+    let a = memchr::memchr3(0x1B, 0x18, 0x9C, bytes);
     let b = memchr::memchr(0x1A, &bytes[..a.unwrap_or(bytes.len())]);
     b.or(a)
 }
@@ -121,10 +138,6 @@ impl Scanner {
                     if byte == b'_' {
                         perform.apc_start();
                         self.apc = ApcState::Apc;
-                    } else if byte == b']' {
-                        self.vte
-                            .advance(&mut VteAdapter { inner: perform }, &[0x1B, byte]);
-                        self.apc = ApcState::Osc { len: 0 };
                     } else if byte == b'P' && detect_tmux {
                         // Give vte the ESC now (it ends any string or
                         // sequence in progress, exactly as the direct
@@ -134,10 +147,15 @@ impl Scanner {
                             .advance(&mut VteAdapter { inner: perform }, &[0x1B]);
                         self.apc = ApcState::DcsIntro { matched: 0 };
                     } else {
-                        // Replay ESC + this byte to vte.
+                        // Replay ESC + this byte to vte, then track the
+                        // body of an OSC (length cap) or DCS (0x9C).
                         self.vte
                             .advance(&mut VteAdapter { inner: perform }, &[0x1B, byte]);
-                        self.apc = ApcState::Ground;
+                        self.apc = match byte {
+                            b']' => ApcState::Osc { len: 0 },
+                            b'P' => ApcState::Dcs,
+                            _ => ApcState::Ground,
+                        };
                     }
                 }
                 ApcState::DcsIntro { matched } => {
@@ -156,19 +174,20 @@ impl Scanner {
                         self.apc = ApcState::Ground;
                         return Some(bytes);
                     }
-                    // Ordinary DCS (or `ESC P` + text): replay what we
-                    // held back and reprocess this byte normally — it
-                    // may itself be an ESC.
+                    // Ordinary DCS: replay what we held back and
+                    // reprocess this byte as DCS body — it may itself
+                    // be an ESC.
                     self.vte.advance(&mut VteAdapter { inner: perform }, b"P");
                     if matched > 0 {
                         self.vte
                             .advance(&mut VteAdapter { inner: perform }, &TMUX_PREFIX[..matched]);
                     }
-                    self.apc = ApcState::Ground;
+                    self.apc = ApcState::Dcs;
                 }
+                ApcState::Dcs => bytes = self.advance_dcs(perform, bytes),
                 ApcState::Apc => {
-                    // Scan for terminators: ESC, BEL (0x07), or 8-bit ST (0x9C).
-                    if let Some(pos) = memchr::memchr3(0x1B, 0x07, 0x9C, bytes) {
+                    // Terminators: ESC (ST is `ESC \\`) or BEL, not 0x9C.
+                    if let Some(pos) = memchr::memchr2(0x1B, 0x07, bytes) {
                         if pos > 0 {
                             perform.apc_chunk(&bytes[..pos]);
                         }
@@ -176,7 +195,7 @@ impl Scanner {
                         bytes = &bytes[pos + 1..];
                         match term {
                             0x1B => self.apc = ApcState::ApcAfterEsc,
-                            0x07 | 0x9C => {
+                            0x07 => {
                                 perform.apc_end();
                                 self.apc = ApcState::Ground;
                             }
@@ -211,6 +230,37 @@ impl Scanner {
             }
         }
         None
+    }
+
+    /// `ApcState::Dcs` step: forward DCS bytes to vte, dropping 0x9C
+    /// (see [`ApcState::Dcs`]). Returns the unconsumed input.
+    fn advance_dcs<'b, P: Perform + ?Sized>(
+        &mut self,
+        perform: &mut P,
+        bytes: &'b [u8],
+    ) -> &'b [u8] {
+        let Some(pos) = dcs_special(bytes) else {
+            self.vte.advance(&mut VteAdapter { inner: perform }, bytes);
+            return &[];
+        };
+        if pos > 0 {
+            self.vte
+                .advance(&mut VteAdapter { inner: perform }, &bytes[..pos]);
+        }
+        match bytes[pos] {
+            // Data, not ST: drop it.
+            0x9C => {}
+            // Possibly ST; the ESC peek replays it to vte, which ends
+            // the DCS on any ESC.
+            0x1B => self.apc = ApcState::AfterEsc,
+            // CAN / SUB: vte cancels the DCS.
+            byte => {
+                self.vte
+                    .advance(&mut VteAdapter { inner: perform }, &[byte]);
+                self.apc = ApcState::Ground;
+            }
+        }
+        &bytes[pos + 1..]
     }
 
     /// `ApcState::Osc` step: forward OSC bytes to vte while counting
@@ -683,11 +733,116 @@ mod tests {
         assert_eq!(r.apc[0], b"kitty data".to_vec());
     }
 
+    /// WIRE-5: 0x9C — bare, the tail of UTF-8 `М` (`\xd0\x9c`), or the
+    /// UTF-8 encoding of U+009C (`\xc2\x9c`) — never ends a string
+    /// sequence (kitty 0.49.2). Only `ESC \\` (and BEL where vte /
+    /// the APC scanner accept it) does.
+    const C1_ST_BODIES: [&[u8]; 3] = [b"a\x9cb", b"a\xd0\x9cb", b"a\xc2\x9cb"];
+
     #[test]
-    fn apc_eight_bit_st_terminator() {
-        let r = parse(b"\x1b_payload\x9c");
-        assert_eq!(r.apc.len(), 1);
-        assert_eq!(r.apc[0], b"payload".to_vec());
+    fn apc_eight_bit_st_is_data() {
+        for body in C1_ST_BODIES {
+            let mut input = b"\x1b_X".to_vec();
+            input.extend_from_slice(body);
+            input.extend_from_slice(b"\x1b\\after");
+            let r = parse(&input);
+            let mut want = b"X".to_vec();
+            want.extend_from_slice(body);
+            assert_eq!(r.apc, vec![want], "body {body:x?}");
+            assert_eq!(r.text, "after", "body {body:x?}");
+        }
+    }
+
+    #[test]
+    fn apc_eight_bit_st_is_data_across_chunks() {
+        // Streaming: the 0x9C lands at a chunk boundary.
+        let mut p = Parser::new();
+        let mut r = Recorder::default();
+        p.advance(&mut r, b"\x1b_Xhello \xd0");
+        p.advance(&mut r, b"\x9c");
+        p.advance(&mut r, b" world\x1b");
+        p.advance(&mut r, b"\\ok");
+        assert_eq!(r.apc, vec![b"Xhello \xd0\x9c world".to_vec()]);
+        assert_eq!(r.text, "ok");
+    }
+
+    #[test]
+    fn dcs_eight_bit_st_does_not_end_it() {
+        for body in C1_ST_BODIES {
+            let mut input = b"\x1bP1$r".to_vec();
+            input.extend_from_slice(body);
+            input.extend_from_slice(b"\x1b\\after");
+            let r = parse(&input);
+            // vte drops bytes >= 0x80 from a DCS body; the rest is kept
+            // and the DCS ends at ESC \\, not at 0x9C.
+            assert_eq!(r.dcs.len(), 1, "body {body:x?}");
+            assert_eq!(r.dcs[0].3, b"ab", "body {body:x?}");
+            assert_eq!(r.text, "after", "body {body:x?}");
+        }
+        // Split across chunks, and a DCS that only looked like tmux.
+        let mut p = Parser::new();
+        let mut r = Recorder::default();
+        p.advance(&mut r, b"\x1bPtm");
+        p.advance(&mut r, b"x\x9c");
+        p.advance(&mut r, b"y\x1b\\ok");
+        assert_eq!(r.dcs.len(), 1);
+        assert_eq!(r.text, "ok");
+    }
+
+    #[test]
+    fn dcs_still_ends_on_st_can_and_sub() {
+        // vte unhooks (dispatches) the DCS on each terminator, and CAN /
+        // SUB are then executed; the byte after is ground text again.
+        for (term, execs) in [
+            (&b"\x1b\\"[..], &b""[..]),
+            (b"\x18", b"\x18"),
+            (b"\x1a", b"\x1a"),
+        ] {
+            let mut input = b"\x1bP1$rab".to_vec();
+            input.extend_from_slice(term);
+            input.extend_from_slice(b"x");
+            let r = parse(&input);
+            assert_eq!(r.dcs.len(), 1, "terminator {term:x?}");
+            let (params, intermediates, action, body) = &r.dcs[0];
+            assert_eq!(params, &vec![vec![1u16]], "terminator {term:x?}");
+            assert_eq!(intermediates, b"$", "terminator {term:x?}");
+            assert_eq!(*action, 'r', "terminator {term:x?}");
+            assert_eq!(body, b"ab", "terminator {term:x?}");
+            assert_eq!(r.execs, execs, "terminator {term:x?}");
+            assert_eq!(r.text, "x", "terminator {term:x?}");
+        }
+        // A DCS right after another one, and back-to-back ESCs (the
+        // first ESC ends DCS 2; `ESC ESC \\` is then a lone ST).
+        let r = parse(b"\x1bP1$ra\x1b\\\x1bP2$rb\x1b\x1b\\z");
+        let bodies: Vec<(Vec<Vec<u16>>, &[u8])> = r
+            .dcs
+            .iter()
+            .map(|d| (d.0.clone(), d.3.as_slice()))
+            .collect();
+        assert_eq!(
+            bodies,
+            vec![(vec![vec![1u16]], &b"a"[..]), (vec![vec![2u16]], &b"b"[..])]
+        );
+        assert_eq!(r.text, "z");
+    }
+
+    #[test]
+    fn osc_pm_sos_eight_bit_st_is_data() {
+        for body in C1_ST_BODIES {
+            let mut osc = b"\x1b]2;".to_vec();
+            osc.extend_from_slice(body);
+            osc.extend_from_slice(b"\x1b\\after");
+            let r = parse(&osc);
+            assert_eq!(r.osc, vec![vec![b"2".to_vec(), body.to_vec()]]);
+            assert_eq!(r.text, "after", "OSC body {body:x?}");
+            for intro in [&b"\x1b^"[..], b"\x1bX"] {
+                let mut s = intro.to_vec();
+                s.extend_from_slice(body);
+                s.extend_from_slice(b"\x1b\\after");
+                let r = parse(&s);
+                assert_eq!(r.text, "after", "{intro:x?} body {body:x?}");
+            }
+        }
     }
 
     #[test]
