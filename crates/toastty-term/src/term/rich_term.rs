@@ -472,18 +472,10 @@ impl Term {
     /// the other side effects of [`Term::resize`].
     fn relayout_rich_in_place(&mut self) {
         let cap = self.rows as usize + self.scrollback as usize;
-        let cursor = if self.alt_active {
-            (self.saved_cursor.row, self.saved_cursor.col)
-        } else {
-            (self.cursor.row, self.cursor.col)
-        };
-        let (r, c) = self.reflow_primary(self.rows, self.cols, cap, cursor);
-        if self.alt_active {
-            self.saved_cursor.row = r;
-            self.saved_cursor.col = c;
-        } else {
-            self.cursor.row = r;
-            self.cursor.col = c;
+        let cursor = self.primary_reflow_cursor();
+        let reflowed = self.reflow_primary(self.rows, self.cols, cap, cursor);
+        self.store_primary_reflow_cursor(reflowed);
+        if !self.alt_active {
             self.clamp_cursor();
         }
         self.viewport.clamp_to(self.primary.history_lines());
