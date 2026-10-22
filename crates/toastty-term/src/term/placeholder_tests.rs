@@ -373,7 +373,7 @@ fn positional_deletes_and_clears_keep_virtual_placements() {
     ] {
         feed(&mut t, format!("\x1b_Ga=d,{d},q=2\x1b\\").as_bytes());
         assert!(t.virtual_placements().contains_image(42), "{d} removed it");
-        assert!(t.image_registry().contains(42), "{d} freed the image");
+        assert!(t.image_store().contains(42), "{d} freed the image");
     }
     feed(&mut t, b"\x1b[2J\x1b[3J\x1bc");
     assert!(t.virtual_placements().contains_image(42));
@@ -391,11 +391,11 @@ fn id_deletes_remove_virtual_placements() {
     // d=i removes the rest but keeps the bytes; d=I frees them.
     feed(&mut t, b"\x1b_Ga=d,d=i,i=1,q=2\x1b\\");
     assert!(!t.has_virtual_placements());
-    assert!(t.image_registry().contains(1));
+    assert!(t.image_store().contains(1));
     transmit(&mut t, "a=T,i=3,U=1", 4, 2);
     feed(&mut t, b"\x1b_Ga=d,d=I,i=3,q=2\x1b\\");
     assert!(!t.has_virtual_placements());
-    assert!(!t.image_registry().contains(3));
+    assert!(!t.image_store().contains(3));
     // d=r over an id range, d=N by image number.
     transmit(&mut t, "a=T,i=10,U=1", 4, 2);
     transmit(&mut t, "a=T,i=11,U=1", 4, 2);
@@ -422,7 +422,7 @@ fn retransmitting_the_image_drops_its_virtual_placements() {
     transmit(&mut t, "a=T,i=42,U=1,c=4,r=2", 8, 8);
     let r = runs(&t, 0)[0];
     assert_eq!(t.resolve_placeholder(&r).map(|v| v.image_id), Some(42));
-    assert_eq!(t.image_registry().get(42).map(|i| i.width), Some(8));
+    assert_eq!(t.image_store().get(42).map(|i| i.width), Some(8));
 }
 
 #[test]
@@ -581,7 +581,7 @@ fn eviction_or_free_on_alt_drops_mains_stale_placement() {
     feed(&mut t, b"\x1b[?1049h");
     // Evict everything while alt is up, then reuse id 5 there.
     t.set_image_cap(1);
-    assert!(!t.image_registry().contains(5));
+    assert!(!t.image_store().contains(5));
     feed(&mut t, b"\x1b[?1049l");
     assert!(!t.virtual_placements().contains_image(5), "evicted on alt");
     // Reusing the id on main doesn't bring the old c/r back.

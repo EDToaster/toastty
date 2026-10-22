@@ -63,11 +63,11 @@ use crate::text::pipeline::{GlobalsUbo, TextPipeline};
 /// placement doesn't force full redraws for nothing.
 fn has_below_cell_bg_placements(
     grid: &toastty_term::ImageGrid,
-    registry: &toastty_term::ImageRegistry,
+    registry: &toastty_term::ImageRegistry<toastty_term::ImageKey>,
 ) -> bool {
     grid.iter().any(|p| {
         classify_layer(p.z) == Layer::BelowCellBg
-            && registry.contains(p.image_id)
+            && registry.contains(p.key)
             && p.cols != 0
             && p.rows != 0
             && !p.clip_rows.is_empty()
@@ -2035,7 +2035,7 @@ impl Renderer {
                     texture_index: idx as u32,
                     z: -1,
                     image_id: 0,
-                    _pad: [0; 1],
+                    key: 0,
                 });
             }
         }
@@ -4052,13 +4052,14 @@ mod below_cell_bg_tests {
         use toastty_term::{ImageGrid, Placement, SrcRect};
         let place = |z: i32| {
             let mut p = Placement::new(1, 1, 1);
+            p.key = toastty_term::ImageKey(1);
             p.src_rect = SrcRect::FULL;
             p.z = z;
             p
         };
-        let mut reg = toastty_term::ImageRegistry::new(1024);
+        let mut reg = toastty_term::ImageRegistry::<toastty_term::ImageKey>::new(1024);
         reg.insert(
-            1,
+            toastty_term::ImageKey(1),
             toastty_term::ImageData {
                 width: 1,
                 height: 1,
@@ -4085,13 +4086,14 @@ mod below_cell_bg_tests {
             let mut p = Placement::new(id, rows.end - rows.start, cols.end - cols.start);
             p.line = i64::from(rows.start);
             p.col = cols.start;
+            p.key = toastty_term::ImageKey(id);
             p.src_rect = SrcRect::FULL;
             p.z = i32::MIN;
             p
         };
-        let mut reg = ImageRegistry::new(1024);
+        let mut reg = ImageRegistry::<toastty_term::ImageKey>::new(1024);
         reg.insert(
-            1,
+            toastty_term::ImageKey(1),
             ImageData {
                 width: 1,
                 height: 1,

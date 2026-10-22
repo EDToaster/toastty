@@ -8,7 +8,7 @@
 use bytemuck::{Pod, Zeroable};
 use std::borrow::Cow;
 use std::num::NonZeroU64;
-use toastty_term::{ImageData, ImageRegistry};
+use toastty_term::{ImageData, ImageKey, ImageRegistry};
 
 use super::atlas::{ImageTexEntry, ImageTextureCache};
 use super::instance::{ImageInstance, UNRESOLVED_TEXTURE};
@@ -213,10 +213,10 @@ impl ImagePipeline {
     /// Returns true iff anything was dropped.
     pub fn sync_registry(
         &mut self,
-        registry: &ImageRegistry,
+        registry: &ImageRegistry<ImageKey>,
         cache: &mut ImageTextureCache,
     ) -> bool {
-        let stale: Vec<u32> = cache
+        let stale: Vec<ImageKey> = cache
             .iter()
             .filter(|(id, e)| registry.generation(*id) != Some(e.generation))
             .map(|(id, _)| id)
@@ -231,7 +231,7 @@ impl ImagePipeline {
 
     /// Bind kitty-image `instances` to GPU textures for this frame.
     ///
-    /// Each instance's `image_id` is looked up in `cache`. A miss, or a
+    /// Each instance's store `key` is looked up in `cache`. A miss, or a
     /// hit whose registry generation has moved on (the id was
     /// re-transmitted, whatever its size or pixels), uploads from
     /// `registry`. Images larger than the device's texture limit are
@@ -245,19 +245,19 @@ impl ImagePipeline {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        registry: &ImageRegistry,
+        registry: &ImageRegistry<ImageKey>,
         cache: &mut ImageTextureCache,
         instances: &mut Vec<ImageInstance>,
     ) -> ResolveStats {
         cache.begin_frame();
         let mut stats = ResolveStats::default();
         instances.retain_mut(|inst| {
-            let (Some(generation), Some(data)) =
-                (registry.generation(inst.image_id), registry.get(inst.image_id))
+            let key = ImageKey(inst.key);
+            let (Some(generation), Some(data)) = (registry.generation(key), registry.get(key))
             else {
                 return false;
             };
-            let entry = match plan(cache.get_touch(inst.image_id), generation) {
+            let entry = match plan(cache.get_touch(key), generation) {
                 Plan::Use(e) => e,
                 Plan::Upload { replaces } => {
                     if let Some(old) = replaces {
@@ -281,7 +281,7 @@ impl ImagePipeline {
                         height: fitted.height,
                         generation,
                     };
-                    cache.insert(inst.image_id, entry);
+                    cache.insert(key, entry);
                     stats.uploaded += 1;
                     entry
                 }
@@ -592,12 +592,12 @@ mod tests {
         assert_eq!(plan(Some(tex(3, 1)), 1), Plan::Use(tex(3, 1)));
         assert_eq!(plan(Some(tex(3, 1)), 2), Plan::Upload { replaces: Some(3) });
         // Same-id same-size re-send through the real registry.
-        let mut r = ImageRegistry::new(1024);
-        r.insert(77, img(4, 4, 1)).unwrap();
-        let resident = tex(0, r.generation(77).unwrap());
-        r.insert(77, img(4, 4, 1)).unwrap();
+        let mut r = ImageRegistry::<ImageKey>::new(1024);
+        r.insert(ImageKey(77), img(4, 4, 1)).unwrap();
+        let resident = tex(0, r.generation(ImageKey(77)).unwrap());
+        r.insert(ImageKey(77), img(4, 4, 1)).unwrap();
         assert_eq!(
-            plan(Some(resident), r.generation(77).unwrap()),
+            plan(Some(resident), r.generation(ImageKey(77)).unwrap()),
             Plan::Upload { replaces: Some(0) }
         );
     }
@@ -640,7 +640,7 @@ mod tests {
             texture_index: UNRESOLVED_TEXTURE,
             z: 0,
             image_id,
-            _pad: [0],
+            key: image_id,
         }
     }
 
@@ -654,9 +654,9 @@ mod tests {
         };
         let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
         let mut cache = ImageTextureCache::default();
-        let mut registry = ImageRegistry::new(64 * 1024 * 1024);
+        let mut registry = ImageRegistry::<ImageKey>::new(64 * 1024 * 1024);
         for id in 1u32..=500 {
-            registry.insert(id, img(2, 2, id as u8)).unwrap();
+            registry.insert(ImageKey(id), img(2, 2, id as u8)).unwrap();
         }
         let placed: Vec<ImageInstance> = (1u32..=500).map(inst).collect();
 
@@ -687,9 +687,9 @@ mod tests {
         };
         let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
         let mut cache = ImageTextureCache::default();
-        let mut registry = ImageRegistry::new(64 * 1024 * 1024);
+        let mut registry = ImageRegistry::<ImageKey>::new(64 * 1024 * 1024);
         for id in 1u32..=100 {
-            registry.insert(id, img(2, 2, id as u8)).unwrap();
+            registry.insert(ImageKey(id), img(2, 2, id as u8)).unwrap();
         }
         assert!(!pipeline.sync_registry(&registry, &mut cache));
         assert!(cache.is_empty(), "sync must not upload unplaced images");
@@ -714,9 +714,9 @@ mod tests {
         let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
         // 4x4 RGBA = 64 bytes per image; the budget fits two.
         let mut cache = ImageTextureCache::new(128);
-        let mut registry = ImageRegistry::new(1024 * 1024);
+        let mut registry = ImageRegistry::<ImageKey>::new(1024 * 1024);
         for id in 1u32..=6 {
-            registry.insert(id, img(4, 4, id as u8)).unwrap();
+            registry.insert(ImageKey(id), img(4, 4, id as u8)).unwrap();
         }
         // Frame 1 draws all six: over budget, but nothing evictable.
         let mut frame: Vec<ImageInstance> = (1u32..=6).map(inst).collect();
@@ -742,7 +742,7 @@ mod tests {
         assert_eq!((stats.uploaded, stats.evicted), (1, 1));
         assert_eq!(pipeline.slots.len(), slots_before, "slot reused");
         assert_eq!(cache.len(), 2, "back under budget");
-        assert!(cache.get(5).is_some());
+        assert!(cache.get(ImageKey(5)).is_some());
     }
 
     /// Deleting or replacing an image drops its texture on the next
@@ -754,15 +754,15 @@ mod tests {
         };
         let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
         let mut cache = ImageTextureCache::default();
-        let mut registry = ImageRegistry::new(1024 * 1024);
-        registry.insert(1, img(4, 4, 1)).unwrap();
-        registry.insert(2, img(4, 4, 2)).unwrap();
+        let mut registry = ImageRegistry::<ImageKey>::new(1024 * 1024);
+        registry.insert(ImageKey(1), img(4, 4, 1)).unwrap();
+        registry.insert(ImageKey(2), img(4, 4, 2)).unwrap();
         let mut frame = vec![inst(1), inst(2)];
         pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
         assert_eq!(pipeline.live_slots(), 2);
 
-        registry.remove(1);
-        registry.insert(2, img(4, 4, 99)).unwrap();
+        registry.remove(ImageKey(1));
+        registry.insert(ImageKey(2), img(4, 4, 99)).unwrap();
         assert!(pipeline.sync_registry(&registry, &mut cache));
         assert!(cache.is_empty());
         assert_eq!(pipeline.live_slots(), 0);
@@ -773,8 +773,8 @@ mod tests {
             pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
         assert_eq!(stats.uploaded, 1);
         assert_eq!(
-            cache.get(2).unwrap().generation,
-            registry.generation(2).unwrap()
+            cache.get(ImageKey(2)).unwrap().generation,
+            registry.generation(ImageKey(2)).unwrap()
         );
     }
 
@@ -913,14 +913,14 @@ mod tests {
         };
         let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
         let mut cache = ImageTextureCache::default();
-        let mut registry = ImageRegistry::new(1024 * 1024);
+        let mut registry = ImageRegistry::<ImageKey>::new(1024 * 1024);
         let centre = |px: &[u8]| -> [u8; 3] {
             let i = (8 * 16 + 8) * 4;
             [px[i], px[i + 1], px[i + 2]]
         };
         let draw = |pipeline: &mut ImagePipeline,
                     cache: &mut ImageTextureCache,
-                    registry: &ImageRegistry| {
+                    registry: &ImageRegistry<ImageKey>| {
             let mut frame = vec![ImageInstance {
                 size: [16.0, 16.0],
                 ..inst(77)
@@ -933,20 +933,20 @@ mod tests {
             )
         };
 
-        registry.insert(77, bordered(16, 16, [255, 0, 0])).unwrap();
+        registry.insert(ImageKey(77), bordered(16, 16, [255, 0, 0])).unwrap();
         let (stats, px) = draw(&mut pipeline, &mut cache, &registry);
         assert_eq!(stats.uploaded, 1);
         assert_eq!(centre(&px), [255, 0, 0]);
 
         // Re-send without a sync in between (one PTY read, no render).
-        registry.insert(77, bordered(16, 16, [0, 255, 0])).unwrap();
+        registry.insert(ImageKey(77), bordered(16, 16, [0, 255, 0])).unwrap();
         let (stats, px) = draw(&mut pipeline, &mut cache, &registry);
         assert_eq!(stats.uploaded, 1, "stale texture reused");
         assert_eq!(centre(&px), [0, 255, 0]);
         assert_eq!(pipeline.live_slots(), 1, "old texture freed");
 
         // Re-send with the sync in between (normal revision path).
-        registry.insert(77, bordered(16, 16, [0, 0, 255])).unwrap();
+        registry.insert(ImageKey(77), bordered(16, 16, [0, 0, 255])).unwrap();
         assert!(pipeline.sync_registry(&registry, &mut cache));
         let (stats, px) = draw(&mut pipeline, &mut cache, &registry);
         assert_eq!(stats.uploaded, 1);
@@ -968,9 +968,9 @@ mod tests {
         let mut pipeline = ImagePipeline::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
         let max = device.limits().max_texture_dimension_2d;
         let mut cache = ImageTextureCache::default();
-        let mut registry = ImageRegistry::new(u64::MAX);
+        let mut registry = ImageRegistry::<ImageKey>::new(u64::MAX);
         registry
-            .insert(9, bordered(max + 1, 4, [255, 0, 0]))
+            .insert(ImageKey(9), bordered(max + 1, 4, [255, 0, 0]))
             .unwrap();
         let mut frame = vec![ImageInstance {
             size: [8.0, 2.0],
@@ -979,7 +979,7 @@ mod tests {
         let stats =
             pipeline.resolve_kitty_textures(&device, &queue, &registry, &mut cache, &mut frame);
         assert_eq!(stats.uploaded, 1);
-        let e = cache.get(9).unwrap();
+        let e = cache.get(ImageKey(9)).unwrap();
         assert!(e.width <= max && e.height <= max);
         assert_eq!((e.width, e.height), ((max + 1).div_ceil(2), 2));
         let px = render_offscreen(&device, &queue, &mut pipeline, &frame, 8, 2);
