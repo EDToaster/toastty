@@ -148,6 +148,10 @@ pub enum Event {
     /// per decision #2, so `Ctrl+A` arrives as `"\x01"`, not `"a"`.
     Key {
         logical: LogicalKey,
+        /// The key with no modifiers applied (winit's
+        /// `key_without_modifiers`): `1` for shift+1, `a` for shift+a. The
+        /// kitty keyboard protocol reports this as the key code.
+        unmodified: LogicalKey,
         physical: PhysicalKey,
         text: Option<String>,
         modifiers: Modifiers,

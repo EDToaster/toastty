@@ -54,7 +54,20 @@ pub fn encode_key(
         state,
         repeat,
         LegacyModes::default(),
+        KeyContext::default(),
     )
+}
+
+/// What the encoder knows about a key beyond its cooked form (KBD-2).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KeyContext<'a> {
+    /// W3C `KeyCode` name, e.g. `"Numpad1"`, `"ShiftLeft"`; empty when
+    /// unknown. Picks the keypad's and the modifier keys' own codes.
+    pub physical: &'a str,
+    /// The key with no modifiers (winit's `key_without_modifiers`): the
+    /// kitty key code of a character key (`1` for shift+1), with the
+    /// shifted key as its alternate.
+    pub unmodified: Option<&'a LogicalKey>,
 }
 
 /// Terminal modes that change the legacy (non-kitty) key encoding.
@@ -77,8 +90,11 @@ impl Default for LegacyModes {
     }
 }
 
-/// [`encode_key`] with the legacy-encoding modes the terminal has set.
+/// [`encode_key`] with the legacy-encoding modes the terminal has set and
+/// what else is known about the key ([`KeyContext`]: its physical key
+/// and its unmodified form).
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn encode_key_with_modes(
     logical: &LogicalKey,
     text: Option<&str>,
@@ -87,6 +103,7 @@ pub fn encode_key_with_modes(
     state: KeyState,
     repeat: bool,
     modes: LegacyModes,
+    ctx: KeyContext<'_>,
 ) -> Option<Vec<u8>> {
     // kitty treats report-alternates (4) alone, and report-text (16)
     // without report-all (8, which the spec says it requires), as the
@@ -96,12 +113,31 @@ pub fn encode_key_with_modes(
         & (KITTY_FLAG_DISAMBIGUATE | KITTY_FLAG_REPORT_EVENTS | KITTY_FLAG_REPORT_ALL_AS_ESC)
         != 0
     {
-        return encode_key_kitty(logical, text, modifiers, kitty_flags, state, repeat, modes);
+        let key = KittyKey {
+            logical,
+            text,
+            modifiers,
+            state,
+            repeat,
+            physical: ctx.physical,
+            unmodified: ctx.unmodified,
+        };
+        return encode_key_kitty(&key, kitty_flags, modes);
     }
     // Legacy path: ignore releases. The terminal doesn't see release events
     // in xterm/VT mode.
     if state == KeyState::Released {
         return None;
+    }
+    // KP_Begin (keypad 5 with NumLock off) has no named key; xterm and
+    // kitty send `CSI E` (`CSI 1 ; mods E` modified).
+    if ctx.physical == "Numpad5" && !matches!(logical, LogicalKey::Character(_)) {
+        let mod_param = legacy_modifier_param(modifiers);
+        return Some(if mod_param == 1 {
+            b"\x1b[E".to_vec()
+        } else {
+            format!("\x1b[1;{mod_param}E").into_bytes()
+        });
     }
     encode_key_legacy(logical, text, modifiers, modes)
 }
@@ -418,15 +454,16 @@ fn kitty_legacy_form(named: NamedKey) -> Option<(u32, u8)> {
 ///   (16) text keys carry their text, and with report-alternates (4) the
 ///   shifted key.
 #[allow(clippy::too_many_lines)]
-fn encode_key_kitty(
-    logical: &LogicalKey,
-    text: Option<&str>,
-    modifiers: Modifiers,
-    flags: u8,
-    state: KeyState,
-    repeat: bool,
-    modes: LegacyModes,
-) -> Option<Vec<u8>> {
+fn encode_key_kitty(key: &KittyKey<'_>, flags: u8, modes: LegacyModes) -> Option<Vec<u8>> {
+    let KittyKey {
+        logical,
+        text,
+        modifiers,
+        state,
+        repeat,
+        physical,
+        unmodified,
+    } = *key;
     let report_events = flags & KITTY_FLAG_REPORT_EVENTS != 0;
     let disambiguate = flags & KITTY_FLAG_DISAMBIGUATE != 0;
     let report_all = flags & KITTY_FLAG_REPORT_ALL_AS_ESC != 0;
@@ -455,6 +492,40 @@ fn encode_key_kitty(
     let csi_mods = modifiers.intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER);
     let any_mods = csi_mods || modifiers.contains(Modifiers::SHIFT);
     let legacy = || encode_key_legacy(logical, text, modifiers, modes);
+
+    // KBD-2: the modifier keys themselves, reported only under
+    // report-all. The key's own bit is set on its press (spec). On its
+    // release `modifiers` must already say whether the modifier is still
+    // held through the other side (the binary tracks both sides; see
+    // `track_modifier_keys` in main.rs).
+    if let Some((code, own)) = modifier_key(physical) {
+        if !report_all {
+            return None;
+        }
+        let key_mods = if released { modifiers } else { modifiers | own };
+        return Some(format_kitty(
+            code,
+            kitty_modifiers(key_mods),
+            event_suffix,
+            None,
+            None,
+        ));
+    }
+    // KBD-2: keypad keys have their own codes.
+    if let Some(kp) = keypad_key(physical, logical) {
+        let text_ctx = KeypadText {
+            printable: text.filter(|t| !t.is_empty() && !t.chars().any(char::is_control)),
+            report_text: report_text && !released && !csi_mods,
+        };
+        return encode_keypad(
+            kp,
+            m,
+            event_suffix,
+            (disambiguate, report_all, released, csi_mods, any_mods),
+            text_ctx,
+            legacy,
+        );
+    }
 
     // Everything below is a text key (letters, digits, Space, ...).
     let code = match logical {
@@ -494,6 +565,12 @@ fn encode_key_kitty(
             return Some(format_kitty_legacy(code, m, event_suffix, final_byte));
         }
         LogicalKey::Character(s) => {
+            // The key code is the unmodified key (`1` for shift+1, kitty),
+            // falling back to the cooked one.
+            let s = match unmodified {
+                Some(LogicalKey::Character(base)) if !base.is_empty() => base,
+                _ => s,
+            };
             let c = s.chars().next()?;
             // Use lowercase codepoint for ASCII letters (kitty wants the
             // un-shifted base character). For other Unicode characters,
@@ -575,6 +652,187 @@ fn encode_key_kitty(
         shifted,
         text_field.as_deref(),
     ))
+}
+
+/// One key event, as the kitty encoder sees it.
+#[derive(Clone, Copy)]
+struct KittyKey<'a> {
+    logical: &'a LogicalKey,
+    text: Option<&'a str>,
+    modifiers: Modifiers,
+    state: KeyState,
+    repeat: bool,
+    /// W3C `KeyCode` name, empty when unknown.
+    physical: &'a str,
+    /// The key with no modifiers, when known.
+    unmodified: Option<&'a LogicalKey>,
+}
+
+/// The modifier bit a modifier key drives (empty for the lock keys), or
+/// `None` when `physical` isn't a modifier / lock key.
+#[must_use]
+pub fn modifier_key_bit(physical: &str) -> Option<Modifiers> {
+    modifier_key(physical).map(|(_, bit)| bit)
+}
+
+/// kitty's code for a modifier or lock key, and the modifier bit it
+/// drives (empty for the lock keys, whose state toastty doesn't track).
+fn modifier_key(physical: &str) -> Option<(u32, Modifiers)> {
+    Some(match physical {
+        "ShiftLeft" => (57441, Modifiers::SHIFT),
+        "ControlLeft" => (57442, Modifiers::CONTROL),
+        "AltLeft" => (57443, Modifiers::ALT),
+        "SuperLeft" | "MetaLeft" => (57444, Modifiers::SUPER),
+        "ShiftRight" => (57447, Modifiers::SHIFT),
+        "ControlRight" => (57448, Modifiers::CONTROL),
+        "AltRight" => (57449, Modifiers::ALT),
+        "SuperRight" | "MetaRight" => (57450, Modifiers::SUPER),
+        "CapsLock" => (57358, Modifiers::empty()),
+        "ScrollLock" => (57359, Modifiers::empty()),
+        "NumLock" => (57360, Modifiers::empty()),
+        _ => return None,
+    })
+}
+
+/// What a keypad key does right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeypadKind {
+    /// Keypad Enter.
+    Enter,
+    /// A digit (`NumLock` on): keeps its keypad code even for the release
+    /// under report-events alone (kitty).
+    Digit,
+    /// An operator / the decimal point: under report-events alone its
+    /// release uses the plain character's code (kitty).
+    Operator(u32),
+    /// A navigation key (`NumLock` off), with the legacy form of the main
+    /// key it stands for.
+    Nav(u32, u8),
+}
+
+/// kitty's keypad code and kind for `physical`, using the logical key to
+/// tell whether `NumLock` turned a digit into a navigation key.
+fn keypad_key(physical: &str, logical: &LogicalKey) -> Option<(u32, KeypadKind)> {
+    let key = physical.strip_prefix("Numpad")?;
+    let numlock_text = matches!(logical, LogicalKey::Character(_));
+    Some(match key {
+        "Enter" => (57414, KeypadKind::Enter),
+        "Divide" => (57410, KeypadKind::Operator(u32::from(b'/'))),
+        "Multiply" => (57411, KeypadKind::Operator(u32::from(b'*'))),
+        "Subtract" => (57412, KeypadKind::Operator(u32::from(b'-'))),
+        "Add" => (57413, KeypadKind::Operator(u32::from(b'+'))),
+        "Equal" => (57415, KeypadKind::Operator(u32::from(b'='))),
+        "Comma" => (57416, KeypadKind::Operator(u32::from(b','))),
+        "Decimal" if numlock_text => (57409, KeypadKind::Operator(u32::from(b'.'))),
+        "Decimal" => (57426, KeypadKind::Nav(3, b'~')),
+        d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() => {
+            let digit = u32::from(d.as_bytes()[0] - b'0');
+            if numlock_text {
+                (57399 + digit, KeypadKind::Digit)
+            } else {
+                match digit {
+                    0 => (57425, KeypadKind::Nav(2, b'~')),
+                    1 => (57424, KeypadKind::Nav(1, b'F')),
+                    2 => (57420, KeypadKind::Nav(1, b'B')),
+                    3 => (57422, KeypadKind::Nav(6, b'~')),
+                    4 => (57417, KeypadKind::Nav(1, b'D')),
+                    5 => (57427, KeypadKind::Nav(1, b'E')),
+                    6 => (57418, KeypadKind::Nav(1, b'C')),
+                    7 => (57423, KeypadKind::Nav(1, b'H')),
+                    8 => (57419, KeypadKind::Nav(1, b'A')),
+                    _ => (57421, KeypadKind::Nav(5, b'~')),
+                }
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// Text side of a keypad event.
+#[derive(Clone, Copy)]
+struct KeypadText<'a> {
+    printable: Option<&'a str>,
+    report_text: bool,
+}
+
+/// Encode a keypad key under the kitty flags. Matches kitty 0.49.2,
+/// checked live for flags 1, 2, 3, 8, 10, 24 and 31 with `NumLock` on and
+/// off:
+/// - Disambiguate (1) or report-all (8): the keypad's own codes
+///   (`KP_Enter` `CSI 57414 u`, `KP_1` `CSI 57400 u`, `KP_End`
+///   `CSI 57424 u`); `KP_Begin` keeps its `CSI E` form. Text keypad keys
+///   without Ctrl / Alt / Super still type their text unless report-all
+///   is on.
+/// - Report-events (2) alone: `KP_Enter` is Enter; navigation keys use the
+///   legacy forms of the keys they stand for; text keys type their text
+///   and release with the keypad code (digits) or the plain character's
+///   code (operators).
+/// - Ctrl / Alt / Super + a digit is `CSI 5740x;mods u` in every mode.
+fn encode_keypad(
+    (code, kind): (u32, KeypadKind),
+    m: u32,
+    event_suffix: Option<&str>,
+    (disambiguate, report_all, released, csi_mods, any_mods): (bool, bool, bool, bool, bool),
+    text: KeypadText<'_>,
+    legacy: impl Fn() -> Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let escape = disambiguate || report_all;
+    match kind {
+        KeypadKind::Enter => {
+            if !escape {
+                // Report-events alone: exactly the main Enter key.
+                if released {
+                    return None;
+                }
+                if !any_mods {
+                    return Some(b"\r".to_vec());
+                }
+                return Some(format_kitty(13, m, event_suffix, None, None));
+            }
+            Some(format_kitty(code, m, event_suffix, None, None))
+        }
+        KeypadKind::Nav(legacy_code, fin) => {
+            if code == 57427 || !escape {
+                // KP_Begin always, and every navigation key under
+                // report-events alone, use the legacy CSI form.
+                let c = if code == 57427 { 1 } else { legacy_code };
+                return Some(format_kitty_legacy(c, m, event_suffix, fin));
+            }
+            Some(format_kitty(code, m, event_suffix, None, None))
+        }
+        KeypadKind::Digit | KeypadKind::Operator(_) => {
+            if report_all {
+                let field = if text.report_text {
+                    text.printable.map(|t| {
+                        t.chars()
+                            .map(|ch| u32::from(ch).to_string())
+                            .collect::<Vec<_>>()
+                            .join(":")
+                    })
+                } else {
+                    None
+                };
+                return Some(format_kitty(code, m, event_suffix, None, field.as_deref()));
+            }
+            let release_code = match kind {
+                KeypadKind::Operator(ch) if !disambiguate => ch,
+                _ => code,
+            };
+            if csi_mods {
+                if disambiguate || released || kind == KeypadKind::Digit {
+                    return Some(format_kitty(release_code, m, event_suffix, None, None));
+                }
+                return legacy();
+            }
+            if released {
+                return Some(format_kitty(release_code, m, event_suffix, None, None));
+            }
+            match text.printable {
+                Some(t) => Some(t.as_bytes().to_vec()),
+                None => Some(format_kitty(code, m, event_suffix, None, None)),
+            }
+        }
+    }
 }
 
 /// Format a key in the legacy `CSI [code][;mod[:event]] <final>` form
@@ -1372,6 +1630,262 @@ mod tests {
         );
     }
 
+    /// Encode with a physical key (KBD-2).
+    fn enc_phys(
+        k: &LogicalKey,
+        text: Option<&str>,
+        m: Modifiers,
+        flags: u8,
+        state: KeyState,
+        physical: &str,
+    ) -> Option<Vec<u8>> {
+        encode_key_with_modes(
+            k,
+            text,
+            m,
+            flags,
+            state,
+            false,
+            LegacyModes::default(),
+            KeyContext {
+                physical,
+                unmodified: None,
+            },
+        )
+    }
+
+    /// KBD-2: the keypad's own codes, as kitty 0.49.2 sends them (checked
+    /// live for flags 1, 2, 3, 8, 10, 24 and 31, `NumLock` on and off).
+    #[test]
+    fn kitty_keypad_keys_use_their_own_codes() {
+        let p = KeyState::Pressed;
+        let none = Modifiers::empty();
+        let enter = named(NamedKey::Enter);
+        let one = char_key("1");
+        let plus = char_key("+");
+        let end = named(NamedKey::End);
+        let check = |got: Option<Vec<u8>>, want: &[u8], what: &str| {
+            assert_eq!(got.as_deref(), Some(want), "{what}");
+        };
+        // Disambiguate: non-text keypad keys get their codes.
+        check(
+            enc_phys(&enter, Some("\r"), none, 1, p, "NumpadEnter"),
+            b"\x1b[57414u",
+            "KP_Enter 1",
+        );
+        check(
+            enc_phys(&end, None, none, 1, p, "Numpad1"),
+            b"\x1b[57424u",
+            "KP_End 1",
+        );
+        check(
+            enc_phys(&one, Some("1"), none, 1, p, "Numpad1"),
+            b"1",
+            "KP_1 text 1",
+        );
+        check(
+            enc_phys(&plus, Some("+"), Modifiers::CONTROL, 1, p, "NumpadAdd"),
+            b"\x1b[57413;5u",
+            "ctrl+KP_Add 1",
+        );
+        check(
+            enc_phys(&one, Some("1"), Modifiers::CONTROL, 1, p, "Numpad1"),
+            b"\x1b[57400;5u",
+            "ctrl+KP_1 1",
+        );
+        // KP_Begin keeps its `CSI E` form.
+        let begin = named(NamedKey::Other);
+        check(
+            enc_phys(&begin, None, none, 1, p, "Numpad5"),
+            b"\x1b[E",
+            "KP_Begin 1",
+        );
+    }
+
+    #[test]
+    fn kitty_keypad_keys_report_events_and_report_all() {
+        let begin = named(NamedKey::Other);
+        let p = KeyState::Pressed;
+        let r = KeyState::Released;
+        let none = Modifiers::empty();
+        let enter = named(NamedKey::Enter);
+        let one = char_key("1");
+        let plus = char_key("+");
+        let end = named(NamedKey::End);
+        let check = |got: Option<Vec<u8>>, want: &[u8], what: &str| {
+            assert_eq!(got.as_deref(), Some(want), "{what}");
+        };
+        // Report-events alone.
+        check(
+            enc_phys(&enter, Some("\r"), none, 2, p, "NumpadEnter"),
+            b"\r",
+            "KP_Enter 2",
+        );
+        assert_eq!(
+            enc_phys(&enter, Some("\r"), none, 2, r, "NumpadEnter"),
+            None,
+            "KP_Enter 2 release"
+        );
+        check(
+            enc_phys(&end, None, none, 2, p, "Numpad1"),
+            b"\x1b[F",
+            "KP_End 2",
+        );
+        check(
+            enc_phys(&end, None, none, 2, r, "Numpad1"),
+            b"\x1b[1;1:3F",
+            "KP_End 2 release",
+        );
+        check(
+            enc_phys(&one, Some("1"), none, 2, r, "Numpad1"),
+            b"\x1b[57400;1:3u",
+            "KP_1 2 release",
+        );
+        check(
+            enc_phys(&plus, Some("+"), none, 2, r, "NumpadAdd"),
+            b"\x1b[43;1:3u",
+            "KP_Add 2 release",
+        );
+        check(
+            enc_phys(&plus, Some("+"), Modifiers::CONTROL, 2, p, "NumpadAdd"),
+            b"+",
+            "ctrl+KP_Add 2",
+        );
+        // Disambiguate + events: keypad codes for releases too.
+        check(
+            enc_phys(&enter, Some("\r"), none, 3, r, "NumpadEnter"),
+            b"\x1b[57414;1:3u",
+            "KP_Enter 3 release",
+        );
+        check(
+            enc_phys(&plus, Some("+"), none, 3, r, "NumpadAdd"),
+            b"\x1b[57413;1:3u",
+            "KP_Add 3 release",
+        );
+        // Report-all, with and without associated text.
+        check(
+            enc_phys(&one, Some("1"), none, 8, p, "Numpad1"),
+            b"\x1b[57400u",
+            "KP_1 8",
+        );
+        check(
+            enc_phys(&plus, Some("+"), none, 24, p, "NumpadAdd"),
+            b"\x1b[57413;;43u",
+            "KP_Add 24",
+        );
+        check(
+            enc_phys(&end, None, none, 8, p, "Numpad1"),
+            b"\x1b[57424u",
+            "KP_End 8",
+        );
+        // NumLock off turns Decimal into KP_Delete.
+        check(
+            enc_phys(&named(NamedKey::Delete), None, none, 1, p, "NumpadDecimal"),
+            b"\x1b[57426u",
+            "KP_Delete 1",
+        );
+        // Legacy mode: KP_Begin is `CSI E`, as in xterm and kitty.
+        check(
+            enc_phys(&begin, None, none, 0, p, "Numpad5"),
+            b"\x1b[E",
+            "KP_Begin 0",
+        );
+        check(
+            enc_phys(&begin, None, Modifiers::SHIFT, 0, p, "Numpad5"),
+            b"\x1b[1;2E",
+            "shift+KP_Begin 0",
+        );
+        // The main keyboard is unaffected.
+        check(
+            enc_phys(&enter, Some("\r"), none, 1, p, "Enter"),
+            b"\r",
+            "Enter 1",
+        );
+    }
+
+    /// KBD-2: modifier keys are reported only under report-all; their own
+    /// bit is set on press and cleared on release (spec, kitty 0.49.2).
+    #[test]
+    fn kitty_modifier_keys_under_report_all() {
+        let other = named(NamedKey::Other);
+        let p = KeyState::Pressed;
+        let r = KeyState::Released;
+        for flags in [1, 2, 3] {
+            assert_eq!(
+                enc_phys(&other, None, Modifiers::empty(), flags, p, "ShiftLeft"),
+                None,
+                "{flags}"
+            );
+        }
+        let got = enc_phys(&other, None, Modifiers::empty(), 8, p, "ShiftLeft");
+        assert_eq!(got.as_deref(), Some(&b"\x1b[57441;2u"[..]));
+        // Release: the caller says whether the modifier is still held
+        // (through the other side); main.rs tracks both sides.
+        let got = enc_phys(&other, None, Modifiers::empty(), 10, r, "ShiftLeft");
+        assert_eq!(got.as_deref(), Some(&b"\x1b[57441;1:3u"[..]));
+        let got = enc_phys(&other, None, Modifiers::SHIFT, 10, r, "ShiftLeft");
+        assert_eq!(got.as_deref(), Some(&b"\x1b[57441;2:3u"[..]));
+        for (phys, code, m) in [
+            ("ControlLeft", 57442, 5),
+            ("AltLeft", 57443, 3),
+            ("SuperLeft", 57444, 9),
+            ("ShiftRight", 57447, 2),
+            ("ControlRight", 57448, 5),
+            ("AltRight", 57449, 3),
+        ] {
+            let got = enc_phys(&other, None, Modifiers::empty(), 8, p, phys);
+            let want = format!("\x1b[{code};{m}u");
+            assert_eq!(got.as_deref(), Some(want.as_bytes()), "{phys}");
+        }
+        // Lock keys have codes but no modifier bit of their own here.
+        let got = enc_phys(&other, None, Modifiers::empty(), 8, p, "NumLock");
+        assert_eq!(got.as_deref(), Some(&b"\x1b[57360u"[..]));
+        // Legacy mode never reports a bare modifier.
+        assert_eq!(
+            enc_phys(&other, None, Modifiers::empty(), 0, p, "ShiftLeft"),
+            None
+        );
+    }
+
+    /// KBD-2 / #43 review: the key code is the unmodified key; the
+    /// shifted one is its alternate. kitty: ctrl+shift+1 is `CSI 49;6u`
+    /// (`49:33;6u` under 5); shift+1 under 8 is `CSI 49;2u`.
+    #[test]
+    fn kitty_key_code_is_the_unmodified_key() {
+        let bang = char_key("!");
+        let one = char_key("1");
+        let ctx = KeyContext {
+            physical: "Digit1",
+            unmodified: Some(&one),
+        };
+        let e = |t: Option<&str>, m: Modifiers, f: u8, st: KeyState| {
+            encode_key_with_modes(&bang, t, m, f, st, false, LegacyModes::default(), ctx)
+        };
+        let cs = Modifiers::CONTROL | Modifiers::SHIFT;
+        let p = KeyState::Pressed;
+        assert_eq!(e(Some("!"), cs, 1, p).as_deref(), Some(&b"\x1b[49;6u"[..]));
+        assert_eq!(
+            e(Some("!"), cs, 5, p).as_deref(),
+            Some(&b"\x1b[49:33;6u"[..])
+        );
+        assert_eq!(
+            e(Some("!"), Modifiers::SHIFT, 8, p).as_deref(),
+            Some(&b"\x1b[49;2u"[..])
+        );
+        assert_eq!(
+            e(Some("!"), Modifiers::SHIFT, 31, p).as_deref(),
+            Some(&b"\x1b[49:33;2;33u"[..])
+        );
+        assert_eq!(
+            e(Some("!"), Modifiers::empty(), 2, KeyState::Released).as_deref(),
+            Some(&b"\x1b[49;1:3u"[..])
+        );
+        // Without the unmodified key (older callers) the cooked one is
+        // used, as before.
+        let got = encode_key(&bang, Some("!"), Modifiers::SHIFT, 8, p, false);
+        assert_eq!(got.as_deref(), Some(&b"\x1b[33;2u"[..]));
+    }
+
     #[test]
     fn kitty_alternates_or_text_alone_are_legacy() {
         // 4 alone (and 16 without 8, undefined in the spec) change
@@ -1811,7 +2325,17 @@ mod legacy_mode_tests {
     }
 
     fn enc(k: &LogicalKey, text: Option<&str>, m: Modifiers, modes: LegacyModes) -> Vec<u8> {
-        encode_key_with_modes(k, text, m, 0, KeyState::Pressed, false, modes).unwrap()
+        encode_key_with_modes(
+            k,
+            text,
+            m,
+            0,
+            KeyState::Pressed,
+            false,
+            modes,
+            KeyContext::default(),
+        )
+        .unwrap()
     }
 
     const APP: LegacyModes = LegacyModes {
@@ -1911,6 +2435,10 @@ mod legacy_mode_tests {
             KeyState::Pressed,
             false,
             APP,
+            KeyContext {
+                physical: "ArrowUp",
+                unmodified: None,
+            },
         );
         assert_eq!(got.as_deref(), Some(&b"\x1b[A"[..]));
     }
