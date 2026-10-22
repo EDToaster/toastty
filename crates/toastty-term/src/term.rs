@@ -304,6 +304,10 @@ pub struct Term {
     /// screen's grid here and install a fresh one as `image_grid`.
     /// `None` while on the primary screen (nothing stashed).
     stashed_image_grid: Option<ImageGrid>,
+    /// Test-only count of `region_scroll_up` calls, so tests can check
+    /// scroll work without timing it.
+    #[cfg(test)]
+    region_scrolls: u64,
     /// Image *number* (`I=`) → most-recently-registered image *id* map.
     /// The kitty spec lets a client refer to "the most recent image with
     /// this number" via `d=n`/`d=N`. Updated on every registration that
@@ -605,6 +609,8 @@ impl Term {
             image_registry: ImageRegistry::new(320 * 1024 * 1024),
             image_grid: ImageGrid::new(),
             stashed_image_grid: None,
+            #[cfg(test)]
+            region_scrolls: 0,
             image_number_to_id: std::collections::HashMap::new(),
             image_revision: 0,
             cursor_underline_color: None,
@@ -2037,6 +2043,10 @@ impl Term {
     /// rows in place within `[top..=bot]`: the top row is dropped
     /// (no scrollback), rows below shift up, and `bot` is blanked.
     fn region_scroll_up(&mut self) {
+        #[cfg(test)]
+        {
+            self.region_scrolls += 1;
+        }
         let top = self.scroll_top;
         let bot = self.scroll_bot.min(self.rows.saturating_sub(1));
         if self.lr_narrowed() {
@@ -10727,10 +10737,15 @@ mod placement_model_tests {
     fn huge_rows_in_a_region_scroll_at_most_the_region() {
         let mut t = Term::new(10, 20, 100);
         feed(&mut t, b"\x1b[3;8r\x1b[5;1H");
-        let start = std::time::Instant::now();
+        t.region_scrolls = 0;
         place(&mut t, 1, 4, 65535, "");
-        assert!(start.elapsed() < std::time::Duration::from_millis(50));
+        assert_eq!(t.region_scrolls, 6, "the region is 6 rows tall");
         assert_eq!(t.cursor().row, 7, "cursor on the bottom margin");
+        // Full-screen margins: at most one ring's worth (10 + 100).
+        let mut t = Term::new(10, 20, 100);
+        t.region_scrolls = 0;
+        place(&mut t, 1, 4, 65535, "");
+        assert_eq!(t.region_scrolls, 110);
     }
 
     #[test]
