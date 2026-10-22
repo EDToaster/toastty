@@ -168,8 +168,14 @@ pub struct Term {
     alt: Grid,
     cursor: Cursor,
     /// Cursor snapshot captured on the most recent `1049` enter; restored
-    /// on `1049` exit.
+    /// on `1049` exit. 47 / 1047 neither save nor restore it.
     saved_cursor: Cursor,
+    /// True while on an alt screen entered with 1049, i.e. while
+    /// `saved_cursor` is the primary screen's cursor. After a 47 / 1047
+    /// entry it is just the last 1049 savepoint (kitty shares one cursor
+    /// between the screens there), so resize mustn't reflow it as the
+    /// primary cursor. Only meaningful while `alt_active`.
+    saved_cursor_is_primary: bool,
     /// DECSC (`ESC 7`) save slot. Separate from `saved_cursor` so a
     /// `DECSC ... enter-alt-screen ... exit-alt-screen ... DECRC`
     /// sequence doesn't have the alt-screen path clobber the user's
@@ -301,8 +307,11 @@ pub struct Term {
     /// Images belonging to the *inactive* screen. The primary and alt
     /// screens maintain independent image lists (per the kitty graphics
     /// protocol), so when we switch screens we stash the departing
-    /// screen's grid here and install a fresh one as `image_grid`.
-    /// `None` while on the primary screen (nothing stashed).
+    /// screen's grid here and install the other screen's as
+    /// `image_grid`. On the primary screen this holds the alt screen's
+    /// images left behind by a 47 / 1047 exit (`None` once 1049 or RIS
+    /// has discarded them); the alt images follow the alt *text*, which
+    /// 47 / 1047 keep and 1049 clears (SCR-12, see [`AltSwitch`]).
     stashed_image_grid: Option<ImageGrid>,
     /// Image *number* (`I=`) → most-recently-registered image *id* map.
     /// The kitty spec lets a client refer to "the most recent image with
@@ -566,6 +575,7 @@ impl Term {
             alt,
             cursor: Cursor::default(),
             saved_cursor: Cursor::default(),
+            saved_cursor_is_primary: false,
             decsc_saved: None,
             alt_active: false,
             rows,
@@ -1563,6 +1573,35 @@ impl Term {
         false
     }
 
+    /// The primary screen's logical cursor, for reflowing the primary
+    /// grid: the live cursor on the primary screen or on a 47 / 1047
+    /// alt screen (one cursor shared by both, as in kitty), else the
+    /// snapshot taken on 1049 entry.
+    pub(super) fn primary_reflow_cursor(&self) -> (u16, u16) {
+        if self.alt_active && self.saved_cursor_is_primary {
+            (self.saved_cursor.row, self.saved_cursor.col)
+        } else {
+            (self.cursor.row, self.cursor.col)
+        }
+    }
+
+    /// Put the cursor [`Self::reflow_primary`] remapped back where
+    /// [`Self::primary_reflow_cursor`] took it from. On a 47 / 1047 alt
+    /// screen the live cursor addresses the alt grid, so the remapped
+    /// position is dropped (the caller clamps the live cursor), and the
+    /// 1049 savepoint is left as it was.
+    pub(super) fn store_primary_reflow_cursor(&mut self, (row, col): (u16, u16)) {
+        if !self.alt_active {
+            self.cursor.row = row;
+            self.cursor.col = col;
+        } else if self.saved_cursor_is_primary {
+            // Keep the saved primary cursor consistent with the reflowed
+            // primary grid for the 1049 exit.
+            self.saved_cursor.row = row;
+            self.saved_cursor.col = col;
+        }
+    }
+
     /// Line ids of the active grid's visible region, top to bottom.
     fn visible_line_ids(&self) -> std::ops::RangeInclusive<u64> {
         let g = self.active_grid();
@@ -1844,25 +1883,10 @@ impl Term {
         let rows = rows.max(1);
         let cols = cols.max(1);
         let primary_cap = rows as usize + self.scrollback as usize;
-        // The primary's logical cursor is the live cursor when the primary
-        // is active, else the snapshot taken on alt-screen (1049) entry.
-        let primary_cursor = if self.alt_active {
-            (self.saved_cursor.row, self.saved_cursor.col)
-        } else {
-            (self.cursor.row, self.cursor.col)
-        };
-        let (new_row, new_col) = self.reflow_primary(rows, cols, primary_cap, primary_cursor);
+        let cursor = self.primary_reflow_cursor();
+        let reflowed = self.reflow_primary(rows, cols, primary_cap, cursor);
         self.alt.resize(rows, cols, rows as usize);
-        if self.alt_active {
-            // The live cursor belongs to alt (clamped below); update the
-            // saved primary cursor so a later 1049 exit restores a position
-            // consistent with the reflowed primary grid.
-            self.saved_cursor.row = new_row;
-            self.saved_cursor.col = new_col;
-        } else {
-            self.cursor.row = new_row;
-            self.cursor.col = new_col;
-        }
+        self.store_primary_reflow_cursor(reflowed);
         self.rows = rows;
         self.cols = cols;
         // Resize collapses any prior DECSTBM region: xterm resets the
@@ -3704,31 +3728,28 @@ impl Term {
                 continue;
             };
             match code {
-                1049 => {
-                    if enable {
-                        self.enter_alt_screen();
+                // 1049 — save the cursor, switch to a cleared alt
+                // screen; reset switches back and restores the cursor.
+                // 47 / 1047 — legacy switch that keeps the alt screen's
+                // text and images between visits and doesn't save or
+                // restore the cursor. See [`AltSwitch`].
+                1049 | 47 | 1047 => {
+                    let kind = if code == 1049 {
+                        AltSwitch::SaveCursorAndClear
                     } else {
-                        self.exit_alt_screen();
-                    }
-                }
-                // 47 / 1047 — legacy alt-screen buffer switch (no
-                // cursor save/restore of their own). We route them
-                // through the same enter/exit helpers as 1049 so the
-                // image-grid stash/restore (B2) stays consistent and
-                // images don't leak across the alt switch. The cursor
-                // save 1049 performs is harmless here: the matching
-                // exit restores it, and apps using 47/1047 pair them
-                // with their own DECSC/DECRC (1048) when they care.
-                47 | 1047 => {
+                        AltSwitch::Legacy
+                    };
                     if enable {
-                        self.enter_alt_screen();
+                        self.enter_alt_screen(kind);
                     } else {
-                        self.exit_alt_screen();
+                        self.exit_alt_screen(kind);
                     }
                 }
                 // 1048 — save (set) / restore (reset) the cursor, using
                 // the same DECSC slot as `ESC 7` / `ESC 8`. No buffer or
-                // image-grid switch.
+                // image-grid switch. (xterm semantics. kitty 0.49.2
+                // ignores 1048 reset, so its cursor isn't restored; we
+                // keep xterm's behaviour, which apps rely on.)
                 1048 => {
                     if enable {
                         self.save_cursor();
@@ -3843,7 +3864,7 @@ impl Term {
         }
     }
 
-    fn enter_alt_screen(&mut self) {
+    fn enter_alt_screen(&mut self, kind: AltSwitch) {
         if self.alt_active {
             return;
         }
@@ -3853,10 +3874,15 @@ impl Term {
         // exit if the primary's rows are then overwritten. Likewise a
         // selection made on the alt screen is dropped on exit below.
         self.drop_selection();
-        self.saved_cursor = self.cursor;
+        let clear = kind == AltSwitch::SaveCursorAndClear;
+        self.saved_cursor_is_primary = clear;
+        if clear {
+            self.saved_cursor = self.cursor;
+            self.alt.clear_visible(Style::RESET);
+        }
         self.alt_active = true;
-        self.alt.clear_visible(Style::RESET);
-        // Reset cursor to home and clear style for the alt screen.
+        // Reset cursor to home and clear style for the alt screen. kitty
+        // does this for all three modes.
         self.cursor = Cursor::default();
         // Snap viewport back to the live bottom — alt screen has no
         // scrollback, and any in-flight scrollback animation from the
@@ -3867,14 +3893,18 @@ impl Term {
         // Switching screens invalidates every cached shaped line.
         self.mark_all_dirty();
         // Primary and alt screens maintain independent image lists.
-        // Stash the primary grid and install a fresh empty one as the
-        // active grid so the alt screen starts blank and the primary's
-        // images survive the round trip.
-        self.stashed_image_grid = Some(std::mem::take(&mut self.image_grid));
+        // Stash the primary grid and install the alt screen's: the one
+        // a 47 / 1047 exit left behind, or a fresh empty one when the
+        // alt text was just cleared (or there is none).
+        let alt_images = self.stashed_image_grid.take().filter(|_| !clear);
+        self.stashed_image_grid = Some(std::mem::replace(
+            &mut self.image_grid,
+            alt_images.unwrap_or_default(),
+        ));
         self.image_revision = self.image_revision.wrapping_add(1);
     }
 
-    fn exit_alt_screen(&mut self) {
+    fn exit_alt_screen(&mut self, kind: AltSwitch) {
         if !self.alt_active {
             return;
         }
@@ -3883,7 +3913,9 @@ impl Term {
         // highlight unrelated rows.
         self.drop_selection();
         self.alt_active = false;
-        self.cursor = self.saved_cursor;
+        if kind == AltSwitch::SaveCursorAndClear {
+            self.cursor = self.saved_cursor;
+        }
         self.clamp_cursor();
         // Returning to the primary grid: snap viewport to the live
         // bottom. The user expects to see the prompt where they left
@@ -3891,10 +3923,13 @@ impl Term {
         self.viewport = crate::viewport::Viewport::new();
         // Switching back: re-shape the primary screen contents.
         self.mark_all_dirty();
-        // Drop the alt screen's images and restore the stashed primary
-        // grid, so the primary screen's images reappear exactly as they
-        // were before we entered the alt screen.
-        self.image_grid = self.stashed_image_grid.take().unwrap_or_default();
+        // Restore the stashed primary grid, so the primary screen's
+        // images reappear exactly as they were before we entered the alt
+        // screen. The alt screen's images stay stashed alongside its
+        // text: a 47 / 1047 re-entry shows them again, a 1049 entry
+        // clears both.
+        let primary_images = self.stashed_image_grid.take().unwrap_or_default();
+        self.stashed_image_grid = Some(std::mem::replace(&mut self.image_grid, primary_images));
         self.image_revision = self.image_revision.wrapping_add(1);
     }
 
@@ -3908,8 +3943,10 @@ impl Term {
         // Leave the alt screen first so the reset lands on the primary
         // grid the user will see.
         if self.alt_active {
-            self.exit_alt_screen();
+            self.exit_alt_screen(AltSwitch::SaveCursorAndClear);
         }
+        // The alt screen's text is rebuilt below; drop its images too.
+        self.stashed_image_grid = None;
         // Fresh primary + alt grids: cleanest way to wipe both the
         // visible region and the entire scrollback ring.
         let primary_cap = self.rows as usize + self.scrollback as usize;
@@ -3951,6 +3988,26 @@ impl Term {
         self.damage.resize(self.rows);
         self.mark_all_dirty();
     }
+}
+
+/// Which DECSET alt-screen mode is switching screens. Matches kitty
+/// 0.49.2, checked live:
+///
+/// | | 47, 1047 | 1049 |
+/// |---|---|---|
+/// | enter | home cursor, reset pen | save cursor, clear alt, home, reset pen |
+/// | alt text and images | kept from the last visit | cleared on entry |
+/// | exit | cursor stays where it is | restore the saved cursor |
+///
+/// xterm differs in two places: it doesn't home the cursor on 47 / 1047
+/// entry, and 1047 reset clears the alt screen before leaving. The
+/// alt screen's images follow the same rule as its text (SCR-12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AltSwitch {
+    /// 47 / 1047.
+    Legacy,
+    /// 1049.
+    SaveCursorAndClear,
 }
 
 fn first_param(params: &Params, default: u16) -> u16 {
@@ -10522,6 +10579,119 @@ mod minor_term_tests {
         feed(&mut t, b"\x1b[?1047l");
         assert!(!t.is_alt_active());
         assert_eq!(t.image_grid().len(), 1);
+    }
+
+    /// Visible text of an alt- or primary-screen row, trailing blanks
+    /// trimmed.
+    fn screen_row(t: &Term, r: u16) -> String {
+        let s: String = t.row(r).cells.iter().map(|c| c.ch).collect();
+        s.trim_end().to_string()
+    }
+
+    #[test]
+    fn legacy_alt_screen_keeps_text_and_images_on_reentry() {
+        // SCR-12: 47 and 1047 keep the alt screen between visits (kitty).
+        for mode in ["47", "1047"] {
+            let mut t = Term::new(8, 16, 0);
+            feed(&mut t, b"primary");
+            feed(&mut t, format!("\x1b[?{mode}h").as_bytes());
+            feed(&mut t, b"\x1b[3;1Halt text");
+            place_image(&mut t, 7);
+            feed(&mut t, format!("\x1b[?{mode}l").as_bytes());
+            assert_eq!(screen_row(&t, 0), "primary", "mode {mode}");
+            assert_eq!(t.image_grid().len(), 0, "mode {mode}: alt image hidden");
+            feed(&mut t, format!("\x1b[?{mode}h").as_bytes());
+            assert_eq!(screen_row(&t, 2), "alt text", "mode {mode}: text kept");
+            assert_eq!(t.image_grid().len(), 1, "mode {mode}: image kept");
+            let id = t.image_grid().iter().next().unwrap().image_id;
+            assert_eq!(id, 7, "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn alt_1049_clears_what_legacy_modes_left_behind() {
+        let mut t = Term::new(8, 16, 0);
+        feed(&mut t, b"\x1b[?47h\x1b[3;1Halt text");
+        place_image(&mut t, 7);
+        feed(&mut t, b"\x1b[?47l\x1b[?1049h");
+        assert_eq!(screen_row(&t, 2), "");
+        assert_eq!(t.image_grid().len(), 0);
+        feed(&mut t, b"\x1b[?1049l\x1b[?47h");
+        assert_eq!(screen_row(&t, 2), "", "1049 cleared it for good");
+        assert_eq!(t.image_grid().len(), 0);
+    }
+
+    #[test]
+    fn legacy_alt_screen_cursor_matches_kitty() {
+        // Entry homes the cursor and resets the pen; exit leaves the
+        // cursor where the alt screen put it (no save / restore).
+        let mut t = Term::new(8, 32, 0);
+        feed(&mut t, b"\x1b[5;10H\x1b[31m\x1b[?1047h");
+        assert_eq!((t.cursor().row, t.cursor().col), (0, 0));
+        assert_eq!(t.cursor().style, Style::RESET);
+        feed(&mut t, b"\x1b[7;20H\x1b[?1047l");
+        assert_eq!((t.cursor().row, t.cursor().col), (6, 19));
+        // 1049 still saves and restores.
+        feed(&mut t, b"\x1b[5;10H\x1b[?1049h\x1b[7;20H\x1b[?1049l");
+        assert_eq!((t.cursor().row, t.cursor().col), (4, 9));
+    }
+
+    #[test]
+    fn mixed_alt_modes_match_kitty() {
+        // Checked live against kitty 0.49.2 with CPR.
+        // 1049 in, 47 out: no cursor restore.
+        let mut t = Term::new(10, 32, 0);
+        feed(&mut t, b"\x1b[5;10H\x1b[?1049h\x1b[7;20H\x1b[?47l");
+        assert!(!t.is_alt_active());
+        assert_eq!((t.cursor().row, t.cursor().col), (6, 19));
+        // 47 in, then 1049h is a no-op (already on alt: nothing cleared,
+        // cursor kept); 1049l restores the last 1049 save (5;10 above).
+        feed(&mut t, b"\x1b[3;3H\x1b[?47h\x1b[2;1Hkept");
+        feed(&mut t, b"\x1b[8;8H\x1b[?1049h");
+        assert!(t.is_alt_active());
+        assert_eq!(screen_row(&t, 1), "kept");
+        assert_eq!((t.cursor().row, t.cursor().col), (7, 7));
+        feed(&mut t, b"\x1b[?1049l");
+        assert_eq!((t.cursor().row, t.cursor().col), (4, 9));
+        // With no 1049 save ever made, 1049l after 47h goes home.
+        let mut t = Term::new(10, 32, 0);
+        feed(&mut t, b"\x1b[5;10H\x1b[?47h\x1b[7;20H\x1b[?1049l");
+        assert_eq!((t.cursor().row, t.cursor().col), (0, 0));
+    }
+
+    #[test]
+    fn resize_on_legacy_alt_screen_keeps_cursor_and_savepoint() {
+        // On a 47 / 1047 alt screen the live cursor is shared with the
+        // primary, and `saved_cursor` is only the last 1049 savepoint:
+        // a resize must neither reflow the savepoint as the primary
+        // cursor nor move the live cursor through the primary reflow.
+        let mut t = Term::new(6, 10, 100);
+        // A soft-wrapped line on the primary, then a 1049 save below it.
+        feed(&mut t, b"0123456789abcde\r\n\x1b[?1049h\x1b[?1049l");
+        let saved = (t.saved_cursor.row, t.saved_cursor.col);
+        assert_eq!(saved, (2, 0));
+        feed(&mut t, b"\x1b[?1047h\x1b[4;5H");
+        t.resize(6, 20);
+        assert_eq!((t.saved_cursor.row, t.saved_cursor.col), saved);
+        assert_eq!((t.cursor().row, t.cursor().col), (3, 4));
+        feed(&mut t, b"\x1b[?1047l");
+        assert_eq!((t.cursor().row, t.cursor().col), (3, 4));
+        // On a 1049 alt screen the saved primary cursor still follows the
+        // reflow: the wrapped line unwraps, so it moves up a row.
+        let mut t = Term::new(6, 10, 100);
+        feed(&mut t, b"0123456789abcde\r\n\x1b[?1049h\x1b[4;5H");
+        t.resize(6, 20);
+        assert_eq!((t.saved_cursor.row, t.saved_cursor.col), (1, 0));
+        assert_eq!((t.cursor().row, t.cursor().col), (3, 4));
+    }
+
+    #[test]
+    fn ris_drops_alt_images_left_by_legacy_exit() {
+        let mut t = Term::new(8, 16, 0);
+        feed(&mut t, b"\x1b[?47h");
+        place_image(&mut t, 7);
+        feed(&mut t, b"\x1b[?47l\x1bc\x1b[?47h");
+        assert_eq!(t.image_grid().len(), 0);
     }
 
     #[test]
