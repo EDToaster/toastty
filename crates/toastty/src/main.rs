@@ -136,6 +136,13 @@ fn smoothing_from_config(cfg: &Config) -> Smoothing {
     }
 }
 
+/// How long is left, at `now`, of a tick of `interval` that started at
+/// `start`: zero once it's due. Keeps a periodic redraw on its period
+/// however long the frame took to render.
+fn remaining_from(start: Instant, interval: Duration, now: Instant) -> Duration {
+    (start + interval).saturating_duration_since(now)
+}
+
 /// Take the shorter of two optional deadlines. `None` means "no
 /// deadline". Used when combining the cursor-blink wake with the
 /// viewport-animation tick.
@@ -2798,9 +2805,20 @@ impl App for Toastty {
                 } else {
                     None
                 };
+                // These ticks count from the frame start (`now`), not from
+                // after rendering: otherwise each period gains the render
+                // time, and a 16 ms viewport tick that misses a vsync
+                // halves smooth scrolling to 30 fps. (`next_blink` is
+                // already relative to after the render.)
+                let after_render = Instant::now();
+                let from_start =
+                    |d: Option<Duration>| d.map(|d| remaining_from(now, d, after_render));
                 match min_deadline(
-                    min_deadline(min_deadline(next_blink, next_anim), next_debug),
-                    next_autoscroll,
+                    min_deadline(
+                        min_deadline(next_blink, from_start(next_anim)),
+                        from_start(next_debug),
+                    ),
+                    from_start(next_autoscroll),
                 ) {
                     Some(d) => ControlSignal::RedrawIn(d),
                     None => ControlSignal::Continue,
@@ -3130,6 +3148,28 @@ mod tests {
 
     fn ch(s: &str) -> LogicalKey {
         LogicalKey::Character(s.to_string())
+    }
+
+    #[test]
+    fn periodic_ticks_count_from_the_frame_start() {
+        // #50 review: the viewport tick used to start after the render,
+        // so each period was render time + 16 ms. With a present that
+        // blocks for most of a vsync, that's 33 ms: 30 fps.
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        // A fast render: the rest of the period.
+        assert_eq!(remaining_from(start, ms(16), start + ms(1)), ms(15));
+        // A render that took the whole period, or more: due at once.
+        assert_eq!(remaining_from(start, ms(16), start + ms(16)), ms(0));
+        assert_eq!(remaining_from(start, ms(16), start + ms(25)), ms(0));
+        // Successive frames stay on the 16 ms grid whatever the render
+        // time: the next start is this start + 16 ms.
+        let mut frame = start;
+        for render in [1, 9, 15, 3] {
+            let next = frame + ms(render) + remaining_from(frame, ms(16), frame + ms(render));
+            assert_eq!(next - frame, ms(16));
+            frame = next;
+        }
     }
 
     #[test]
