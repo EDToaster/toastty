@@ -90,7 +90,7 @@ The fix is probably one redesign: anchor placements to absolute line ids
 (like `Grid::bottom_id`), keep a pixel-space destination rect, and crop the
 UVs at draw time. Don't patch each item separately.
 
-- [ ] **P0 — SCR-1. Partly scrolled-off images are squashed, not cropped.**
+- [x] **P0 — SCR-1. Partly scrolled-off images are squashed, not cropped.**
   - Repro: `K send a=T,i=1,c=20,r=10 --png img.png`, then `seq 1 25`.
     The image ends up 3 rows above the top edge.
   - Expected (spec, "Interaction with other terminal actions"): images
@@ -105,7 +105,10 @@ UVs at draw time. Don't patch each item separately.
   - Cause: `image_grid.rs` `shift_rows_up` (356-392), `shift_rows_down`
     (318-347), `shift_rows_up_within` (445-488) and `shift_rows_down_within`
     (402-436) clamp the range but leave `src_rect` alone.
-- [ ] **P0 — SCR-2. Images don't follow the viewport into scrollback.**
+  - Fixed in #29. Placements are anchored to line ids and keep their whole
+    cell box; the renderer crops at draw time. See
+    [`decisions/image-placement-model.md`](decisions/image-placement-model.md).
+- [x] **P0 — SCR-2. Images don't follow the viewport into scrollback.**
   - Repro: as SCR-1, then scroll up with the mouse wheel.
   - Expected (spec): "When scrolling the screen (… or scrolling through the
     history buffer), images must be scrolled along with text". kitty
@@ -121,20 +124,28 @@ UVs at draw time. Don't patch each item separately.
     - `instance.rs:121-178` doesn't apply the viewport offset. Text does
       (`crates/toastty-render/src/lib.rs:1832-1838, 1876`).
     - `image_grid.rs:382-386` drops placements at row 0.
-- [ ] **P0 — SCR-3. New output arriving while scrolled back moves the image.**
+  - Fixed in #29. Placements live in scrollback until their lines are
+    evicted, and the renderer applies the viewport offset.
+- [x] **P0 — SCR-3. New output arriving while scrolled back moves the image.**
   - Repro: scroll back one notch while a background job prints 6 lines.
   - Expected: kitty keeps the text and the image still.
   - Actual: toastty keeps the text anchored, but the image moves up
     2 rows and loses 2 rows.
   - Cause: same as SCR-2.
-- [ ] **P1 — SCR-4. Pixel (smooth) scrolling moves text but not images.**
+  - Fixed in #29. Same fix as SCR-2: the image is anchored to its line, so
+    the viewport compensation that holds the text still holds the image
+    too.
+- [x] **P1 — SCR-4. Pixel (smooth) scrolling moves text but not images.**
   - Repro: set `smoothing_function = "linear"` and capture frames during a
     wheel animation.
   - Actual: text slides at fractional-row offsets under an image that stays
     on the cell grid.
   - Cause: `lib.rs:2860-2878` builds image instances without the
     `y_translate` that text and rich blocks get (`lib.rs:1835, 1975, 2763`).
-- [ ] **P1 — SCR-5. DECSTBM scrolls images that are only partly inside the
+  - Fixed in #29. Image instances get the same translation as text
+    (`view_offset_lines * cell_h + view_offset_pixel`), and are cropped at
+    the window edge.
+- [x] **P1 — SCR-5. DECSTBM scrolls images that are only partly inside the
   margins.**
   - Repro: place an image on rows 3–8, then `K raw '\x1b[2;7r\x1b[7;1H\n\n\x1b[r'`.
   - Expected (spec): "only images that are entirely within the page area
@@ -142,6 +153,8 @@ UVs at draw time. Don't patch each item separately.
   - Actual: it moves up 2 rows and is clipped into 5 rows.
   - Cause: `image_grid.rs:423` and `:469` check only `row_range.start`;
     they also need `end <= scroll_bottom`.
+  - Fixed in #29. Only placements entirely inside the margins scroll, and
+    they are clipped at the margin.
 - [ ] **P1 — SCR-6. IL/DL (`CSI L` / `CSI M`) move images; kitty doesn't.**
   - Repro: place an image, put the cursor above it, then `K raw '\x1b[2L'`
     or `'\x1b[2M'`.
@@ -178,6 +191,10 @@ UVs at draw time. Don't patch each item separately.
   - Cause: `resolve_relative_positions` (`image_grid.rs:201-249`) uses the
     parent's clamped row. Once the parent is dropped, the child loses its
     anchor.
+  - Partly addressed in #29: placements now stay in scrollback and children
+    resolve as `parent.line + V` with no clamp, so a child keeps its offset
+    while the parent scrolls off the top. Left open for A4 to verify against
+    kitty and cover the remaining cases.
 - [x] **P1 — SCR-9 (text bug found while testing scrolling). SD and RI at
   the top pull scrollback back onto the screen.**
   - Repro: `seq 1 100`, then `K raw '\x1b[3T'`.
@@ -190,7 +207,7 @@ UVs at draw time. Don't patch each item separately.
   - Fix: `scroll_down` now rotates the visible slots in place and leaves
     `history_lines` and `bottom_id` alone, matching kitty 0.49.2. Fixed in
     #23.
-- [ ] **P0 — SCR-10. An image that doesn't fit below the cursor always
+- [x] **P0 — SCR-10. An image that doesn't fit below the cursor always
   scrolls the screen, even with `C=1` and in the alt screen.**
   - Repro:
     - Put the cursor on the last row and run
@@ -204,6 +221,11 @@ UVs at draw time. Don't patch each item separately.
   - Cause: `term.rs:4697-4712` always scrolls to make room, ignoring `C=1`,
     the alt screen and DECSTBM. The comment there misreads the spec, which
     says nothing about scrolling.
+  - Fixed in #29. Placing never scrolls. Like kitty, only the cursor
+    advance after a non-`C=1` placement scrolls the region by the
+    overshoot. kitty-ref check: with `C=0` kitty *does* scroll the alt
+    screen too, so toastty does the same; only `C=1` prevents the scroll
+    on both screens.
 - [ ] **P2 — SCR-11. Scrolling inside DECSLRM left/right margins leaves
   images in place.**
   - Repro: `K raw '\x1b[?69h\x1b[5;40s\x1b[3;12r'`, then line feeds inside
@@ -230,6 +252,16 @@ UVs at draw time. Don't patch each item separately.
     - Divergence kept on purpose: kitty 0.49.2 ignores `CSI ? 1048 l`, so
       the cursor isn't restored. toastty keeps xterm's save / restore.
     - Fixed in #27.
+- [x] **P1 — SCR-14. An image taller than the screen scrolls it by the
+  full overshoot.**
+  - Repro: a natural 100×2000 image placed at row 6 without `C=1`.
+  - Expected (kitty-ref 0.49.2): the screen scrolls at most one screen
+    (region) height. On a 30-row screen the image top lands 25 rows above
+    the screen, so source rows 500..1100 are visible, and the cursor sits
+    on the last row.
+  - Actual: toastty scrolled the full overshoot (up to one ring), so the
+    image's bottom landed on the cursor row and a different slice showed.
+  - Fixed in #29: the cursor-advance scroll is capped at the region height.
 
 ## 2. Sizing, scaling and rendering
 

@@ -1,24 +1,38 @@
-//! `ImageGrid`: per-Term parallel structure tracking image placements.
+//! `ImageGrid`: per-screen parallel structure tracking image placements.
 //!
 //! Architecture choice (M11a, pre-approved): we keep image placements
 //! *parallel* to the cell grid rather than folding them into `Cell`. This
 //! avoids bloating `Cell` (40 bytes already) and keeps text mutations
 //! (the hot path) cheap.
 //!
-//! A `Placement` covers a contiguous rectangle of cells with a slice
-//! (sub-rect) of a single image. Multiple placements can overlap; render
-//! order is broken by `z` then insertion order. `z >= 0` draws above
-//! text, `z < 0` draws below.
+//! A `Placement` reserves a rectangle of cells and shows a slice
+//! (sub-rect) of a single image in it. Multiple placements can overlap;
+//! render order is broken by `z` then insertion order. `z >= 0` draws
+//! above text, `z < 0` draws below.
 //!
-//! Lookups are linear today (`O(n)` per cell test). Image placements are
-//! few — kitty's protocol limits each image to a handful of placements,
-//! and real apps rarely show more than a few images at once — so this is
-//! pragmatic. If it ever shows up in profiling, swap for an interval
-//! tree.
+//! ## Anchoring (see `docs/decisions/image-placement-model.md`)
+//!
+//! A placement is anchored to an **absolute line id** (`Placement::line`)
+//! in the line-id space of the screen's `Grid` (`Grid::bottom_id`), not to
+//! a screen row. A full-screen scroll changes which line ids are on
+//! screen, so placements ride along with their text into scrollback for
+//! free: no per-scroll work, and nothing is ever squashed. Only scrolls
+//! that move text *without* moving line ids (DECSTBM margin scrolls,
+//! IL/DL) touch placements, via [`ImageGrid::scroll_region`].
+//!
+//! The reserved cell box (`rows` × `cols`) is never trimmed. Anything
+//! that falls outside the window is cropped at draw time by the
+//! renderer. The one permanent crop is [`Placement::clip_rows`], which
+//! DECSTBM margin scrolls narrow so an image scrolled against a margin
+//! stays cut there (kitty does the same).
+//!
+//! Lookups are linear today (`O(n)` per query). Image placements are
+//! few, so this is pragmatic. If it ever shows up in profiling, swap for
+//! an interval tree.
 
 use std::ops::Range;
 
-/// A single image placement on the grid.
+/// A single image placement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placement {
     /// Source image id (matches `ImageRegistry`).
@@ -26,10 +40,24 @@ pub struct Placement {
     /// Stable per-image placement id. Kitty's `p=` field; zero means
     /// "unnamed".
     pub placement_id: u32,
-    /// Row span (inclusive start, exclusive end), in grid cells.
-    pub row_range: Range<u16>,
-    /// Column span (inclusive start, exclusive end), in grid cells.
-    pub col_range: Range<u16>,
+    /// Absolute line id of the top row of the reserved cell box, in the
+    /// owning screen's `Grid` line-id space (see `Grid::bottom_id`).
+    /// Signed so a box whose top hangs above the oldest line (or above
+    /// line 0) is representable. The screen row is
+    /// `line - top_line`, where `top_line` is the id of screen row 0.
+    pub line: i64,
+    /// Left column of the reserved cell box.
+    pub col: u16,
+    /// Height of the reserved cell box, in rows. Never trimmed.
+    pub rows: u16,
+    /// Width of the reserved cell box, in columns. Never trimmed: a box
+    /// wider than the screen is cropped at draw time.
+    pub cols: u16,
+    /// Rows of the box still shown, relative to [`Self::line`]
+    /// (`0..rows` = unclipped). DECSTBM margin scrolls narrow this so an
+    /// image pushed against a margin is permanently cut there; nothing
+    /// else touches it.
+    pub clip_rows: Range<u16>,
     /// Sub-rect of the source image to show, in source pixels.
     /// Stored as `(x, y, w, h)`. Use `full_image` to cover the whole
     /// image (the renderer interprets `w == 0 || h == 0` as "full").
@@ -42,21 +70,78 @@ pub struct Placement {
     /// "the x/y offset within the first cell at which to start
     /// displaying the image" (must be smaller than the cell size). This
     /// is a sub-cell pixel shift applied at render time on top of the
-    /// cell-aligned position derived from `col_range` / `row_range`. It
-    /// does NOT change which cells the placement occupies. Defaults to
-    /// `(0, 0)`.
+    /// cell-aligned position derived from `line` / `col`. It does NOT
+    /// change which cells the placement occupies. Defaults to `(0, 0)`.
     pub pix_offset: (u32, u32),
     /// M13: parent linkage for a *relative placement*. `Some((image_id,
     /// placement_id))` when this placement is positioned relative to
     /// another placement (kitty's `P=`/`Q=` keys); `None` for an
     /// ordinary absolute placement. When set, this placement's
-    /// `row_range`/`col_range` are resolved from the parent's origin plus
+    /// `line`/`col` are resolved from the parent's origin plus
     /// [`Self::rel_offset`], and re-resolved whenever the parent moves.
     pub parent: Option<(u32, u32)>,
     /// M13: `(cols, rows)` cell offset from the parent placement's origin
     /// (kitty's `H=`/`V=`). Only meaningful when [`Self::parent`] is
     /// `Some`. Signed. Defaults to `(0, 0)`.
     pub rel_offset: (i32, i32),
+}
+
+impl Placement {
+    /// A placement of `image_id` reserving `rows` × `cols` cells,
+    /// anchored at line 0, column 0, with every other field at its
+    /// default (unnamed, full image, `z = 0`, no offset, no parent). The
+    /// host rebases `line`/`col` onto the cursor.
+    #[must_use]
+    pub fn new(image_id: u32, rows: u16, cols: u16) -> Self {
+        Self {
+            image_id,
+            placement_id: 0,
+            line: 0,
+            col: 0,
+            rows,
+            cols,
+            clip_rows: 0..rows,
+            src_rect: SrcRect::FULL,
+            z: 0,
+            pix_offset: (0, 0),
+            parent: None,
+            rel_offset: (0, 0),
+        }
+    }
+
+    /// Column span of the reserved box (may extend past the screen).
+    #[must_use]
+    pub fn col_range(&self) -> Range<u16> {
+        self.col..self.col.saturating_add(self.cols)
+    }
+
+    /// Absolute line ids of the rows still shown (the reserved box minus
+    /// any margin clip).
+    #[must_use]
+    pub fn shown_lines(&self) -> Range<i64> {
+        self.line + i64::from(self.clip_rows.start)..self.line + i64::from(self.clip_rows.end)
+    }
+
+    /// Screen rows of the rows still shown, given `top_line` (the line id
+    /// of screen row 0). Negative rows are in scrollback; rows `>=` the
+    /// screen height hang below it.
+    #[must_use]
+    pub fn screen_rows(&self, top_line: i64) -> Range<i64> {
+        let r = self.shown_lines();
+        r.start - top_line..r.end - top_line
+    }
+
+    /// True iff the shown part covers screen cell `(row, col)`.
+    #[must_use]
+    pub fn covers(&self, top_line: i64, row: u16, col: u16) -> bool {
+        self.on_row(top_line, row) && self.col_range().contains(&col)
+    }
+
+    /// True iff the shown part intersects screen row `row`.
+    #[must_use]
+    pub fn on_row(&self, top_line: i64, row: u16) -> bool {
+        self.screen_rows(top_line).contains(&i64::from(row))
+    }
 }
 
 /// Pixel rectangle on the source image, in image pixels.
@@ -109,11 +194,16 @@ pub enum RelativeError {
     TooDeep,
 }
 
-/// Parallel image placement layer for a `Term` grid.
+/// Parallel image placement layer for one screen of a `Term`.
 #[derive(Debug, Default)]
 pub struct ImageGrid {
     placements: Vec<(PlacementHandle, Placement)>,
     next_handle: u32,
+    /// Cached `(min shown end, max shown start)` line over all
+    /// placements, so [`Self::retain_lines`] (run on every full-screen
+    /// LF) is O(1) when nothing can be evicted. `None` = stale; every
+    /// mutation clears it and the next `retain_lines` recomputes it.
+    bounds: Option<(i64, i64)>,
 }
 
 impl ImageGrid {
@@ -128,6 +218,7 @@ impl ImageGrid {
         let handle = PlacementHandle(self.next_handle);
         self.next_handle = self.next_handle.wrapping_add(1);
         self.placements.push((handle, p));
+        self.bounds = None;
         handle
     }
 
@@ -146,17 +237,16 @@ impl ImageGrid {
 
     /// Create a relative placement (M13).
     ///
-    /// `child` carries the resolved geometry SPANS in its `row_range` /
-    /// `col_range` (anchored at origin, like `add`); its `parent` and
-    /// `rel_offset` fields drive positioning. The parent referenced by
-    /// `child.parent` must already exist (else [`RelativeError::NoParent`]).
-    /// Linking is rejected if it would form a cycle
-    /// ([`RelativeError::Cycle`]) or push the chain past
+    /// `child` carries its cell span in `rows` / `cols`; its `parent`
+    /// and `rel_offset` fields drive positioning. The parent referenced
+    /// by `child.parent` must already exist (else
+    /// [`RelativeError::NoParent`]). Linking is rejected if it would form
+    /// a cycle ([`RelativeError::Cycle`]) or push the chain past
     /// [`MAX_RELATIVE_DEPTH`] ([`RelativeError::TooDeep`]).
     ///
-    /// On success the child's `row_range`/`col_range` are rebased onto
-    /// the parent's current origin plus `rel_offset`, the child is
-    /// inserted, and its handle is returned.
+    /// On success the child's `line`/`col` are rebased onto the parent's
+    /// current origin plus `rel_offset`, the child is inserted, and its
+    /// handle is returned.
     pub fn add_relative(&mut self, mut child: Placement) -> Result<PlacementHandle, RelativeError> {
         let (pimg, pplace) = child.parent.ok_or(RelativeError::NoParent)?;
         // A placement cannot be its own parent.
@@ -165,7 +255,7 @@ impl ImageGrid {
         }
         // Parent must exist.
         let parent = self.find(pimg, pplace).ok_or(RelativeError::NoParent)?;
-        let parent_origin = (parent.row_range.start, parent.col_range.start);
+        let parent_origin = (parent.line, parent.col);
         // Walk the parent chain from the parent upward: detect a cycle
         // back to the child, and enforce the depth cap. Depth counts the
         // number of ancestors (parent = depth 1).
@@ -181,62 +271,49 @@ impl ImageGrid {
             }
             cursor = self.find(aimg, aplace).and_then(|p| p.parent);
         }
-        // Rebase the child's spans onto the parent origin + offset.
-        let span_rows = child.row_range.end - child.row_range.start;
-        let span_cols = child.col_range.end - child.col_range.start;
-        let (start_row, start_col) = offset_origin(parent_origin, child.rel_offset);
-        child.row_range = start_row..start_row.saturating_add(span_rows);
-        child.col_range = start_col..start_col.saturating_add(span_cols);
+        // Rebase the child onto the parent origin + offset.
+        (child.line, child.col) = offset_origin(parent_origin, child.rel_offset);
         Ok(self.add(child))
     }
 
     /// Re-resolve every relative placement's position against its current
-    /// parent (M13). Called after the grid mutates (scroll / shift /
-    /// insert / delete lines) so children follow their parents. Processes
-    /// placements in dependency order via repeated passes (chains resolve
-    /// outward from roots); bounded by [`MAX_RELATIVE_DEPTH`] passes.
-    /// A relative placement whose parent has disappeared is left at its
-    /// last resolved position (it will be cleaned up by the normal
-    /// off-screen/eviction paths).
+    /// parent (M13). Called after a mutation that moves placements
+    /// individually (margin scroll, IL/DL) so children follow their
+    /// parents. Full-screen scrolls move nothing (placements are anchored
+    /// to line ids), so they need no resolve. Processes placements in
+    /// dependency order via repeated passes (chains resolve outward from
+    /// roots); bounded by [`MAX_RELATIVE_DEPTH`] passes. A relative
+    /// placement whose parent has disappeared is left at its last
+    /// resolved position (it will be cleaned up by the normal
+    /// eviction paths).
     pub fn resolve_relative_positions(&mut self) {
         let has_relative = self.placements.iter().any(|(_, p)| p.parent.is_some());
         if !has_relative {
             return;
         }
+        self.bounds = None;
         for _ in 0..MAX_RELATIVE_DEPTH {
             let mut changed = false;
             // Snapshot parent origins by (image_id, placement_id) before
             // mutating, so each pass uses a consistent view.
-            let origins: Vec<(u32, u32, u16, u16)> = self
+            let origins: Vec<(u32, u32, i64, u16)> = self
                 .placements
                 .iter()
-                .map(|(_, p)| {
-                    (
-                        p.image_id,
-                        p.placement_id,
-                        p.row_range.start,
-                        p.col_range.start,
-                    )
-                })
+                .map(|(_, p)| (p.image_id, p.placement_id, p.line, p.col))
                 .collect();
             for (_, p) in &mut self.placements {
                 let Some((pimg, pplace)) = p.parent else {
                     continue;
                 };
-                let Some(&(_, _, prow, pcol)) = origins
+                let Some(&(_, _, pline, pcol)) = origins
                     .iter()
                     .find(|(img, place, _, _)| *img == pimg && *place == pplace)
                 else {
                     continue;
                 };
-                let span_rows = p.row_range.end - p.row_range.start;
-                let span_cols = p.col_range.end - p.col_range.start;
-                let (start_row, start_col) = offset_origin((prow, pcol), p.rel_offset);
-                let new_rows = start_row..start_row.saturating_add(span_rows);
-                let new_cols = start_col..start_col.saturating_add(span_cols);
-                if p.row_range != new_rows || p.col_range != new_cols {
-                    p.row_range = new_rows;
-                    p.col_range = new_cols;
+                let origin = offset_origin((pline, pcol), p.rel_offset);
+                if (p.line, p.col) != origin {
+                    (p.line, p.col) = origin;
                     changed = true;
                 }
             }
@@ -250,21 +327,28 @@ impl ImageGrid {
     /// present.
     pub fn remove(&mut self, handle: PlacementHandle) -> Option<Placement> {
         let pos = self.placements.iter().position(|(h, _)| *h == handle)?;
+        self.bounds = None;
         Some(self.placements.swap_remove(pos).1)
     }
 
     /// Remove every placement matching `pred`. Returns the removed
-    /// placements in their original order.
+    /// placements in their original order; the survivors keep theirs.
+    /// Single pass, O(n) however many are removed.
     pub fn remove_where(&mut self, mut pred: impl FnMut(&Placement) -> bool) -> Vec<Placement> {
+        if !self.placements.iter().any(|(_, p)| pred(p)) {
+            return Vec::new();
+        }
         let mut removed = Vec::new();
-        let mut i = 0;
-        while i < self.placements.len() {
-            if pred(&self.placements[i].1) {
-                removed.push(self.placements.remove(i).1);
+        let mut kept = Vec::with_capacity(self.placements.len());
+        for (h, p) in self.placements.drain(..) {
+            if pred(&p) {
+                removed.push(p);
             } else {
-                i += 1;
+                kept.push((h, p));
             }
         }
+        self.placements = kept;
+        self.bounds = None;
         removed
     }
 
@@ -274,14 +358,15 @@ impl ImageGrid {
         self.remove_where(|p| p.image_id == image_id)
     }
 
-    /// Drop every placement on `row`. Returns the dropped placements so
-    /// the caller can mark cells dirty.
-    pub fn clear_row(&mut self, row: u16) -> Vec<Placement> {
-        self.remove_where(|p| p.row_range.contains(&row))
+    /// Drop every placement whose shown part intersects screen `row`.
+    /// Returns the dropped placements so the caller can mark cells dirty.
+    pub fn clear_row(&mut self, top_line: i64, row: u16) -> Vec<Placement> {
+        self.remove_where(|p| p.on_row(top_line, row))
     }
 
     /// Drop every placement. Returns the dropped placements.
     pub fn clear(&mut self) -> Vec<Placement> {
+        self.bounds = None;
         let out: Vec<Placement> = self.placements.drain(..).map(|(_, p)| p).collect();
         out
     }
@@ -308,257 +393,179 @@ impl ImageGrid {
         self.placements.is_empty()
     }
 
-    /// Shift every placement starting at or below `scroll_top` down by
-    /// `n` rows, clamped to `scroll_bottom` (exclusive). Placements
-    /// whose `start` would land at or past `scroll_bottom` are dropped
-    /// and returned so the caller can mark cells dirty.
+    /// Move every placement by `delta` line ids. Used when the line-id
+    /// space itself shifts under the placements (a resize that rebuilds
+    /// the ring, or a grid op that renumbers rows), to keep each
+    /// placement at the same screen row. `delta == 0` is a no-op.
+    pub fn shift_lines(&mut self, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        self.bounds = None;
+        for (_, p) in &mut self.placements {
+            p.line += delta;
+        }
+    }
+
+    /// Move every placement whose shown part reaches screen row
+    /// `from_row` or below (`end > from_row`) by `delta` lines, untrimmed,
+    /// then re-resolve relative children. Used for a full-screen scroll
+    /// down (SD / RI at the top), which moves the on-screen text down
+    /// while scrollback and the line ids stay put. Images on screen move
+    /// with their text, including one that straddles the top edge (its
+    /// hidden top rows come back on screen, as in kitty). One pushed
+    /// partly off the bottom keeps its whole box, so a later scroll up
+    /// brings it all back. Placements entirely in scrollback stay with
+    /// the scrollback text (kitty shifts those too; keeping them on
+    /// their history text is a deliberate divergence).
+    pub fn shift_rows_from(&mut self, top_line: i64, from_row: i64, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        self.bounds = None;
+        for (_, p) in &mut self.placements {
+            if p.screen_rows(top_line).end > from_row {
+                p.line += delta;
+            }
+        }
+        self.resolve_relative_positions();
+    }
+
+    /// Scroll the placements inside a screen-row band whose text moves
+    /// without its line ids moving: a DECSTBM margin scroll, or IL/DL.
     ///
-    /// `n == 0` is a no-op. Symmetric to [`Self::shift_rows_up`]; used
-    /// by RI (Reverse Index) when the grid scrolls down.
-    pub fn shift_rows_down(
+    /// `top_line` is the line id of screen row 0, `region` the band's
+    /// screen rows (exclusive end) and `delta` the distance the text
+    /// moved (negative = up). Per the kitty spec ("only images that are
+    /// entirely within the page area (between the margins) must be
+    /// scrolled"), only placements whose shown rows lie entirely inside
+    /// `region` move; the rest are left alone. A moved placement is
+    /// clipped at the region edges through [`Placement::clip_rows`], and
+    /// one with nothing left inside the region is dropped and returned.
+    ///
+    /// Returns the dropped placements. `delta == 0` is a no-op.
+    pub fn scroll_region(
         &mut self,
-        n: u16,
-        scroll_top: u16,
-        scroll_bottom: u16,
+        top_line: i64,
+        region: Range<u16>,
+        delta: i32,
     ) -> Vec<Placement> {
-        if n == 0 {
+        if delta == 0 || region.is_empty() {
             return Vec::new();
         }
+        let (rt, rb) = (i64::from(region.start), i64::from(region.end));
+        let delta = i64::from(delta);
+        self.bounds = None;
         let mut removed = Vec::new();
         let mut i = 0;
         while i < self.placements.len() {
             let p = &mut self.placements[i].1;
-            if p.row_range.start < scroll_top {
-                // Above the scroll region — unaffected.
+            let shown = p.screen_rows(top_line);
+            if shown.is_empty() || shown.start < rt || shown.end > rb {
                 i += 1;
                 continue;
             }
-            let new_start = p.row_range.start.saturating_add(n);
-            let new_end = p.row_range.end.saturating_add(n);
-            if new_start >= scroll_bottom {
-                // Entire placement scrolled past the bottom — drop.
+            p.line += delta;
+            let start = (shown.start + delta).max(rt);
+            let end = (shown.end + delta).min(rb);
+            if start >= end {
+                // Rare (a whole image scrolled out of its region), so the
+                // O(n) shift of `remove` is fine here.
                 removed.push(self.placements.remove(i).1);
                 continue;
             }
-            // Clip the bottom edge to the scroll region.
-            let new_end = new_end.min(scroll_bottom);
-            p.row_range = new_start..new_end;
+            // Back into box-relative rows. Both lie inside the old clip
+            // (the shift only shrinks it), so the casts can't truncate.
+            let base = p.line - top_line;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            {
+                p.clip_rows = (start - base) as u16..(end - base) as u16;
+            }
             i += 1;
         }
         removed
     }
 
-    /// Shift every placement starting at or below `scroll_top` up by `n`
-    /// rows. Placements whose entire row range scrolls above 0 are
-    /// dropped and returned so the caller can mark cells dirty.
+    /// Drop every placement whose shown rows lie entirely outside the
+    /// line ids `first..=last`: those scrolled out of the history
+    /// (`first` = oldest retained line) or pushed below the screen
+    /// (`last` = the live bottom line). Returns the dropped placements.
     ///
-    /// `n == 0` is a no-op. Used by `linefeed` when the grid scrolls.
-    pub fn shift_rows_up(&mut self, n: u16, scroll_top: u16) -> Vec<Placement> {
-        if n == 0 {
+    /// O(1) when nothing can be evicted (the common case on every LF):
+    /// it checks cached line bounds before scanning.
+    pub fn retain_lines(&mut self, first: i64, last: i64) -> Vec<Placement> {
+        if self.placements.is_empty() {
             return Vec::new();
         }
-        let mut removed = Vec::new();
-        let mut i = 0;
-        while i < self.placements.len() {
-            let p = &mut self.placements[i].1;
-            if p.row_range.start < scroll_top {
-                // Above the scroll region — unaffected.
-                i += 1;
-                continue;
-            }
-            let start = p.row_range.start;
-            let end = p.row_range.end;
-            // Shift; saturate at zero.
-            let new_start = start.saturating_sub(n);
-            let new_end = end.saturating_sub(n);
-            // If the placement's entire range scrolled off (end <= n),
-            // drop it.
-            if new_end <= scroll_top.saturating_sub(0) && end <= n {
-                removed.push(self.placements.remove(i).1);
-                continue;
-            }
-            // Drop when the entire range scrolled above row 0.
-            if new_end == 0 {
-                removed.push(self.placements.remove(i).1);
-                continue;
-            }
-            p.row_range = new_start..new_end;
-            i += 1;
-        }
-        removed
-    }
-
-    /// Like [`Self::shift_rows_down`], but only affects placements that
-    /// start within `[scroll_top, scroll_bottom)` and clips the bottom
-    /// edge to `scroll_bottom` (exclusive). Placements above or below
-    /// the region are untouched; a placement whose top would scroll past
-    /// `scroll_bottom` is dropped and returned.
-    ///
-    /// Used by DECSTBM partial-region scroll-down (Reverse Index inside
-    /// margins): images inside the region scroll with the text and clip
-    /// at the region boundaries.
-    ///
-    /// `n == 0` is a no-op.
-    pub fn shift_rows_down_within(
-        &mut self,
-        n: u16,
-        scroll_top: u16,
-        scroll_bottom: u16,
-    ) -> Vec<Placement> {
-        if n == 0 {
+        let (min_end, max_start) = *self.bounds.get_or_insert_with(|| {
+            self.placements
+                .iter()
+                .fold((i64::MAX, i64::MIN), |(e, s), (_, p)| {
+                    let shown = p.shown_lines();
+                    // An empty shown band must always be swept.
+                    let end = if shown.is_empty() {
+                        i64::MIN
+                    } else {
+                        shown.end
+                    };
+                    (e.min(end), s.max(shown.start))
+                })
+        });
+        if min_end > first && max_start <= last {
             return Vec::new();
         }
-        let mut removed = Vec::new();
-        let mut i = 0;
-        while i < self.placements.len() {
-            let p = &mut self.placements[i].1;
-            // Only placements wholly within the region participate.
-            if p.row_range.start < scroll_top || p.row_range.start >= scroll_bottom {
-                i += 1;
-                continue;
-            }
-            let new_start = p.row_range.start.saturating_add(n);
-            let new_end = p.row_range.end.saturating_add(n);
-            if new_start >= scroll_bottom {
-                // Entire placement scrolled past the region bottom — drop.
-                removed.push(self.placements.remove(i).1);
-                continue;
-            }
-            let new_end = new_end.min(scroll_bottom);
-            p.row_range = new_start..new_end;
-            i += 1;
-        }
-        removed
+        self.remove_where(|p| {
+            let shown = p.shown_lines();
+            shown.is_empty() || shown.end <= first || shown.start > last
+        })
     }
 
-    /// Like [`Self::shift_rows_up`], but clips the bottom edge of each
-    /// shifted placement to `scroll_bottom` (exclusive) and only affects
-    /// placements that start at or below `scroll_top`. Placements whose
-    /// entire row range scrolls above `scroll_top` are dropped and
-    /// returned so the caller can mark cells dirty.
-    ///
-    /// Used by DECSTBM partial-region scroll-up: images inside the
-    /// margin region scroll with the text and are clipped at the region
-    /// boundaries; images above or below the region are untouched.
-    ///
-    /// `n == 0` is a no-op.
-    pub fn shift_rows_up_within(
-        &mut self,
-        n: u16,
-        scroll_top: u16,
-        scroll_bottom: u16,
-    ) -> Vec<Placement> {
-        if n == 0 {
-            return Vec::new();
-        }
-        let mut removed = Vec::new();
-        let mut i = 0;
-        while i < self.placements.len() {
-            let p = &mut self.placements[i].1;
-            // Only placements wholly within the region participate; a
-            // placement that starts above the region or starts at/below
-            // the region bottom is left alone (it isn't "entirely within
-            // the page area").
-            if p.row_range.start < scroll_top || p.row_range.start >= scroll_bottom {
-                i += 1;
-                continue;
-            }
-            let new_start = p.row_range.start.saturating_sub(n);
-            let new_end = p.row_range.end.saturating_sub(n);
-            // Clamp the top edge to the region top — a placement can't
-            // scroll above its own region; if its whole span scrolls
-            // above `scroll_top`, drop it.
-            if new_end <= scroll_top {
-                removed.push(self.placements.remove(i).1);
-                continue;
-            }
-            let new_start = new_start.max(scroll_top);
-            // Clip the bottom edge to the region (defensive; shifting up
-            // only shrinks the end).
-            let new_end = new_end.min(scroll_bottom);
-            p.row_range = new_start..new_end;
-            i += 1;
-        }
-        removed
-    }
-
-    /// Clip every placement to the new geometry `rows` x `cols` after a
-    /// resize. Ranges are trimmed to `[0, rows)` / `[0, cols)`; any
-    /// placement whose row or column range starts past the new edge (it
-    /// has no visible cells) is dropped. The placement's `pix_offset` is
-    /// preserved untouched — only the cell ranges are clipped. Returns
-    /// `true` if anything changed.
-    pub fn clip_to(&mut self, rows: u16, cols: u16) -> bool {
-        let mut changed = false;
-        let mut i = 0;
-        while i < self.placements.len() {
-            let p = &mut self.placements[i].1;
-            // A placement that begins at/after the new edge has no
-            // visible cells — drop it entirely.
-            if p.row_range.start >= rows || p.col_range.start >= cols {
-                self.placements.remove(i);
-                changed = true;
-                continue;
-            }
-            if p.row_range.end > rows {
-                p.row_range.end = rows;
-                changed = true;
-            }
-            if p.col_range.end > cols {
-                p.col_range.end = cols;
-                changed = true;
-            }
-            i += 1;
-        }
-        changed
-    }
-
-    /// Returns true iff any placement covers cell `(row, col)`.
+    /// Returns true iff any placement's shown part covers screen cell
+    /// `(row, col)`.
     #[must_use]
-    pub fn covers(&self, row: u16, col: u16) -> bool {
+    pub fn covers(&self, top_line: i64, row: u16, col: u16) -> bool {
         self.placements
             .iter()
-            .any(|(_, p)| p.row_range.contains(&row) && p.col_range.contains(&col))
+            .any(|(_, p)| p.covers(top_line, row, col))
     }
 
-    /// Returns true iff any placement covers any cell on `row`.
+    /// Returns true iff any placement's shown part intersects screen
+    /// row `row`.
     #[must_use]
-    pub fn any_on_row(&self, row: u16) -> bool {
-        self.placements
-            .iter()
-            .any(|(_, p)| p.row_range.contains(&row))
+    pub fn any_on_row(&self, top_line: i64, row: u16) -> bool {
+        self.placements.iter().any(|(_, p)| p.on_row(top_line, row))
     }
 }
 
-/// Apply a signed `(cols, rows)` cell offset to a `(row, col)` cell
-/// origin, clamping at the grid edge (row/col 0). Used to resolve
-/// relative placements (M13). Note the offset tuple is `(H=cols,
-/// V=rows)` to match kitty's key ordering, while the origin tuple is
-/// `(row, col)`.
-fn offset_origin(origin: (u16, u16), offset: (i32, i32)) -> (u16, u16) {
-    let (row, col) = origin;
+/// Apply a signed `(cols, rows)` cell offset to a `(line, col)` origin.
+/// Used to resolve relative placements (M13). Rows are line ids, so they
+/// need no clamp (a child above the screen is simply in scrollback); the
+/// column clamps at 0. Note the offset tuple is `(H=cols, V=rows)` to
+/// match kitty's key ordering, while the origin tuple is `(line, col)`.
+fn offset_origin(origin: (i64, u16), offset: (i32, i32)) -> (i64, u16) {
+    let (line, col) = origin;
     let (h_cols, v_rows) = offset;
-    let new_row = (i64::from(row) + i64::from(v_rows)).max(0) as u16;
-    let new_col = (i64::from(col) + i64::from(h_cols)).max(0) as u16;
-    (new_row, new_col)
+    let new_line = line + i64::from(v_rows);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let new_col = (i64::from(col) + i64::from(h_cols)).clamp(0, i64::from(u16::MAX)) as u16;
+    (new_line, new_col)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn p(image_id: u32, rows: Range<u16>, cols: Range<u16>, z: i32) -> Placement {
-        Placement {
+    /// A placement whose box covers `rows` (as line ids) × `cols`.
+    fn p(image_id: u32, rows: Range<i64>, cols: Range<u16>, z: i32) -> Placement {
+        let mut pl = Placement::new(
             image_id,
-            placement_id: 0,
-            row_range: rows,
-            col_range: cols,
-            src_rect: SrcRect::FULL,
-            z,
-            pix_offset: (0, 0),
-            parent: None,
-            rel_offset: (0, 0),
-        }
+            u16::try_from(rows.end - rows.start).unwrap(),
+            cols.end - cols.start,
+        );
+        pl.line = rows.start;
+        pl.col = cols.start;
+        pl.z = z;
+        pl
     }
 
     #[test]
@@ -604,9 +611,10 @@ mod tests {
     #[test]
     fn clear_row_only_drops_placements_intersecting_row() {
         let mut g = ImageGrid::new();
-        g.add(p(1, 0..2, 0..4, 0));
-        g.add(p(2, 2..4, 0..4, 0));
-        let dropped = g.clear_row(0);
+        g.add(p(1, 10..12, 0..4, 0));
+        g.add(p(2, 12..14, 0..4, 0));
+        // Screen row 0 is line 10.
+        let dropped = g.clear_row(10, 0);
         assert_eq!(dropped.len(), 1);
         assert_eq!(g.len(), 1);
         assert_eq!(g.iter().next().unwrap().image_id, 2);
@@ -623,62 +631,152 @@ mod tests {
     }
 
     #[test]
-    fn shift_rows_up_zero_is_noop() {
-        let mut g = ImageGrid::new();
-        g.add(p(1, 5..10, 0..5, 0));
-        let dropped = g.shift_rows_up(0, 0);
-        assert!(dropped.is_empty());
-        let p0 = g.iter().next().unwrap();
-        assert_eq!(p0.row_range, 5..10);
+    fn screen_rows_follow_top_line() {
+        let pl = p(1, 100..105, 0..5, 0);
+        assert_eq!(pl.screen_rows(100), 0..5);
+        // Three lines scrolled in at the bottom: the box is now 3 rows
+        // into scrollback, but still whole.
+        assert_eq!(pl.screen_rows(103), -3..2);
+        assert_eq!(pl.rows, 5);
+        assert_eq!(pl.clip_rows, 0..5);
     }
 
     #[test]
-    fn shift_rows_up_one_shifts_below_scroll_top() {
+    fn shift_lines_moves_every_placement() {
         let mut g = ImageGrid::new();
         g.add(p(1, 5..10, 0..5, 0));
-        let dropped = g.shift_rows_up(1, 0);
-        assert!(dropped.is_empty());
-        let p0 = g.iter().next().unwrap();
-        assert_eq!(p0.row_range, 4..9);
+        g.shift_lines(-2);
+        assert_eq!(g.iter().next().unwrap().line, 3);
+        g.shift_lines(0);
+        assert_eq!(g.iter().next().unwrap().line, 3);
     }
 
     #[test]
-    fn shift_rows_up_drops_placements_scrolled_above() {
+    fn scroll_region_zero_is_noop() {
         let mut g = ImageGrid::new();
-        g.add(p(1, 0..2, 0..5, 0));
-        let dropped = g.shift_rows_up(3, 0);
+        g.add(p(1, 5..10, 0..5, 0));
+        assert!(g.scroll_region(0, 0..20, 0).is_empty());
+        assert_eq!(g.iter().next().unwrap().line, 5);
+    }
+
+    #[test]
+    fn scroll_region_moves_placement_entirely_inside() {
+        let mut g = ImageGrid::new();
+        g.add(p(1, 5..8, 0..5, 0));
+        assert!(g.scroll_region(0, 2..12, -2).is_empty());
+        let pl = g.iter().next().unwrap();
+        assert_eq!(pl.line, 3);
+        assert_eq!(pl.clip_rows, 0..3);
+    }
+
+    #[test]
+    fn scroll_region_leaves_straddling_placement_alone() {
+        // SCR-5: rows 2..8 straddle the bottom margin of region 1..7.
+        let mut g = ImageGrid::new();
+        g.add(p(1, 2..8, 0..5, 0));
+        g.scroll_region(0, 1..7, -2);
+        let pl = g.iter().next().unwrap();
+        assert_eq!(pl.line, 2);
+        assert_eq!(pl.clip_rows, 0..6);
+        // Straddling the top margin too.
+        g.scroll_region(0, 3..20, -2);
+        assert_eq!(g.iter().next().unwrap().line, 2);
+    }
+
+    #[test]
+    fn scroll_region_up_clips_at_top_margin() {
+        let mut g = ImageGrid::new();
+        g.add(p(1, 4..8, 0..5, 0));
+        g.scroll_region(0, 3..10, -2);
+        let pl = g.iter().next().unwrap();
+        // Box moved up 2 (rows 2..6); the first row is above the margin.
+        assert_eq!(pl.line, 2);
+        assert_eq!(pl.rows, 4, "the reserved box is never trimmed");
+        assert_eq!(pl.clip_rows, 1..4);
+        assert_eq!(pl.screen_rows(0), 3..6);
+        // The clip sticks: scrolling further keeps cutting from the top.
+        g.scroll_region(0, 3..10, -1);
+        let pl = g.iter().next().unwrap();
+        assert_eq!(pl.line, 1);
+        assert_eq!(pl.clip_rows, 2..4);
+        assert_eq!(pl.screen_rows(0), 3..5);
+    }
+
+    #[test]
+    fn scroll_region_down_clips_at_bottom_margin() {
+        let mut g = ImageGrid::new();
+        g.add(p(1, 4..8, 0..5, 0));
+        g.scroll_region(0, 3..9, 3);
+        let pl = g.iter().next().unwrap();
+        assert_eq!(pl.line, 7);
+        assert_eq!(pl.clip_rows, 0..2);
+        assert_eq!(pl.screen_rows(0), 7..9);
+    }
+
+    #[test]
+    fn scroll_region_drops_placement_scrolled_out() {
+        let mut g = ImageGrid::new();
+        g.add(p(1, 4..6, 0..5, 0));
+        let dropped = g.scroll_region(0, 3..9, -5);
         assert_eq!(dropped.len(), 1);
         assert!(g.is_empty());
     }
 
     #[test]
-    fn shift_rows_up_above_scroll_top_unaffected() {
+    fn scroll_region_uses_screen_rows_not_lines() {
+        // Line 104 is screen row 4 when the top line is 100.
         let mut g = ImageGrid::new();
-        // Placement entirely above scroll top: rows 0..2 with scroll_top=5
-        g.add(p(1, 0..2, 0..5, 0));
-        let dropped = g.shift_rows_up(2, 5);
-        assert!(dropped.is_empty());
-        let p0 = g.iter().next().unwrap();
-        assert_eq!(p0.row_range, 0..2);
+        g.add(p(1, 104..106, 0..5, 0));
+        g.scroll_region(100, 3..9, -1);
+        assert_eq!(g.iter().next().unwrap().screen_rows(100), 3..5);
+    }
+
+    #[test]
+    fn retain_lines_drops_only_fully_outside() {
+        let mut g = ImageGrid::new();
+        g.add(p(1, 0..3, 0..1, 0)); // lines 0..3: evicted when first = 3
+        g.add(p(2, 2..5, 0..1, 0)); // straddles the oldest line: kept
+        g.add(p(3, 18..25, 0..1, 0)); // hangs below the bottom: kept
+        g.add(p(4, 21..23, 0..1, 0)); // entirely below the bottom: dropped
+        let dropped = g.retain_lines(3, 20);
+        let ids: Vec<u32> = dropped.iter().map(|p| p.image_id).collect();
+        assert_eq!(ids, vec![1, 4]);
+        let kept: Vec<u32> = g.iter().map(|p| p.image_id).collect();
+        assert_eq!(kept, vec![2, 3]);
+    }
+
+    #[test]
+    fn retain_lines_respects_clip() {
+        // A box at lines 0..4 shown only on lines 2..4 is gone once the
+        // oldest retained line is 4.
+        let mut g = ImageGrid::new();
+        let mut pl = p(1, 0..4, 0..1, 0);
+        pl.clip_rows = 2..4;
+        g.add(pl);
+        assert!(g.retain_lines(3, 100).is_empty());
+        assert_eq!(g.retain_lines(4, 100).len(), 1);
     }
 
     #[test]
     fn covers_returns_true_when_cell_in_range() {
         let mut g = ImageGrid::new();
         g.add(p(1, 2..5, 3..8, 0));
-        assert!(g.covers(3, 5));
-        assert!(!g.covers(1, 5));
-        assert!(!g.covers(3, 8));
+        assert!(g.covers(0, 3, 5));
+        assert!(!g.covers(0, 1, 5));
+        assert!(!g.covers(0, 3, 8));
+        // Two lines scrolled: screen row 1 is now line 3.
+        assert!(g.covers(2, 1, 5));
+        assert!(!g.covers(2, 3, 5));
     }
 
     #[test]
     fn any_on_row_finds_any_placement() {
         let mut g = ImageGrid::new();
         g.add(p(1, 2..5, 3..8, 0));
-        assert!(g.any_on_row(2));
-        assert!(g.any_on_row(4));
-        assert!(!g.any_on_row(5));
-        assert!(!g.any_on_row(1));
+        assert!(g.any_on_row(0, 2));
+        assert!(g.any_on_row(0, 4));
+        assert!(!g.any_on_row(0, 5));
+        assert!(!g.any_on_row(0, 1));
     }
 
     #[test]
@@ -715,31 +813,25 @@ mod tests {
     /// Build a relative-placement child: image/placement ids, parent
     /// ref, `(H,V)` offset, and a 1x1 span anchored at origin.
     fn rel(image_id: u32, placement_id: u32, parent: (u32, u32), offset: (i32, i32)) -> Placement {
-        Placement {
-            image_id,
-            placement_id,
-            row_range: 0..1,
-            col_range: 0..1,
-            src_rect: SrcRect::FULL,
-            z: 0,
-            pix_offset: (0, 0),
-            parent: Some(parent),
-            rel_offset: offset,
-        }
+        let mut pl = Placement::new(image_id, 1, 1);
+        pl.placement_id = placement_id;
+        pl.parent = Some(parent);
+        pl.rel_offset = offset;
+        pl
     }
 
     #[test]
     fn add_relative_resolves_against_parent_origin() {
         let mut g = ImageGrid::new();
-        // Parent at row 5, col 3, named (img=1, place=10).
+        // Parent at line 5, col 3, named (img=1, place=10).
         let mut parent = p(1, 5..7, 3..6, 0);
         parent.placement_id = 10;
         g.add(parent);
-        // Child offset H=2 (cols), V=1 (rows) → row 6, col 5.
+        // Child offset H=2 (cols), V=1 (rows) → line 6, col 5.
         let h = g.add_relative(rel(2, 20, (1, 10), (2, 1))).unwrap();
         let child = g.iter().find(|p| p.image_id == 2).unwrap();
-        assert_eq!(child.row_range.start, 6);
-        assert_eq!(child.col_range.start, 5);
+        assert_eq!(child.line, 6);
+        assert_eq!(child.col, 5);
         assert!(g.remove(h).is_some());
     }
 
@@ -797,14 +889,93 @@ mod tests {
         parent.placement_id = 10;
         g.add(parent);
         g.add_relative(rel(2, 20, (1, 10), (2, 1))).unwrap();
-        // Move the parent up by 2 rows (simulate a scroll).
-        g.shift_rows_up(2, 0);
+        // Move only the parent up by 2 rows (a margin scroll over rows
+        // 4..7 holds the parent but not the child at row 6..7... which
+        // it does hold, so use a direct move instead).
+        g.remove_where(|p| p.image_id == 1);
+        let mut parent = p(1, 3..5, 3..6, 0);
+        parent.placement_id = 10;
+        g.add(parent);
         g.resolve_relative_positions();
-        let parent = g.find(1, 10).unwrap();
-        assert_eq!(parent.row_range.start, 3);
         let child = g.find(2, 20).unwrap();
-        // child = parent origin (3,3) + (H=2 cols, V=1 row) = row 4, col 5.
-        assert_eq!(child.row_range.start, 4);
-        assert_eq!(child.col_range.start, 5);
+        // child = parent origin (3,3) + (H=2 cols, V=1 row) = line 4, col 5.
+        assert_eq!(child.line, 4);
+        assert_eq!(child.col, 5);
+    }
+
+    #[test]
+    fn relative_child_keeps_offset_when_parent_scrolls_off() {
+        // SCR-8 groundwork: a parent anchored to a line id keeps its
+        // origin while it scrolls into history, so the child stays at
+        // its offset (no clamp at screen row 0).
+        let mut g = ImageGrid::new();
+        let mut parent = p(1, 5..7, 0..3, 0);
+        parent.placement_id = 10;
+        g.add(parent);
+        g.add_relative(rel(2, 20, (1, 10), (0, 6))).unwrap();
+        // A full-screen scroll by 20 lines changes only the top line.
+        g.resolve_relative_positions();
+        let child = g.find(2, 20).unwrap();
+        assert_eq!(child.line, 11);
+        assert_eq!(child.screen_rows(25), -14..-13);
+    }
+
+    #[test]
+    fn shift_rows_from_moves_top_straddler_and_resolves_children() {
+        // SD with fixed line ids (#23): a parent straddling the top edge
+        // (screen rows -2..4) moves with its text, and its child keeps
+        // its offset. A placement entirely in scrollback stays.
+        let mut g = ImageGrid::new();
+        let mut parent = p(1, 98..104, 0..20, 0);
+        parent.placement_id = 1;
+        g.add(parent);
+        g.add_relative(rel(2, 2, (1, 1), (0, 4))).unwrap();
+        g.add(p(3, 90..95, 0..4, 0)); // rows -10..-5: history
+        g.shift_rows_from(100, 0, 2);
+        let parent = g.find(1, 1).unwrap();
+        assert_eq!(parent.screen_rows(100), 0..6);
+        assert_eq!(g.find(2, 2).unwrap().line - parent.line, 4);
+        assert_eq!(g.find(3, 0).unwrap().screen_rows(100), -10..-5);
+    }
+
+    #[test]
+    fn remove_where_keeps_survivor_order() {
+        let mut g = ImageGrid::new();
+        for id in 1..=6 {
+            g.add(p(id, 0..1, 0..1, 0));
+        }
+        let gone = g.remove_where(|p| p.image_id % 2 == 0);
+        let ids: Vec<u32> = gone.iter().map(|p| p.image_id).collect();
+        assert_eq!(ids, vec![2, 4, 6]);
+        let kept: Vec<u32> = g.iter().map(|p| p.image_id).collect();
+        assert_eq!(kept, vec![1, 3, 5]);
+        assert!(g.remove_where(|_| false).is_empty());
+    }
+
+    #[test]
+    fn retain_lines_bounds_cache_tracks_mutations() {
+        let mut g = ImageGrid::new();
+        g.add(p(1, 10..12, 0..1, 0));
+        assert!(g.retain_lines(5, 100).is_empty()); // caches (12, 10)
+        g.shift_lines(-8); // now 2..4: the cache must not hide it
+        assert_eq!(g.retain_lines(5, 100).len(), 1);
+        g.add(p(2, 10..12, 0..1, 0));
+        assert!(g.retain_lines(5, 100).is_empty());
+        g.add(p(3, 1..3, 0..1, 0)); // a new, older placement
+        assert_eq!(g.retain_lines(5, 100).len(), 1);
+        // Below the live bottom.
+        assert_eq!(g.retain_lines(0, 9).len(), 1);
+        assert!(g.is_empty());
+    }
+
+    #[test]
+    fn negative_column_offset_clamps_at_zero() {
+        let mut g = ImageGrid::new();
+        let mut parent = p(1, 5..7, 2..4, 0);
+        parent.placement_id = 10;
+        g.add(parent);
+        g.add_relative(rel(2, 20, (1, 10), (-5, -2))).unwrap();
+        let child = g.find(2, 20).unwrap();
+        assert_eq!((child.line, child.col), (3, 0));
     }
 }

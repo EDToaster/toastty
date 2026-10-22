@@ -48,7 +48,7 @@ use crate::chip::ChipFade;
 use crate::chip::pipeline::{ChipPipeline, ChipUniform};
 use crate::image::atlas::ImageTextureCache;
 use crate::image::instance::{
-    ImageInstance, Layer, build_image_instances, classify_layer, split_layers,
+    ImageInstance, ImageView, Layer, build_image_instances, classify_layer, split_layers,
 };
 use crate::image::pipeline::ImagePipeline;
 use crate::rgp::{GpuAssetCache, Rgp3dPipeline};
@@ -68,8 +68,9 @@ fn has_below_cell_bg_placements(
     grid.iter().any(|p| {
         classify_layer(p.z) == Layer::BelowCellBg
             && registry.contains(p.image_id)
-            && !p.col_range.is_empty()
-            && !p.row_range.is_empty()
+            && p.cols != 0
+            && p.rows != 0
+            && !p.clip_rows.is_empty()
     })
 }
 
@@ -185,6 +186,35 @@ fn build_term_dirty_instances_into(
 /// the damage space when not fractionally scrolled). During a
 /// fractional scroll the frame is a full redraw anyway, so just mark
 /// everything.
+/// Clip rect for image instances, `[x0, y0, x1, y1]` relative to the
+/// content origin, matching what the text pass covers so images and text
+/// are cut at the same edges. At the live bottom that is the grid itself
+/// (`cols × rows` cells, not the sub-cell sliver below the last row).
+/// While scrolled back or mid smooth-scroll the text pass also draws the
+/// partial row hanging above the top (into the top padding) and the rows
+/// below the grid that fill the content area, so images get the same span.
+#[allow(clippy::cast_precision_loss)]
+fn image_clip(term: &Term, cell: (f32, f32), content_h: f32) -> [f32; 4] {
+    let (rows, cols) = term.size();
+    let grid_w = f32::from(cols) * cell.0;
+    let view_pixel = term.view_offset_pixel();
+    if term.view_offset_lines() == 0 && view_pixel <= 0.0 {
+        return [0.0, 0.0, grid_w, f32::from(rows) * cell.1];
+    }
+    let y_translate = if view_pixel > 0.0 {
+        view_pixel - cell.1
+    } else {
+        0.0
+    };
+    let drawn = crate::text::instance::rows_to_render(rows, view_pixel, cell.1, content_h);
+    [
+        0.0,
+        y_translate.min(0.0),
+        grid_w,
+        y_translate + f32::from(drawn) * cell.1,
+    ]
+}
+
 fn mark_blinking_cells_dirty(term: &mut Term, row_blink: &[bool]) {
     if term.view_offset_pixel() > 0.0 {
         term.mark_all_dirty();
@@ -2942,11 +2972,25 @@ impl Renderer {
             let t_img = trace.then(std::time::Instant::now);
             let mut tmp: Vec<ImageInstance> = Vec::new();
             if !term.image_grid().is_empty() {
+                // Placements are anchored to line ids: place them against
+                // the live screen's top line and shift them by the same
+                // scrollback offset text gets (`(L + view_lines) * cell_h +
+                // view_pixel` for logical row L), then crop to the content
+                // area.
+                #[allow(clippy::cast_precision_loss)]
+                let scroll_px =
+                    term.view_offset_lines() as f32 * cell_size.1 + term.view_offset_pixel();
+                let view = ImageView {
+                    top_line: term.image_top_line(),
+                    scroll_px,
+                    clip: image_clip(term, cell_size, content_dims.1),
+                };
                 build_image_instances(
                     &mut tmp,
                     term.image_grid(),
                     term.image_registry(),
                     cell_size,
+                    &view,
                 );
             }
             // Unicode-placeholder images, resolved from the rows drawn
@@ -4002,16 +4046,11 @@ mod below_cell_bg_tests {
     #[test]
     fn below_cell_bg_detection_uses_the_kitty_band() {
         use toastty_term::{ImageGrid, Placement, SrcRect};
-        let place = |z: i32| Placement {
-            image_id: 1,
-            placement_id: 0,
-            row_range: 0..1,
-            col_range: 0..1,
-            src_rect: SrcRect::FULL,
-            z,
-            pix_offset: (0, 0),
-            parent: None,
-            rel_offset: (0, 0),
+        let place = |z: i32| {
+            let mut p = Placement::new(1, 1, 1);
+            p.src_rect = SrcRect::FULL;
+            p.z = z;
+            p
         };
         let mut reg = toastty_term::ImageRegistry::new(1024);
         reg.insert(
@@ -4038,16 +4077,13 @@ mod below_cell_bg_tests {
     #[test]
     fn below_cell_bg_detection_ignores_placements_that_never_draw() {
         use toastty_term::{ImageData, ImageGrid, ImageRegistry, Placement, SrcRect};
-        let place = |id: u32, rows: std::ops::Range<u16>, cols: std::ops::Range<u16>| Placement {
-            image_id: id,
-            placement_id: 0,
-            row_range: rows,
-            col_range: cols,
-            src_rect: SrcRect::FULL,
-            z: i32::MIN,
-            pix_offset: (0, 0),
-            parent: None,
-            rel_offset: (0, 0),
+        let place = |id: u32, rows: std::ops::Range<u16>, cols: std::ops::Range<u16>| {
+            let mut p = Placement::new(id, rows.end - rows.start, cols.end - cols.start);
+            p.line = i64::from(rows.start);
+            p.col = cols.start;
+            p.src_rect = SrcRect::FULL;
+            p.z = i32::MIN;
+            p
         };
         let mut reg = ImageRegistry::new(1024);
         reg.insert(
