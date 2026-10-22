@@ -48,6 +48,7 @@ use toastty::mouse::{
     protocol_wants_event,
 };
 use toastty::paste::wrap_for_paste;
+use toastty::perf_stats::PerfStats;
 use toastty::pty_log::{Direction, PtyLogger};
 use toastty::shell::resolve_command;
 use toastty::theme_bridge::{
@@ -221,6 +222,7 @@ fn main() -> Result<()> {
         .init();
 
     info!("toastty {} starting", env!("CARGO_PKG_VERSION"));
+    toastty::perf_stats::start_profiler();
 
     let (config, source, load_err) = Config::load_default_with_error();
     info!("config source: {source}");
@@ -356,6 +358,8 @@ struct Toastty {
     /// Optional bidirectional PTY-byte logger, enabled by
     /// `TOASTTY_PTY_LOG=<path>`. No-op when the env var is unset.
     pty_log: PtyLogger,
+    /// Benchmark counters, enabled by `TOASTTY_STATS=<path>`.
+    stats: PerfStats,
     /// Sub-row pixel accumulator for the alt-screen-arrow translation
     /// path. macOS trackpad inertial frames arrive as small per-frame
     /// pixel deltas; we accumulate them here and emit one ↑/↓ arrow
@@ -522,6 +526,7 @@ impl Toastty {
             held_modifier_keys: Vec::new(),
             middle_paste_consumed: false,
             pty_log: PtyLogger::from_env(),
+            stats: PerfStats::from_env(),
             alt_scroll_pixel_accum: 0.0,
             mouse_scroll_accum_y: 0.0,
             mouse_scroll_accum_x: 0.0,
@@ -1652,6 +1657,9 @@ impl Toastty {
                 return ControlSignal::Continue;
             }
             return self.handle_close_prompt_key(logical, text);
+        }
+        if state == KeyState::Pressed {
+            self.stats.key_press(Instant::now());
         }
         // KBD-2: report a release as the key that was pressed, and keep a
         // modifier's bit while its other side is held. Before any early
@@ -2946,8 +2954,10 @@ impl Toastty {
                 self.refresh_rich_chip();
                 let mut next_blink: Option<Duration> = None;
                 if let Some(r) = self.renderer.as_mut() {
+                    let frame_start = Instant::now();
                     match r.render_term(&mut self.term) {
                         Ok(RenderOutcome::Rendered) => {
+                            self.stats.frame(frame_start, Instant::now());
                             // Consume the per-cell damage signal so the
                             // next render only re-emits cells that
                             // changed. Clear the BSU timeout-flush
@@ -2960,6 +2970,7 @@ impl Toastty {
                             }
                         }
                         Ok(RenderOutcome::Skipped) => {
+                            self.stats.skipped();
                             // Frame skipped (pause-gated or surface
                             // hiccup): leave the damage signal and the
                             // BSU force-flushed flag alone so the next
@@ -3133,7 +3144,9 @@ impl Toastty {
                 }
             }
             Event::PtyBytes(bytes) => {
+                let at = Instant::now();
                 let fresh_bsu = self.handle_pty_bytes(&bytes);
+                self.stats.pty_batch(at, bytes.len(), at.elapsed());
                 // New output may have rewritten or moved the hovered
                 // link; re-resolve it (clears when it's gone).
                 if self.term.link_hover().is_some() {
@@ -3160,6 +3173,8 @@ impl Toastty {
             }
             Event::PtyClosed => {
                 debug!("pty closed; exiting");
+                self.stats.write();
+                toastty::perf_stats::finish_profiler();
                 if let Some(pty) = self.pty.as_mut() {
                     let _ = pty.wait();
                 }
