@@ -2968,6 +2968,10 @@ impl Renderer {
         self.image_instances_below_bg.clear();
         self.image_instances_below.clear();
         self.image_instances_above.clear();
+        // A3: placements are positioned against the content origin
+        // (pixel sizing snaps to physical pixels); take it before the
+        // pipeline borrow below.
+        let image_origin = self.content_origin();
         if let Some(image_pipeline) = self.image_pipeline.as_mut() {
             let t_img = trace.then(std::time::Instant::now);
             let mut tmp: Vec<ImageInstance> = Vec::new();
@@ -2984,6 +2988,7 @@ impl Renderer {
                     top_line: term.image_top_line(),
                     scroll_px,
                     clip: image_clip(term, cell_size, content_dims.1),
+                    origin: image_origin,
                 };
                 build_image_instances(
                     &mut tmp,
