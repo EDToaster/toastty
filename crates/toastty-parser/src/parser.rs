@@ -313,8 +313,11 @@ impl Scanner {
                     .advance(&mut VteAdapter { inner: perform }, b"\x1b\\");
                 self.apc = ApcState::Ground;
             }
-            // CAN / SUB: vte cancels the DCS.
+            // CAN / SUB cancel the DCS (xterm, vte). vte unhooks it as
+            // if it had ended normally, so tell the handler first that
+            // it must not be acted on (WIRE-15).
             byte => {
+                perform.dcs_cancel();
                 self.vte
                     .advance(&mut VteAdapter { inner: perform }, &[byte]);
                 self.apc = ApcState::Ground;
@@ -888,6 +891,38 @@ mod tests {
 
     /// WIRE-13: kitty 0.49.2 ends every string type on BEL. OSC and APC
     /// already did; DCS, PM and SOS now do too.
+    #[test]
+    fn dcs_cancel_is_signalled_before_unhook() {
+        #[derive(Default)]
+        struct Rec(Vec<&'static str>);
+        impl Perform for Rec {
+            fn hook(&mut self, _: &Params, _: &[u8], _: bool, _: char) {
+                self.0.push("hook");
+            }
+            fn dcs_cancel(&mut self) {
+                self.0.push("cancel");
+            }
+            fn unhook(&mut self) {
+                self.0.push("unhook");
+            }
+        }
+        for cancel in [0x18u8, 0x1A] {
+            let mut input = b"\x1bP$qm".to_vec();
+            input.push(cancel);
+            let mut r = Rec::default();
+            Parser::new().advance(&mut r, &input);
+            assert_eq!(r.0, ["hook", "cancel", "unhook"], "{cancel:#x}");
+        }
+        // ST and BEL end it normally: no cancel.
+        for end in [&b"\x1b\\"[..], b"\x07"] {
+            let mut input = b"\x1bP$qm".to_vec();
+            input.extend_from_slice(end);
+            let mut r = Rec::default();
+            Parser::new().advance(&mut r, &input);
+            assert_eq!(r.0, ["hook", "unhook"], "{end:x?}");
+        }
+    }
+
     #[test]
     fn dcs_ends_on_bel_like_st() {
         let r = parse(b"\x1bP1$rab\x07x");
