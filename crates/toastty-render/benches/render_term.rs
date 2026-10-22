@@ -644,6 +644,90 @@ const CJK_WORDS: [&str; 10] = [
     "👍",
 ];
 
+/// Frames per `TOASTTY_BENCH_MIN` scenario.
+const MIN_FRAMES: usize = 400;
+
+/// Print the minimum and median of per-frame times (µs).
+fn report_min(name: &str, mut times: Vec<f64>) {
+    times.sort_by(f64::total_cmp);
+    println!(
+        "min-time {name:<26} min {:>8.1} us  p50 {:>8.1} us",
+        times[0],
+        times[times.len() / 2]
+    );
+}
+
+/// Time `frames` CPU-only frames; `step` mutates the term before each.
+fn time_frames(
+    h: &mut Harness,
+    term: &mut Term,
+    frames: usize,
+    mut step: impl FnMut(&mut Term, usize),
+) -> Vec<f64> {
+    let mut times = Vec::with_capacity(frames);
+    for i in 0..frames {
+        step(term, i);
+        let t0 = Instant::now();
+        h.render_term(term);
+        times.push(t0.elapsed().as_secs_f64() * 1e6);
+        term.clear_damage();
+    }
+    times
+}
+
+/// One screen of new coloured words, `kind` = `256` / `rgb` / `cjk`
+/// (256-colour with CJK / emoji words mixed in). `seed` carries the
+/// LCG state between screens.
+fn new_text_screen(kind: &str, rows: u16, cols: u16, frame: usize, seed: &mut u32) -> String {
+    use std::fmt::Write as _;
+    const LOREM: [&str; 19] = [
+        "lorem",
+        "ipsum",
+        "dolor",
+        "sit",
+        "amet",
+        "consectetur",
+        "adipiscing",
+        "elit",
+        "sed",
+        "do",
+        "eiusmod",
+        "tempor",
+        "incididunt",
+        "ut",
+        "labore",
+        "et",
+        "dolore",
+        "magna",
+        "aliqua",
+    ];
+    let mut screen = String::from("\x1b[H");
+    for row in 0..rows {
+        let _ = write!(screen, "\x1b[{};1H", row + 1);
+        let mut width = 0usize;
+        while width + 12 < usize::from(cols) {
+            *seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let s = *seed;
+            let (word, word_w) = if kind == "cjk" && (s >> 20) % 10 < 3 {
+                let w = CJK_WORDS[(s >> 16) as usize % CJK_WORDS.len()];
+                (w, 2 * w.chars().count())
+            } else {
+                let w = LOREM[(s >> 16) as usize % LOREM.len()];
+                (w, w.len())
+            };
+            if kind == "rgb" {
+                let (red, green, blue) = (s >> 8 & 255, s >> 12 & 255, s >> 4 & 255);
+                let _ = write!(screen, "\x1b[38;2;{red};{green};{blue}m{word} ");
+            } else {
+                let _ = write!(screen, "\x1b[38;5;{}m{word} ", (s >> 8) % 256);
+            }
+            width += word_w + 1;
+        }
+        let _ = write!(screen, "{frame}\x1b[K");
+    }
+    screen
+}
+
 /// Low-noise CPU numbers — runs when `TOASTTY_BENCH_MIN=1` is set,
 /// otherwise a no-op. Each scenario renders 400 frames CPU-only
 /// (shaping + instance building, no GPU) and prints the minimum and
@@ -653,19 +737,7 @@ fn bench_min_times(c: &mut Criterion) {
     if std::env::var_os("TOASTTY_BENCH_MIN").is_none() {
         return;
     }
-    const FRAMES: usize = 400;
-    let report = |name: &str, mut t: Vec<f64>| {
-        t.sort_by(f64::total_cmp);
-        println!(
-            "min-time {name:<26} min {:>8.1} us  p50 {:>8.1} us",
-            t[0],
-            t[t.len() / 2]
-        );
-    };
-    let lorem: Vec<&str> = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do \
-                            eiusmod tempor incididunt ut labore et dolore magna aliqua"
-        .split(' ')
-        .collect();
+    let repaint = |term: &mut Term, _| term.mark_all_dirty();
     for (rows, cols) in [(ROWS, COLS), (BIG_ROWS, BIG_COLS)] {
         let (width, height) = viewport_pixels(rows, cols);
         let mut h = Harness::new(width, height);
@@ -673,55 +745,24 @@ fn bench_min_times(c: &mut Criterion) {
         // Full repaint of unchanged text.
         let mut term = make_term_filled(rows, cols);
         h.render_term(&term);
-        let mut t = Vec::with_capacity(FRAMES);
-        for _ in 0..FRAMES {
-            term.mark_all_dirty();
-            let t0 = Instant::now();
-            h.render_term(&term);
-            t.push(t0.elapsed().as_secs_f64() * 1e6);
-            term.clear_damage();
-        }
-        report(&format!("repaint_{cols}x{rows}"), t);
+        let times = time_frames(&mut h, &mut term, MIN_FRAMES, repaint);
+        report_min(&format!("repaint_{cols}x{rows}"), times);
         // Every row new text every frame (no memo hits), coloured words:
         // 256-colour, truecolor, and 256-colour with CJK / emoji words
         // mixed in (every row needs cosmic-text; fewer frames, it's slow).
         for kind in ["256", "rgb", "cjk"] {
-            let truecolor = kind == "rgb";
-            let frames = if kind == "cjk" { FRAMES / 4 } else { FRAMES };
+            let frames = if kind == "cjk" {
+                MIN_FRAMES / 4
+            } else {
+                MIN_FRAMES
+            };
             let mut parser = Parser::new();
             let mut seed = 1u32;
-            let mut t = Vec::with_capacity(frames);
-            for f in 0..frames {
-                let mut screen = String::from("\x1b[H");
-                for r in 0..rows {
-                    screen.push_str(&format!("\x1b[{};1H", r + 1));
-                    let mut w = 0usize;
-                    while w + 12 < usize::from(cols) {
-                        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
-                        let (word, word_w) = if kind == "cjk" && (seed >> 20) % 10 < 3 {
-                            let w = CJK_WORDS[(seed >> 16) as usize % CJK_WORDS.len()];
-                            (w, 2 * w.chars().count())
-                        } else {
-                            let w = lorem[(seed >> 16) as usize % lorem.len()];
-                            (w, w.len())
-                        };
-                        if truecolor {
-                            let (r, g, b) = (seed >> 8 & 255, seed >> 12 & 255, seed >> 4 & 255);
-                            screen.push_str(&format!("\x1b[38;2;{r};{g};{b}m{word} "));
-                        } else {
-                            screen.push_str(&format!("\x1b[38;5;{}m{word} ", (seed >> 8) % 256));
-                        }
-                        w += word_w + 1;
-                    }
-                    screen.push_str(&format!("{f}\x1b[K"));
-                }
-                parser.advance(&mut term, screen.as_bytes());
-                let t0 = Instant::now();
-                h.render_term(&term);
-                t.push(t0.elapsed().as_secs_f64() * 1e6);
-                term.clear_damage();
-            }
-            report(&format!("newtext_{kind}_{cols}x{rows}"), t);
+            let times = time_frames(&mut h, &mut term, frames, |term, f| {
+                let screen = new_text_screen(kind, rows, cols, f, &mut seed);
+                parser.advance(term, screen.as_bytes());
+            });
+            report_min(&format!("newtext_{kind}_{cols}x{rows}"), times);
         }
     }
     let (width, height) = viewport_pixels(ROWS, COLS);
@@ -732,42 +773,23 @@ fn bench_min_times(c: &mut Criterion) {
     Parser::new().advance(&mut term, b"\x1b[2;33m");
     let filled = make_term_filled(ROWS, COLS);
     let text: String = (0..ROWS)
-        .flat_map(|r| filled.row(r).cells().iter().map(|c| c.ch))
+        .flat_map(|r| filled.row(r).cells().iter().map(|cell| cell.ch))
         .collect();
     Parser::new().advance(&mut term, text.as_bytes());
     h.render_term(&term);
-    let mut t = Vec::with_capacity(FRAMES);
-    for _ in 0..FRAMES {
-        term.mark_all_dirty();
-        let t0 = Instant::now();
-        h.render_term(&term);
-        t.push(t0.elapsed().as_secs_f64() * 1e6);
-        term.clear_damage();
-    }
-    report("repaint_dim_200x60", t);
+    let times = time_frames(&mut h, &mut term, MIN_FRAMES, repaint);
+    report_min("repaint_dim_200x60", times);
     let mut term = make_term_unicode(ROWS, COLS);
     h.render_term(&term);
-    let mut t = Vec::with_capacity(FRAMES);
-    for _ in 0..FRAMES {
-        term.mark_all_dirty();
-        let t0 = Instant::now();
-        h.render_term(&term);
-        t.push(t0.elapsed().as_secs_f64() * 1e6);
-        term.clear_damage();
-    }
-    report("repaint_unicode_200x60", t);
+    let times = time_frames(&mut h, &mut term, MIN_FRAMES, repaint);
+    report_min("repaint_unicode_200x60", times);
     let mut parser = Parser::new();
     parser.advance(&mut term, b"\x1b[60;1H");
-    let mut t = Vec::with_capacity(FRAMES);
-    for i in 0..FRAMES {
-        parser.advance(&mut term, b"\r\n");
-        parser.advance(&mut term, unicode_line(i + 1000, COLS).as_bytes());
-        let t0 = Instant::now();
-        h.render_term(&term);
-        t.push(t0.elapsed().as_secs_f64() * 1e6);
-        term.clear_damage();
-    }
-    report("scroll_unicode_200x60", t);
+    let times = time_frames(&mut h, &mut term, MIN_FRAMES, |term, i| {
+        parser.advance(term, b"\r\n");
+        parser.advance(term, unicode_line(i + 1000, COLS).as_bytes());
+    });
+    report_min("scroll_unicode_200x60", times);
     c.bench_function("min_times_dummy", |b| b.iter(|| {}));
 }
 
