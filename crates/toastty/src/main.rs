@@ -2712,6 +2712,9 @@ impl App for Toastty {
                     }
                 }
                 self.last_viewport_tick = Some(now);
+                // Kitty animations: put up any frame that has come due.
+                // A no-op when no animation is running.
+                self.term.tick_animations(now);
                 // Selection drag held past the top/bottom edge.
                 let next_autoscroll = self.tick_selection_autoscroll(now);
 
@@ -2789,6 +2792,13 @@ impl App for Toastty {
                     // Ps=2/4/6) so we don't pointlessly wake the event
                     // loop.
                     next_blink = r.next_redraw_deadline(&self.term);
+                    // The next kitty animation frame, if one is running:
+                    // an absolute time, like the blink's.
+                    let next_image_frame = self
+                        .term
+                        .next_animation_frame()
+                        .map(|t| t.saturating_duration_since(Instant::now()));
+                    next_blink = min_deadline(next_blink, next_image_frame);
                 }
                 // If the viewport is still animating, schedule the next
                 // frame ~60 Hz. Combined with any blink deadline via

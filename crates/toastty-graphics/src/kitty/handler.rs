@@ -28,10 +28,14 @@ use base64::Engine as _;
 
 use super::b64;
 use super::decode::{DecodeError, RAW_DATA_SLACK, decode, raw_len};
-use super::header::{Action, Compression, DeleteSpec, Header, Quiet, Transmission};
+use super::header::{
+    Action, AnimationKeys, CompositionKeys, Compression, DeleteSpec, FrameKeys, Header, Quiet,
+    Transmission,
+};
 use super::medium::{self, FileError, FileRequest, ShmRequest};
 use super::placeholder::VirtualPlacement;
-use super::reply::{ErrorCode, encode_error, encode_ok};
+use super::reply::{ErrorCode, encode_error, encode_frame_error, encode_frame_ok, encode_ok};
+use crate::frames::{FrameError, frame_target};
 use crate::image_grid::{Placement, RelativeError, SrcRect};
 use crate::registry::ImageData;
 
@@ -185,6 +189,40 @@ pub trait KittySink {
     fn cell_pixel_size(&self) -> (u16, u16) {
         (1, 1)
     }
+
+    /// Frames of stored image `id`, root included (1 for a still image).
+    /// The handler needs it before decoding an `a=f` payload: kitty tags
+    /// the reply, errors included, with the frame the command targets.
+    fn frame_count(&self, _id: u32) -> u32 {
+        1
+    }
+
+    /// `a=f`: add or edit a frame of stored image `id` from the decoded
+    /// `data` (see [`crate::frames`]). Returns the 1-based frame number
+    /// created or edited. Default: animation unsupported.
+    fn add_frame(
+        &mut self,
+        _id: u32,
+        _keys: &FrameKeys,
+        _data: ImageData,
+    ) -> Result<u32, FrameError> {
+        Err(FrameError {
+            code: ErrorCode::Enotsup,
+            detail: "animation".into(),
+        })
+    }
+
+    /// `a=a`: control the animation of stored image `id`. Never replies.
+    fn control_animation(&mut self, _id: u32, _keys: &AnimationKeys) {}
+
+    /// `a=c`: compose frames of stored image `id`. Default: animation
+    /// unsupported.
+    fn compose_frames(&mut self, _id: u32, _keys: &CompositionKeys) -> Result<(), FrameError> {
+        Err(FrameError {
+            code: ErrorCode::Enotsup,
+            detail: "animation".into(),
+        })
+    }
 }
 
 /// The in-flight chunked upload. kitty has exactly one loading slot: while
@@ -237,6 +275,9 @@ pub struct KittyHandler {
     /// Set while finishing an upload whose last chunk was an `a=q` with
     /// `i=`: kitty replies under the query's id.
     reply_id_override: Option<u32>,
+    /// Set while finishing a chunked `a=f` whose last chunk said `a=f`:
+    /// the header its reply echoes (#47).
+    frame_reply: Option<Header>,
 }
 
 impl Default for KittyHandler {
@@ -253,6 +294,7 @@ impl KittyHandler {
             loading: None,
             pending_cap: usize::MAX,
             reply_id_override: None,
+            frame_reply: None,
         }
     }
 
@@ -326,10 +368,38 @@ impl KittyHandler {
                 // registry is not consulted.
                 self.handle_query(header, body, sink);
             }
-            Action::Frame | Action::Animate | Action::Compose => {
-                self.handle_animation(&header, sink);
+            Action::Frame => {
+                self.handle_frame(header, body, sink);
+            }
+            Action::Animate | Action::Compose => {
+                // The image still loading counts as present (kitty doesn't
+                // answer `a=a` on it).
+                if self.loading.as_ref().is_some_and(|u| u.targets(&header)) {
+                    return;
+                }
+                if header.action == Action::Animate {
+                    handle_animate(&header, sink);
+                } else {
+                    handle_compose(&header, sink);
+                }
             }
         }
+    }
+
+    /// `a=f`: frame data. It travels like a transmit (chunks, mediums,
+    /// compression, formats; #44's loading slot) and is finished by
+    /// [`finalize_frame`]. A first chunk naming an image that isn't stored
+    /// gets kitty's ENOENT and starts no upload; its continuation chunks,
+    /// which carry no id, then fall on the floor (as in kitty). While an
+    /// upload is loading, an `a=f` chunk continues it like any direct
+    /// transmit (WIRE-9).
+    fn handle_frame<S: KittySink>(&mut self, header: Header, body: &[u8], sink: &mut S) {
+        let continues =
+            self.loading.is_some() && matches!(header.transmission, Transmission::Direct);
+        if !continues && resolve_image(&header, sink, "Animation").is_none() {
+            return;
+        }
+        self.handle_transmit(header, body, sink);
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -479,14 +549,14 @@ impl KittyHandler {
             if let Err(e) = self.start_upload(&header, body, quota, false)
                 && !e.silent
             {
-                reply_transmit_error(&header, sink, e.code, &e.detail);
+                reply_payload_error(&header, sink, e.code, &e.detail);
             }
             return;
         }
 
         // Single-chunk transmission.
         if let Err(e) = check_body_fits(&header, body, quota) {
-            reply_transmit_error(&header, sink, e.code, &e.detail);
+            reply_payload_error(&header, sink, e.code, &e.detail);
             return;
         }
         let decoded = b64::decode_all(body);
@@ -548,7 +618,7 @@ impl KittyHandler {
             // chunks then fall on the floor.
             let head = up.head.clone();
             self.loading = None;
-            reply_transmit_error(&head, sink, ErrorCode::Efbig, "Too much data");
+            reply_payload_error(&head, sink, ErrorCode::Efbig, "Too much data");
             return;
         }
         if header.more {
@@ -560,6 +630,16 @@ impl KittyHandler {
         up.b64.finish(&mut up.data);
         if header.action == Action::Query && header.image_id != 0 {
             self.reply_id_override = Some(header.image_id);
+        }
+        if up.head.action == Action::Frame && header.action == Action::Frame {
+            // kitty answers a chunked frame whose last chunk says `a=f`
+            // with that chunk's ids (usually none: no reply). A bare
+            // `m=0` last chunk is answered with the first's (#47).
+            let mut r = up.head.clone();
+            r.image_id = header.image_id;
+            r.image_number = header.image_number;
+            r.placement_id = header.placement_id;
+            self.frame_reply = Some(r);
         }
         self.finalize_decoded(up.head, up.data, PayloadSource::Direct, sink);
         self.reply_id_override = None;
@@ -614,17 +694,26 @@ impl KittyHandler {
                 // the file, and replies about the command, not the file.
                 if let Err(e) = check_medium_header(&header) {
                     if !e.silent {
-                        reply_transmit_error(&header, sink, e.code, &e.detail);
+                        reply_payload_error(&header, sink, e.code, &e.detail);
                     }
                     return;
                 }
                 let raw = match read_medium(&header, body, sink.max_image_bytes()) {
                     Ok(bytes) => bytes,
+                    Err(e) if header.action == Action::Frame => {
+                        let target = frame_target_for(&header, sink);
+                        reply_frame_file_error(&header, target, sink, &e);
+                        return;
+                    }
                     Err(e) => {
                         reply_file_error(&header, sink, &e);
                         return;
                     }
                 };
+                if header.action == Action::Frame {
+                    finalize_frame(&header, &header, raw, PayloadSource::File, sink);
+                    return;
+                }
                 self.finalize_decoded(header, raw, PayloadSource::File, sink);
             }
         }
@@ -646,6 +735,11 @@ impl KittyHandler {
         // kitty answers an upload that an `a=q` chunk finished under the
         // query's id (the image is still stored under its own).
         let reply_as = self.reply_id_override.take();
+        if header.action == Action::Frame {
+            let reply = self.frame_reply.take().unwrap_or_else(|| header.clone());
+            finalize_frame(&header, &reply, decoded, source, sink);
+            return;
+        }
         let reply_head = match reply_as {
             Some(id) => Header {
                 image_id: id,
@@ -829,26 +923,140 @@ impl KittyHandler {
         self.abort_loading("delete");
         sink.delete_image(header.delete, &header);
     }
+}
 
-    /// `a=f` / `a=a` / `a=c` (WIRE-3, WIRE-12). Animation isn't
-    /// implemented yet: on a stored image the command is accepted
-    /// silently, so the still first frame stays up and nothing lands in
-    /// the shell (kitty doesn't answer `kitten icat`'s `a=a` commands
-    /// either). On an image that isn't stored it gets kitty's ENOENT.
-    ///
-    /// An implementation reads the keys under their animation meaning
-    /// with [`Header::frame`], [`Header::animation`] and
-    /// [`Header::composition`].
-    fn handle_animation<S: KittySink>(&mut self, header: &Header, sink: &mut S) {
-        // The image still loading counts as present (kitty doesn't
-        // answer `a=a` on it).
-        if self.loading.as_ref().is_some_and(|u| u.targets(header)) {
+/// `a=a`: animation control. kitty never answers it, except ENOENT for
+/// an image that isn't stored (WIRE-3, WIRE-12), so `kitten icat`'s
+/// control commands (sent without `q=`) put nothing in the shell.
+fn handle_animate<S: KittySink>(header: &Header, sink: &mut S) {
+    if let Some(id) = resolve_image(header, sink, "Animation") {
+        sink.control_animation(id, &header.animation());
+    }
+}
+
+/// `a=c`: frame composition. Replies OK or kitty's frame error, keyed by
+/// the client's own `i=` / `I=`.
+fn handle_compose<S: KittySink>(header: &Header, sink: &mut S) {
+    let Some(id) = resolve_image(header, sink, "Animation") else {
+        return;
+    };
+    match sink.compose_frames(id, &header.composition()) {
+        Ok(()) => reply_ok_if_verbose(header, sink),
+        Err(e) => reply_error_if_verbose(header, sink, e.code, &e.detail),
+    }
+}
+
+/// The frame an `a=f` with `header` targets, for its reply's `r=`.
+fn frame_target_for<S: KittySink>(header: &Header, sink: &S) -> u32 {
+    let id = stored_image(header, sink).unwrap_or(0);
+    frame_target(sink.frame_count(id), header.frame().edit_frame)
+}
+
+/// The stored image `header` names (`i=`, or the newest `I=`), if any.
+fn stored_image<S: KittySink>(header: &Header, sink: &S) -> Option<u32> {
+    let id = if header.image_id != 0 {
+        Some(header.image_id)
+    } else if header.image_number != 0 {
+        sink.image_id_for_number(header.image_number)
+    } else {
+        None
+    };
+    id.filter(|&id| sink.image_exists(id))
+}
+
+/// Decode a complete `a=f` payload and add or edit the frame. `header`
+/// holds the frame keys (the first chunk's); `reply` the ids the answer
+/// echoes. Replies are tagged `r=<frame>`, errors included, in kitty's
+/// order: decode errors, then frame size, then base frame (WIRE-3).
+fn finalize_frame<S: KittySink>(
+    header: &Header,
+    reply: &Header,
+    decoded: Vec<u8>,
+    source: PayloadSource,
+    sink: &mut S,
+) {
+    // The image may have gone while the chunks were arriving.
+    let Some(id) = stored_image(header, sink) else {
+        resolve_image(reply, sink, "Animation");
+        return;
+    };
+    let keys = header.frame();
+    let target = frame_target(sink.frame_count(id), keys.edit_frame);
+    let data = match decode_payload(header, decoded, sink.max_image_bytes()) {
+        Ok(d) => d,
+        Err(e) => {
+            match source {
+                PayloadSource::File => reply_frame_file_error(reply, target, sink, &e.detail),
+                PayloadSource::Direct => {
+                    reply_frame_error_if_verbose(reply, sink, target, e.code, &e.detail);
+                }
+            }
             return;
         }
-        let Some(_id) = resolve_image(header, sink, "Animation") else {
-            return;
-        };
+    };
+    match sink.add_frame(id, &keys, data) {
+        Ok(frame) => {
+            if reply.quiet == Quiet::Verbose && client_wants_reply(reply) {
+                sink.queue_reply(&encode_frame_ok(
+                    reply.image_id,
+                    reply.image_number,
+                    reply.placement_id,
+                    frame,
+                ));
+            }
+        }
+        Err(e) => reply_frame_error_if_verbose(reply, sink, target, e.code, &e.detail),
     }
+}
+
+fn reply_frame_error_if_verbose<S: KittySink>(
+    reply: &Header,
+    sink: &mut S,
+    frame: u32,
+    code: ErrorCode,
+    detail: &str,
+) {
+    if reply.quiet == Quiet::Silent || !client_wants_reply(reply) {
+        return;
+    }
+    sink.queue_reply(&encode_frame_error(
+        reply.image_id,
+        reply.image_number,
+        reply.placement_id,
+        frame,
+        code,
+        detail,
+    ));
+}
+
+/// An error found before a transmit's or frame's payload is decoded
+/// (format, dimensions, size). An `a=f` is answered tagged with the frame
+/// it targets, as its decode errors are (#47); anything else as a
+/// transmit.
+fn reply_payload_error<S: KittySink>(header: &Header, sink: &mut S, code: ErrorCode, detail: &str) {
+    if header.action == Action::Frame {
+        let target = frame_target_for(header, sink);
+        reply_frame_error_if_verbose(header, sink, target, code, detail);
+    } else {
+        reply_transmit_error(header, sink, code, detail);
+    }
+}
+
+/// SEC-4 for frames: the uniform file error, tagged with the frame.
+fn reply_frame_file_error<S: KittySink>(
+    reply: &Header,
+    frame: u32,
+    sink: &mut S,
+    reason: &dyn std::fmt::Display,
+) {
+    tracing::debug!(image_id = reply.image_id, %reason, "kitty: frame file medium failed");
+    reply_frame_error_if_verbose(
+        reply,
+        sink,
+        frame,
+        ErrorCode::Ebadf,
+        medium::FILE_READ_ERROR,
+    );
 }
 
 /// Errors from [`KittyHandler::process`] before any sink calls happen.
@@ -1326,6 +1534,10 @@ mod tests {
         numbers: std::collections::HashMap<u32, u32>,
         deleted: Vec<u32>,
         cursor_advances: usize,
+        /// `a=f` frames received: (image id, keys, decoded size).
+        frames: Vec<(u32, FrameKeys, (u32, u32))>,
+        controls: Vec<(u32, AnimationKeys)>,
+        composes: Vec<(u32, CompositionKeys)>,
     }
 
     impl MockSink {
@@ -1382,6 +1594,42 @@ mod tests {
         }
         fn queue_reply(&mut self, bytes: &[u8]) {
             self.replies.push(bytes.to_vec());
+        }
+        fn frame_count(&self, id: u32) -> u32 {
+            1 + self
+                .frames
+                .iter()
+                .filter(|f| f.0 == id && f.1.edit_frame == 0)
+                .count() as u32
+        }
+        fn add_frame(
+            &mut self,
+            id: u32,
+            keys: &FrameKeys,
+            data: ImageData,
+        ) -> Result<u32, FrameError> {
+            let n = frame_target(self.frame_count(id), keys.edit_frame);
+            if keys.base_frame > self.frame_count(id) {
+                return Err(FrameError {
+                    code: ErrorCode::Einval,
+                    detail: format!("No frame with number: {} found", keys.base_frame),
+                });
+            }
+            self.frames.push((id, *keys, (data.width, data.height)));
+            Ok(n)
+        }
+        fn control_animation(&mut self, id: u32, keys: &AnimationKeys) {
+            self.controls.push((id, *keys));
+        }
+        fn compose_frames(&mut self, id: u32, keys: &CompositionKeys) -> Result<(), FrameError> {
+            self.composes.push((id, *keys));
+            if keys.src_frame == 0 {
+                return Err(FrameError {
+                    code: ErrorCode::Enoent,
+                    detail: format!("No source frame number 0 exists in image id: {id}\n"),
+                });
+            }
+            Ok(())
         }
     }
 
@@ -1703,11 +1951,12 @@ mod tests {
         );
     }
 
-    /// WIRE-3: until animation is implemented, `a=f`/`a=a`/`a=c` on a
-    /// stored image are silent no-ops, so `kitten icat anim.gif` gets no
-    /// ENOTSUP replies injected into the shell. The image is untouched.
+    /// §9: `a=f` / `a=a` / `a=c` on a stored image reach the sink with
+    /// their keys under the animation meaning, and get kitty's replies:
+    /// `a=f` tagged `r=<frame>`, `a=a` never, `a=c` OK or its error. A
+    /// bare `a=f,m=1` names no image and is dropped.
     #[test]
-    fn animation_on_stored_image_is_silent() {
+    fn animation_commands_reach_the_sink() {
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
         h.process(
@@ -1717,20 +1966,86 @@ mod tests {
         )
         .unwrap();
         for header in [
-            &b"Ga=f,i=9,f=32,s=1,v=1"[..],
-            b"Ga=a,i=9,s=3,v=1",
-            b"Ga=a,i=9,c=1",
-            b"Ga=c,i=9,r=1,c=1",
-            b"Ga=c,i=9,C=2",
+            &b"Ga=f,i=9,f=32,s=1,v=1,x=3,y=4,c=1,z=-7,X=1,Y=255"[..],
+            b"Ga=f,i=9,f=32,s=1,v=1,c=5",
+            b"Ga=f,i=9,f=32,s=1,v=1,q=1",
+            b"Ga=a,i=9,s=3,v=2,r=1,z=150,c=2",
+            b"Ga=c,i=9,r=1,c=2,x=1,y=2,w=3,h=4,X=5,Y=6,C=1",
+            b"Ga=c,i=9",
             b"Ga=f,m=1",
         ] {
             h.process(header, b64_red_pixel().as_bytes(), &mut sink)
                 .unwrap();
         }
-        assert!(sink.replies.is_empty(), "{:?}", sink.replies);
+        assert_eq!(
+            joined(&sink),
+            "\x1b_Gi=9,r=2;OK\x1b\\\
+             \x1b_Gi=9,r=3;EINVAL:No frame with number: 5 found\x1b\\\
+             \x1b_Gi=9;OK\x1b\\\
+             \x1b_Gi=9;ENOENT:No source frame number 0 exists in image id: 9\n\x1b\\"
+        );
+        let (id, keys, size) = sink.frames[0];
+        assert_eq!((id, size), (9, (1, 1)));
+        assert_eq!(
+            (
+                keys.x,
+                keys.y,
+                keys.base_frame,
+                keys.gap_ms,
+                keys.blend_mode,
+                keys.background
+            ),
+            (3, 4, 1, -7, 1, 255)
+        );
+        assert_eq!(sink.frames.len(), 2, "q=1 frame stored, its OK suppressed");
+        let (_, a) = sink.controls[0];
+        assert_eq!(
+            (a.state, a.loops, a.frame, a.gap_ms, a.current_frame),
+            (3, 2, 1, 150, 2)
+        );
+        let (_, c) = sink.composes[0];
+        assert_eq!(
+            (
+                c.src_frame,
+                c.dest_frame,
+                c.dest_x,
+                c.dest_y,
+                c.width,
+                c.height,
+                c.src_x,
+                c.src_y,
+                c.blend_mode
+            ),
+            (1, 2, 1, 2, 3, 4, 5, 6, 1)
+        );
         assert_eq!(sink.registered.len(), 1);
         assert!(sink.placements.is_empty());
         assert_eq!(h.pending_uploads(), 0);
+    }
+
+    /// `a=f` decode errors carry `r=` too, and come before frame checks.
+    #[test]
+    fn frame_decode_errors_are_tagged_with_the_frame() {
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        h.process(
+            b"Ga=t,f=32,s=1,v=1,i=9,q=2",
+            b64_red_pixel().as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
+        h.process(b"Ga=f,i=9,f=32,s=4,v=2,c=5", b"AAAA", &mut sink)
+            .unwrap();
+        h.process(b"Ga=f,i=9,f=32", b"AAAA", &mut sink).unwrap();
+        h.process(b"Ga=f,i=9,f=32,s=1,v=1,o=z", b"AAAA", &mut sink)
+            .unwrap();
+        assert_eq!(
+            joined(&sink),
+            "\x1b_Gi=9,r=2;ENODATA:Insufficient image data: 3 < 32\x1b\\\
+             \x1b_Gi=9,r=2;EINVAL:Zero width/height not allowed\x1b\\\
+             \x1b_Gi=9,r=2;EINVAL:Failed to inflate image data with error: Z_DATA_ERROR\x1b\\"
+        );
+        assert!(sink.frames.is_empty());
     }
 
     #[test]

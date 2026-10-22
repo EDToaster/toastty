@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod frames;
 pub mod image_grid;
 pub mod kitty;
 pub mod registry;
@@ -10,6 +11,7 @@ pub mod rgp;
 pub mod sixel;
 pub mod store;
 
+pub use frames::{Animation, AnimationState, FrameError};
 pub use image_grid::{ImageGrid, Placement, PlacementHandle, SrcRect};
 pub use kitty::{
     handler::{HandlerError, KittyHandler, KittySink},
@@ -20,7 +22,10 @@ pub use kitty::{
     },
     reply::{ErrorCode, encode_error, encode_ok},
 };
-pub use registry::{ImageData, ImageKey, ImageRegistry, InsertError, Inserted, RegistryKey};
+pub use registry::{
+    FrameChange, FrameDelete, ImageData, ImageKey, ImageRegistry, InsertError, Inserted,
+    RegistryKey,
+};
 pub use rgp::{
     asset::{CpuAsset, CpuMaterial, CpuMesh},
     glb_loader::{GlbLoadError, load_glb},
