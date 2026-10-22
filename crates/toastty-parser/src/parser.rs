@@ -216,6 +216,10 @@ struct Scanner {
     /// still is when the input ends, the state becomes
     /// [`ApcState::Seq`] so the next input is checked.
     open_seq: Option<bool>,
+    /// Inside a CSI (after `ESC [`) whose final byte hasn't arrived:
+    /// whether a parameter digit was seen so far. Reported through
+    /// [`Perform::csi_params_explicit`] right before vte dispatches it.
+    csi_digits: Option<bool>,
 }
 
 impl Scanner {
@@ -226,6 +230,7 @@ impl Scanner {
             max_osc_len,
             utf8: Utf8Sanitizer::default(),
             open_seq: None,
+            csi_digits: None,
         }
     }
 
@@ -246,6 +251,7 @@ impl Scanner {
         clean: (usize, usize),
         cut_by_esc: bool,
     ) {
+        self.note_csi_params(perform, text);
         // Hot path, the same work as with no sanitizer at all: a run
         // inside the clean span (all of an ASCII or valid chunk).
         if clean.0 <= at && at + text.len() <= clean.1 && !self.utf8.holds_partial() {
@@ -298,6 +304,32 @@ impl Scanner {
         }
     }
 
+    /// Track the parameter bytes of a CSI in ground text `chunk` (before
+    /// vte sees it) and, when its final byte is in `chunk`, tell the
+    /// handler whether any digit was present.
+    fn note_csi_params<P: Perform + ?Sized>(&mut self, perform: &mut P, chunk: &[u8]) {
+        let Some(mut digits) = self.csi_digits else {
+            return;
+        };
+        for &b in chunk {
+            match b {
+                b'0'..=b'9' => digits = true,
+                0x40..=0x7E => {
+                    self.csi_digits = None;
+                    perform.csi_params_explicit(digits);
+                    return;
+                }
+                // CAN / SUB abort the CSI.
+                0x18 | 0x1A => {
+                    self.csi_digits = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.csi_digits = Some(digits);
+    }
+
     /// Feed bytes through the scanner. With `detect_tmux`, stops right
     /// after an `ESC P tmux ;` introducer and returns the unconsumed
     /// rest (vte is left in ground state, as after a cancelled
@@ -344,6 +376,8 @@ impl Scanner {
                     ApcState::AfterEsc => {
                         let byte = bytes[0];
                         bytes = &bytes[1..];
+                        // Any ESC ends a CSI in progress; `ESC [` starts one.
+                        self.csi_digits = (byte == b'[').then_some(false);
                         let csi = match after_esc::TABLE[usize::from(byte)] {
                             after_esc::APC => {
                                 perform.apc_start();
@@ -566,6 +600,7 @@ impl Scanner {
         loop {
             let Some(pos) = seq_end(bytes, csi) else {
                 if !bytes.is_empty() {
+                    self.note_csi_params(perform, bytes);
                     vte_advance(&mut self.vte, perform, bytes);
                 }
                 self.apc = ApcState::Seq { csi };
@@ -574,12 +609,14 @@ impl Scanner {
             let b = bytes[pos];
             if b == 0x7F {
                 // DEL: vte ignores it inside a sequence. Pass it, go on.
+                self.note_csi_params(perform, &bytes[..=pos]);
                 vte_advance(&mut self.vte, perform, &bytes[..=pos]);
                 bytes = &bytes[pos + 1..];
                 continue;
             }
             if b == 0x1B {
                 if pos > 0 {
+                    self.note_csi_params(perform, &bytes[..pos]);
                     vte_advance(&mut self.vte, perform, &bytes[..pos]);
                 }
                 self.apc = ApcState::AfterEsc;
@@ -587,6 +624,7 @@ impl Scanner {
             }
             if b >= 0x80 {
                 if pos > 0 {
+                    self.note_csi_params(perform, &bytes[..pos]);
                     vte_advance(&mut self.vte, perform, &bytes[..pos]);
                 }
                 self.abort_sequence(perform, false);
@@ -601,6 +639,7 @@ impl Scanner {
             let next_esc = memchr::memchr(0x1B, rest);
             let run = next_esc.unwrap_or(rest.len());
             if clean.0 <= at && at + run <= clean.1 && !self.utf8.holds_partial() {
+                self.note_csi_params(perform, &bytes[..=pos + run]);
                 vte_advance(&mut self.vte, perform, &bytes[..=pos + run]);
                 let Some(e) = next_esc else {
                     self.apc = ApcState::Ground;
@@ -609,6 +648,7 @@ impl Scanner {
                 self.apc = ApcState::AfterEsc;
                 return Step::Rest(&rest[e + 1..]);
             }
+            self.note_csi_params(perform, &bytes[..=pos]);
             vte_advance(&mut self.vte, perform, &bytes[..=pos]);
             self.apc = ApcState::Ground;
             return Step::Rest(rest);
@@ -621,6 +661,7 @@ impl Scanner {
     /// progress as usual. CAN then returns vte to ground; the null
     /// performer swallows CAN's own execute.
     fn abort_sequence<P: Perform + ?Sized>(&mut self, perform: &mut P, with_esc: bool) {
+        self.csi_digits = None;
         if with_esc {
             vte_advance(&mut self.vte, perform, &[0x1B]);
         }
@@ -1222,6 +1263,40 @@ mod tests {
         // Two back-to-back OSCs each under the cap but together over it.
         let r = parse_capped(7, &[b"\x1b]2;abcde\x07\x1b]2;fghij\x07"]);
         assert_eq!(r.osc.len(), 2);
+    }
+
+    #[test]
+    fn csi_params_explicit_tells_absent_from_zero() {
+        #[derive(Default)]
+        struct Rec(Vec<(bool, char)>, Option<bool>);
+        impl Perform for Rec {
+            fn csi_params_explicit(&mut self, any_digit: bool) {
+                self.1 = Some(any_digit);
+            }
+            fn csi_dispatch(&mut self, _: &Params, _: &[u8], _: bool, action: char) {
+                self.0
+                    .push((self.1.take().expect("hook before dispatch"), action));
+            }
+        }
+        let mut r = Rec::default();
+        Parser::new().advance(&mut r, b"\x1b[<u\x1b[<0u\x1b[u\x1b[5;0ux\x1b[?1h");
+        assert_eq!(
+            r.0,
+            vec![
+                (false, 'u'),
+                (true, 'u'),
+                (false, 'u'),
+                (true, 'u'),
+                (true, 'h')
+            ]
+        );
+        // Split inside the CSI.
+        let mut r = Rec::default();
+        let mut p = Parser::new();
+        p.advance(&mut r, b"\x1b[<");
+        p.advance(&mut r, b"0");
+        p.advance(&mut r, b"u");
+        assert_eq!(r.0, vec![(true, 'u')]);
     }
 
     #[test]

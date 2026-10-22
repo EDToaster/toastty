@@ -40,6 +40,13 @@ pub trait Perform {
     /// have", which is a no-op when there is none.
     fn dcs_cancel(&mut self) {}
 
+    /// Called just before a CSI is dispatched: whether its parameter
+    /// bytes held any digit. vte reports `CSI < u` and `CSI < 0 u` with
+    /// the same params (`[0]`); this tells them apart for handlers where
+    /// an explicit 0 differs from the default (kitty's `CSI < 0 u` pops
+    /// nothing, `CSI < u` pops one).
+    fn csi_params_explicit(&mut self, _any_digit: bool) {}
+
     /// Beginning of an APC payload (`ESC _`). The header parameters
     /// (e.g. kitty graphics `a=T,f=24,s=...`) appear in subsequent
     /// [`Self::apc_chunk`] calls — the parser does not split header
@@ -123,6 +130,9 @@ impl<H: BufferedApc> Perform for BufferingApcHandler<H> {
     }
     fn dcs_cancel(&mut self) {
         self.inner.dcs_cancel();
+    }
+    fn csi_params_explicit(&mut self, any_digit: bool) {
+        self.inner.csi_params_explicit(any_digit);
     }
 
     fn apc_start(&mut self) {
