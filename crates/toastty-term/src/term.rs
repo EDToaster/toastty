@@ -286,6 +286,15 @@ pub struct Term {
     /// renderer keeps a cached linear-light palette and compares
     /// revisions to decide when to rebuild.
     palette_revision: u32,
+    /// Bump-counter incremented on every BEL (0x07) the program prints.
+    /// The renderer compares revisions to spot new bells (user shaders
+    /// animate on them). An OSC terminated by BEL never reaches
+    /// `execute`, so it doesn't count.
+    bell_revision: u32,
+    /// Cursor cell `(row, col)` in screen coordinates when the last BEL
+    /// arrived. Captured here because the cursor has usually moved on by
+    /// the time the next frame is drawn.
+    last_bell_cell: (u16, u16),
     /// Intern table for OSC 8 hyperlink URLs. The cell stores a
     /// `NonZeroU16` index into this `Vec`; closing the hyperlink
     /// (`OSC 8 ; ; ST`) clears `current_hyperlink` without touching
@@ -592,6 +601,8 @@ impl Term {
             pty_replies: Vec::new(),
             palette_overrides: Box::new([None; 256]),
             palette_revision: 0,
+            bell_revision: 0,
+            last_bell_cell: (0, 0),
             hyperlinks: Vec::new(),
             current_hyperlink: None,
             extras: ExtraTable::default(),
@@ -964,6 +975,19 @@ impl Term {
     #[must_use]
     pub fn palette_revision(&self) -> u32 {
         self.palette_revision
+    }
+
+    /// Bump-counter incremented on every BEL. See [`Self::last_bell_cell`].
+    #[must_use]
+    pub fn bell_revision(&self) -> u32 {
+        self.bell_revision
+    }
+
+    /// Cursor cell `(row, col)` in screen coordinates at the most recent
+    /// BEL. `(0, 0)` before the first one; check [`Self::bell_revision`].
+    #[must_use]
+    pub fn last_bell_cell(&self) -> (u16, u16) {
+        self.last_bell_cell
     }
 
     /// Set palette override for `idx` and bump the revision. Marks every
@@ -4400,7 +4424,14 @@ impl Perform for Term {
             // HT: advance to the next tab stop (HTS / TBC editable),
             // clamped at the right margin. Same damage-gap fix as BS.
             b'\t' => self.tab_forward(1),
-            // BEL and everything else are no-ops for M3.
+            // BEL: record where it rang. Nothing on screen changes, so no
+            // damage; the renderer watches `bell_revision`.
+            0x07 => {
+                let col = self.cursor.col.min(self.cols.saturating_sub(1));
+                self.last_bell_cell = (self.cursor.row, col);
+                self.bell_revision = self.bell_revision.wrapping_add(1);
+            }
+            // Everything else is a no-op.
             _ => {}
         }
     }
@@ -9332,6 +9363,25 @@ mod tests {
         feed(&mut t, b"\x1b[2;5H");
         feed(&mut t, b"\x1b[?6n");
         assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?2;5R");
+    }
+
+    #[test]
+    fn bel_records_cursor_cell_and_bumps_revision() {
+        let mut t = Term::new(5, 10, 0);
+        assert_eq!(t.bell_revision(), 0);
+        feed(&mut t, b"\x1b[3;7H\x07ab");
+        assert_eq!(t.bell_revision(), 1);
+        assert_eq!(t.last_bell_cell(), (2, 6));
+        feed(&mut t, b"\x07");
+        assert_eq!(t.bell_revision(), 2);
+        assert_eq!(t.last_bell_cell(), (2, 8));
+    }
+
+    #[test]
+    fn bel_terminated_osc_is_not_a_bell() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b]0;title\x07");
+        assert_eq!(t.bell_revision(), 0);
     }
 
     #[test]
