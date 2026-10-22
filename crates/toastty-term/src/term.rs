@@ -1078,6 +1078,8 @@ impl Term {
     ///
     /// - Continuation cells (trailing half of a wide cluster) contribute
     ///   nothing — the primary already carries the cluster.
+    /// - A wide-char wrap pad ([`Cell::wrap_pad`]) copies as nothing: it
+    ///   isn't text, so wrapped CJK copies without a stray space.
     /// - NUL (the `Cell::default()` filler) copies as a space.
     /// - A grapheme cell copies as `ch` followed by its stored tail, so
     ///   decomposed accents, ZWJ emoji and variation selectors survive.
@@ -1090,7 +1092,7 @@ impl Term {
         let Some(cell) = cells.get(col) else {
             return end;
         };
-        if cell.is_continuation {
+        if cell.is_continuation || cell.wrap_pad {
             return col + 1;
         }
         match self.cell_extra(cell) {
@@ -1927,7 +1929,8 @@ impl Term {
     /// - Trailing whitespace is stripped only at *hard* line ends (and
     ///   at the end of the selection). A soft-wrapped row's trailing
     ///   spaces are real content — `abcd efgh` wrapped at 5 columns
-    ///   must copy back with its space.
+    ///   must copy back with its space. The pad a wrapped wide char
+    ///   leaves ([`Cell::wrap_pad`]) isn't, and is skipped.
     /// - Block selections produce one line per row, truncated at the
     ///   selection's column bounds and trimmed per row.
     /// - Rows evicted from scrollback since the selection was made are
@@ -1952,21 +1955,6 @@ impl Term {
             // Soft-wrapped rows in char/word/line mode join without a
             // newline (the wrap is presentational, not logical).
             let join_soft = !block && !is_last_row && row.soft_wrap;
-            // A wide char that didn't fit in the last column wrapped to
-            // the next row, leaving a blank pad cell behind; that pad is
-            // not part of the text.
-            let pad_col = if join_soft
-                && self
-                    .row_by_line_id(line_id + 1)
-                    .is_some_and(|next| next.cells.get(1).is_some_and(|c| c.is_continuation))
-            {
-                row.cells
-                    .len()
-                    .checked_sub(1)
-                    .filter(|&i| matches!(row.cells[i].ch, ' ' | '\0'))
-            } else {
-                None
-            };
             // Selected cells in a row are one contiguous run (every mode,
             // incl. the wide-char partner rule). Collect its text: full
             // graphemes, intact tab runs as `\t` (see `append_cell_text`).
@@ -1982,10 +1970,6 @@ impl Term {
             ) {
                 let mut col = lo;
                 while col <= hi {
-                    if Some(col) == pad_col {
-                        col += 1;
-                        continue;
-                    }
                     col = self.append_cell_text(&row.cells, col, hi + 1, &mut line_buf);
                 }
             }
@@ -2322,6 +2306,7 @@ impl Term {
             ch: ' ',
             style,
             is_continuation: false,
+            wrap_pad: false,
             hyperlink_id: None,
             extra: None,
         };
@@ -2391,6 +2376,7 @@ impl Term {
             ch: ' ',
             style,
             is_continuation: false,
+            wrap_pad: false,
             hyperlink_id: None,
             extra: None,
         };
@@ -2512,7 +2498,18 @@ impl Term {
                 0
             };
             if right_edge == self.cols && wrap_col == 0 {
-                self.active_grid_mut().row_mut(leaving).soft_wrap = true;
+                let bumped_wide = !pending && cell_w == 2 && self.cursor.col + 1 == right_edge;
+                let row = self.active_grid_mut().row_mut(leaving);
+                row.soft_wrap = true;
+                // A wide char that didn't fit in the last column leaves
+                // that column unwritten. Mark it as a pad so reflow and
+                // copy can tell it from a real space printed there.
+                if bumped_wide
+                    && let Some(cell) = row.cells.get_mut(usize::from(right_edge) - 1)
+                    && *cell == Cell::BLANK
+                {
+                    *cell = Cell::WRAP_PAD;
+                }
             }
             let last_col = right_edge.saturating_sub(1);
             self.mark_cell(leaving, last_col);
@@ -2533,6 +2530,7 @@ impl Term {
             ch: c,
             style: self.cursor.style,
             is_continuation: false,
+            wrap_pad: false,
             hyperlink_id: self.current_hyperlink,
             extra: if c == crate::PLACEHOLDER {
                 self.placeholder_cell_extra()
@@ -2557,6 +2555,7 @@ impl Term {
                 ch: '\0',
                 style: self.cursor.style,
                 is_continuation: true,
+                wrap_pad: false,
                 hyperlink_id: self.current_hyperlink,
                 extra: None,
             };
@@ -2756,6 +2755,7 @@ impl Term {
                 ch: '\0',
                 style: prev.style,
                 is_continuation: true,
+                wrap_pad: false,
                 hyperlink_id: prev.hyperlink_id,
                 extra: None,
             };
@@ -2788,6 +2788,7 @@ impl Term {
             ch: ' ',
             style: self.cursor.style,
             is_continuation: false,
+            wrap_pad: false,
             hyperlink_id: None,
             extra: None,
         };
@@ -3442,6 +3443,7 @@ impl Term {
             ch: ' ',
             style,
             is_continuation: false,
+            wrap_pad: false,
             hyperlink_id: None,
             extra: None,
         };
@@ -3485,6 +3487,7 @@ impl Term {
             ch: ' ',
             style,
             is_continuation: false,
+            wrap_pad: false,
             hyperlink_id: None,
             extra: None,
         };
@@ -3564,6 +3567,7 @@ impl Term {
             ch: ' ',
             style,
             is_continuation: false,
+            wrap_pad: false,
             hyperlink_id: None,
             extra: None,
         };
@@ -3632,6 +3636,7 @@ impl Term {
             ch: ' ',
             style,
             is_continuation: false,
+            wrap_pad: false,
             hyperlink_id: None,
             extra: None,
         };
@@ -7005,6 +7010,69 @@ mod tests {
         // Widen back to 12: the soft-wrap chain rejoins — no lost glyphs.
         t.resize(3, 12);
         assert_eq!(row_text(&t, 0), "hello world");
+    }
+
+    /// [`row_text`] without the continuation halves of wide chars.
+    fn row_glyphs(t: &Term, r: u16) -> String {
+        let s: String = t
+            .row(r)
+            .cells
+            .iter()
+            .filter(|c| !c.is_continuation)
+            .map(|c| c.ch)
+            .collect();
+        s.trim_end().to_owned()
+    }
+
+    #[test]
+    fn reflow_keeps_a_printed_space_in_the_last_column() {
+        // The space lands in column 19 of 20, so the row soft-wraps right
+        // after it. Widening used to drop it and join the words.
+        let mut t = Term::new(3, 20, 100);
+        feed(&mut t, b"aaaaaaaaaaaaaaaaaaa bbbb");
+        assert_eq!(row_text(&t, 0), "aaaaaaaaaaaaaaaaaaa");
+        assert!(t.row(0).soft_wrap);
+        t.resize(3, 60);
+        assert_eq!(row_text(&t, 0), "aaaaaaaaaaaaaaaaaaa bbbb");
+        // And through a narrower width and back.
+        t.resize(3, 7);
+        t.resize(3, 60);
+        assert_eq!(row_text(&t, 0), "aaaaaaaaaaaaaaaaaaa bbbb");
+    }
+
+    #[test]
+    fn printing_a_wide_char_into_the_last_column_leaves_a_wrap_pad() {
+        // "abc" then a wide char at 4 cols: it doesn't fit in column 3,
+        // so it wraps and column 3 holds the pad.
+        let t = run(3, 4, "abc世".as_bytes());
+        assert_eq!(t.row(0).cells[3], Cell::WRAP_PAD);
+        assert!(t.row(0).soft_wrap);
+        assert_eq!(row_glyphs(&t, 1), "世");
+        // A space printed into the last column is a real blank.
+        let t = run(3, 4, b"abc d");
+        assert_eq!(t.row(0).cells[3], Cell::BLANK);
+        // So is a wide char after a pending wrap: column 3 was printed.
+        let t = run(3, 4, "abcd世".as_bytes());
+        assert_eq!(t.row(0).cells[3].ch, 'd');
+    }
+
+    #[test]
+    fn reflow_drops_the_wide_char_pad_but_not_real_spaces() {
+        // At 6 cols "ab 世世" puts a real space in column 2, then the
+        // second 世 doesn't fit and leaves a pad in column 5.
+        let mut t = Term::new(3, 6, 100);
+        feed(&mut t, "ab 世世x".as_bytes());
+        assert_eq!(t.row(0).cells[5], Cell::WRAP_PAD);
+        t.resize(3, 20);
+        assert_eq!(row_glyphs(&t, 0), "ab 世世x");
+        // Odd widths bump a wide char at every row end; drag-resizing
+        // through them must not turn the pads into spaces.
+        let mut t = Term::new(3, 5, 100);
+        feed(&mut t, "a世界世界世界世界".as_bytes());
+        for cols in [5, 4, 7, 3, 6, 5, 40] {
+            t.resize(3, cols);
+        }
+        assert_eq!(row_glyphs(&t, 0), "a世界世界世界世界");
     }
 
     #[test]

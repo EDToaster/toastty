@@ -398,3 +398,27 @@ fn block_selection_respects_tab_runs() {
     t.set_selection(sel);
     assert_eq!(t.extract_selection_text().as_deref(), Some("a\tb\nc\td"));
 }
+
+#[test]
+fn copy_skips_the_pad_a_wrapped_wide_char_leaves() {
+    // At 6 cols "ab 世" fills columns 0-4 and the second 世 doesn't fit
+    // in column 5, so it wraps and leaves a pad there. Copying across the
+    // wrap gives the text as printed: the real space stays, the pad goes.
+    let mut t = run(4, 6, "ab 世世x");
+    assert_eq!(copy(&mut t, 0, 0, 1, 2), "ab 世世x");
+}
+
+#[test]
+fn copy_keeps_a_real_space_at_the_wrap_point() {
+    let mut t = run(4, 4, "abc def");
+    assert_eq!(copy(&mut t, 0, 0, 1, 2), "abc def");
+}
+
+#[test]
+fn copy_keeps_a_real_space_before_a_wrapped_wide_char() {
+    // "abc " fills the row exactly and 世 wraps after it as usual. The
+    // space was printed, so it isn't a pad even though the next row starts
+    // with a wide char.
+    let mut t = run(4, 4, "abc 世");
+    assert_eq!(copy(&mut t, 0, 0, 1, 1), "abc 世");
+}
