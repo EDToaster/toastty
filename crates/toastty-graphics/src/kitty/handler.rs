@@ -1084,8 +1084,9 @@ fn default_placement_from_header(
     // source rect's native pixels with no `c=`/`r=` (SIZE-1, SIZE-4), the
     // given side plus the source aspect ratio with only one (SIZE-2), the
     // box with both (SIZE-3: kitty stretches). The cell box reserved for
-    // it is `c=`/`r=` when given, else `ceil((drawn + offset) / cell)`,
-    // which is what kitty reserves (and moves the cursor by).
+    // it (and moved over by the cursor) is kitty's, see
+    // `Placement::reserved_cells`: offsets only widen a natural-size box,
+    // and a single given side derives the other from its own span.
     let cols_req = u16::try_from(header.cols).unwrap_or(u16::MAX);
     let rows_req = u16::try_from(header.rows).unwrap_or(u16::MAX);
     let mut p = Placement::new(id, rows_req.max(1), cols_req.max(1));
@@ -1109,24 +1110,7 @@ fn default_placement_from_header(
         let r = src.resolve(img_w, img_h);
         (r.w, r.h)
     };
-    #[allow(clippy::cast_precision_loss)]
-    let ((ox, oy), (w, h)) = p.draw_rect(shown, (cw as f32, ch as f32));
-    let span = |px: f32, off: f32, cell: u32| -> u16 {
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        let n = ((px + off) / cell as f32).ceil() as u32;
-        u16::try_from(n.max(1)).unwrap_or(u16::MAX)
-    };
-    if cols_req == 0 {
-        p.cols = span(w, ox, cw);
-    }
-    if rows_req == 0 {
-        p.rows = span(h, oy, ch);
-    }
-    p.clip_rows = 0..p.rows;
+    p.reserve(shown, (cw, ch));
     p
 }
 
@@ -2624,6 +2608,24 @@ mod major_place_handler_tests {
         assert_eq!(fit(&xyb, 200, 100).1, (49.0, 53.0));
         let x3 = hdr(|h| (h.cell_x, h.cols) = (3, 7));
         assert_eq!(fit(&x3, 333, 100).1, (60.0, 18.0));
+    }
+
+    /// Review of #39 (kitty-ref, 9x20): `X=`/`Y=` widen the reservation
+    /// only for a natural-size image. With one side given, the derived
+    /// side comes from the given span plus its own offset.
+    #[test]
+    fn single_axis_fit_reserves_like_kitty() {
+        let c10y = hdr(|h| (h.cols, h.cell_y) = (10, 19));
+        assert_eq!(fit(&c10y, 400, 200).0, (10, 3), "kitty 8;31, not 4 rows");
+        let r3x = hdr(|h| (h.rows, h.cell_x) = (3, 9));
+        assert_eq!(fit(&r3x, 400, 200).0, (14, 3), "kitty 8;35, not 15 cols");
+        let r3y = hdr(|h| (h.rows, h.cell_y) = (3, 19));
+        assert_eq!(fit(&r3y, 400, 200).0, (18, 3), "kitty 8;39");
+        let c4x = hdr(|h| (h.cols, h.cell_x) = (4, 8));
+        assert_eq!(fit(&c4x, 400, 200).0, (4, 2), "kitty 7;25");
+        // Natural size: both offsets count (unchanged).
+        let nat = hdr(|h| (h.cell_x, h.cell_y) = (8, 19));
+        assert_eq!(fit(&nat, 200, 100).0, (24, 6));
     }
 
     #[test]

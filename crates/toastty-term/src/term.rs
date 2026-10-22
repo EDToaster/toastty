@@ -836,12 +836,29 @@ impl Term {
     /// Plumb the renderer's cell pixel size into Term so the
     /// `CSI 16 t` (XTWINOPS) handler can report it back to apps.
     /// Called by the binary at startup and on resize.
+    ///
+    /// On a change (font zoom) the reserved cell boxes of image
+    /// placements are recomputed, as kitty does; the drawn sizes follow
+    /// the cell size at render time already.
     pub fn set_cell_pixel_size(&mut self, width: u16, height: u16) {
         let new = (width.max(1), height.max(1));
-        if new != self.cell_pixel_size {
-            self.rich_dirty = true;
+        if new == self.cell_pixel_size {
+            return;
         }
+        self.rich_dirty = true;
         self.cell_pixel_size = new;
+        let cell = (u32::from(new.0), u32::from(new.1));
+        let registry = &self.image_registry;
+        let src_of = |p: &Placement| {
+            registry.get(p.image_id).map(|d| {
+                let r = p.src_rect.resolve(d.width, d.height);
+                (r.w, r.h)
+            })
+        };
+        self.image_grid.reserve_all(src_of, cell);
+        if let Some(stashed) = self.stashed_image_grid.as_mut() {
+            stashed.reserve_all(src_of, cell);
+        }
     }
 
     /// Plumb the full window size in pixels (the surface, padding
@@ -1912,9 +1929,10 @@ impl Term {
                 sel.contains(line_id, col) || wide_partner_selected(sel, row, line_id, col)
             };
             let len = row.cells.len();
-            if let (Some(lo), Some(hi)) =
-                ((0..len).find(|&i| selected(i)), (0..len).rev().find(|&i| selected(i)))
-            {
+            if let (Some(lo), Some(hi)) = (
+                (0..len).find(|&i| selected(i)),
+                (0..len).rev().find(|&i| selected(i)),
+            ) {
                 let mut col = lo;
                 while col <= hi {
                     if Some(col) == pad_col {
@@ -11970,5 +11988,69 @@ mod placement_size_tests {
         let p = only(&t);
         assert_eq!((p.fit_cols, p.fit_rows), (0, 0));
         assert_eq!((p.cols, p.rows), (1, 1));
+    }
+
+    /// Review of #39, at toastty's 10x19 cells: kitty's rule leaves the
+    /// cursor at 8;31 after `c=10,Y=19` and at 8;33 after `r=3,X=9`
+    /// (it was 9;31 and 8;34).
+    #[test]
+    fn single_axis_fit_with_offset_moves_the_cursor_like_kitty() {
+        for (keys, want) in [(",c=10,Y=19", (7, 30)), (",r=3,X=9", (7, 32))] {
+            let mut t = Term::new(24, 80, 0);
+            t.set_cell_pixel_size(10, 19);
+            feed(&mut t, b"\x1b[6;21H");
+            place_px(&mut t, 400, 200, keys);
+            assert_eq!((t.cursor().row, t.cursor().col), want, "{keys}");
+        }
+    }
+
+    /// kitty recomputes the reserved cells on a font-size change
+    /// (kitty-ref: after zooming in, a `d=p` outside the drawn image but
+    /// inside the old reservation misses it; after zooming out, one
+    /// inside the drawn image but outside the old reservation hits it).
+    #[test]
+    fn font_zoom_recomputes_the_reservation() {
+        let natural = |t: &mut Term| {
+            t.set_cell_pixel_size(10, 19);
+            feed(t, b"\x1b[2;1H");
+            place_px(t, 205, 105, ",C=1");
+            assert_eq!((only(t).cols, only(t).rows), (21, 6));
+        };
+        // Zoom in: 205 px over 12 px cells is 18 columns.
+        let mut t = Term::new(24, 80, 0);
+        natural(&mut t);
+        t.set_cell_pixel_size(12, 28);
+        assert_eq!((only(&t).cols, only(&t).rows), (18, 4));
+        feed(&mut t, b"\x1b_Ga=d,d=p,x=20,y=2,q=2\x1b\\");
+        assert_eq!(t.image_grid().len(), 1, "col 20 is outside the image now");
+        feed(&mut t, b"\x1b_Ga=d,d=p,x=17,y=2,q=2\x1b\\");
+        assert!(t.image_grid().is_empty());
+        // Zoom out: 6 px cells make it 35 columns.
+        let mut t = Term::new(24, 80, 0);
+        natural(&mut t);
+        t.set_cell_pixel_size(6, 13);
+        assert_eq!((only(&t).cols, only(&t).rows), (35, 9));
+        feed(&mut t, b"\x1b_Ga=d,d=p,x=26,y=2,q=2\x1b\\");
+        assert!(t.image_grid().is_empty(), "col 26 is inside the image now");
+        // c=/r= keep their given side; the derived one follows the zoom.
+        let mut t = Term::new(24, 80, 0);
+        t.set_cell_pixel_size(10, 19);
+        place_px(&mut t, 400, 200, ",c=10,C=1");
+        assert_eq!((only(&t).cols, only(&t).rows), (10, 3));
+        t.set_cell_pixel_size(10, 10);
+        assert_eq!((only(&t).cols, only(&t).rows), (10, 5));
+    }
+
+    /// The stashed primary placements are re-reserved too, so a zoom on
+    /// the alt screen doesn't leave them stale.
+    #[test]
+    fn font_zoom_on_the_alt_screen_re_reserves_the_primary_images() {
+        let mut t = Term::new(24, 80, 0);
+        t.set_cell_pixel_size(10, 19);
+        place_px(&mut t, 205, 105, ",C=1");
+        feed(&mut t, b"\x1b[?1049h");
+        t.set_cell_pixel_size(12, 28);
+        feed(&mut t, b"\x1b[?1049l");
+        assert_eq!((only(&t).cols, only(&t).rows), (18, 4));
     }
 }
