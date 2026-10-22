@@ -54,7 +54,10 @@ impl Row {
     /// build rows this way).
     #[must_use]
     pub fn from_cells(cells: Vec<Cell>, soft_wrap: bool) -> Self {
-        let used = cells.iter().rposition(|c| *c != Cell::BLANK).map_or(0, |i| i + 1);
+        let used = cells
+            .iter()
+            .rposition(|c| *c != Cell::BLANK)
+            .map_or(0, |i| i + 1);
         Self {
             used: u16::try_from(used).unwrap_or(u16::MAX),
             cells,
@@ -175,6 +178,12 @@ impl Row {
         };
     }
 
+    /// Release the cell storage, leaving an empty row (an unused ring
+    /// slot, see [`Grid`]).
+    pub(crate) fn release(&mut self) {
+        *self = Self::default();
+    }
+
     /// True when every cell is [`Cell::BLANK`] — the written prefix is
     /// checked, the rest is blank by construction.
     #[must_use]
@@ -201,6 +210,12 @@ pub type RelayoutFn<'a> = dyn FnMut(RichBlockId, &[Row]) -> Option<Vec<Row>> + '
 /// screen), `clear_history` and `resize` (which rebuild the ring) are the
 /// only places that touch off-screen slots, and they uphold this
 /// invariant. `scroll_down` only permutes the visible slots.
+///
+/// A blank off-screen slot may also be *empty* (no cells, no
+/// allocation): the ring starts that way and fills on demand as output
+/// scrolls into history, so an idle terminal doesn't pay for 10k rows of
+/// blank cells (~26 MB at 128 columns). Visible rows always hold `cols`
+/// cells; every path that brings a slot on screen sizes it.
 #[derive(Debug)]
 pub struct Grid {
     rows: Box<[Row]>,
@@ -311,10 +326,11 @@ impl Grid {
         debug_assert!(cap >= visible_rows as usize, "cap < visible_rows");
         debug_assert!(visible_rows > 0 && cols > 0, "zero-sized grid");
         let cap = cap.max(visible_rows as usize).max(1);
+        // Only the visible rows get cells; the scrollback slots stay
+        // empty until something scrolls into them.
         let mut v: Vec<Row> = Vec::with_capacity(cap);
-        for _ in 0..cap {
-            v.push(Row::blank(cols));
-        }
+        v.resize_with(visible_rows as usize, || Row::blank(cols));
+        v.resize_with(cap, Row::default);
         Self {
             rows: v.into_boxed_slice(),
             head: 0,
@@ -391,8 +407,21 @@ impl Grid {
         }
     }
 
+    /// Ring slot of logical row `idx`. `head < cap` and callers nearly
+    /// always pass a visible row, so a conditional subtract replaces the
+    /// `%` (a 64-bit divide on every cell write and row read); far
+    /// out-of-range indices still wrap as before.
+    #[inline]
     fn slot(&self, idx: u16) -> usize {
-        (self.head + idx as usize) % self.rows.len()
+        let s = self.head + idx as usize;
+        let cap = self.rows.len();
+        if s < cap {
+            s
+        } else if s - cap < cap {
+            s - cap
+        } else {
+            s % cap
+        }
     }
 
     /// Every ring slot — visible, scrollback and blank — in storage
@@ -403,11 +432,13 @@ impl Grid {
     }
 
     /// Borrow visible row `idx` (0-based, top of viewport = 0).
+    #[inline]
     pub fn row(&self, idx: u16) -> &Row {
         &self.rows[self.slot(idx)]
     }
 
     /// Mutably borrow visible row `idx`.
+    #[inline]
     pub fn row_mut(&mut self, idx: u16) -> &mut Row {
         let s = self.slot(idx);
         &mut self.rows[s]
@@ -452,10 +483,14 @@ impl Grid {
         // becomes scrollback row 0 after the head bump — that's the
         // retention path.
         let cap = self.rows.len();
-        let new_bottom_slot = (self.head + self.visible_rows as usize) % cap;
+        let new_bottom_slot = self.slot(self.visible_rows);
         self.rows[new_bottom_slot].clear();
         self.rows[new_bottom_slot].resize_cols(self.cols);
-        self.head = (self.head + 1) % cap;
+        self.head = if self.head + 1 == cap {
+            0
+        } else {
+            self.head + 1
+        };
         // Grow history, capped at the ring's scrollback budget.
         let max_history = (cap as u32).saturating_sub(u32::from(self.visible_rows));
         if self.history_lines < max_history {
@@ -500,8 +535,8 @@ impl Grid {
         let cap = self.rows.len();
         for n in 0..self.history_lines as usize {
             let slot = (self.head + cap - 1 - n) % cap;
-            self.rows[slot].clear();
-            self.rows[slot].resize_cols(self.cols);
+            // Hand the memory back: the slot refills on demand.
+            self.rows[slot].release();
         }
         self.history_lines = 0;
     }
@@ -540,8 +575,12 @@ impl Grid {
         let cap = cap.max(visible_rows as usize).max(1);
         let old_visible_rows = self.visible_rows;
         if cap == self.rows.len() {
+            // Empty (never-used) slots stay empty; the visible rows are
+            // sized below, since a taller screen can take in some.
             for r in &mut self.rows {
-                r.resize_cols(cols);
+                if !r.is_empty() {
+                    r.resize_cols(cols);
+                }
             }
         } else {
             let mut v: Vec<Row> = Vec::with_capacity(cap);
@@ -552,9 +591,8 @@ impl Grid {
                 r.resize_cols(cols);
                 v.push(r);
             }
-            for _ in preserve..cap {
-                v.push(Row::blank(cols));
-            }
+            v.resize_with(visible_rows as usize, || Row::blank(cols));
+            v.resize_with(cap, Row::default);
             self.rows = v.into_boxed_slice();
             self.head = 0;
             // Cap changed → fresh ring; existing scrollback is dropped.
@@ -562,6 +600,9 @@ impl Grid {
         }
         self.cols = cols;
         self.visible_rows = visible_rows;
+        for i in 0..visible_rows {
+            self.row_mut(i).resize_cols(cols);
+        }
         // Re-clamp history to the new scrollback budget. If the visible
         // region grew within the same cap, some scrollback slots may now
         // overlap the visible region.
@@ -693,7 +734,9 @@ impl Grid {
         let vis = visible_rows as usize;
         let budget = cap.saturating_sub(vis);
         let n = flat.len();
-        let mut ring: Vec<Row> = (0..cap).map(|_| Row::blank(cols)).collect();
+        let mut ring: Vec<Row> = Vec::with_capacity(cap);
+        ring.resize_with(vis, || Row::blank(cols));
+        ring.resize_with(cap, Row::default);
         let mut flat = flat;
 
         let (cursor_row, new_history) = if n <= vis {
@@ -1029,6 +1072,43 @@ mod tests {
         // start >= end is a no-op (no panic).
         r.erase(3, 3, red_style());
         assert_eq!(r.cells()[3].ch, 'd');
+    }
+
+    /// The scrollback part of the ring is allocated on demand: empty
+    /// slots until output scrolls into them, and again after ED 3.
+    /// Whatever brings a slot on screen gives it `cols` cells.
+    #[test]
+    fn grid_allocates_scrollback_slots_lazily() {
+        let mut g = Grid::new(2, 3, 6);
+        let sized = |g: &Grid| g.ring_rows().filter(|r| !r.is_empty()).count();
+        assert_eq!(sized(&g), 2, "only the visible rows have cells");
+        for _ in 0..3 {
+            put_at(&mut g, 0, 'a');
+            g.scroll_up();
+        }
+        assert_eq!(sized(&g), 5);
+        assert_eq!(g.history_lines(), 3);
+        for n in 0..3 {
+            assert_eq!(g.scrollback_row(n).unwrap().len(), 3);
+        }
+        for r in 0..2 {
+            assert_eq!(g.row(r).len(), 3);
+        }
+        g.clear_history();
+        assert_eq!(sized(&g), 2, "ED 3 frees the history rows");
+        // A taller screen in the same ring takes in empty slots: they
+        // come on screen sized and blank.
+        g.resize(5, 4, 6);
+        for r in 0..5 {
+            assert_eq!(g.row(r).len(), 4);
+            assert!(g.row(r).cells()[1..].iter().all(|c| *c == Cell::BLANK));
+        }
+        // So does a ring rebuilt at a new capacity, and a reflow.
+        g.resize(3, 4, 9);
+        assert_eq!(sized(&g), 3);
+        let _ = g.resize_reflow(4, 5, 12, (0, 0));
+        assert_eq!(sized(&g), 4);
+        assert!((0..4).all(|r| g.row(r).len() == 5));
     }
 
     #[test]
