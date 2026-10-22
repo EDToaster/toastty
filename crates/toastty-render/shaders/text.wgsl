@@ -70,6 +70,8 @@ const FLAG_NO_GLYPH: u32     = 4u;
 const FLAG_UNDERLINE: u32    = 8u;
 const FLAG_STRIKE: u32       = 16u;
 const FLAG_OVERLINE: u32     = 32u;
+// UI overlay glyph (close dialog text): skips the cursor recolour.
+const FLAG_OVERLAY: u32      = 64u;
 // Any decoration strip (see `FLAG_DECORATION` in instance.rs).
 const FLAG_DECORATION: u32   = FLAG_UNDERLINE | FLAG_STRIKE | FLAG_OVERLINE;
 
@@ -189,8 +191,8 @@ fn fs_glyph(in: VsOut) -> @location(0) vec4<f32> {
     // backward compatibility with the old combined shader (see
     // `underline_instance`). Like glyphs, strikethrough / overline
     // pixels over the cursor block take the contrast color so they stay
-    // visible. FLAG_UNDERLINE alone is excluded: the banner / dialog
-    // "cover" quads reuse it and must keep their own color.
+    // visible. FLAG_UNDERLINE alone is excluded: the banner "cover"
+    // quads reuse it and must keep their own color.
     if ((in.flags & FLAG_DECORATION) != 0u) {
         let line_over_cursor = (in.flags & (FLAG_STRIKE | FLAG_OVERLINE)) != 0u
             && pixel_in_cursor(in.clip.xy);
@@ -207,7 +209,7 @@ fn fs_glyph(in: VsOut) -> @location(0) vec4<f32> {
     // to a luminance-based black or white so it always contrasts
     // strongly against the cursor block underneath. Applies to both
     // mono and color glyphs.
-    let on_cursor = pixel_in_cursor(in.clip.xy);
+    let on_cursor = pixel_in_cursor(in.clip.xy) && (in.flags & FLAG_OVERLAY) == 0u;
     let contrast_rgb = cursor_contrast_color();
 
     let is_color = (in.flags & FLAG_COLOR_GLYPH) != 0u;
