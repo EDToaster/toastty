@@ -131,19 +131,28 @@ fn decode_raw_passthrough<'a>(
 }
 
 fn decode_png(body: &[u8], max_bytes: u64) -> Result<ImageData, DecodeError> {
+    use image::ImageDecoder;
     use std::io::Cursor;
-    let reader = || image::ImageReader::with_format(Cursor::new(body), image::ImageFormat::Png);
-    // Header-only pass: a 12000x12000 PNG would otherwise be decoded
-    // (~1.3 GB peak) before the registry rejected it.
-    let (width, height) = reader()
-        .into_dimensions()
+    // Build a decoder (reads only the header), and check the *native*
+    // decoded size before touching pixel data. `total_bytes()` accounts
+    // for bit depth and channel count, so a 16-bit image isn't
+    // undercounted the way `w * h * 4` would be (SEC-7; reviewer item 5).
+    // A lying IHDR that claims a huge size is caught here too. `max_alloc`
+    // makes the image crate's own allocation limit agree with the quota,
+    // so an image right at the cap is rejected as ENOMEM rather than a
+    // `BadPng` decode error.
+    let mut reader = image::ImageReader::with_format(Cursor::new(body), image::ImageFormat::Png);
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(max_bytes);
+    reader.limits(limits);
+    let decoder = reader
+        .into_decoder()
         .map_err(|e| DecodeError::BadPng(e.to_string()))?;
-    if u64::from(width) * u64::from(height) * 4 > max_bytes {
+    let (width, height) = decoder.dimensions();
+    if decoder.total_bytes() > max_bytes {
         return Err(DecodeError::PngTooLarge { width, height });
     }
-    let reader = reader();
-    let img = reader
-        .decode()
+    let img = image::DynamicImage::from_decoder(decoder)
         .map_err(|e| DecodeError::BadPng(e.to_string()))?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
@@ -291,5 +300,30 @@ mod tests {
             decode(Format::Png, &buf, 0, 0, 15),
             Err(DecodeError::PngTooLarge { .. })
         ));
+    }
+
+    /// A 16-bit PNG decodes to 2 bytes per channel, so its quota check
+    /// must use the native decoded size (`total_bytes`), not `w*h*4`
+    /// (reviewer item 5). A 2x2 16-bit RGBA image is 32 bytes decoded;
+    /// `w*h*4` would under-count it as 16.
+    #[test]
+    fn decode_png_16bit_uses_native_size_for_quota() {
+        use image::ImageEncoder;
+        let mut buf = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut buf)
+            .write_image(
+                &[0u8; 2 * 2 * 4 * 2],
+                2,
+                2,
+                image::ExtendedColorType::Rgba16,
+            )
+            .unwrap();
+        // Native size is 32 bytes. A 16-byte quota (what `w*h*4` sees)
+        // must reject it; 32 accepts it.
+        assert!(matches!(
+            decode(Format::Png, &buf, 0, 0, 16),
+            Err(DecodeError::PngTooLarge { .. })
+        ));
+        assert!(decode(Format::Png, &buf, 0, 0, 32).is_ok());
     }
 }

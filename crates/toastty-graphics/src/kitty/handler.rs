@@ -252,7 +252,10 @@ impl KittyHandler {
     /// Bytes buffered across all in-flight chunked uploads.
     #[must_use]
     pub fn pending_bytes(&self) -> usize {
-        self.pending.values().map(|p| p.buf.len()).sum()
+        // Count allocated capacity, not length: `extend_from_slice` grows
+        // the buffer geometrically, so capacity is the memory actually
+        // held. Counting it keeps the global cap honest (reviewer item 7).
+        self.pending.values().map(|p| p.buf.capacity()).sum()
     }
 
     /// Number of in-flight chunked uploads.
@@ -432,6 +435,10 @@ impl KittyHandler {
             self.make_room(Some(key), body.len());
             self.chunk_seq += 1;
             let pending = self.pending.get_mut(&key).expect("make_room keeps `key`");
+            // Reserve exactly, so capacity stays equal to length and the
+            // byte cap counted by `pending_bytes` reflects real memory
+            // (reviewer item 7) instead of geometric over-allocation.
+            pending.buf.reserve_exact(body.len());
             pending.buf.extend_from_slice(body);
             pending.last_chunk = Instant::now();
             pending.last_seq = self.chunk_seq;
@@ -821,7 +828,16 @@ fn decode_payload(header: &Header, data: Vec<u8>, quota: u64) -> Result<ImageDat
         Compression::None => data,
         Compression::Zlib => {
             // SEC-5: never inflate past what the image can use: exactly
-            // `s*v*bpp` for raw pixels, the quota for PNG.
+            // `s*v*bpp` for raw pixels, the quota for PNG. When the
+            // declared raw size already exceeds the quota, reject before
+            // inflating at all, so an attacker can't make us do the work
+            // of inflating up to the cap (reviewer item 6).
+            if raw_pixel_bytes(header).is_some_and(|n| n > quota) {
+                return Err(PayloadError {
+                    code: ErrorCode::Efbig,
+                    detail: "declared image size exceeds the image budget".into(),
+                });
+            }
             let limit = raw_pixel_bytes(header).map_or(quota, |n| n.min(quota));
             inflate_zlib(&data, limit).map_err(|e| PayloadError {
                 code: ErrorCode::Einval,
@@ -2350,10 +2366,15 @@ mod major_medium_tests {
     }
 
     /// SEC-4: every way a file read can fail puts the same bytes on the
-    /// wire, so a client can't tell "missing" from "directory" from "not a
-    /// PNG" or learn a file's size. kitty: `EBADF:Failed to read image
+    /// wire, so a client can't tell *why* it failed — "missing" from
+    /// "directory" from "not a PNG". kitty: `EBADF:Failed to read image
     /// file` for all of them. (kitty answers `EBADPNG` for a readable
     /// non-PNG; we don't, see the checklist.)
+    ///
+    /// This removes a *content* oracle only. A successful read still
+    /// reveals that a file exists and is readable, and `O=` plus the
+    /// OK/EBADF split lets a client binary-search its size — inherent to
+    /// `t=f` and the same in kitty.
     #[test]
     fn file_failures_all_reply_identically() {
         use std::os::unix::fs::symlink;
@@ -2572,6 +2593,19 @@ mod major_medium_tests {
         // Same for `a=q`.
         let sink = run("Ga=q,f=32,s=1,v=1,o=z,i=3", &b64(&bomb), None);
         assert!(replies_joined(&sink).contains("exceeds 4 bytes"));
+    }
+
+    /// SEC-5, reviewer item 6: when the declared raw size already exceeds
+    /// the quota, reply EFBIG before inflating anything. The 1.4 KB bomb
+    /// below would otherwise inflate up to the quota first.
+    #[test]
+    fn zlib_over_quota_declared_size_rejected_before_inflating() {
+        let bomb = zlib(&vec![0u8; 4 << 20]);
+        let sink = run("Ga=t,f=32,s=1000,v=1000,o=z,i=7", &b64(&bomb), Some(1024));
+        assert_eq!(
+            replies_joined(&sink),
+            "\x1b_Gi=7;EFBIG:declared image size exceeds the image budget\x1b\\"
+        );
     }
 
     /// SEC-5: `f=100,o=z` has no `s*v`, so the quota bounds it.
