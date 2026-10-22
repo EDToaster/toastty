@@ -23,6 +23,9 @@ pub enum ErrorCode {
     Enotsup,
     /// Image too large to fit under the memory cap.
     Efbig,
+    /// Decoded image would exceed the image quota (kitty's reply to an
+    /// oversized PNG, checked on the IHDR before decoding).
+    Enomem,
     /// Relative placement references a parent image/placement that does
     /// not exist.
     Enoparent,
@@ -42,6 +45,7 @@ impl ErrorCode {
             ErrorCode::Enoent => "ENOENT",
             ErrorCode::Enotsup => "ENOTSUP",
             ErrorCode::Efbig => "EFBIG",
+            ErrorCode::Enomem => "ENOMEM",
             ErrorCode::Enoparent => "ENOPARENT",
             ErrorCode::Ecycle => "ECYCLE",
             ErrorCode::Etoodeep => "ETOODEEP",
