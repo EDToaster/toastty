@@ -355,13 +355,6 @@ pub struct Term {
     /// underline color; a Unicode placeholder cell printed with it
     /// records it as its placement id (see [`placeholder`]).
     cursor_underline_color: Option<Color>,
-    /// Virtual (`U=1`) placements of the active screen. Unicode
-    /// placeholder cells refer to them; the renderer resolves the cells
-    /// against this table every frame (see [`placeholder`]).
-    virtual_placements: VirtualPlacements,
-    /// The inactive screen's virtual placements, stashed alongside
-    /// [`Term::stashed_image_grid`]: kitty keeps them per screen.
-    stashed_virtual_placements: Option<VirtualPlacements>,
     /// Cell pixel size (width, height). Set by the binary at startup
     /// and on resize. Read by the `CSI 16 t` (XTWINOPS) handler to
     /// report char cell pixel dimensions back to apps. Apps like yazi
@@ -610,8 +603,6 @@ impl Term {
             region_scrolls: 0,
             image_revision: 0,
             cursor_underline_color: None,
-            virtual_placements: VirtualPlacements::default(),
-            stashed_virtual_placements: None,
             // Reasonable defaults until the binary plumbs the real
             // values from the renderer.
             cell_pixel_size: (8, 16),
@@ -931,11 +922,7 @@ impl Term {
                 let dropped = s.grid.remove_image_key(key);
                 s.release(&dropped, false);
             }
-            // #28: the stashed screen's virtual placements of evicted
-            // images go too.
-            if let Some(vps) = self.stashed_virtual_placements.as_mut() {
-                vps.remove_where(|v| !s.store.contains(v.image_id));
-            }
+            s.prune_virtual();
         }
         self.prune_virtual_placements();
         for key in evicted {
@@ -4011,18 +3998,12 @@ impl Term {
         self.viewport = crate::viewport::Viewport::new();
         // Switching screens invalidates every cached shaped line.
         self.mark_all_dirty();
-        // Primary and alt screens keep independent images (grid and
-        // store, PLC-6). Stash the primary's. 1049 gives the alt screen
-        // fresh ones; 47 / 1047 bring back the ones its last visit left
-        // (#27), so its images (and their ids, numbers and quota) survive
-        // the round trip.
+        // Primary and alt screens keep independent images (grid, store
+        // and virtual placements, PLC-6). Stash the primary's. 1049 gives
+        // the alt screen fresh ones; 47 / 1047 bring back the ones its last
+        // visit left (#27), so its images (and their ids, numbers and
+        // quota) survive the round trip.
         self.swap_screen_images(clear);
-        // Virtual placements (#28) are per screen too, stashed the same way.
-        let alt_vps = self.stashed_virtual_placements.take().filter(|_| !clear);
-        self.stashed_virtual_placements = Some(std::mem::replace(
-            &mut self.virtual_placements,
-            alt_vps.unwrap_or_default(),
-        ));
     }
 
     fn exit_alt_screen(&mut self, kind: AltSwitch) {
@@ -4049,9 +4030,6 @@ impl Term {
         // stashed with its text: a 47 / 1047 re-entry shows them again, a
         // 1049 entry replaces them (#27).
         self.swap_screen_images(false);
-        let primary_vps = self.stashed_virtual_placements.take().unwrap_or_default();
-        self.stashed_virtual_placements =
-            Some(std::mem::replace(&mut self.virtual_placements, primary_vps));
     }
 
     /// RIS — Reset to Initial State (`ESC c`). A hard reset: return to
@@ -4866,7 +4844,7 @@ impl KittySink for Term {
             .iter()
             .map(|p| p.key)
             .chain(
-                self.virtual_placements
+                self.images.virtual_placements
                     .iter()
                     .filter_map(|v| self.images.store.key_of(v.image_id)),
             )
@@ -5060,7 +5038,7 @@ impl KittySink for Term {
             return;
         };
         self.images.store.touch(key);
-        self.virtual_placements.insert(placement);
+        self.images.virtual_placements.insert(placement);
         self.image_revision = self.image_revision.wrapping_add(1);
     }
 
@@ -5130,17 +5108,18 @@ impl KittySink for Term {
                                 .remove_where(|p| p.image_id == img && p.placement_id == pid),
                         );
                         virtual_dropped |= self
+                            .images
                             .virtual_placements
                             .remove_where(|v| v.image_id == img && v.placement_id == pid);
                     } else {
                         dropped_placements.extend(self.images.grid.remove_image(img));
-                        virtual_dropped |= self.virtual_placements.remove_image(img);
+                        virtual_dropped |= self.images.virtual_placements.remove_image(img);
                     }
                     // Uppercase frees the bytes, but only when no
                     // placement of this image survives. (B5)
                     if drop_bytes
                         && !self.images.grid.iter().any(|p| p.image_id == img)
-                        && !self.virtual_placements.contains_image(img)
+                        && !self.images.virtual_placements.contains_image(img)
                     {
                         self.remove_image_bytes(img);
                     }
@@ -5155,7 +5134,7 @@ impl KittySink for Term {
                 if header.image_number != 0 {
                     if let Some(img) = self.newest_image_for_number(header.image_number) {
                         dropped_placements.extend(self.images.grid.remove_image(img));
-                        virtual_dropped |= self.virtual_placements.remove_image(img);
+                        virtual_dropped |= self.images.virtual_placements.remove_image(img);
                         if drop_bytes && !self.images.grid.iter().any(|p| p.image_id == img) {
                             self.remove_image_bytes(img);
                         }
@@ -5195,6 +5174,7 @@ impl KittySink for Term {
                             .remove_where(|p| p.image_id != 0 && (lo..=hi).contains(&p.image_id)),
                     );
                     virtual_dropped |= self
+                        .images
                         .virtual_placements
                         .remove_where(|v| (lo..=hi).contains(&v.image_id));
                     if drop_bytes {
@@ -5513,12 +5493,16 @@ impl RgpSink for Term {
 
 /// Mark the on-screen cells under `p`'s shown part dirty.
 /// One screen's images, swapped as a unit on a screen switch: the
-/// placements and the stored bytes they show (#28 adds the virtual
-/// placements here). kitty keeps one graphics manager per screen.
+/// placements, the virtual (`U=1`) placements Unicode placeholder cells
+/// refer to (#28), and the stored bytes they show. kitty keeps one
+/// graphics manager per screen.
 #[derive(Debug)]
 struct ScreenImages {
     grid: ImageGrid,
     store: ImageStore,
+    /// The renderer resolves placeholder cells against this table every
+    /// frame (see [`placeholder`]).
+    virtual_placements: VirtualPlacements,
 }
 
 impl ScreenImages {
@@ -5526,7 +5510,31 @@ impl ScreenImages {
         Self {
             grid: ImageGrid::new(),
             store: ImageStore::new(cap_bytes),
+            virtual_placements: VirtualPlacements::default(),
         }
+    }
+
+    /// Keys of the images with a placement on this screen, virtual ones
+    /// included: an image shown only through placeholders is placed too
+    /// (kitty counts virtual refs).
+    fn placed_keys(&self) -> std::collections::HashSet<ImageKey> {
+        self.grid
+            .iter()
+            .map(|p| p.key)
+            .chain(
+                self.virtual_placements
+                    .iter()
+                    .filter_map(|v| self.store.key_of(v.image_id)),
+            )
+            .collect()
+    }
+
+    /// Drop the virtual placements whose image left the store (quota
+    /// eviction). Returns whether any went.
+    fn prune_virtual(&mut self) -> bool {
+        let store = &self.store;
+        self.virtual_placements
+            .remove_where(|v| !store.contains(v.image_id))
     }
 
     /// Settle the store after `dropped` left the grid. An image left
@@ -5539,7 +5547,7 @@ impl ScreenImages {
         if dropped.is_empty() {
             return;
         }
-        let placed: std::collections::HashSet<ImageKey> = self.grid.iter().map(|p| p.key).collect();
+        let placed = self.placed_keys();
         let mut seen: Vec<ImageKey> = Vec::new();
         for p in dropped {
             if seen.contains(&p.key) || placed.contains(&p.key) {
@@ -5557,7 +5565,7 @@ impl ScreenImages {
     /// client id counts only images still on the screen or in its
     /// history. Returns whether anything was freed.
     fn free_unplaced(&mut self) -> bool {
-        let placed: std::collections::HashSet<ImageKey> = self.grid.iter().map(|p| p.key).collect();
+        let placed = self.placed_keys();
         let gone: Vec<ImageKey> = self.store.keys().filter(|k| !placed.contains(k)).collect();
         for key in &gone {
             self.store.remove_key(*key);
@@ -5580,10 +5588,17 @@ impl ScreenImages {
         );
     }
 
-    /// Drop every placement and image (RIS).
+    /// RIS: drop every placement and every image no virtual placement
+    /// still shows. kitty 0.49.2 frees the images (`a=p,i=1` gets ENOENT
+    /// afterwards; PLC-8) but keeps virtual placements and so their
+    /// images (#28, PH-7).
     fn clear(&mut self) {
         self.grid.clear();
-        self.store.clear();
+        if self.virtual_placements.is_empty() {
+            self.store.clear();
+        } else {
+            self.free_unplaced();
+        }
     }
 }
 

@@ -150,8 +150,10 @@ Each store holds:
   - If it is kept, it must not be per-registry: each screen's store has
     its own registry, and their counters would collide.
 - **#28 (Unicode placeholders, virtual placements).**
-  - `VirtualPlacements` belongs in `ImageStore`, so it moves with the
-    screen.
+  - `VirtualPlacements` belongs with the screen. Done in the merge train:
+    it is a `ScreenImages` field, so it swaps with the grid and store, and
+    `ScreenImages::release` / `free_unplaced` / RIS count an image with a
+    virtual placement as placed.
   - "Re-send drops virtual placements" hooks on `Stored::replaced`.
   - Eviction cleanup hooks on `Stored::evicted` and `ImageStore::set_cap`'s
     return.
