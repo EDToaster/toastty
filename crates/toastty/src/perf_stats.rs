@@ -49,7 +49,9 @@ impl PerfStats {
         Self(Some(Box::new(Inner {
             path: path.into(),
             start: Instant::now(),
-            start_unix: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default(),
+            start_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default(),
             first_frame: None,
             first_bytes: None,
             frames: 0,
@@ -203,7 +205,10 @@ thread_local! {
 pub fn start_profiler() {
     #[cfg(feature = "pprof")]
     if let Some(path) = std::env::var_os("TOASTTY_PPROF") {
-        match pprof::ProfilerGuardBuilder::default().frequency(1999).build() {
+        match pprof::ProfilerGuardBuilder::default()
+            .frequency(1999)
+            .build()
+        {
             Ok(g) => PROFILER.with(|p| *p.borrow_mut() = Some((path.into(), g))),
             Err(e) => tracing::warn!("TOASTTY_PPROF: {e}"),
         }
@@ -217,7 +222,9 @@ pub fn finish_profiler() {
         let Some((path, guard)) = p.borrow_mut().take() else {
             return;
         };
-        let Ok(report) = guard.report().build() else { return };
+        let Ok(report) = guard.report().build() else {
+            return;
+        };
         let mut o = String::new();
         for (frames, count) in &report.data {
             o.push_str(&frames.thread_name);

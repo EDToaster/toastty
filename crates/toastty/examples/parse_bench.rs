@@ -12,6 +12,7 @@ use std::time::Instant;
 use toastty_parser::Parser;
 use toastty_term::Term;
 
+#[allow(clippy::cast_precision_loss)] // MB/s for a report
 fn main() {
     let mut files = Vec::new();
     let (mut cols, mut rows, mut reps, mut scrollback) = (128u16, 42u16, 3u32, 10_000u16);
@@ -40,7 +41,10 @@ fn main() {
             }
             best = best.min(t.elapsed().as_secs_f64());
         }
-        let name = std::path::Path::new(f).file_name().unwrap().to_string_lossy();
+        let name = std::path::Path::new(f)
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
         println!(
             "{name:<16} {:>8.1} MB/s  ({:.3} s for {:.1} MB, best of {reps})",
             data.len() as f64 / best / 1e6,
