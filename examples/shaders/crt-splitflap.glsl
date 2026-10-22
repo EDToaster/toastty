@@ -5,9 +5,11 @@
 // between bells toastty draws nothing at all.
 //
 // On each BEL (try `printf '\a'`), the cells flip like the tiles of a
-// split-flap departure board. The wave starts at the cell where the bell
-// rang and spreads outward until it has crossed the window. Up to four
-// overlapping bells (`iBells`) each run their own wave.
+// split-flap departure board: each tile riffles through two characters
+// borrowed from elsewhere on screen, then lands back on its own. The wave
+// starts at the cell where the bell rang and spreads outward until it has
+// crossed the window. Up to four overlapping bells (`iBells`) each run
+// their own wave.
 //
 // Enable it with:
 //
@@ -15,7 +17,7 @@
 //   paths = ["~/src/toastty/examples/shaders/crt-splitflap.glsl"]
 
 // toastty: animate for this long after an event (bell, cursor move, focus),
-// then stop drawing. Must cover SWEEP_SECONDS + FLIP_SECONDS.
+// then stop drawing. Must cover SWEEP_SECONDS + FLIPS * FLIP_SECONDS.
 const float TOASTTY_EVENT_DURATION = 1.6;
 
 // ---- CRT ----
@@ -28,10 +30,12 @@ const float VIGNETTE = 0.30;    // corner darkening, 0..1
 const float BRIGHTNESS = 1.12;  // makes up for scanline/mask loss
 
 // ---- split-flap ----
-const float SWEEP_SECONDS = 1.0;  // time for the wave to cross the window
-const float FLIP_SECONDS = 0.34;  // time for one tile to flip
+const float SWEEP_SECONDS = 1.2;  // time for the wave to cross the window
+const int FLIPS = 3;              // flips per tile: two random characters, then home
+const float FLIP_SECONDS = 0.1;   // time for one flip
 const float FLAP_SHADE = 0.55;    // darkest the flap gets edge-on
-const float SHADOW = 0.35;        // shadow the flap casts on the half below
+const float SHADOW = 0.45;        // shadow the flap casts on the card behind it
+const float TILE_LIFT = 0.07;     // flipping tiles are drawn as lighter cards
 
 const float PI = 3.14159265;
 
@@ -42,71 +46,123 @@ vec2 curve(vec2 uv) {
     return c * 0.5 + 0.5;
 }
 
-// Flip phase of the cell centred at `center`: 0..1 while it is flipping,
-// -1 when it is at rest. The newest bell that is flipping this cell wins.
-float flip_phase(vec2 center) {
+// Dave Hoskins' hash: no `sin`, so it stays random for large inputs.
+float hash(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// How far the tile centred at `center` is through its flips (0..FLIPS),
+// or -1 when it is at rest. `y` is a per-bell seed. The newest bell that
+// is flipping this tile wins.
+vec2 flip_progress(vec2 center) {
     float diag = length(iResolution.xy);
     for (int i = 0; i < 4; i++) {
         vec4 bell = iBells[i];
         float delay = distance(center, bell.xy) / diag * SWEEP_SECONDS;
-        float t = (bell.w - delay) / FLIP_SECONDS;
-        if (t > 0.0 && t < 1.0) {
-            return t;
+        float p = (bell.w - delay) / FLIP_SECONDS;
+        if (p > 0.0 && p < float(FLIPS)) {
+            return vec2(p, mod(bell.z * 61.0, 997.0));
         }
     }
-    return -1.0;
+    return vec2(-1.0, 0.0);
 }
 
-// Where to sample for pixel `p` (px), plus a brightness factor. Inside a
-// flipping cell this folds the top half down over the hinge at the
-// cell's middle, the way a split-flap tile turns.
-vec3 split_flap(vec2 p) {
+// How much a cell differs from the background: a few taps across it.
+float ink(vec2 cell) {
+    vec2 o = iGridRect.xy + cell * iCellSize;
+    float sum = 0.0;
+    for (int i = 0; i < 3; i++) {
+        vec2 at = o + iCellSize * vec2(0.5, 0.3 + 0.2 * float(i));
+        sum += dot(abs(texture(iChannel0, at / iResolution.xy).rgb - iBackgroundColor), vec3(1.0));
+    }
+    return sum;
+}
+
+// The cell whose character card `k` of tile `cell` shows. Card 0 is the
+// tile's own character and so is the last one, so every tile comes home.
+// The cards in between borrow a random character from elsewhere on
+// screen, skipping (up to a few) blank ones.
+vec2 card(vec2 cell, int k, float seed) {
+    if (k <= 0 || k >= FLIPS) {
+        return cell;
+    }
+    vec2 cells = floor(iGridRect.zw / iCellSize);
+    vec2 cand = cell;
+    for (int j = 0; j < 6; j++) {
+        // Retries step far apart: with `+ j`, tile x's second try would be
+        // tile x+1's first, and neighbours would settle on the same cell.
+        vec2 h = vec2(float(k * 6 + j) * 211.0, seed);
+        cand = floor(vec2(hash(cell + h), hash(cell.yx + h.yx + 17.0)) * cells);
+        if (ink(cand) > 0.25) {
+            break;
+        }
+    }
+    return cand;
+}
+
+// Where to sample for pixel `p` (px): `xy` = source pixel, `z` = shade,
+// `w` = 1 inside a flipping tile. A flip is the physical one: the top
+// flap of the old card falls toward the viewer over the hinge in the
+// middle, uncovering the new card's top half, and its back (the new
+// card's bottom half) unfolds over the old bottom half.
+vec4 split_flap(vec2 p) {
     vec2 grid = p - iGridRect.xy;
     if (any(lessThan(grid, vec2(0.0))) || any(greaterThanEqual(grid, iGridRect.zw))) {
-        return vec3(p, 1.0);
+        return vec4(p, 1.0, 0.0);
     }
-    vec2 origin = iGridRect.xy + floor(grid / iCellSize) * iCellSize;
-    float t = flip_phase(origin + 0.5 * iCellSize);
-    if (t < 0.0) {
-        return vec3(p, 1.0);
+    vec2 cell = floor(grid / iCellSize);
+    vec2 origin = iGridRect.xy + cell * iCellSize;
+    vec2 progress = flip_progress(origin + 0.5 * iCellSize);
+    if (progress.x < 0.0) {
+        return vec4(p, 1.0, 0.0);
     }
+
+    int k = int(progress.x);
+    float t = fract(progress.x);
+    vec2 old_card = card(cell, k, progress.y);
+    vec2 new_card = card(cell, k + 1, progress.y);
 
     vec2 local = (p - origin) / iCellSize;  // 0..1, y down
     float fold = cos(PI * t);               // 1 -> 0 -> -1
     float half_h = 0.5 * abs(fold);         // projected height of the flap
     float light = mix(FLAP_SHADE, 1.0, abs(fold));
+    vec2 from = new_card;
     float y = local.y;
     float shade = 1.0;
 
     if (fold > 0.0) {
-        // First half: the top flap tips toward the viewer and shrinks
-        // onto the hinge, uncovering the (shadowed) card behind it.
-        if (y >= 0.5 - half_h && y < 0.5) {
+        if (y < 0.5 - half_h) {
+            shade = 1.0 - SHADOW * abs(fold);   // new top, in the flap's shadow
+        } else if (y < 0.5) {
+            from = old_card;                    // the falling flap
             y = 0.5 - (0.5 - y) / abs(fold);
             shade = light;
-        } else if (y < 0.5) {
-            shade = 1.0 - SHADOW * abs(fold);
+        } else {
+            from = old_card;                    // old bottom, not covered yet
         }
     } else {
-        // Second half: the flap has passed the hinge and now covers the
-        // bottom half, unfolding downward. The half it hasn't reached yet
-        // sits in its shadow.
-        if (y >= 0.5 && y < 0.5 + half_h) {
-            y = 0.5 + (y - 0.5) / abs(fold);
+        if (y < 0.5) {
+            // new top, settled
+        } else if (y < 0.5 + half_h) {
+            y = 0.5 + (y - 0.5) / abs(fold);    // the flap's back unfolding
             shade = light;
-        } else if (y >= 0.5) {
+        } else {
+            from = old_card;                    // old bottom, in shadow
             shade = 1.0 - SHADOW * (1.0 - abs(fold));
         }
     }
 
-    // The hinge and the tile edges show as thin dark gaps mid-flip.
-    float px_y = abs(local.y - 0.5) * iCellSize.y;
+    // The hinge and the gaps between tiles.
+    float hinge = abs(local.y - 0.5) * iCellSize.y;
     vec2 edge = min(local, 1.0 - local) * iCellSize;
-    if (px_y < 0.75 || min(edge.x, edge.y) < 0.75) {
-        shade *= 0.35;
+    if (hinge < 0.75 || min(edge.x, edge.y) < 0.75) {
+        shade *= 0.3;
     }
 
-    return vec3(origin + vec2(local.x, y) * iCellSize, shade);
+    vec2 src = iGridRect.xy + (from + vec2(local.x, y)) * iCellSize;
+    return vec4(src, shade, 1.0);
 }
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
@@ -116,7 +172,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         return;
     }
 
-    vec3 flap = split_flap(uv * iResolution.xy);
+    vec4 flap = split_flap(uv * iResolution.xy);
     vec2 src = flap.xy / iResolution.xy;
 
     // Colour fringing grows toward the edges.
@@ -127,7 +183,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         base.g,
         texture(iChannel0, src - fringe).b
     );
-    color *= flap.z;
+    color = (color + flap.w * TILE_LIFT) * flap.z;
 
     // Scanlines follow the curved surface, so they bend with it.
     float scan = 0.5 + 0.5 * cos(2.0 * PI * uv.y * iResolution.y / SCANLINE_PX);
