@@ -5220,16 +5220,12 @@ impl KittySink for Term {
         let bot = self.scroll_bot.min(self.rows.saturating_sub(1));
         let in_region = (self.scroll_top..=bot).contains(&self.cursor.row);
         if in_region && target_row > bot {
-            // Past the region height a partial region is all blank, so
-            // stop there; a full-screen scroll stops once it has cycled
-            // the whole ring (screen plus history). This bounds the cost
-            // of a huge `r=` (e.g. 65535).
-            let full = self.scroll_top == 0 && bot == self.rows.saturating_sub(1);
-            let limit = if full {
-                self.active_grid().cap()
-            } else {
-                usize::from(bot - self.scroll_top + 1)
-            };
+            // SCR-14: kitty scrolls by the overshoot but at most the
+            // region height (kitty-ref: a 100x2000 image at row 6 of a
+            // 30-row screen scrolls 30 rows, leaving source rows 500..1100
+            // visible and the cursor on the last row). That also bounds
+            // the cost of a huge `r=` (e.g. 65535).
+            let limit = usize::from(bot - self.scroll_top + 1);
             for _ in 0..usize::from(target_row - bot).min(limit) {
                 self.region_scroll_up();
             }
@@ -11315,6 +11311,24 @@ mod placement_model_tests {
     }
 
     #[test]
+    fn scr14_tall_image_scrolls_at_most_the_screen_height() {
+        // kitty-ref: a 100x2000 image (100 rows at 9x20) at row 6 of a
+        // 30-row screen scrolls 30 rows: its top lands 25 rows above the
+        // screen and the cursor on the last row.
+        let mut t = Term::new(30, 80, 200);
+        feed(&mut t, b"\x1b[6;1H");
+        place(&mut t, 1, 12, 100, "");
+        assert_eq!(t.history_lines(), 30);
+        assert_eq!(t.prows(only(&t)), -25..75);
+        assert_eq!(t.cursor().row, 29);
+        // A smaller overshoot still scrolls just the overshoot.
+        let mut t = Term::new(30, 80, 200);
+        feed(&mut t, b"\x1b[6;1H");
+        place(&mut t, 1, 5, 50, "");
+        assert_eq!(t.history_lines(), 25);
+    }
+
+    #[test]
     fn scr10_c1_at_bottom_never_scrolls() {
         let mut t = Term::new(10, 20, 100);
         feed(&mut t, b"top\x1b[10;1H");
@@ -11417,11 +11431,11 @@ mod placement_model_tests {
         place(&mut t, 1, 4, 65535, "");
         assert_eq!(t.region_scrolls, 6, "the region is 6 rows tall");
         assert_eq!(t.cursor().row, 7, "cursor on the bottom margin");
-        // Full-screen margins: at most one ring's worth (10 + 100).
+        // Full-screen margins: at most the screen height (SCR-14).
         let mut t = Term::new(10, 20, 100);
         t.region_scrolls = 0;
         place(&mut t, 1, 4, 65535, "");
-        assert_eq!(t.region_scrolls, 110);
+        assert_eq!(t.region_scrolls, 10);
     }
 
     #[test]

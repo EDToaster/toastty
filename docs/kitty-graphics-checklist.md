@@ -272,6 +272,16 @@ UVs at draw time. Don't patch each item separately.
   - Fix: `Grid::clear_history` blanks the history ring. ED 3 calls it on
     the primary screen, snaps the viewport to the live screen (a pixel-only
     touchpad offset included), and drops any selection. Fixed in #38.
+- [x] **P1 — SCR-14. An image taller than the screen scrolls it by the
+  full overshoot.**
+  - Repro: a natural 100×2000 image placed at row 6 without `C=1`.
+  - Expected (kitty-ref 0.49.2): the screen scrolls at most one screen
+    (region) height. On a 30-row screen the image top lands 25 rows above
+    the screen, so source rows 500..1100 are visible, and the cursor sits
+    on the last row.
+  - Actual: toastty scrolled the full overshoot (up to one ring), so the
+    image's bottom landed on the cursor row and a different slice showed.
+  - Fixed in #29: the cursor-advance scroll is capped at the region height.
 
 ## 2. Sizing, scaling and rendering
 
