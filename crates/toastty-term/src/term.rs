@@ -11532,9 +11532,10 @@ mod placement_model_tests {
     }
 
     #[test]
-    fn placeholder_placements_are_line_anchored() {
-        // Minimal: a virtual placement plus one placeholder cell; the
-        // resulting per-cell placement sits on the cursor's line.
+    fn placeholder_images_ride_with_their_text() {
+        // Was `placeholder_placements_are_line_anchored` (per-cell tiles,
+        // removed by #28): placeholder images now render from the cells,
+        // so they move with the text into scrollback.
         let mut t = Term::new(10, 20, 100);
         feed(&mut t, &lines(12));
         place(&mut t, 7, 1, 1, ",U=1,q=2");
@@ -11542,10 +11543,13 @@ mod placement_model_tests {
             &mut t,
             b"\x1b[38;5;7m\xf4\x8e\xbb\xae\xcc\x85\xcc\x85\x1b[0m x",
         );
-        let p = t.image_grid().iter().next().expect("placeholder placement");
-        assert_eq!(t.prows(p), 9..10);
+        assert!(t.image_grid().is_empty(), "no tiles any more");
+        let mut runs = Vec::new();
+        t.placeholder_runs(t.active_grid().row(9), &mut runs);
+        assert_eq!(runs.len(), 1);
         feed(&mut t, &lines(3));
-        let p = t.image_grid().iter().next().expect("still there");
-        assert_eq!(t.prows(p), 6..7, "moved up with its text");
+        runs.clear();
+        t.placeholder_runs(t.active_grid().row(6), &mut runs);
+        assert_eq!(runs.len(), 1, "moved up with its text");
     }
 }
