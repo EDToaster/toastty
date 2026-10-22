@@ -17,8 +17,8 @@
 //! redraws. Placeholders printed before the image or its virtual
 //! placement arrive show up as soon as they do.
 //!
-//! Virtual placements live in [`Term::virtual_placements`], one table per
-//! screen like kitty's. Only the id-based deletes (`d=i`/`n`/`r` and
+//! Virtual placements live in each screen's images (`ScreenImages`, #42),
+//! one table per screen like kitty's, and swap with the screen. Only the id-based deletes (`d=i`/`n`/`r` and
 //! capitals) and re-transmitting the image remove them; ED 2, RIS and
 //! the positional deletes don't (kitty 0.49.2).
 
@@ -308,16 +308,12 @@ impl Term {
         self.collect_extras()
     }
 
-    /// Drop image `id`'s virtual placements on *both* screens. Called
-    /// whenever the image's bytes are replaced or freed (re-transmit,
-    /// eviction, byte-freeing delete). The registry is shared between the
-    /// screens, so a placement left in the stashed table would otherwise
-    /// apply its old `c`/`r` to whatever image later reuses the id.
+    /// Drop image `id`'s virtual placements. Called whenever the image's
+    /// bytes are replaced or freed (re-transmit, byte-freeing delete).
+    /// Active screen only: each screen has its own store (#42), so the
+    /// other screen's `i=id` is a different image.
     pub(super) fn forget_virtual_placements(&mut self, id: u32) {
-        let mut dropped = self.virtual_placements.remove_image(id);
-        if let Some(stashed) = self.stashed_virtual_placements.as_mut() {
-            dropped |= stashed.remove_image(id);
-        }
+        let dropped = self.images.virtual_placements.remove_image(id);
         if dropped {
             self.image_revision = self.image_revision.wrapping_add(1);
         }
@@ -326,8 +322,7 @@ impl Term {
     /// Drop the virtual placements whose image left this screen's store
     /// (quota eviction).
     pub(super) fn prune_virtual_placements(&mut self) {
-        let store = &self.images.store;
-        if self.virtual_placements.remove_where(|v| !store.contains(v.image_id)) {
+        if self.images.prune_virtual() {
             self.image_revision = self.image_revision.wrapping_add(1);
         }
     }
@@ -335,7 +330,7 @@ impl Term {
     /// The active screen's virtual (`U=1`) placements.
     #[must_use]
     pub fn virtual_placements(&self) -> &VirtualPlacements {
-        &self.virtual_placements
+        &self.images.virtual_placements
     }
 
     /// True when the active screen has any virtual placement, i.e. when
@@ -343,7 +338,7 @@ impl Term {
     /// the per-row scan otherwise.
     #[must_use]
     pub fn has_virtual_placements(&self) -> bool {
-        !self.virtual_placements.is_empty()
+        !self.images.virtual_placements.is_empty()
     }
 
     /// Append the placeholder runs of `row` (any row: live grid,
@@ -355,7 +350,7 @@ impl Term {
     /// The virtual placement `run` draws, if it exists right now.
     #[must_use]
     pub fn resolve_placeholder(&self, run: &PlaceholderRun) -> Option<&VirtualPlacement> {
-        self.virtual_placements.find(run.image_id, run.placement_id)
+        self.images.virtual_placements.find(run.image_id, run.placement_id)
     }
 
     /// Top-left `(row, col)` of the placeholder cells on the visible
@@ -365,7 +360,7 @@ impl Term {
     /// for relative placements. `None` when no cell refers to it.
     #[must_use]
     pub fn placeholder_origin(&self, image_id: u32, placement_id: u32) -> Option<(u16, u16)> {
-        if !self.virtual_placements.contains_image(image_id) {
+        if !self.images.virtual_placements.contains_image(image_id) {
             return None;
         }
         let mut runs = Vec::new();
