@@ -199,31 +199,76 @@ pub(crate) fn reflow_rows(
     cursor_idx: usize,
     cursor_col: u16,
 ) -> (Vec<Row>, (usize, u16)) {
-    let mut row_map = Vec::new();
-    reflow_rows_mapped(rows, cols, cursor_idx, cursor_col, &mut row_map)
+    let mut map = ReflowMap::default();
+    reflow_rows_mapped(rows, cols, cursor_idx, cursor_col, &mut map)
 }
 
-/// [`reflow_rows`], also filling `row_map` with the output row each input
-/// row's first cell lands on (`row_map[i]` for input row `i`; ascending).
-/// Image placements anchored to a row follow it through the rewrap this
-/// way.
+/// Where a reflow put each input row, for following line-anchored state
+/// (image placements) through it. Built by [`reflow_rows_mapped`], which
+/// appends, so several segments can share one map.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ReflowMap {
+    /// Per input row: the output row its first cell lands on (ascending).
+    pub(crate) row_map: Vec<usize>,
+    /// Per input row: `(logical line, content offset of its first cell)`,
+    /// or `None` for a row that wasn't reflowed as text (a rich block).
+    pub(crate) in_pos: Vec<Option<(u32, u32)>>,
+    /// Per output text row, ascending: `(logical line, content offset it
+    /// starts at, output row)`.
+    pub(crate) out_pos: Vec<(u32, u32, u32)>,
+    /// Logical lines numbered so far.
+    pub(crate) lines: u32,
+}
+
+impl ReflowMap {
+    /// Output row holding content offset `off` of logical line `line`.
+    #[must_use]
+    pub(crate) fn out_row(&self, line: u32, off: u32) -> Option<usize> {
+        let i = self
+            .out_pos
+            .partition_point(|&(l, s, _)| (l, s) <= (line, off));
+        let &(l, _, r) = self.out_pos.get(i.checked_sub(1)?)?;
+        (l == line).then_some(r as usize)
+    }
+}
+
+/// [`reflow_rows`], also appending to `map` where each input row (and
+/// each output row) sits, numbering logical lines from `map.lines` and
+/// output rows from `out_base`. Image placements anchored to a row follow
+/// it through the rewrap this way.
+#[cfg(test)]
 pub(crate) fn reflow_rows_mapped(
     rows: &[Row],
     cols: u16,
     cursor_idx: usize,
     cursor_col: u16,
-    row_map: &mut Vec<usize>,
+    map: &mut ReflowMap,
+) -> (Vec<Row>, (usize, u16)) {
+    reflow_rows_mapped_at(rows, cols, cursor_idx, cursor_col, map, 0)
+}
+
+/// [`reflow_rows_mapped`] for a segment whose first output row will sit at
+/// `out_base` in the caller's output.
+#[allow(clippy::cast_possible_truncation)] // row / offset counts fit u32.
+pub(crate) fn reflow_rows_mapped_at(
+    rows: &[Row],
+    cols: u16,
+    cursor_idx: usize,
+    cursor_col: u16,
+    map: &mut ReflowMap,
+    out_base: usize,
 ) -> (Vec<Row>, (usize, u16)) {
     let mut row_starts = Vec::with_capacity(rows.len());
     let (lines, (cursor_line, cursor_offset)) =
         build_logical_lines(rows, cursor_idx, cursor_col, &mut row_starts);
+    let line_base = map.lines;
+    let map_start = map.row_map.len();
 
     let mut out: Vec<Row> = Vec::new();
     let mut cur_idx = 0usize;
     let mut cur_col = 0u16;
     let mut out_starts = Vec::new();
     let mut starts = row_starts.iter().peekable();
-    row_map.clear();
     for (li, line) in lines.iter().enumerate() {
         let want = if li == cursor_line {
             Some(cursor_offset)
@@ -235,6 +280,7 @@ pub(crate) fn reflow_rows_mapped(
             cur_idx = out.len() + r;
             cur_col = c;
         }
+        let gl = line_base + li as u32;
         // Input rows of this line, in order: each lands on the last
         // output row that starts at or before its content offset.
         while let Some(&&(l, off)) = starts.peek() {
@@ -242,11 +288,17 @@ pub(crate) fn reflow_rows_mapped(
                 break;
             }
             let r = out_starts.partition_point(|&s| s <= off).saturating_sub(1);
-            row_map.push(out.len() + r);
+            map.row_map.push(out_base + out.len() + r);
+            map.in_pos.push(Some((gl, off as u32)));
             starts.next();
+        }
+        for (r, &s) in out_starts.iter().enumerate() {
+            map.out_pos
+                .push((gl, s as u32, (out_base + out.len() + r) as u32));
         }
         out.extend(wrapped);
     }
+    map.lines = line_base + lines.len() as u32;
 
     if out.is_empty() {
         out.push(Row::blank(cols));
@@ -254,7 +306,9 @@ pub(crate) fn reflow_rows_mapped(
         cur_col = 0;
     }
     // Defensive: every input row gets an entry.
-    row_map.resize(rows.len(), out.len() - 1);
+    let want = map_start + rows.len();
+    map.row_map.resize(want, out_base + out.len() - 1);
+    map.in_pos.resize(want, None);
 
     (out, (cur_idx, cur_col))
 }
@@ -449,14 +503,23 @@ mod tests {
             row(vec![Cell::BLANK; 6], false),
             row(vec![cell('B')], false),
         ];
-        let mut map = Vec::new();
+        let mut map = ReflowMap::default();
         let (out, _) = reflow_rows_mapped(&rows, 3, 0, 0, &mut map);
         assert_eq!(out.len(), 4);
-        assert_eq!(map, vec![0, 2, 3]);
+        assert_eq!(map.row_map, vec![0, 2, 3]);
+        assert_eq!(map.in_pos, vec![Some((0, 0)), Some((1, 0)), Some((2, 0))]);
+        assert_eq!(
+            map.out_pos,
+            vec![(0, 0, 0), (0, 3, 1), (1, 0, 2), (2, 0, 3)]
+        );
         // Widening back maps the rewrapped rows onto the first again.
+        let mut map = ReflowMap::default();
         let (wide, _) = reflow_rows_mapped(&out, 6, 0, 0, &mut map);
         assert_eq!(wide.len(), 3);
-        assert_eq!(map, vec![0, 0, 1, 2]);
+        assert_eq!(map.row_map, vec![0, 0, 1, 2]);
+        // The second A row started at offset 3: it lands in row 0.
+        assert_eq!(map.in_pos[1], Some((0, 3)));
+        assert_eq!(map.out_row(0, 3), Some(0));
     }
 
     #[test]
@@ -467,9 +530,10 @@ mod tests {
             row(vec![cell('a'), cell('b'), cell('c'), cell('d')], true),
             row(vec![cell('e'), cell('f'), Cell::BLANK, Cell::BLANK], false),
         ];
-        let mut map = Vec::new();
+        let mut map = ReflowMap::default();
         let (out, _) = reflow_rows_mapped(&rows, 2, 0, 0, &mut map);
         assert_eq!(out.len(), 3);
-        assert_eq!(map, vec![0, 2]);
+        assert_eq!(map.row_map, vec![0, 2]);
+        assert_eq!(map.in_pos, vec![Some((0, 0)), Some((0, 4))]);
     }
 }

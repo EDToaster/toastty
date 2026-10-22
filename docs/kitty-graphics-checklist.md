@@ -170,7 +170,8 @@ UVs at draw time. Don't patch each item separately.
   - Fixed in #31. Matches kitty: IL/DL move only the text. Re-checked on
     kitty-ref: kitty also keeps an image whole when DL deletes the rows
     under it, so toastty does not clip it either. Placeholder images move,
-    because they are text.
+    because they are text: their per-cell tiles keep the old shift until
+    #28 renders placeholders from the cells.
 - [x] **P1 — SCR-7. Resize and reflow separate images from their text and
   truncate them permanently.**
   - Repro: place an image, shrink the window to 8 rows, then grow it back.
@@ -253,9 +254,12 @@ UVs at draw time. Don't patch each item separately.
     image stays over different text.
   - Cause: `term.rs:1975-1981, 2042-2046` return before touching
     `image_grid`.
-  - Fixed in #31. Matches kitty: inside DECSLRM margins the text still
-    moves only within the margin rectangle, but images get a plain region
-    scroll over the top/bottom margins and are clipped at them.
+  - Fixed in #31. Inside DECSLRM margins the text moves only within the
+    margin rectangle, and images whose columns lie inside the side margins
+    move with it, clipped at the top/bottom margins. Images outside a side
+    margin, or straddling one, stay with their (unmoved) text. kitty has no
+    side margins, so it moves the whole region; inside the rectangle the
+    two agree.
 - [x] **P2 — SCR-12. Alt screen modes 47 and 1047 clear text and images on
   re-entry; kitty keeps them.**
   - The spec requires clearing only for 1049.
