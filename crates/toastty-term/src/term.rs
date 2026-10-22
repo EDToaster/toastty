@@ -743,14 +743,28 @@ impl Term {
     /// moving line ids. Per the kitty spec only placements entirely inside
     /// the region move, clipped at its edges.
     fn scroll_region_images(&mut self, top: u16, bot: u16, delta: i32) {
-        if self.image_grid.is_empty() {
+        self.scroll_region_images_where(top, bot, delta, |_| true);
+    }
+
+    /// [`Self::scroll_region_images`] for the placements `only` accepts.
+    fn scroll_region_images_where(
+        &mut self,
+        top: u16,
+        bot: u16,
+        delta: i32,
+        only: impl Fn(&Placement) -> bool,
+    ) {
+        if self.image_grid.is_empty() || delta == 0 {
             return;
         }
         let top_line = self.image_top_line();
-        let dropped = self
-            .image_grid
-            .scroll_region(top_line, top..bot.saturating_add(1), delta);
+        let dropped =
+            self.image_grid
+                .scroll_region_where(top_line, top..bot.saturating_add(1), delta, only);
         self.image_grid.resolve_relative_positions();
+        // Placements may have moved without being dropped; the renderer
+        // rebuilds image instances every frame and the rows were marked,
+        // so only a drop needs the revision bump.
         if !dropped.is_empty() {
             self.image_revision = self.image_revision.wrapping_add(1);
         }
@@ -2081,12 +2095,18 @@ impl Term {
         let bot = self.scroll_bot.min(self.rows.saturating_sub(1));
         if self.lr_narrowed() {
             // DECSLRM: only the margin rectangle moves; no scrollback.
-            // kitty has no left/right margins, so for images this is a
-            // plain region scroll (SCR-11): images in the rows move and
-            // are clipped at the top/bottom margins.
+            // Images inside the rectangle move with its text and are
+            // clipped at the top/bottom margins (SCR-11); those outside
+            // the left/right margins, or straddling one, stay with the
+            // text that stays. (kitty has no left/right margins at all,
+            // so there its text and images all move together.)
             if top < bot {
                 self.rect_scroll_up(top, bot);
-                self.scroll_region_images(top, bot, -1);
+                let (l, r) = self.lr_bounds();
+                self.scroll_region_images_where(top, bot, -1, |p| {
+                    let c = p.col_range();
+                    c.start >= l && c.end <= r.saturating_add(1)
+                });
             }
             return;
         }
@@ -2136,10 +2156,14 @@ impl Term {
         let top = self.scroll_top;
         let bot = self.scroll_bot.min(self.rows.saturating_sub(1));
         if self.lr_narrowed() {
-            // See `region_scroll_up`: a plain region scroll for images.
+            // See `region_scroll_up`: images inside the rectangle move.
             if top < bot {
                 self.rect_scroll_down(top, bot);
-                self.scroll_region_images(top, bot, 1);
+                let (l, r) = self.lr_bounds();
+                self.scroll_region_images_where(top, bot, 1, |p| {
+                    let c = p.col_range();
+                    c.start >= l && c.end <= r.saturating_add(1)
+                });
             }
             return;
         }
@@ -2722,6 +2746,7 @@ impl Term {
             let sw = cell_pw.min(img_w.saturating_sub(sx));
             let sh = cell_ph.min(img_h.saturating_sub(sy));
             let mut placement = Placement::new(id, 1, 1);
+            placement.from_placeholder = true;
             placement.placement_id = placement_id;
             placement.line = top_line + i64::from(cell.row);
             placement.col = cell.col;
@@ -3454,7 +3479,9 @@ impl Term {
         // SCR-6: image placements stay put. kitty 0.49.2 moves only the
         // text on IL (checked on kitty-ref) and the spec lists only index
         // and history scrolling as moving images. Unicode-placeholder
-        // images are text, so they move with their cells.
+        // images are text, so their tiles move with their cells.
+        // TODO(#28): drop this once placeholders render from the cells.
+        self.scroll_region_images_where(cur_row, bot, i32::from(n), |p| p.from_placeholder);
     }
 
     /// DL — Delete Line. `CSI Ps M` removes `n` lines at the cursor
@@ -3520,6 +3547,9 @@ impl Term {
         }
         // SCR-6: image placements stay put, as on IL. kitty 0.49.2 keeps
         // an image whole even when DL deletes the rows under it.
+        // Placeholder tiles move with their cells.
+        // TODO(#28): drop this once placeholders render from the cells.
+        self.scroll_region_images_where(cur_row, bot, -i32::from(n), |p| p.from_placeholder);
     }
 
     /// VPA — Vertical Position Absolute. `CSI Ps d` moves the cursor
@@ -5305,7 +5335,7 @@ fn line_i64(id: u64) -> i64 {
 /// [`LineRemap`] so each placement follows its text, then drop those whose
 /// text left `grid`'s history. Returns `true` if any were dropped.
 fn remap_images(images: &mut ImageGrid, remap: &crate::grid::LineRemap, grid: &Grid) -> bool {
-    images.map_lines(|l| remap.map(l));
+    images.map_anchors(|l, off| remap.map_with_offset(l, off));
     evict_unretained(images, grid)
 }
 
@@ -10998,5 +11028,102 @@ mod placement_resize_tests {
         // no-op (no scroll), so the image doesn't move either.
         feed(&mut t, b"\x1b[14;50H\n");
         assert_eq!(rows(&t), 2..6);
+    }
+
+    /// Transmit-and-place image `id` (1x1 red) over `cols`x`rows` at the
+    /// cursor with `C=1`.
+    fn place_id(t: &mut Term, id: u32, cols: u16, rows: u16) {
+        let s = format!("\x1b_Ga=T,f=32,s=1,v=1,i={id},c={cols},r={rows},C=1,q=2;/wAA/w==\x1b\\");
+        feed(t, s.as_bytes());
+    }
+
+    fn rows_of(t: &Term, id: u32) -> std::ops::Range<i64> {
+        t.prows(t.image_grid().iter().find(|p| p.image_id == id).unwrap())
+    }
+
+    #[test]
+    fn decslrm_leaves_images_outside_or_straddling_the_side_margins() {
+        // #31 review: only images inside the left/right margins move with
+        // the margin rectangle's text.
+        let mut t = Term::new(20, 60, 0);
+        feed(&mut t, b"\x1b[5;10H");
+        place_id(&mut t, 1, 4, 5); // cols 9..13: inside 4..40
+        feed(&mut t, b"\x1b[5;46H");
+        place_id(&mut t, 2, 4, 5); // cols 45..49: outside
+        feed(&mut t, b"\x1b[5;38H");
+        place_id(&mut t, 3, 6, 5); // cols 37..43: straddles the right margin
+        feed(&mut t, b"\x1b[?69h\x1b[5;40s\x1b[3;14r\x1b[14;5H\n\n\n");
+        assert_eq!(rows_of(&t, 1), 2..6, "inside: moves and is clipped");
+        assert_eq!(rows_of(&t, 2), 4..9, "outside: stays with its text");
+        assert_eq!(rows_of(&t, 3), 4..9, "straddling: stays");
+        // Reverse index at the top margin, inside the margins.
+        feed(&mut t, b"\x1b[3;5H\x1bM");
+        assert_eq!(rows_of(&t, 1), 3..7);
+        assert_eq!(rows_of(&t, 2), 4..9);
+    }
+
+    #[test]
+    fn mid_line_anchor_survives_width_round_trips() {
+        // #31 review: an image anchored on a soft-wrapped continuation row
+        // used to creep towards the line start on every width change.
+        let mut t = Term::new(10, 20, 100);
+        feed(&mut t, &[b'A'; 50]); // rows 0..3 at 20 cols, offsets 0/20/40
+        feed(&mut t, b"\x1b[3;1H");
+        place(&mut t, 2, 2, ",C=1"); // row 2: offset 40
+        assert_eq!(rows(&t), 2..4);
+        t.resize(10, 30);
+        assert_eq!(rows(&t), 1..3, "offset 40 is on row 1 at 30 cols");
+        t.resize(10, 20);
+        assert_eq!(rows(&t), 2..4, "back on row 2, not row 1");
+        t.resize(10, 15);
+        assert_eq!(rows(&t), 2..4, "offset 40 is on row 2 at 15 cols");
+        t.resize(10, 20);
+        assert_eq!(rows(&t), 2..4);
+        // A drag through many widths.
+        for w in (21..=45).chain((20..45).rev()) {
+            t.resize(10, w);
+        }
+        assert_eq!(rows(&t), 2..4, "a drag doesn't walk it up the line");
+    }
+
+    // TODO(#28): drop these two once placeholders render from the cells.
+    fn placeholder_tile_rows(t: &Term) -> std::ops::Range<i64> {
+        let p = t
+            .image_grid()
+            .iter()
+            .find(|p| p.from_placeholder)
+            .expect("placeholder tile");
+        t.prows(p)
+    }
+
+    fn print_placeholder_on_row_5(t: &mut Term) {
+        feed(t, b"\x1b_Ga=t,f=32,s=1,v=1,i=42,q=2;/wAA/w==\x1b\\");
+        // U+10EEEE with row/col diacritic 0 (U+0305), fg = image id 42.
+        feed(
+            t,
+            "\x1b[6;1H\x1b[38;5;42m\u{10EEEE}\u{305}\u{305}\x1b[0m".as_bytes(),
+        );
+        feed(t, b"x"); // end the placeholder run
+        assert_eq!(placeholder_tile_rows(t), 5..6);
+    }
+
+    #[test]
+    fn il_moves_placeholder_tiles_with_their_cells() {
+        let mut t = Term::new(10, 20, 0);
+        print_placeholder_on_row_5(&mut t);
+        place_id(&mut t, 1, 2, 2); // an ordinary image at row 5 too
+        feed(&mut t, b"\x1b[3;1H\x1b[2L");
+        assert_eq!(placeholder_tile_rows(&t), 7..8, "follows its cell");
+        assert_eq!(t.row(7).cells[0].ch, '\u{10EEEE}');
+        assert_eq!(rows_of(&t, 1), 5..7, "ordinary image stays (SCR-6)");
+    }
+
+    #[test]
+    fn dl_moves_placeholder_tiles_with_their_cells() {
+        let mut t = Term::new(10, 20, 0);
+        print_placeholder_on_row_5(&mut t);
+        feed(&mut t, b"\x1b[3;1H\x1b[2M");
+        assert_eq!(placeholder_tile_rows(&t), 3..4);
+        assert_eq!(t.row(3).cells[0].ch, '\u{10EEEE}');
     }
 }

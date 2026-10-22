@@ -141,6 +141,12 @@ pub struct LineRemap {
     /// New line id of the row each old retained row's first cell landed
     /// on, oldest first (non-decreasing).
     new_ids: Vec<i64>,
+    /// Where each old row and each new row sit in their logical lines
+    /// (see [`LineRemap::map_with_offset`]).
+    pos: crate::reflow::ReflowMap,
+    /// New line id = `top + flat index - shift`.
+    top: i64,
+    shift: i64,
 }
 
 impl LineRemap {
@@ -162,6 +168,41 @@ impl LineRemap {
             self.new_ids[k as usize]
         } else {
             last + (k - (len - 1))
+        }
+    }
+
+    /// [`Self::map`], keeping a sub-line position stable across repeated
+    /// reflows. A row in the middle of a soft-wrapped line has no fixed
+    /// identity: after a rewrap, the row holding its first cell usually
+    /// starts earlier in the line, so following row starts alone drifts
+    /// an anchor towards the line start on every width change. `hint` is
+    /// the content offset (within its logical line) the caller anchored
+    /// at last time; when it still lies inside the old row it is used
+    /// instead of the row's start, and the offset used is returned to
+    /// pass back next time. A 20 → 30 → 20 column round trip lands on the
+    /// original row.
+    #[must_use]
+    pub fn map_with_offset(&self, line: i64, hint: Option<u32>) -> (i64, Option<u32>) {
+        let k = line - self.old_first;
+        let Ok(k) = usize::try_from(k) else {
+            return (self.map(line), None);
+        };
+        let Some(&Some((l, s))) = self.pos.in_pos.get(k) else {
+            return (self.map(line), None);
+        };
+        // The old row covers offsets `s..end` of logical line `l`.
+        let end = match self.pos.in_pos.get(k + 1) {
+            Some(&Some((l2, s2))) if l2 == l => Some(s2),
+            _ => None,
+        };
+        let off = match hint {
+            Some(h) if h >= s && end.is_none_or(|e| h < e) => h,
+            _ => s,
+        };
+        match self.pos.out_row(l, off) {
+            #[allow(clippy::cast_possible_wrap)]
+            Some(f) => (self.top + f as i64 - self.shift, Some(off)),
+            None => (self.map(line), None),
         }
     }
 }
@@ -526,15 +567,9 @@ impl Grid {
             .min(retained.len().saturating_sub(1));
         retained.truncate(end + 1);
 
-        let mut row_map = Vec::with_capacity(retained.len());
-        let (flat, (cur_idx, cur_col)) = reflow_segments(
-            &retained,
-            cols,
-            cursor_idx,
-            cursor.1,
-            relayout,
-            &mut row_map,
-        );
+        let mut pos = crate::reflow::ReflowMap::default();
+        let (flat, (cur_idx, cur_col)) =
+            reflow_segments(&retained, cols, cursor_idx, cursor.1, relayout, &mut pos);
 
         // Lay the rewrapped rows into a fresh ring with `head = 0`, so
         // logical row `i` sits at slot `i` and scrollback row `n` at slot
@@ -595,8 +630,18 @@ impl Grid {
         #[allow(clippy::cast_possible_wrap)]
         let shift = n.saturating_sub(vis) as i64;
         #[allow(clippy::cast_possible_wrap)]
-        let new_ids = row_map.iter().map(|&f| top + f as i64 - shift).collect();
-        let remap = LineRemap { old_first, new_ids };
+        let new_ids = pos
+            .row_map
+            .iter()
+            .map(|&f| top + f as i64 - shift)
+            .collect();
+        let remap = LineRemap {
+            old_first,
+            new_ids,
+            pos,
+            top,
+            shift,
+        };
 
         ((cursor_row, cur_col.min(cols)), remap)
     }
@@ -607,19 +652,17 @@ impl Grid {
 /// `relayout`), and concatenate the results. With no tagged rows this is
 /// exactly `reflow_rows` over the whole slice.
 ///
-/// `row_map` receives the output index each input row's first cell lands
-/// on (rows of a re-laid-out rich block map to the same index within the
-/// new run, clamped to its end).
+/// `map` receives where each input row lands (rows of a re-laid-out rich
+/// block map to the same index within the new run, clamped to its end,
+/// with no logical-line position).
 fn reflow_segments(
     rows: &[Row],
     cols: u16,
     cursor_idx: usize,
     cursor_col: u16,
     relayout: &mut RelayoutFn<'_>,
-    row_map: &mut Vec<usize>,
+    map: &mut crate::reflow::ReflowMap,
 ) -> (Vec<Row>, (usize, u16)) {
-    row_map.clear();
-    let mut seg_map = Vec::new();
     let mut out: Vec<Row> = Vec::with_capacity(rows.len());
     let mut cur = (0usize, 0u16);
     let mut i = 0usize;
@@ -651,7 +694,9 @@ fn reflow_segments(
                 cur = (base + off, cursor_col.min(cols));
             }
             let last = out.len() - base - 1;
-            row_map.extend((0..i - start).map(|j| base + j.min(last)));
+            map.row_map
+                .extend((0..i - start).map(|j| base + j.min(last)));
+            map.in_pos.extend((start..i).map(|_| None));
         } else {
             while i < rows.len() && rows[i].rich.is_none() {
                 i += 1;
@@ -662,18 +707,17 @@ fn reflow_segments(
             } else {
                 usize::MAX
             };
-            let (seg, (ci, cc)) = crate::reflow::reflow_rows_mapped(
+            let (seg, (ci, cc)) = crate::reflow::reflow_rows_mapped_at(
                 &rows[start..i],
                 cols,
                 want,
                 cursor_col,
-                &mut seg_map,
+                map,
+                out.len(),
             );
             if has_cursor {
                 cur = (out.len() + ci, cc);
             }
-            let base = out.len();
-            row_map.extend(seg_map.iter().map(|&r| base + r));
             out.extend(seg);
         }
     }
@@ -681,7 +725,8 @@ fn reflow_segments(
         out.push(Row::blank(cols));
         cur = (0, 0);
     }
-    row_map.resize(rows.len(), out.len() - 1);
+    map.row_map.resize(rows.len(), out.len() - 1);
+    map.in_pos.resize(rows.len(), None);
     (out, cur)
 }
 

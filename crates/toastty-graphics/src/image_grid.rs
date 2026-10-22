@@ -84,6 +84,17 @@ pub struct Placement {
     /// (kitty's `H=`/`V=`). Only meaningful when [`Self::parent`] is
     /// `Some`. Signed. Defaults to `(0, 0)`.
     pub rel_offset: (i32, i32),
+    /// Content offset of [`Self::line`] within its logical (soft-wrapped)
+    /// line, as of the last reflow, so repeated width changes keep the
+    /// placement on the same text instead of drifting to the line start.
+    /// `None` until a reflow sets it. Only resize code reads or writes it.
+    pub wrap_offset: Option<u32>,
+    /// Set on the per-cell tiles the Unicode-placeholder pipeline makes.
+    /// Those are text: IL/DL move them with their cells, unlike ordinary
+    /// placements.
+    // TODO(#28): delete once placeholders are resolved from the cells at
+    // render time and no longer live in `ImageGrid`.
+    pub from_placeholder: bool,
 }
 
 impl Placement {
@@ -106,6 +117,8 @@ impl Placement {
             pix_offset: (0, 0),
             parent: None,
             rel_offset: (0, 0),
+            wrap_offset: None,
+            from_placeholder: false,
         }
     }
 
@@ -407,17 +420,18 @@ impl ImageGrid {
         }
     }
 
-    /// Re-anchor every placement through `f` (old line id → new line id).
-    /// Used when a reflow renumbers the lines, so each placement follows
-    /// the row its text moved to. Relative children are re-resolved from
-    /// their (mapped) parents afterwards.
-    pub fn map_lines(&mut self, f: impl Fn(i64) -> i64) {
+    /// Re-anchor every placement through `f`, which maps `(line,
+    /// wrap_offset)` before a reflow to the same after it. Used when a
+    /// reflow renumbers the lines, so each placement follows the text it
+    /// sits on. Relative children are re-resolved from their (mapped)
+    /// parents afterwards.
+    pub fn map_anchors(&mut self, f: impl Fn(i64, Option<u32>) -> (i64, Option<u32>)) {
         if self.placements.is_empty() {
             return;
         }
         self.bounds = None;
         for (_, p) in &mut self.placements {
-            p.line = f(p.line);
+            (p.line, p.wrap_offset) = f(p.line, p.wrap_offset);
         }
         self.resolve_relative_positions();
     }
@@ -465,6 +479,19 @@ impl ImageGrid {
         region: Range<u16>,
         delta: i32,
     ) -> Vec<Placement> {
+        self.scroll_region_where(top_line, region, delta, |_| true)
+    }
+
+    /// [`Self::scroll_region`], moving only the placements `only` accepts
+    /// (e.g. those inside DECSLRM left/right margins, or placeholder
+    /// tiles on IL/DL). The rest are left alone.
+    pub fn scroll_region_where(
+        &mut self,
+        top_line: i64,
+        region: Range<u16>,
+        delta: i32,
+        only: impl Fn(&Placement) -> bool,
+    ) -> Vec<Placement> {
         if delta == 0 || region.is_empty() {
             return Vec::new();
         }
@@ -476,7 +503,7 @@ impl ImageGrid {
         while i < self.placements.len() {
             let p = &mut self.placements[i].1;
             let shown = p.screen_rows(top_line);
-            if shown.is_empty() || shown.start < rt || shown.end > rb {
+            if shown.is_empty() || shown.start < rt || shown.end > rb || !only(p) {
                 i += 1;
                 continue;
             }
