@@ -336,7 +336,7 @@ UVs at draw time. Don't patch each item separately.
     the grid stays visible.
   - Cause: `pipeline.rs:161-163` uses linear filtering with no mipmaps.
   - Consider mipmaps, or a box prefilter on upload.
-- [ ] **P2 — SIZE-13. `TIOCGWINSZ` pixel size includes the leftover sub-cell
+- [x] **P2 — SIZE-13. `TIOCGWINSZ` pixel size includes the leftover sub-cell
   strip.**
   - Measured: toastty reports 1000×600 for 100×31 cells (19.35 px rows),
     while `CSI 16t` says 19 and `CSI 14t` says 589. kitty reports
@@ -348,6 +348,12 @@ UVs at draw time. Don't patch each item separately.
     content rect.
   - Also, `CSI 14;2t` answers the same as `14t`. kitty reports the full
     window there.
+  - Fix: `TIOCGWINSZ` pixels and `CSI 14t` both come from
+    `Term::text_area_pixel_size` (`cols*cell_w × rows*cell_h`). `CSI 14;2t`
+    reports the window surface, padding included. Checked against kitty
+    0.49.2 on a 1000×600 window: kitty gives 999×600 / 1000×600, and
+    toastty now gives 1000×589 / 1000×600. Each pair is consistent with
+    that terminal's own `16t`/`18t`. Fixed in #25.
 
 ## 3. Unicode placeholders
 
@@ -821,7 +827,7 @@ These behave like kitty or the spec. Keep them working when fixing the above.
 - [x] Extreme `c`/`r`/`X`/`Y`/`x`/`y`/`w`/`h`/`H`/`V` values don't crash.
   No panics in any test.
 - [x] `CSI 14t`, `16t` and `18t` agree with each other after resize and font
-  zoom (but see SIZE-13 for `TIOCGWINSZ`).
+  zoom, and so does `TIOCGWINSZ` (SIZE-13).
 
 **Placement and deletion**
 - [x] Unnamed placements accumulate. The same `i`+`p` replaces the previous
