@@ -109,6 +109,66 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
+# Size-optimise cold, code-heavy dependencies: the Markdown block parsers
+# and layout engines (Mermaid, LaTeX maths, SVG tree building), the glTF /
+# OBJ loaders behind RGP, the config TOML parser, and petgraph (only the
+# Wayland clipboard's MIME sniffing uses it). Each runs once per block /
+# asset / config load / paste, never per frame or per PTY byte, and
+# rendering the demo Markdown document (diagrams + maths) measured the
+# same at "s" as at 3. Binary: -430 KB. Rasterisers (tiny-skia, resvg),
+# image codecs, regex engines, font parsing and everything on the
+# startup path stay at opt-level 3.
+[profile.release.package.mermaid-svg]
+opt-level = "s"
+
+[profile.release.package.ratex-parser]
+opt-level = "s"
+
+[profile.release.package.ratex-layout]
+opt-level = "s"
+
+[profile.release.package.ratex-render]
+opt-level = "s"
+
+[profile.release.package.ratex-types]
+opt-level = "s"
+
+[profile.release.package.ratex-lexer]
+opt-level = "s"
+
+[profile.release.package.ratex-font]
+opt-level = "s"
+
+[profile.release.package.usvg]
+opt-level = "s"
+
+[profile.release.package.svgtypes]
+opt-level = "s"
+
+[profile.release.package.pulldown-cmark]
+opt-level = "s"
+
+[profile.release.package.gltf]
+opt-level = "s"
+
+[profile.release.package.gltf-json]
+opt-level = "s"
+
+[profile.release.package.tobj]
+opt-level = "s"
+
+[profile.release.package.toml_edit]
+opt-level = "s"
+
+[profile.release.package.toml]
+opt-level = "s"
+
+[profile.release.package.winnow]
+opt-level = "s"
+
+[profile.release.package.petgraph]
+opt-level = "s"
+
 [profile.profiling]
 inherits = "release"
 debug = "line-tables-only"
