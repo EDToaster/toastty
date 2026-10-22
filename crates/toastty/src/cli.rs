@@ -627,6 +627,7 @@ mod tests {
             "[shell]",
             "[scrollback]",
             "[window]",
+            "[shader]",
         ] {
             assert!(s.contains(section), "missing section {section} in:\n{s}");
         }

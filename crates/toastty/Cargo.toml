@@ -54,6 +54,7 @@ libc = "0.2"
 pprof = ["dep:pprof"]
 
 [dev-dependencies]
+tempfile = "3"
 toastty-graphics.workspace = true
 
 [lints]
