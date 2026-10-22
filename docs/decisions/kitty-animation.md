@@ -170,7 +170,8 @@ With frames left, `d=F` also deletes just a frame. On a single-frame image,
   12.8–13.5% to 5.9–7.5% CPU.
 
 `Term::tick_animations(now)` ticks the animations of images that have a
-placement on the active screen. kitty also animates only images it draws.
+placement on the active screen, real or virtual (a `U=1` placement for
+Unicode placeholders). kitty also animates only images it draws.
 It marks their placements dirty and bumps `image_revision` and the
 registry generation. It is a no-op when no animation is running.
 
@@ -186,23 +187,19 @@ with it.
 
 ## Rendering and the texture cache
 
-The renderer keys textures on what `get(id)` returns and on its
-generation:
+The renderer needs no changes. C1's texture cache (#24) keys each
+image's texture on `ImageRegistry::generation(id)`. The registry keeps
+C1's semantics, a new value on every insert, and adds one: a new value
+on every change of the displayed frame. So a frame change drops the old
+texture and uploads the new frame on its next draw. That covers real
+placements and Unicode placeholders, which bind through the same
+`resolve_kitty_textures`.
 
-- `ImageRegistry::generation(id)` has the same signature as in C1 (#24).
-- It changes on every insert, and on every change of the displayed frame.
-- The pre-C1 renderer on this branch folds the generation into its
-  fingerprint (the sampled fingerprint alone can miss a new frame). It
-  then re-uploads the current frame when it changes.
-
-When C1 lands, its cache already refreshes on a generation change.
-Per-frame textures would then mean keying C1's cache on
+Caching each frame as its own texture would mean keying the cache on
 `(id, frame, epoch)` instead of `id`, so frames cycling within the GPU
-budget stop re-uploading. The registry would expose the frame identity.
-
-We measured whether that is worth doing. A 400-frame 480×270 GIF at
-25 fps costs 4.5% CPU with re-uploads, and a 240×120 one 2%. The
-per-frame cache is left for when C1 is in.
+budget stop re-uploading. We measured whether that is worth doing: a
+400-frame 480×270 GIF at 25 fps costs about 5% CPU with re-uploads, and
+a 240×120 one 2%. It is left as a possible follow-up.
 
 ## Quota
 
