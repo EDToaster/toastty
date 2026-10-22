@@ -651,7 +651,11 @@ impl Term {
     /// binary calls this after every `parser.advance` and writes the
     /// returned bytes to the PTY master. Returns an empty `Vec` when
     /// nothing was queued.
+    ///
+    /// It also expires an abandoned chunked kitty upload (60 s idle), so
+    /// one doesn't stay resident when no further graphics command comes.
     pub fn drain_pty_replies(&mut self) -> Vec<u8> {
+        self.image_handler.expire_pending(Instant::now());
         std::mem::take(&mut self.pty_replies)
     }
 
@@ -4581,9 +4585,9 @@ impl Perform for Term {
 
     fn apc_chunk(&mut self, bytes: &[u8]) {
         // Cap on a single APC packet's buffered bytes — defends against
-        // a hostile stream sending an unbounded APC payload that's
-        // larger than the kitty handler's per-upload cap. 256 MiB
-        // here matches the registry default cap.
+        // a hostile stream sending an unbounded APC payload. The kitty
+        // handler then bounds the decoded size from the base64 length
+        // before decoding (`b64::decoded_len_bound`).
         const APC_BUFFER_CAP: usize = 256 * 1024 * 1024;
         if self.apc_buffer.len().saturating_add(bytes.len()) > APC_BUFFER_CAP {
             // Drop further chunks for this packet — `apc_end` will see
@@ -5349,16 +5353,6 @@ impl KittySink for Term {
 
     fn queue_reply(&mut self, bytes: &[u8]) {
         self.pty_replies.extend_from_slice(bytes);
-    }
-
-    fn pending_budget_remaining(&self) -> u64 {
-        // Take registry budget minus the bytes already buffered in the
-        // APC reassembly buffer.
-        let used_buf = self.apc_buffer.len() as u64;
-        self.images
-            .store
-            .budget_remaining()
-            .saturating_sub(used_buf)
     }
 
     fn max_image_bytes(&self) -> u64 {
@@ -9147,16 +9141,32 @@ mod tests {
 
     #[test]
     fn apc_kitty_oversized_payload_replies_efbig() {
+        use base64::Engine;
         let mut t = Term::new(2, 4, 0);
         // Shrink the cap so the test isn't sensitive to the default.
         t.set_image_cap(1024);
-        // Declare a payload bigger than the cap.
-        let mut payload = Vec::new();
-        payload.extend_from_slice(b"\x1b_Ga=t,f=32,s=8192,v=8192,i=1,S=268435456;\x1b\\");
+        // A chunked 32x32 RGBA upload (4 KiB) can hold at most the 1 KiB
+        // registry cap plus kitty's 10-byte slack of decoded data; the
+        // first chunk past it gets EFBIG and the upload is dropped.
+        let chunk = base64::engine::general_purpose::STANDARD.encode([0u8; 2048]);
+        let mut payload = b"\x1b_Ga=t,f=32,s=32,v=32,i=1,m=1;".to_vec();
+        payload.extend_from_slice(chunk.as_bytes());
+        payload.extend_from_slice(b"\x1b\\");
         feed(&mut t, &payload);
         let replies = t.drain_pty_replies();
-        let s = String::from_utf8_lossy(&replies);
-        assert!(s.contains("EFBIG"), "expected EFBIG, got {s:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&replies),
+            "\x1b_Gi=1;EFBIG:Too much data\x1b\\"
+        );
+        // `S=` on a direct transmission is only a hint (WIRE-11).
+        feed(
+            &mut t,
+            b"\x1b_Ga=t,f=32,s=1,v=1,i=2,S=268435456;/wAA/w==\x1b\\",
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&t.drain_pty_replies()),
+            "\x1b_Gi=2;OK\x1b\\"
+        );
     }
 
     /// SEC-7: the PNG quota is the registry cap. This PNG's IHDR claims

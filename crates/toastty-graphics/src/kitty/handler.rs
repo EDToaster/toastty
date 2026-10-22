@@ -9,42 +9,31 @@
 //! testable without `Term` and so the implementation can grow without
 //! bloating `term.rs`.
 //!
-//! Chunked-upload reassembly:
-//! - `m=1` keeps `id`'s pending buffer alive across chunks.
-//! - `m=0` (or no `m=`) is the final chunk; concatenate, decode, dispatch.
-//! - A header mismatch between chunks → `Einval` and we abandon the upload.
-//! - Cap on pending buffer size — overflow → `Efbig`.
-//! - Global caps on in-flight uploads (count and total bytes) evict the
-//!   least recently active one; an upload idle for
-//!   [`PENDING_UPLOAD_TTL`] is freed (SEC-6).
+//! Chunked-upload reassembly follows kitty 0.49.2 (WIRE-9/10/11, DEL-3):
+//! - There is one loading slot. `m=1` on a first chunk starts it, after
+//!   checking the format and dimensions; while it's busy, every direct
+//!   transmit is a continuation, whatever its own keys say.
+//! - Chunks are base64-decoded on arrival ([`b64`]), each with its own
+//!   padding (WIRE-4), so the size cap counts decoded bytes: kitty's
+//!   `s*v*bpp` plus slack, or the image quota for PNG (SEC-6, WIRE-11).
+//!   Past it the upload is dropped with `EFBIG:Too much data`.
+//! - `m=0` (or no `m=`) is the final chunk: decode and dispatch.
+//! - Any delete, or a file-medium transmit, aborts the upload silently;
+//!   so does [`PENDING_UPLOAD_TTL`] of idleness.
 
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use base64::Engine;
+#[cfg(test)]
+use base64::Engine as _;
 
-use super::decode::{DecodeError, decode, raw_len};
+use super::b64;
+use super::decode::{DecodeError, RAW_DATA_SLACK, decode, raw_len};
 use super::header::{Action, Compression, DeleteSpec, Header, Quiet, Transmission};
 use super::medium::{self, FileError, FileRequest};
 use super::placeholder::VirtualPlacement;
 use super::reply::{ErrorCode, encode_error, encode_ok};
 use crate::image_grid::{Placement, RelativeError, SrcRect};
 use crate::registry::ImageData;
-
-/// Maximum pending-upload buffer size in bytes. Larger uploads are
-/// rejected mid-stream with [`ErrorCode::Efbig`].
-pub const DEFAULT_PENDING_CAP: usize = 64 * 1024 * 1024;
-
-/// Most chunked uploads in flight at once (SEC-6). The spec says a client
-/// must finish one upload before it starts another, so this only has to
-/// absorb abandoned ones. Starting one more evicts the least recently
-/// active upload.
-pub const MAX_PENDING_UPLOADS: usize = 8;
-
-/// Cap on the buffers of all in-flight uploads together (SEC-6). Room for
-/// a new chunk is made by evicting the least recently active other
-/// uploads. At least [`DEFAULT_PENDING_CAP`], so one upload always fits.
-pub const DEFAULT_PENDING_TOTAL_CAP: usize = 2 * DEFAULT_PENDING_CAP;
 
 /// An upload that receives no chunk for this long is abandoned, and its
 /// buffer freed on the next graphics command (SEC-6).
@@ -114,14 +103,6 @@ pub trait KittySink {
     /// Queue `bytes` for write back to the PTY. The host's drain
     /// (`Term::drain_pty_replies`) returns these to the binary.
     fn queue_reply(&mut self, bytes: &[u8]);
-
-    /// Approximate bytes the registry could still accept. The handler
-    /// uses this for an early-reject on declared payload size (`S=`),
-    /// so a 4 GiB declared upload doesn't allocate before failing.
-    /// Default returns `u64::MAX` — i.e. "no budget gate from the host".
-    fn pending_budget_remaining(&self) -> u64 {
-        u64::MAX
-    }
 
     /// Largest decoded image, in RGBA8 bytes, the host could ever store
     /// (its registry cap, not what is free right now: inserts evict).
@@ -199,46 +180,56 @@ pub trait KittySink {
     }
 }
 
-/// In-flight chunked transmission state.
+/// The in-flight chunked upload. kitty has exactly one loading slot: while
+/// it is busy, every direct transmit is a continuation of it, whatever its
+/// own keys say (WIRE-9).
 #[derive(Debug)]
-struct PendingUpload {
-    /// Header from the first chunk. The handler validates incoming
-    /// chunk headers against this.
+struct Upload {
+    /// Header from the first chunk; it governs the whole upload. Only
+    /// `q=` is taken from later chunks (WIRE-8).
     head: Header,
-    /// Concatenated base64 bytes (NOT decoded yet — kitty's
-    /// reassembly happens on the wire-format bytes).
-    buf: Vec<u8>,
-    /// When the latest chunk arrived; drives [`PENDING_UPLOAD_TTL`]
-    /// expiry.
+    /// Decoded payload so far. Chunks are decoded on arrival (WIRE-4), so
+    /// caps count decoded bytes, not base64 (WIRE-11).
+    data: Vec<u8>,
+    /// base64 state carried between chunks.
+    b64: b64::Decoder,
+    /// Most decoded bytes this upload may hold: kitty's buffer capacity
+    /// (`s*v*bpp` plus slack, or the image quota for PNG). Past it, kitty
+    /// replies `EFBIG:Too much data` and drops the upload.
+    limit: u64,
+    /// `a=q,m=1`: kitty consumes exactly one more chunk and drops the
+    /// query silently (WIRE-10).
+    query: bool,
+    /// When the latest chunk arrived; drives [`PENDING_UPLOAD_TTL`].
     last_chunk: Instant,
-    /// Handler-wide chunk counter at the latest chunk. Orders eviction
-    /// (least recently active first) without relying on clock ticks.
-    last_seq: u64,
+}
+
+impl Upload {
+    /// True iff `header` (an `a=p` or animation command) names the image
+    /// this upload is loading.
+    fn targets(&self, header: &Header) -> bool {
+        if self.query {
+            return false;
+        }
+        if header.image_id != 0 {
+            header.image_id == self.head.image_id
+        } else {
+            header.image_number != 0 && header.image_number == self.head.image_number
+        }
+    }
 }
 
 /// Top-level Kitty dispatcher.
 #[derive(Debug)]
 pub struct KittyHandler {
-    /// Pending chunked uploads keyed by `i=` (image id). For `I=`
-    /// (image number) we don't currently maintain a parallel slot —
-    /// `i=` is the canonical id (pre-approved trade-off).
-    pending: HashMap<u32, PendingUpload>,
-    /// Image id of the upload currently in progress. Set by the first
-    /// chunk (which carries `a=t|T,i=N,m=1`); consulted by continuation
-    /// chunks that omit `i=` (yazi, kitty +kitten icat, every
-    /// real-world client). Cleared when `m=0` finalizes or the upload
-    /// is abandoned with an error.
-    ///
-    /// The kitty spec doesn't strictly require `i=` on continuation
-    /// chunks — terminals are expected to track an active upload — so
-    /// rejecting headerless continuations would break every client.
-    active_upload_id: Option<u32>,
-    /// Per-instance override of [`DEFAULT_PENDING_CAP`].
+    /// The one in-flight chunked upload, if any.
+    loading: Option<Upload>,
+    /// Extra ceiling on an upload's decoded bytes, on top of the
+    /// format/quota limit (`usize::MAX` by default; tests lower it).
     pending_cap: usize,
-    /// Per-instance override of [`DEFAULT_PENDING_TOTAL_CAP`].
-    pending_total_cap: usize,
-    /// Chunks seen so far; stamps [`PendingUpload::last_seq`].
-    chunk_seq: u64,
+    /// Set while finishing an upload whose last chunk was an `a=q` with
+    /// `i=`: kitty replies under the query's id.
+    reply_id_override: Option<u32>,
 }
 
 impl Default for KittyHandler {
@@ -252,34 +243,28 @@ impl KittyHandler {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            pending: HashMap::new(),
-            active_upload_id: None,
-            pending_cap: DEFAULT_PENDING_CAP,
-            pending_total_cap: DEFAULT_PENDING_TOTAL_CAP,
-            chunk_seq: 0,
+            loading: None,
+            pending_cap: usize::MAX,
+            reply_id_override: None,
         }
     }
 
-    /// Override the maximum pending-upload buffer size. The global cap
-    /// grows with it if needed, so a single upload always fits.
+    /// Cap an upload's decoded bytes below the format/quota limit.
     pub fn set_pending_cap(&mut self, cap: usize) {
         self.pending_cap = cap;
-        self.pending_total_cap = self.pending_total_cap.max(cap);
     }
 
-    /// Bytes buffered across all in-flight chunked uploads.
+    /// Bytes held by the in-flight upload. Counts capacity, the memory
+    /// actually allocated.
     #[must_use]
     pub fn pending_bytes(&self) -> usize {
-        // Count allocated capacity, not length: `extend_from_slice` grows
-        // the buffer geometrically, so capacity is the memory actually
-        // held. Counting it keeps the global cap honest (reviewer item 7).
-        self.pending.values().map(|p| p.buf.capacity()).sum()
+        self.loading.as_ref().map_or(0, |u| u.data.capacity())
     }
 
-    /// Number of in-flight chunked uploads.
+    /// Number of in-flight chunked uploads (0 or 1, as in kitty).
     #[must_use]
     pub fn pending_uploads(&self) -> usize {
-        self.pending.len()
+        usize::from(self.loading.is_some())
     }
 
     /// Process one APC payload split into `(header, body)`.
@@ -329,17 +314,9 @@ impl KittyHandler {
                 // app sends a (typically tiny) image and the terminal
                 // replies OK if it could decode it, or the appropriate
                 // error code if not. The terminal must NOT store or
-                // display the payload.
-                //
-                // This is what apps use to probe kitty-graphics support
-                // at startup (yazi, helix, btop, ...). Replying ENOENT
-                // here — which M11a-followup.I2 did by looking the id
-                // up in the registry — tells the probing app "no
-                // support", which is the opposite of what we want.
-                //
-                // `KittySink::image_exists` is still exposed for future
-                // use cases (e.g. a hypothetical "does cache hold N"
-                // action) but is NOT consulted by `a=q`.
+                // display the payload. Apps probe kitty-graphics support
+                // this way at startup (yazi, helix, btop, ...), so the
+                // registry is not consulted.
                 self.handle_query(header, body, sink);
             }
             Action::Frame | Action::Animate | Action::Compose => {
@@ -348,25 +325,76 @@ impl KittyHandler {
         }
     }
 
-    #[allow(clippy::needless_pass_by_value, clippy::unused_self)]
+    #[allow(clippy::needless_pass_by_value)]
     fn handle_query<S: KittySink>(&mut self, header: Header, body: &[u8], sink: &mut S) {
-        // kitty answers a query only when it carries `i=`: an anonymous
-        // or `I=`-only query is silent, success or failure (WIRE-7).
+        // kitty drops a query without `i=` (anonymous or `I=`-only) before
+        // any of its loading logic: it doesn't append to, finish, abort or
+        // EILSEQ an upload in progress, and gets no reply (WIRE-7/9/10).
         if header.image_id == 0 {
             return;
         }
         if !matches!(header.transmission, Transmission::Direct) {
+            self.abort_loading("file query");
             reply_error_if_verbose(&header, sink, ErrorCode::Enotsup, "transmission medium");
+            return;
+        }
+        // During an upload a direct query is, to kitty, more of that
+        // upload (WIRE-9/10, measured on 0.49.2):
+        if let Some(up) = &self.loading {
+            if up.query && header.more {
+                // A second chunked query while one is loading: EILSEQ,
+                // under the new query's id.
+                self.loading = None;
+                reply_error_if_verbose(
+                    &header,
+                    sink,
+                    ErrorCode::Eilseq,
+                    "More payload loading refers to non-existent image",
+                );
+            } else if up.query {
+                // The chunk after `a=q,m=1` ends that query, silently.
+                self.loading = None;
+            } else if header.more {
+                // A chunked query can't continue a transmit: kitty
+                // replies EILSEQ for the upload and drops it.
+                let head = up.head.clone();
+                self.loading = None;
+                reply_error_if_verbose(
+                    &head,
+                    sink,
+                    ErrorCode::Eilseq,
+                    "More payload loading refers to non-existent image",
+                );
+            } else {
+                self.continue_upload(&header, body, sink);
+            }
+            return;
+        }
+        let quota = sink.max_image_bytes();
+        if header.more {
+            // WIRE-10: a chunked query is checked like the first chunk of
+            // a transmit, then consumes the next chunk and ends without a
+            // reply, as in kitty. Nothing is stored.
+            if let Err(e) = self.start_upload(&header, body, quota, true)
+                && !e.silent
+            {
+                reply_error_if_verbose(&header, sink, e.code, &e.detail);
+            }
             return;
         }
         // Decode and validate. Same pipeline as `finalize_transmit`
         // but we discard the result (Query must not store/display). An
         // empty body is not special: like kitty it fails the dimension
         // or data checks (`EINVAL:Zero width/height not allowed`).
-        let decoded = decode_base64(body);
-        match decode_payload(&header, decoded, sink.max_image_bytes()) {
+        if let Err(e) = check_body_fits(&header, body, quota) {
+            reply_error_if_verbose(&header, sink, e.code, &e.detail);
+            return;
+        }
+        let decoded = b64::decode_all(body);
+        match decode_payload(&header, decoded, quota) {
             Ok(_) => reply_ok_if_verbose(&header, sink),
-            Err(e) => reply_error_if_verbose(&header, sink, e.code, &e.detail),
+            Err(e) if !e.silent => reply_error_if_verbose(&header, sink, e.code, &e.detail),
+            Err(_) => {}
         }
     }
 
@@ -374,187 +402,153 @@ impl KittyHandler {
         // M6: Non-direct mediums (`t=f`, `t=t`, `t=s`) carry a
         // base64-encoded PATH (or shm name) in the body rather than the
         // image data itself. They are inherently single-shot — the file
-        // holds the whole payload — so they never participate in the
-        // chunked (`m=1`) reassembly machinery below. Acquire the bytes
-        // from the medium, then run them through the SAME
-        // compression/format decode-and-place tail as direct
-        // transmission via `finalize_decoded`.
+        // holds the whole payload — so they never join the chunked
+        // reassembly below; like kitty, one arriving mid-upload drops
+        // that upload. Acquire the bytes from the medium, then run them
+        // through the SAME compression/format decode-and-place tail as
+        // direct transmission via `finalize_decoded`.
         if !matches!(header.transmission, Transmission::Direct) {
+            self.abort_loading("file transmit");
             self.handle_medium_transmit(header, body, sink);
             return;
         }
 
-        // Resolve which pending upload this chunk targets. Real-world
-        // clients (yazi, kitty +kitten icat) emit the first chunk with
-        // `a=T,i=N,m=1,<other params>` and subsequent chunks with just
-        // `m={1|0}` — no `i=`. Per the kitty spec the terminal must
-        // remember the active upload and route headerless continuations
-        // to it. Without this, `m=0` would be parsed as a brand-new
-        // single-chunk transmit with no `s=`/`v=`, which trips the
-        // decoder's "missing required dimensions" check.
-        let key = if header.image_id != 0 {
-            header.image_id
-        } else {
-            self.active_upload_id.unwrap_or(0)
-        };
-
-        // We have a continuation target either because the client passed
-        // an explicit `i=` (rare with chunked uploads) or because we're
-        // already mid-stream on an anonymous (no-`i=`) upload that we've
-        // been tracking via `active_upload_id`. Without the latter
-        // branch, clients like bannerfetch that omit `i=` on every chunk
-        // would have their `m=0` final chunk parsed as a brand-new
-        // single-shot transmit — the bare header carries no `s=` / `v=`
-        // and the decoder rejects it with `EINVAL`.
-        let has_route = header.image_id != 0 || self.active_upload_id.is_some();
-
-        // Continuation: append to the existing pending buffer.
-        if has_route && let Some(pending) = self.pending.get_mut(&key) {
-            // WIRE-8: a `q=` on a continuation chunk applies to the whole
-            // upload, as in kitty. `q=0` can't be told apart from no `q=`,
-            // so it never lowers an earlier chunk's quietness.
-            if header.quiet != Quiet::Verbose {
-                pending.head.quiet = header.quiet;
+        // While an upload is loading, kitty treats every direct transmit
+        // as its continuation, whatever its own `i=`/keys say: real
+        // clients (yazi, `kitten icat`) send continuations as bare
+        // `m=1`/`m=0`, and a stray command from another program is
+        // appended too (WIRE-9). The upload's own first header governs;
+        // the 60 s idle expiry keeps an abandoned upload from capturing
+        // later images forever.
+        if let Some(up) = &self.loading {
+            if up.query {
+                self.loading = None;
+            } else {
+                self.continue_upload(&header, body, sink);
             }
-            // Compare critical header fields. Mismatches → Einval and
-            // abandon the upload. Skip the check when the continuation
-            // chunk was routed via `active_upload_id` (its header is
-            // intentionally bare — only `m=` is set — so comparing it
-            // against the first-chunk header would always fail).
-            let bare_continuation = header.image_id == 0;
-            if !bare_continuation && !headers_continuation_compatible(&pending.head, &header) {
-                let head = pending.head.clone();
-                self.pending.remove(&key);
-                self.active_upload_id = None;
-                reply_error_if_verbose(&head, sink, ErrorCode::Einval, "header mismatch");
-                return;
-            }
-            if pending.buf.len() + body.len() > self.pending_cap {
-                let head = pending.head.clone();
-                self.pending.remove(&key);
-                self.active_upload_id = None;
-                reply_error_if_verbose(&head, sink, ErrorCode::Efbig, "pending overflow");
-                return;
-            }
-            // SEC-6: stay under the global cap by evicting other uploads.
-            self.make_room(Some(key), body.len());
-            self.chunk_seq += 1;
-            let pending = self.pending.get_mut(&key).expect("make_room keeps `key`");
-            // Geometric growth is fine: `pending_bytes` counts capacity,
-            // so the global cap already accounts for the slack.
-            pending.buf.extend_from_slice(body);
-            pending.last_chunk = Instant::now();
-            pending.last_seq = self.chunk_seq;
-            if header.more {
-                return;
-            }
-            // Final chunk — pop and finalize.
-            let pending = self.pending.remove(&key).unwrap();
-            self.active_upload_id = None;
-            self.finalize_transmit(pending.head, pending.buf, sink);
             return;
         }
 
-        // First / only chunk.
-        // Early reject if declared payload size exceeds host budget.
-        if header.size > 0 && u64::from(header.size) > sink.pending_budget_remaining() {
-            reply_error_if_verbose(&header, sink, ErrorCode::Efbig, "declared size > budget");
-            return;
-        }
-        if body.len() > self.pending_cap {
-            reply_error_if_verbose(&header, sink, ErrorCode::Efbig, "body > pending cap");
-            return;
-        }
-
+        let quota = sink.max_image_bytes();
         if header.more {
-            // First chunk of a multi-chunk upload. Always record
-            // `active_upload_id` — including `Some(0)` for fully
-            // anonymous uploads (no `i=` on any chunk). Continuation
-            // chunks omit `i=` in every real-world client, so this is
-            // the only state we can route them back through.
-            // SEC-6: free a slot and room under the global byte cap first.
-            self.pending.remove(&key);
-            self.make_room(None, body.len());
-            self.chunk_seq += 1;
-            self.active_upload_id = Some(key);
-            self.pending.insert(
-                key,
-                PendingUpload {
-                    head: header,
-                    buf: body.to_vec(),
-                    last_chunk: Instant::now(),
-                    last_seq: self.chunk_seq,
-                },
-            );
+            // First chunk of a multi-chunk upload. kitty checks the format
+            // and dimensions now, replies at once if they're wrong, and
+            // then doesn't start loading (so the rest of the chunks fall
+            // on the floor).
+            if let Err(e) = self.start_upload(&header, body, quota, false)
+                && !e.silent
+            {
+                reply_transmit_error(&header, sink, e.code, &e.detail);
+            }
             return;
         }
 
         // Single-chunk transmission.
-        self.finalize_transmit(header, body.to_vec(), sink);
-    }
-
-    #[allow(clippy::needless_pass_by_value, clippy::unused_self)]
-    fn finalize_transmit<S: KittySink>(&mut self, header: Header, b64_buf: Vec<u8>, sink: &mut S) {
-        // base64-decode. Kitty uses standard base64; whitespace is
-        // tolerated by some clients but not all. We use the lenient
-        // decoder that accepts standard alphabet, no padding required.
-        let decoded = decode_base64(&b64_buf);
-        // After base64 decode, direct and medium transmissions converge:
-        // `decoded` is the raw (still possibly zlib-compressed) payload.
+        if let Err(e) = check_body_fits(&header, body, quota) {
+            reply_transmit_error(&header, sink, e.code, &e.detail);
+            return;
+        }
+        let decoded = b64::decode_all(body);
         self.finalize_decoded(header, decoded, PayloadSource::Direct, sink);
     }
 
-    /// Drop uploads that have had no chunk for [`PENDING_UPLOAD_TTL`].
-    /// Silent: the client that abandoned them isn't listening.
-    fn expire_pending(&mut self, now: Instant) {
-        let before = self.pending.len();
-        self.pending
-            .retain(|_, p| now.saturating_duration_since(p.last_chunk) < PENDING_UPLOAD_TTL);
-        if self.pending.len() != before {
+    /// Begin loading a chunked upload with its first chunk. Fails (and
+    /// loads nothing) when kitty would reject the first chunk: bad format
+    /// or dimensions, or already more data than the upload may hold.
+    fn start_upload(
+        &mut self,
+        header: &Header,
+        body: &[u8],
+        quota: u64,
+        query: bool,
+    ) -> Result<(), PayloadError> {
+        let limit = upload_limit(header, quota)?.min(self.pending_cap as u64);
+        let mut up = Upload {
+            head: header.clone(),
+            data: Vec::new(),
+            b64: b64::Decoder::default(),
+            limit,
+            query,
+            last_chunk: Instant::now(),
+        };
+        // Bound the decoded size from the base64 length before decoding,
+        // so one huge APC can't make us allocate it first.
+        if b64::decoded_len_bound(body, 0) > up.limit {
+            return Err(DecodeError::TooMuchData.into());
+        }
+        up.b64.feed(body, &mut up.data);
+        if up.data.len() as u64 > up.limit {
+            return Err(DecodeError::TooMuchData.into());
+        }
+        self.loading = Some(up);
+        Ok(())
+    }
+
+    /// Append a continuation chunk to the loading upload; on its last
+    /// chunk, decode and dispatch the image.
+    fn continue_upload<S: KittySink>(&mut self, header: &Header, body: &[u8], sink: &mut S) {
+        let Some(up) = self.loading.as_mut() else {
+            return;
+        };
+        // WIRE-8: a `q=` on a continuation chunk applies to the whole
+        // upload, as in kitty. `q=0` can't be told apart from no `q=`,
+        // so it never lowers an earlier chunk's quietness.
+        if header.quiet != Quiet::Verbose {
+            up.head.quiet = header.quiet;
+        }
+        up.last_chunk = Instant::now();
+        let fits =
+            up.data.len() as u64 + b64::decoded_len_bound(body, up.b64.carried()) <= up.limit;
+        if fits {
+            up.b64.feed(body, &mut up.data);
+        }
+        if !fits || up.data.len() as u64 > up.limit {
+            // kitty replies at once and drops the upload; the rest of its
+            // chunks then fall on the floor.
+            let head = up.head.clone();
+            self.loading = None;
+            reply_transmit_error(&head, sink, ErrorCode::Efbig, "Too much data");
+            return;
+        }
+        if header.more {
+            return;
+        }
+        let Some(mut up) = self.loading.take() else {
+            return;
+        };
+        up.b64.finish(&mut up.data);
+        if header.action == Action::Query && header.image_id != 0 {
+            self.reply_id_override = Some(header.image_id);
+        }
+        self.finalize_decoded(up.head, up.data, PayloadSource::Direct, sink);
+        self.reply_id_override = None;
+    }
+
+    /// Drop the loading upload, if any (a delete or a file transmit
+    /// arrived, kitty's abort points). Silent.
+    fn abort_loading(&mut self, why: &str) {
+        if let Some(up) = self.loading.take() {
             tracing::debug!(
-                expired = before - self.pending.len(),
-                "kitty: expired abandoned chunked uploads"
+                image_id = up.head.image_id,
+                image_number = up.head.image_number,
+                why,
+                "kitty: chunked upload aborted"
             );
-            self.forget_active_if_gone();
         }
     }
 
-    /// Evict least-recently-active uploads (never `keep`) until there is
-    /// a free slot (when starting a new upload, `keep == None`) and
-    /// `incoming` more bytes fit under the global byte cap. Silent, like
-    /// expiry.
-    fn make_room(&mut self, keep: Option<u32>, incoming: usize) {
-        loop {
-            let need_slot = keep.is_none() && self.pending.len() >= MAX_PENDING_UPLOADS;
-            let over_bytes = self.pending_bytes() + incoming > self.pending_total_cap;
-            if !need_slot && !over_bytes {
-                break;
-            }
-            let Some(victim) = self
-                .pending
-                .iter()
-                .filter(|(k, _)| Some(**k) != keep)
-                .min_by_key(|(_, p)| p.last_seq)
-                .map(|(k, _)| *k)
-            else {
-                break;
-            };
-            let freed = self.pending.remove(&victim).map_or(0, |p| p.buf.len());
-            tracing::debug!(
-                image_id = victim,
-                freed,
-                "kitty: evicted an in-flight chunked upload"
-            );
-        }
-        self.forget_active_if_gone();
-    }
-
-    fn forget_active_if_gone(&mut self) {
+    /// Drop an upload that has had no chunk for [`PENDING_UPLOAD_TTL`].
+    /// Silent: the client that abandoned it isn't listening. Runs at the
+    /// start of every graphics command; the host also calls it after each
+    /// batch of PTY input, so an abandoned upload doesn't stay resident
+    /// when no further graphics command comes.
+    pub fn expire_pending(&mut self, now: Instant) {
         if self
-            .active_upload_id
-            .is_some_and(|k| !self.pending.contains_key(&k))
+            .loading
+            .as_ref()
+            .is_some_and(|u| now.saturating_duration_since(u.last_chunk) >= PENDING_UPLOAD_TTL)
         {
-            self.active_upload_id = None;
+            self.abort_loading("expired");
         }
     }
 
@@ -613,6 +607,16 @@ impl KittyHandler {
         source: PayloadSource,
         sink: &mut S,
     ) {
+        // kitty answers an upload that an `a=q` chunk finished under the
+        // query's id (the image is still stored under its own).
+        let reply_as = self.reply_id_override.take();
+        let reply_head = match reply_as {
+            Some(id) => Header {
+                image_id: id,
+                ..header.clone()
+            },
+            None => header.clone(),
+        };
         let img = match decode_payload(&header, decoded, sink.max_image_bytes()) {
             Ok(d) => d,
             Err(e) => {
@@ -620,8 +624,9 @@ impl KittyHandler {
                     // SEC-4: a decode error would reveal what the file
                     // holds (its size, whether it is a PNG).
                     PayloadSource::File => reply_file_error(&header, sink, &e.detail),
+                    PayloadSource::Direct if e.silent => {}
                     PayloadSource::Direct => {
-                        reply_transmit_error(&header, sink, e.code, &e.detail);
+                        reply_transmit_error(&reply_head, sink, e.code, &e.detail);
                     }
                 }
                 return;
@@ -632,7 +637,7 @@ impl KittyHandler {
         // we can build the placement after the borrow ends.
         let (img_w, img_h) = (img.width, img.height);
         let Some(final_id) = sink.register_image(header.image_id, header.image_number, img) else {
-            reply_transmit_error(&header, sink, ErrorCode::Efbig, "registry full");
+            reply_transmit_error(&reply_head, sink, ErrorCode::Efbig, "registry full");
             return;
         };
 
@@ -679,7 +684,7 @@ impl KittyHandler {
         }
 
         // Reply OK (subject to quietness).
-        reply_ok_if_verbose_with_id(&header, sink, final_id);
+        reply_ok_if_verbose_with_id(&reply_head, sink, reply_as.unwrap_or(final_id));
     }
 
     #[allow(clippy::needless_pass_by_value, clippy::unused_self)]
@@ -689,6 +694,26 @@ impl KittyHandler {
         // `q=1`) before anything is placed or the cursor moves. From here
         // on `header.image_id` is the resolved id, so an `I=` placement
         // replies `i=<id>,I=<n>;OK` like kitty.
+        // A put for the image still loading: kitty replies this ENOENT
+        // and leaves the upload running.
+        if let Some(up) = self.loading.as_ref().filter(|u| u.targets(&header)) {
+            let mut reply = header.clone();
+            reply.image_id = if up.head.image_id != 0 {
+                up.head.image_id
+            } else {
+                sink.next_image_id()
+            };
+            reply_error_if_verbose(
+                &reply,
+                sink,
+                ErrorCode::Enoent,
+                &format!(
+                    "Put command refers to image with id: {} that could not load its data",
+                    header.image_id
+                ),
+            );
+            return;
+        }
         let Some(id) = resolve_image(&header, sink, "Put") else {
             return;
         };
@@ -754,8 +779,14 @@ impl KittyHandler {
     /// DEL-1: kitty never replies to `a=d`, even with `i=` and `q=0`, so
     /// neither do we. A client that doesn't read replies would otherwise
     /// get them on stdin.
-    #[allow(clippy::needless_pass_by_value, clippy::unused_self)]
+    ///
+    /// DEL-3: any delete aborts a chunked upload in progress ("the partial
+    /// upload must be aborted"), whatever it deletes. Like kitty, the
+    /// remaining chunks then get no reply: a bare continuation has no
+    /// dimensions, so it fails the first-chunk check, anonymously.
+    #[allow(clippy::needless_pass_by_value)]
     fn handle_delete<S: KittySink>(&mut self, header: Header, sink: &mut S) {
+        self.abort_loading("delete");
         sink.delete_image(header.delete, &header);
     }
 
@@ -768,8 +799,12 @@ impl KittyHandler {
     /// An implementation reads the keys under their animation meaning
     /// with [`Header::frame`], [`Header::animation`] and
     /// [`Header::composition`].
-    #[allow(clippy::unused_self)]
     fn handle_animation<S: KittySink>(&mut self, header: &Header, sink: &mut S) {
+        // The image still loading counts as present (kitty doesn't
+        // answer `a=a` on it).
+        if self.loading.as_ref().is_some_and(|u| u.targets(header)) {
+            return;
+        }
         let Some(_id) = resolve_image(header, sink, "Animation") else {
             return;
         };
@@ -783,40 +818,6 @@ pub enum HandlerError {
     /// Malformed header.
     #[error("malformed kitty header: {0}")]
     BadHeader(super::header::KittyHeaderError),
-}
-
-/// A continuation chunk belongs to the same upload as the first chunk
-/// when it routes to the same in-flight identity.
-///
-/// Reference kitty ignores everything except `m=` (and the running
-/// payload) on continuation chunks — the spec says continuation chunks
-/// "must have only the `m` and optionally `q` keys", and terminals
-/// ignore extras rather than validating them. We therefore only compare
-/// the chunk-routing identity (`i=`); incidental keys like `f=`, `o=`,
-/// `a=`, `S=`/`v=` on a continuation chunk are tolerated (and ignored)
-/// rather than rejected with EINVAL.
-fn headers_continuation_compatible(first: &Header, next: &Header) -> bool {
-    first.image_id == next.image_id
-}
-
-/// Decode a base64 payload. Whitespace is stripped (some clients wrap
-/// lines) and padding is optional. Data that still doesn't decode is
-/// treated as empty, the way kitty's decoder drops bad input, so the
-/// reply is about the missing data (`ENODATA:Insufficient image data:
-/// 0 < N`) rather than the encoding.
-fn decode_base64(input: &[u8]) -> Vec<u8> {
-    let cleaned: Vec<u8> = input
-        .iter()
-        .copied()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
-    base64::engine::general_purpose::STANDARD
-        .decode(&cleaned)
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&cleaned))
-        .unwrap_or_else(|e| {
-            tracing::debug!(error = %e, "kitty: undecodable base64 payload");
-            Vec::new()
-        })
 }
 
 /// Where a payload's bytes came from. File payloads get SEC-4's uniform
@@ -834,6 +835,10 @@ enum PayloadSource {
 struct PayloadError {
     code: ErrorCode,
     detail: String,
+    /// Send no reply. kitty answers "Image too large, width or height
+    /// greater than 10000" under a stale id, which in practice is nearly
+    /// always none at all.
+    silent: bool,
 }
 
 impl From<DecodeError> for PayloadError {
@@ -841,7 +846,38 @@ impl From<DecodeError> for PayloadError {
         Self {
             code: e.code(),
             detail: e.to_string(),
+            silent: matches!(e, DecodeError::DimsTooLarge),
         }
+    }
+}
+
+/// Most decoded bytes a chunked upload with first header `header` may
+/// hold, as kitty sizes its load buffer (WIRE-11): `s*v*bpp` plus
+/// [`RAW_DATA_SLACK`] (or [`COMPRESSED_DATA_SLACK`] for `o=z`), capped at
+/// the quota plus that slack; the quota for PNG. Also runs kitty's
+/// first-chunk checks on the format and dimensions.
+fn upload_limit(header: &Header, quota: u64) -> Result<u64, PayloadError> {
+    let slack = match header.compression {
+        Compression::None => RAW_DATA_SLACK as u64,
+        Compression::Zlib => COMPRESSED_DATA_SLACK,
+    };
+    Ok(
+        match raw_len(header.format, header.source_width, header.source_height)? {
+            Some(n) => n.min(quota) + slack,
+            None => quota,
+        },
+    )
+}
+
+/// A single-chunk payload whose base64 alone can't fit the upload limit
+/// is refused before it's decoded (`EFBIG:Too much data`), the way a
+/// chunked one is. Bad format or dimensions are left to the decoder.
+fn check_body_fits(header: &Header, body: &[u8], quota: u64) -> Result<(), PayloadError> {
+    match upload_limit(header, quota) {
+        Ok(limit) if b64::decoded_len_bound(body, 0) > limit => {
+            Err(DecodeError::TooMuchData.into())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -863,6 +899,7 @@ fn decode_payload(header: &Header, data: Vec<u8>, quota: u64) -> Result<ImageDat
             // with compression, and kitty holds the stream to it.
             let inflated = expected.unwrap_or(u64::from(header.size));
             let mismatch = || PayloadError {
+                silent: false,
                 code: ErrorCode::Einval,
                 detail: "Image data size post inflation does not match expected size".into(),
             };
@@ -877,6 +914,7 @@ fn decode_payload(header: &Header, data: Vec<u8>, quota: u64) -> Result<ImageDat
                 return Err(DecodeError::TooMuchData.into());
             }
             let out = inflate_zlib(&data, inflated).map_err(|e| PayloadError {
+                silent: false,
                 code: ErrorCode::Einval,
                 detail: format!("Failed to inflate image data with error: {}", e.zlib_name()),
             })?;
@@ -956,7 +994,7 @@ fn inflate_zlib(input: &[u8], limit: u64) -> Result<Vec<u8>, InflateError> {
 /// path. See [`medium::read_image_file`] for the policy.
 fn read_medium_file(header: &Header, body: &[u8], quota: u64) -> Result<Vec<u8>, FileError> {
     // Undecodable base64 becomes an empty path, which fails like any other.
-    let path_bytes = decode_base64(body);
+    let path_bytes = b64::decode_all(body);
     let path = path_from_bytes(path_bytes);
     // Uncompressed raw pixels need exactly `s*v*bpp` bytes: read that
     // much and no more. A longer file is fine (kitty ignores the tail), a
@@ -1226,7 +1264,6 @@ mod tests {
         placements: Vec<Placement>,
         deletes: Vec<(DeleteSpec, Header)>,
         replies: Vec<Vec<u8>>,
-        budget: u64,
         assign_next: u32,
         /// `I=` → newest id, like `Term::image_number_to_id`.
         numbers: std::collections::HashMap<u32, u32>,
@@ -1235,9 +1272,10 @@ mod tests {
     }
 
     impl MockSink {
-        fn with_budget(budget: u64) -> Self {
+        /// The budget argument is historical: the handler no longer asks
+        /// the sink for a byte budget (WIRE-11).
+        fn with_budget(_budget: u64) -> Self {
             Self {
-                budget,
                 assign_next: 1,
                 ..Self::default()
             }
@@ -1287,9 +1325,6 @@ mod tests {
         }
         fn queue_reply(&mut self, bytes: &[u8]) {
             self.replies.push(bytes.to_vec());
-        }
-        fn pending_budget_remaining(&self) -> u64 {
-            self.budget
         }
     }
 
@@ -1560,17 +1595,18 @@ mod tests {
         assert_eq!(sink.replies, vec![b"\x1b_Gi=7;OK\x1b\\".to_vec()]);
     }
 
+    /// WIRE-11: `S=` on a direct transmission is a hint, not a budget
+    /// gate: the reply is about the missing data, as in kitty.
     #[test]
-    fn oversized_declared_payload_rejected_with_efbig() {
+    fn declared_size_is_not_a_budget_gate() {
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(16);
         h.process(b"Ga=t,f=32,s=64,v=64,i=1,S=16384", b"", &mut sink)
             .unwrap();
         assert_eq!(sink.registered.len(), 0);
-        assert!(
-            sink.replies
-                .iter()
-                .any(|r| { std::str::from_utf8(r).is_ok_and(|s| s.contains("EFBIG")) })
+        assert_eq!(
+            sink.replies,
+            vec![b"\x1b_Gi=1;ENODATA:Insufficient image data: 0 < 16384\x1b\\".to_vec()]
         );
     }
 
@@ -2104,63 +2140,403 @@ mod tests {
         h.process(header.as_bytes(), body, sink).unwrap();
     }
 
-    /// SEC-6: more than [`MAX_PENDING_UPLOADS`] in flight evicts the
-    /// least recently active ones, silently.
-    #[test]
-    fn pending_upload_count_is_capped() {
+    fn run_seq(cmds: &[(&str, &str)]) -> (KittyHandler, MockSink) {
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
-        let n = MAX_PENDING_UPLOADS as u32 + 2;
-        for id in 1..=n {
-            start_upload(&mut h, &mut sink, id, b"AAAA");
+        for (head, body) in cmds {
+            let _ = h.process(head.as_bytes(), body.as_bytes(), &mut sink);
         }
-        assert_eq!(h.pending_uploads(), MAX_PENDING_UPLOADS);
-        assert!(!h.pending.contains_key(&1) && !h.pending.contains_key(&2));
-        assert!((3..=n).all(|id| h.pending.contains_key(&id)));
-        assert_eq!(h.active_upload_id, Some(n));
-        assert!(sink.replies.is_empty(), "eviction is silent");
+        (h, sink)
     }
 
-    /// SEC-6: all buffers together stay under the global byte cap, both
-    /// when an upload starts and when one grows.
+    /// WIRE-9 (kitty 0.49.2): a bare final chunk completes a leftover
+    /// upload.
     #[test]
-    fn pending_total_bytes_are_capped() {
-        let mut h = KittyHandler::new();
-        h.pending_cap = 60;
-        h.pending_total_cap = 90;
-        let mut sink = MockSink::with_budget(1 << 30);
-        start_upload(&mut h, &mut sink, 1, &[b'A'; 40]);
-        start_upload(&mut h, &mut sink, 2, &[b'A'; 40]);
-        assert_eq!(h.pending_bytes(), 80);
-        // 120 > 90: the oldest (1) goes.
-        start_upload(&mut h, &mut sink, 3, &[b'A'; 40]);
-        assert!(!h.pending.contains_key(&1));
-        assert_eq!(h.pending_bytes(), 80);
-        // Growing 3 to 60 would make 100 > 90: 2 goes, 3 is kept.
-        h.process(b"Gm=1", &[b'A'; 20], &mut sink).unwrap();
-        assert!(!h.pending.contains_key(&2));
-        assert_eq!(h.pending[&3].buf.len(), 60);
-        // Capacity (what `pending_bytes` counts) may round up past len.
-        assert!(h.pending_bytes() >= 60);
-        assert!(sink.replies.is_empty(), "eviction is silent");
+    fn wire9_bare_final_chunk_completes_leftover() {
+        let (h, sink) = run_seq(&[
+            ("Ga=t,i=110,f=32,s=2,v=2,m=1", "AQIDBA=="),
+            ("Gm=0", "/wAA/w=="),
+        ]);
+        assert_eq!(
+            joined(&sink),
+            "\x1b_Gi=110;ENODATA:Insufficient image data: 8 < 16\x1b\\"
+        );
+        assert_eq!(h.pending_uploads(), 0);
     }
 
-    /// The checklist repro, scaled down: many abandoned uploads with
-    /// different ids never hold more than the global cap.
+    /// WIRE-9 (kitty 0.49.2): while an upload is loading, a direct
+    /// transmit with another `i=` is appended to it and answered as the
+    /// loading image. One slot keeps memory bounded by one upload.
     #[test]
-    fn many_abandoned_uploads_stay_under_the_cap() {
-        let mut h = KittyHandler::new();
-        h.pending_total_cap = 1000;
+    fn wire9_new_transmit_during_load_is_a_continuation() {
+        let (h, sink) = run_seq(&[
+            ("Ga=t,i=112,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Ga=t,i=113,f=32,s=1,v=1", "/wAA/w=="),
+        ]);
+        assert_eq!(joined(&sink), "\x1b_Gi=112;OK\x1b\\");
+        assert_eq!(sink.registered.len(), 1);
+        assert_eq!(sink.registered[0].0, 112);
+        assert_eq!(h.pending_uploads(), 0);
+        // A new chunked upload during a load joins it too.
+        let (_, sink) = run_seq(&[
+            ("Ga=t,i=115,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Ga=t,i=116,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Gm=0", "/w=="),
+        ]);
+        assert_eq!(joined(&sink), "\x1b_Gi=115;OK\x1b\\");
+    }
+
+    /// WIRE-9 (kitty 0.49.2): a stale anonymous upload swallows an
+    /// anonymous `a=T,I=…`, so no reply comes. The 60 s expiry is what
+    /// keeps an abandoned upload from doing this forever.
+    #[test]
+    fn wire9_stale_anonymous_upload_swallows_next_transmit() {
+        let (h, sink) = run_seq(&[
+            ("Ga=T,f=32,s=1,v=1,C=1,m=1", "/wAA"),
+            ("Ga=T,I=965,f=32,s=1,v=1,C=1", "/wAA/w=="),
+        ]);
+        assert!(sink.replies.is_empty(), "{}", joined(&sink));
+        assert_eq!(h.pending_uploads(), 0);
+    }
+
+    /// kitty checks the format and dimensions on the first chunk, replies
+    /// at once, and doesn't start loading; the rest of the chunks fall on
+    /// the floor silently.
+    #[test]
+    fn first_chunk_is_validated_up_front() {
+        let px = b64_red_pixel();
+        let (h, sink) = run_seq(&[
+            ("Ga=t,i=180,f=32,m=1", "/wAA"),
+            ("Gm=0", "/w=="),
+            ("Ga=t,i=183,f=32,s=1,v=1", &px),
+        ]);
+        assert_eq!(
+            joined(&sink),
+            "\x1b_Gi=180;EINVAL:Zero width/height not allowed\x1b\\\x1b_Gi=183;OK\x1b\\"
+        );
+        assert_eq!(h.pending_uploads(), 0);
+        let (_, sink) = run_seq(&[("Ga=t,i=181,f=8,s=1,v=1,m=1", "/wAA"), ("Gm=0", "/w==")]);
+        assert_eq!(
+            joined(&sink),
+            "\x1b_Gi=181;EINVAL:Unknown image format: 8\x1b\\"
+        );
+        // Over 10000 px: kitty answers under a stale id, so in practice
+        // not at all; we stay silent, single-shot or chunked, and nothing
+        // loads.
+        let (h, sink) = run_seq(&[
+            ("Ga=t,i=211,f=32,s=10001,v=10000", &px),
+            ("Ga=t,i=217,f=32,s=20000,v=20000,m=1", "/wAA"),
+            ("Ga=t,i=218,f=32,s=1,v=1", &px),
+        ]);
+        assert_eq!(joined(&sink), "\x1b_Gi=218;OK\x1b\\");
+        assert_eq!(h.pending_uploads(), 0);
+    }
+
+    /// kitty: an upload finished by an `a=q` chunk is stored under its own
+    /// id but answered under the query's.
+    #[test]
+    fn query_chunk_finishing_an_upload_replies_as_the_query() {
+        let (_, sink) = run_seq(&[
+            ("Ga=t,i=202,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Ga=q,i=203,f=32,s=1,v=1", "/wAA/w=="),
+        ]);
+        assert_eq!(joined(&sink), "\x1b_Gi=203;OK\x1b\\");
+        assert_eq!(sink.registered.len(), 1);
+        assert_eq!(sink.registered[0].0, 202);
+    }
+
+    /// Review of #44, measured on kitty 0.49.2: a query without `i=` is
+    /// dropped before any loading logic. During an upload it doesn't
+    /// finish, EILSEQ or abort it; the upload carries on.
+    #[test]
+    fn query_without_id_never_touches_the_upload() {
+        // Anonymous query mid-upload: silent, nothing stored, upload still
+        // loading.
+        let (h, sink) = run_seq(&[
+            ("Ga=t,i=370,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Ga=q,f=32,s=1,v=1", "/w=="),
+        ]);
+        assert!(sink.replies.is_empty(), "{}", joined(&sink));
+        assert!(sink.registered.is_empty());
+        assert_eq!(h.pending_uploads(), 1);
+        // Chunked anonymous query: not appended, no EILSEQ.
+        let (_, sink) = run_seq(&[
+            ("Ga=t,i=372,f=32,s=2,v=1,m=1", "/wAA"),
+            ("Ga=q,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Gm=0", "/w=="),
+        ]);
+        assert_eq!(
+            joined(&sink),
+            "\x1b_Gi=372;ENODATA:Insufficient image data: 4 < 8\x1b\\"
+        );
+        // File-medium anonymous query: the load is not aborted.
+        let (_, sink) = run_seq(&[
+            ("Ga=t,i=373,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Ga=q,t=f,f=32,s=1,v=1", "L25vbmV4aXN0ZW50"),
+            ("Gm=0", "/w=="),
+        ]);
+        assert_eq!(joined(&sink), "\x1b_Gi=373;OK\x1b\\");
+        // `I=`-only query: the same.
+        let (_, sink) = run_seq(&[
+            ("Ga=t,i=324,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Ga=q,I=9,f=32,s=1,v=1", "/w=="),
+        ]);
+        assert!(sink.replies.is_empty());
+        assert!(sink.registered.is_empty());
+    }
+
+    /// kitty: a second chunked `a=q` while a chunked query is loading
+    /// replies EILSEQ under the new query's id.
+    #[test]
+    fn second_chunked_query_replies_eilseq() {
+        let (h, sink) = run_seq(&[
+            ("Ga=q,i=321,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Ga=q,i=322,f=32,s=1,v=1,m=1", "/wAA"),
+        ]);
+        assert_eq!(
+            joined(&sink),
+            "\x1b_Gi=322;EILSEQ:More payload loading refers to non-existent image\x1b\\"
+        );
+        assert_eq!(h.pending_uploads(), 0);
+    }
+
+    /// Review of #44: a chunk's decoded size is bounded from its base64
+    /// length before it is decoded, so a huge APC for a 1x1 image is
+    /// refused without decoding it. (Tested via the bound: a 4 MiB body
+    /// decodes to far more than 14 bytes.)
+    #[test]
+    fn oversized_chunk_is_refused_before_decoding() {
+        let body = "A".repeat(4 << 20);
+        assert!(b64::decoded_len_bound(body.as_bytes(), 0) > 14);
+        let (h, sink) = run_seq(&[("Ga=t,i=380,f=32,s=1,v=1,m=1", &body)]);
+        assert_eq!(joined(&sink), "\x1b_Gi=380;EFBIG:Too much data\x1b\\");
+        assert_eq!(h.pending_bytes(), 0, "nothing was decoded or kept");
+        // Continuation and single-chunk paths too.
+        let (h, sink) = run_seq(&[("Ga=t,i=381,f=32,s=1,v=1,m=1", "/wAA"), ("Gm=1", &body)]);
+        assert_eq!(joined(&sink), "\x1b_Gi=381;EFBIG:Too much data\x1b\\");
+        assert_eq!(h.pending_uploads(), 0);
+        let (_, sink) = run_seq(&[("Ga=t,i=382,f=32,s=1,v=1", &body)]);
+        assert_eq!(joined(&sink), "\x1b_Gi=382;EFBIG:Too much data\x1b\\");
+        // The exact limit still fits: 14 bytes for a 1x1 RGBA image.
+        let fourteen = base64::engine::general_purpose::STANDARD.encode([7u8; 14]);
+        let (_, sink) = run_seq(&[("Ga=t,i=383,f=32,s=1,v=1", &fourteen)]);
+        assert_eq!(joined(&sink), "\x1b_Gi=383;OK\x1b\\");
+    }
+
+    /// WIRE-11: the cap counts decoded bytes: `s*v*bpp` plus kitty's
+    /// 10-byte slack. Over it, the upload is dropped at once with
+    /// `EFBIG:Too much data`; the next command starts fresh.
+    #[test]
+    fn wire11_overflow_drops_the_upload() {
+        let z12 = "AAAAAAAAAAAAAAAA";
+        let (h, sink) = run_seq(&[
+            ("Ga=t,i=133,f=32,s=1,v=1,m=1", z12),
+            ("Gm=1", z12),
+            ("Ga=t,i=134,f=32,s=1,v=1", "/wAA/w=="),
+        ]);
+        assert_eq!(
+            joined(&sink),
+            "\x1b_Gi=133;EFBIG:Too much data\x1b\\\x1b_Gi=134;OK\x1b\\"
+        );
+        assert_eq!(h.pending_uploads(), 0);
+    }
+
+    /// WIRE-11: `S=` on a direct transmission is only a hint.
+    #[test]
+    fn wire11_s_is_a_hint_for_direct() {
+        let (_, sink) = run_seq(&[
+            ("Ga=t,i=130,f=32,s=1,v=1,S=999999999", "/wAA/w=="),
+            ("Ga=t,i=132,f=32,s=1,v=1,S=1", "/wAA/w=="),
+            ("Ga=t,i=177,f=32,s=1,v=1,S=999999999,m=1", "/wAA"),
+            ("Gm=0", "/w=="),
+        ]);
+        assert_eq!(
+            joined(&sink),
+            "\x1b_Gi=130;OK\x1b\\\x1b_Gi=132;OK\x1b\\\x1b_Gi=177;OK\x1b\\"
+        );
+    }
+
+    /// WIRE-11: a 4096x4096 RGBA upload (64 MiB decoded, 89 MiB base64)
+    /// fits: the limit is `s*v*4 + 10` decoded bytes, where B1's 64 MiB
+    /// base64 cap refused it.
+    #[test]
+    fn wire11_large_upload_limit_counts_decoded_bytes() {
+        let h = Header {
+            format: crate::kitty::header::Format::Rgba32,
+            source_width: 4096,
+            source_height: 4096,
+            ..Header::default()
+        };
+        assert_eq!(upload_limit(&h, 320 << 20).unwrap(), (4096 * 4096 * 4) + 10);
+        // A real (smaller) chunked upload end to end: 1024x512 RGBA.
+        let raw = vec![0x5au8; 1024 * 512 * 4];
+        let enc = base64::engine::general_purpose::STANDARD.encode(&raw);
+        let mut handler = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
-        for id in 1..=16 {
-            start_upload(&mut h, &mut sink, id, &[b'A'; 300]);
-            assert!(h.pending_bytes() <= 1000);
+        let parts: Vec<&str> = enc
+            .as_bytes()
+            .chunks(4096)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        for (n, part) in parts.iter().enumerate() {
+            let more = u8::from(n + 1 < parts.len());
+            let head = if n == 0 {
+                format!("Ga=t,i=4096,f=32,s=1024,v=512,m={more}")
+            } else {
+                format!("Gm={more}")
+            };
+            handler
+                .process(head.as_bytes(), part.as_bytes(), &mut sink)
+                .unwrap();
+            assert!(handler.pending_bytes() <= raw.len() * 2);
         }
-        assert_eq!(h.pending_uploads(), 3);
+        assert_eq!(joined(&sink), "\x1b_Gi=4096;OK\x1b\\");
+        assert_eq!(sink.registered[0].1.pixels, raw);
+    }
+
+    /// WIRE-4: chunks padded independently, as kitty sends them.
+    #[test]
+    fn wire4_per_chunk_padding() {
+        let (_, sink) = run_seq(&[
+            ("Ga=t,i=101,f=32,s=2,v=1,m=1", "AQIDBA=="),
+            ("Gm=0", "BQYHCA=="),
+        ]);
+        assert_eq!(joined(&sink), "\x1b_Gi=101;OK\x1b\\");
+        // toastty's leniency: a split mid-quantum (kitty: ENODATA 7 < 8).
+        let (_, sink) = run_seq(&[
+            ("Ga=t,i=103,f=32,s=2,v=1,m=1", "AQIDB"),
+            ("Gm=0", "AUGBwg="),
+        ]);
+        assert_eq!(joined(&sink), "\x1b_Gi=103;OK\x1b\\");
+    }
+
+    /// WIRE-10 (kitty 0.49.2): a chunked `a=q` is checked up front, then
+    /// consumes the next chunk and ends without a reply; nothing is
+    /// stored and the following command is independent.
+    #[test]
+    fn wire10_chunked_query() {
+        let px = b64_red_pixel();
+        let (h, sink) = run_seq(&[
+            ("Ga=q,i=120,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Gm=0", "/w=="),
+            ("Ga=t,i=123,f=32,s=1,v=1", &px),
+        ]);
+        assert_eq!(joined(&sink), "\x1b_Gi=123;OK\x1b\\");
+        assert_eq!(sink.registered.len(), 1);
+        assert_eq!(h.pending_uploads(), 0);
+        // The next chunk ends the query even when it says m=1.
+        let (_, sink) = run_seq(&[
+            ("Ga=q,i=190,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Gm=1", "/w=="),
+            ("Ga=t,i=191,f=32,s=1,v=1", &px),
+        ]);
+        assert_eq!(joined(&sink), "\x1b_Gi=191;OK\x1b\\");
+        // Bad dimensions are reported on the first chunk.
+        let (_, sink) = run_seq(&[("Ga=q,i=188,f=32,m=1", "/wAA")]);
+        assert_eq!(
+            joined(&sink),
+            "\x1b_Gi=188;EINVAL:Zero width/height not allowed\x1b\\"
+        );
+        // Anonymous chunked queries are ignored entirely.
+        let (_, sink) = run_seq(&[
+            ("Ga=q,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Ga=t,i=192,f=32,s=1,v=1", &px),
+        ]);
+        assert_eq!(joined(&sink), "\x1b_Gi=192;OK\x1b\\");
+        // A chunked query in the middle of a transmit: EILSEQ for the
+        // upload, which is dropped.
+        let (h, sink) = run_seq(&[
+            ("Ga=t,i=207,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Ga=q,i=208,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Gm=0", "/w=="),
+            ("Ga=t,i=209,f=32,s=1,v=1", &px),
+        ]);
+        assert_eq!(
+            joined(&sink),
+            "\x1b_Gi=207;EILSEQ:More payload loading refers to non-existent image\x1b\\\x1b_Gi=209;OK\x1b\\"
+        );
+        assert_eq!(h.pending_uploads(), 0);
+    }
+
+    /// DEL-3 (kitty 0.49.2): any delete aborts the upload in progress,
+    /// and its remaining chunks get no reply.
+    #[test]
+    fn del3_delete_aborts_the_upload() {
+        let z8 = "AAAAAAAAAAA=";
+        for del in [
+            "Ga=d,d=i,i=140",
+            "Ga=d,d=I,i=140",
+            "Ga=d,d=a",
+            "Ga=d,d=i,i=999",
+        ] {
+            let (h, sink) = run_seq(&[
+                ("Ga=t,i=140,f=32,s=2,v=2,m=1", z8),
+                (del, ""),
+                ("Gm=1", "AAAAAA=="),
+                ("Gm=0", z8),
+                ("Ga=p,i=140", ""),
+            ]);
+            assert_eq!(
+                joined(&sink),
+                "\x1b_Gi=140;ENOENT:Put command refers to non-existent image with id: 140 and number: 0\x1b\\",
+                "{del}"
+            );
+            assert!(sink.registered.is_empty(), "{del}");
+            assert_eq!(h.pending_uploads(), 0);
+        }
+    }
+
+    /// kitty: a put for the image still loading gets a dedicated ENOENT,
+    /// and the upload carries on.
+    #[test]
+    fn put_on_the_loading_image() {
+        let (_, sink) = run_seq(&[
+            ("Ga=t,i=119,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Ga=p,i=119", ""),
+            ("Gm=0", "/w=="),
+        ]);
+        assert_eq!(
+            joined(&sink),
+            "\x1b_Gi=119;ENOENT:Put command refers to image with id: 119 that could not load its data\x1b\\\x1b_Gi=119;OK\x1b\\"
+        );
+        // By number: kitty reports the id the image was given.
+        let (_, sink) = run_seq(&[
+            ("Ga=t,I=172,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Ga=p,I=172", ""),
+            ("Gm=0", "/w=="),
+        ]);
+        assert_eq!(
+            joined(&sink),
+            "\x1b_Gi=1,I=172;ENOENT:Put command refers to image with id: 0 that could not load its data\x1b\\\x1b_Gi=1,I=172;OK\x1b\\"
+        );
+    }
+
+    /// A file transmit or a direct query during a load: kitty processes
+    /// the new command on its own and drops the upload (file), or appends
+    /// the query's data to it (query).
+    #[test]
+    fn other_commands_during_a_load() {
+        let (h, sink) = run_seq(&[
+            ("Ga=t,i=200,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Ga=t,t=f,i=201,f=32,s=1,v=1", "L25vbmV4aXN0ZW50"),
+            ("Gm=0", "/w=="),
+        ]);
+        assert_eq!(
+            joined(&sink),
+            "\x1b_Gi=201;EBADF:Failed to read image file\x1b\\"
+        );
+        assert_eq!(h.pending_uploads(), 0);
+        // An `a=a` on the loading image is silent and harmless.
+        let (_, sink) = run_seq(&[
+            ("Ga=t,i=215,f=32,s=1,v=1,m=1", "/wAA"),
+            ("Ga=a,i=215,s=3", ""),
+            ("Gm=0", "/w=="),
+        ]);
+        assert_eq!(joined(&sink), "\x1b_Gi=215;OK\x1b\\");
     }
 
     /// SEC-6: an upload with no chunk for [`PENDING_UPLOAD_TTL`] is freed,
-    /// and headerless continuations no longer route to it.
+    /// so it can't swallow later transmits.
     #[test]
     fn abandoned_upload_expires() {
         let mut h = KittyHandler::new();
@@ -2171,7 +2547,6 @@ mod tests {
         h.expire_pending(Instant::now() + PENDING_UPLOAD_TTL + Duration::from_secs(1));
         assert_eq!(h.pending_uploads(), 0);
         assert_eq!(h.pending_bytes(), 0);
-        assert_eq!(h.active_upload_id, None);
     }
 
     /// A continuation chunk refreshes the TTL.
@@ -2180,18 +2555,19 @@ mod tests {
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
         start_upload(&mut h, &mut sink, 1, b"AAAA");
-        let t0 = h.pending[&1].last_chunk;
-        h.process(b"Gm=1", b"AAAA", &mut sink).unwrap();
-        assert!(h.pending[&1].last_chunk >= t0);
-        h.expire_pending(h.pending[&1].last_chunk + PENDING_UPLOAD_TTL / 2);
+        let t0 = h.loading.as_ref().unwrap().last_chunk;
+        h.process(b"Gm=1", b"", &mut sink).unwrap();
+        let t1 = h.loading.as_ref().unwrap().last_chunk;
+        assert!(t1 >= t0);
+        h.expire_pending(t1 + PENDING_UPLOAD_TTL / 2);
         assert_eq!(h.pending_uploads(), 1);
     }
 
     #[test]
-    fn default_handler_has_default_caps() {
+    fn default_handler_has_no_extra_cap() {
         let h = KittyHandler::default();
-        assert_eq!(h.pending_cap, DEFAULT_PENDING_CAP);
-        assert_eq!(h.pending_total_cap, DEFAULT_PENDING_TOTAL_CAP);
+        assert_eq!(h.pending_cap, usize::MAX);
+        assert_eq!(h.pending_uploads(), 0);
     }
 
     #[test]
@@ -3156,7 +3532,8 @@ mod major_medium_tests {
     /// SEC-5: `f=100,o=z` has no `s*v`; its `S=` is bounded by the quota.
     #[test]
     fn zlib_png_is_bounded_by_quota() {
-        let z = zlib(&vec![0u8; 1 << 20]);
+        let z = zlib(&vec![0u8; 256 << 10]);
+        assert!(z.len() < 1024);
         // `S=` over the quota: refused before inflating.
         let sink = run("Ga=t,f=100,o=z,S=1048576,i=4", &b64(&z), Some(1024));
         assert_eq!(replies_joined(&sink), "\x1b_Gi=4;EFBIG:Too much data\x1b\\");
@@ -3519,14 +3896,12 @@ mod minor_graphics_tests {
     struct MockSink {
         registered: Vec<(u32, ImageData)>,
         replies: Vec<Vec<u8>>,
-        budget: u64,
         assign_next: u32,
     }
 
     impl MockSink {
         fn new() -> Self {
             Self {
-                budget: 1 << 30,
                 assign_next: 1,
                 ..Self::default()
             }
@@ -3566,9 +3941,6 @@ mod minor_graphics_tests {
         fn delete_image(&mut self, _delete: DeleteSpec, _header: &Header) {}
         fn queue_reply(&mut self, bytes: &[u8]) {
             self.replies.push(bytes.to_vec());
-        }
-        fn pending_budget_remaining(&self) -> u64 {
-            self.budget
         }
     }
 
