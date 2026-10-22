@@ -172,7 +172,7 @@ pub fn build_image_instances(
         if placement.cols == 0 || placement.rows == 0 || placement.clip_rows.is_empty() {
             continue;
         }
-        let Some(image) = registry.get(placement.image_id) else {
+        let Some(image) = registry.get(placement.key) else {
             continue;
         };
         // What part of the image is shown (spec defaults + intersection
@@ -216,7 +216,7 @@ pub fn build_image_instances(
         if x1 <= x0 || y1 <= y0 {
             continue;
         }
-        let Some(entry) = cache.get(placement.image_id) else {
+        let Some(entry) = cache.get(placement.key) else {
             continue;
         };
         let iw = image.width.max(1) as f32;

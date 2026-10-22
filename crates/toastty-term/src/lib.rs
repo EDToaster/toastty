@@ -60,7 +60,7 @@ pub use toastty_config::CursorShape;
 /// Re-exports for the image protocol layer so the renderer can refer
 /// to graphics types via `toastty_term` instead of taking a direct dep
 /// on `toastty-graphics`.
-pub use toastty_graphics::{ImageData, ImageGrid, ImageRegistry, Placement, SrcRect};
+pub use toastty_graphics::{ImageData, ImageGrid, ImageRegistry, ImageStore, Placement, SrcRect};
 
 /// Re-export the Unicode placeholder base codepoint (`U+10EEEE`) so the
 /// renderer can suppress glyph emission for cells that hold it without

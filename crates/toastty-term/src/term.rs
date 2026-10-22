@@ -28,7 +28,12 @@ use toastty_graphics::rgp::operation::{
 use toastty_graphics::rgp::path_resolver::resolve as resolve_rgp_path;
 use toastty_graphics::rgp::scene::{RgpAsset, RgpScene};
 use toastty_graphics::sixel::{SIXEL_MAX_COLORS, SixelDcs, SixelHandler};
-use toastty_graphics::{ImageData, ImageGrid, ImageRegistry, Placement};
+use toastty_graphics::{ImageData, ImageGrid, ImageRegistry, ImageStore, Placement};
+
+/// m7: default per-screen image quota, 320 MiB (kitty's default storage
+/// limit, which kitty also applies per screen). Generous but bounded; the
+/// binary can override it via `Term::set_image_cap`.
+const DEFAULT_IMAGE_CAP: u64 = 320 * 1024 * 1024;
 use toastty_parser::{Params, Perform};
 pub use toastty_protocols::clipboard::{ClipboardTarget, ClipboardTargets};
 
@@ -293,8 +298,19 @@ pub struct Term {
     /// DECSET 8452 — leave the cursor to the RIGHT of a sixel image
     /// (on its last row) instead of on the line below it. Off by default.
     sixel_cursor_right: bool,
-    /// Cache of decoded image bytes keyed by Kitty image id.
-    image_registry: ImageRegistry,
+    /// The active screen's images: bytes, client ids, numbers, quota.
+    /// kitty keeps one store per screen; see
+    /// `docs/decisions/image-store.md`.
+    image_store: ImageStore,
+    /// The inactive screen's store, swapped with `image_store` (and
+    /// `stashed_image_grid` with `image_grid`) on every screen switch.
+    stashed_image_store: Option<ImageStore>,
+    /// Next image key to hand out ([`Term::alloc_image_key`]). Keys are
+    /// unique across both screens' stores.
+    next_image_key: u32,
+    /// Key of the image the last `register_image` stored, for the
+    /// placement an anonymous `a=T` (no id to name it by) makes next.
+    last_registered_key: Option<u32>,
     /// Parallel layer of placements over the cell grid. Always refers
     /// to the *active* screen's images.
     image_grid: ImageGrid,
@@ -308,12 +324,6 @@ pub struct Term {
     /// scroll work without timing it.
     #[cfg(test)]
     region_scrolls: u64,
-    /// Image *number* (`I=`) → most-recently-registered image *id* map.
-    /// The kitty spec lets a client refer to "the most recent image with
-    /// this number" via `d=n`/`d=N`. Updated on every registration that
-    /// carried a non-zero `I=`; pruned when the target id leaves the
-    /// registry (delete / eviction).
-    image_number_to_id: std::collections::HashMap<u32, u32>,
     /// Monotonic counter bumped whenever the registry or grid mutates.
     /// The renderer compares against its cached value to decide when
     /// to re-sync GPU textures (and force a full clear of the frame).
@@ -606,12 +616,14 @@ impl Term {
             // m7: default 320 MiB image cache cap (kitty spec recommends
             // 320 MB). Generous but bounded; the binary can override via
             // `Term::set_image_cap`.
-            image_registry: ImageRegistry::new(320 * 1024 * 1024),
+            image_store: ImageStore::new(DEFAULT_IMAGE_CAP),
+            stashed_image_store: None,
+            next_image_key: 1,
+            last_registered_key: None,
             image_grid: ImageGrid::new(),
             stashed_image_grid: None,
             #[cfg(test)]
             region_scrolls: 0,
-            image_number_to_id: std::collections::HashMap::new(),
             image_revision: 0,
             cursor_underline_color: None,
             placeholder_run: None,
@@ -671,10 +683,60 @@ impl Term {
         self.pty_replies.extend_from_slice(bytes);
     }
 
-    /// Read-only view of the cached image bytes.
+    /// The active screen's image bytes, keyed by image key (what
+    /// `Placement::key` and the renderer use).
     #[must_use]
     pub fn image_registry(&self) -> &ImageRegistry {
-        &self.image_registry
+        self.image_store.registry()
+    }
+
+    /// The active screen's image store (client ids, numbers, quota).
+    #[must_use]
+    pub fn image_store(&self) -> &ImageStore {
+        &self.image_store
+    }
+
+    /// A fresh image key, unused by either screen's store. Keys are
+    /// never reused while the old one is stored, so a re-transmission
+    /// is always new content to the renderer.
+    fn alloc_image_key(&mut self) -> u32 {
+        loop {
+            let key = self.next_image_key;
+            self.next_image_key = self.next_image_key.wrapping_add(1).max(1);
+            let in_use = self.image_store.contains_key(key)
+                || self
+                    .stashed_image_store
+                    .as_ref()
+                    .is_some_and(|s| s.contains_key(key));
+            if !in_use {
+                return key;
+            }
+        }
+    }
+
+    /// Swap the active and stashed screens' images (grid and store) on a
+    /// screen switch. `fresh_active` installs an empty store and grid for
+    /// the screen being entered instead of what was stashed for it.
+    fn swap_screen_images(&mut self, fresh_active: bool) {
+        let cap = self.image_store.cap_bytes();
+        let (grid, store) = if fresh_active {
+            (None, None)
+        } else {
+            (
+                self.stashed_image_grid.take(),
+                self.stashed_image_store.take(),
+            )
+        };
+        self.stashed_image_grid = Some(std::mem::replace(
+            &mut self.image_grid,
+            grid.unwrap_or_default(),
+        ));
+        self.stashed_image_store = Some(std::mem::replace(
+            &mut self.image_store,
+            store.unwrap_or_else(|| ImageStore::new(cap)),
+        ));
+        self.last_registered_key = None;
+        self.image_revision = self.image_revision.wrapping_add(1);
     }
 
     /// Read-only view of placements over the cell grid.
@@ -852,11 +914,19 @@ impl Term {
     }
 
     /// Override the per-Term image-cache byte budget. May evict.
+    /// Each screen has its own quota of `cap_bytes`, as in kitty.
     pub fn set_image_cap(&mut self, cap_bytes: u64) {
-        let evicted = self.image_registry.set_cap(cap_bytes);
+        let evicted = self.image_store.set_cap(cap_bytes);
+        if let Some(store) = self.stashed_image_store.as_mut() {
+            for key in store.set_cap(cap_bytes) {
+                if let Some(grid) = self.stashed_image_grid.as_mut() {
+                    grid.remove_image_key(key);
+                }
+            }
+        }
         if !evicted.is_empty() {
-            for id in &evicted {
-                self.image_grid.remove_image(*id);
+            for key in &evicted {
+                self.image_grid.remove_image_key(*key);
             }
             self.image_revision = self.image_revision.wrapping_add(1);
             self.mark_all_dirty();
@@ -2732,7 +2802,11 @@ impl Term {
             let id = (u32::from(id_msb) << 24) | run.fg_bits;
             // Image not registered: still occupy the cell as a
             // placeholder so layout doesn't shift; just skip rendering.
-            let Some(img) = self.image_registry.get(id) else {
+            // TODO(#28): placeholders resolve from the cells there.
+            let Some(key) = self.image_store.key_of(id) else {
+                continue;
+            };
+            let Some(img) = self.image_store.get_key(key) else {
                 continue;
             };
             let (img_w, img_h) = (img.width, img.height);
@@ -2746,6 +2820,7 @@ impl Term {
             let sw = cell_pw.min(img_w.saturating_sub(sx));
             let sh = cell_ph.min(img_h.saturating_sub(sy));
             let mut placement = Placement::new(id, 1, 1);
+            placement.key = key;
             placement.from_placeholder = true;
             placement.placement_id = placement_id;
             placement.line = top_line + i64::from(cell.row);
@@ -3926,12 +4001,11 @@ impl Term {
         self.viewport = crate::viewport::Viewport::new();
         // Switching screens invalidates every cached shaped line.
         self.mark_all_dirty();
-        // Primary and alt screens maintain independent image lists.
-        // Stash the primary grid and install a fresh empty one as the
-        // active grid so the alt screen starts blank and the primary's
-        // images survive the round trip.
-        self.stashed_image_grid = Some(std::mem::take(&mut self.image_grid));
-        self.image_revision = self.image_revision.wrapping_add(1);
+        // Primary and alt screens keep independent images (grid and
+        // store, PLC-6). Stash the primary's and give the alt screen
+        // fresh ones, so it starts blank and the primary's images (and
+        // their ids, numbers and quota) survive the round trip.
+        self.swap_screen_images(true);
     }
 
     fn exit_alt_screen(&mut self) {
@@ -3951,11 +4025,12 @@ impl Term {
         self.viewport = crate::viewport::Viewport::new();
         // Switching back: re-shape the primary screen contents.
         self.mark_all_dirty();
-        // Drop the alt screen's images and restore the stashed primary
-        // grid, so the primary screen's images reappear exactly as they
-        // were before we entered the alt screen.
-        self.image_grid = self.stashed_image_grid.take().unwrap_or_default();
-        self.image_revision = self.image_revision.wrapping_add(1);
+        // Restore the stashed primary images, so they reappear exactly as
+        // they were before we entered the alt screen, then drop the alt
+        // screen's (1049 clears them on the next entry anyway).
+        self.swap_screen_images(false);
+        self.stashed_image_grid = None;
+        self.stashed_image_store = None;
     }
 
     /// RIS — Reset to Initial State (`ESC c`). A hard reset: return to
@@ -4600,13 +4675,10 @@ impl Perform for Term {
 // ---- Kitty delete helpers (M10/M11/M12) ----
 
 impl Term {
-    /// Remove `id`'s decoded bytes from the registry and prune any
-    /// image-number→id entries pointing at it. Used by every by-id /
-    /// byte-freeing delete path so the `d=n`/`d=N` map never points at
-    /// a freed id.
+    /// Free the active screen's image answering to client `id` (and its
+    /// number entries). Used by every by-id byte-freeing delete path.
     fn remove_image_bytes(&mut self, id: u32) {
-        self.image_registry.remove(id);
-        self.image_number_to_id.retain(|_, v| *v != id);
+        self.image_store.remove_client(id);
     }
 
     /// Free image bytes for every image that just lost its last
@@ -4617,12 +4689,14 @@ impl Term {
     fn free_orphaned_image_bytes(&mut self, dropped: &[Placement]) {
         let mut seen: Vec<u32> = Vec::new();
         for p in dropped {
-            if seen.contains(&p.image_id) {
+            if seen.contains(&p.key) {
                 continue;
             }
-            seen.push(p.image_id);
-            if !self.image_grid.iter().any(|q| q.image_id == p.image_id) {
-                self.remove_image_bytes(p.image_id);
+            seen.push(p.key);
+            // By key, so anonymous images are freed too; only this
+            // screen's store and grid are consulted (PLC-6).
+            if !self.image_grid.iter().any(|q| q.key == p.key) {
+                self.image_store.remove_key(p.key);
             }
         }
     }
@@ -4697,40 +4771,41 @@ impl KittySink for Term {
             bytes_len = data.pixels.len(),
             "kitty: register_image (payload)",
         );
-        // m6: collect ids that currently have live placements so the
-        // registry preferentially evicts images WITHOUT placements when
-        // it has to free quota space (kitty spec).
+        // m6: collect keys that currently have live placements so the
+        // store preferentially evicts images WITHOUT placements when it
+        // has to free quota space (kitty spec). Only this screen's
+        // placements count: the other screen has its own store and
+        // quota, so its images are never evicted from here (PLC-6).
         let pinned: std::collections::HashSet<u32> =
-            self.image_grid.iter().map(|p| p.image_id).collect();
+            self.image_grid.iter().map(|p| p.key).collect();
+        let key = self.alloc_image_key();
         match self
-            .image_registry
-            .insert_with_pinned(id_request, data, &pinned)
+            .image_store
+            .insert(key, id_request, image_number, data, &pinned)
         {
-            Ok(inserted) => {
+            Ok(stored) => {
                 tracing::info!(
                     target: "kitty",
-                    id = inserted.id,
+                    key,
+                    id = stored.client_id,
                     image_number,
-                    evicted = ?inserted.evicted,
+                    replaced = ?stored.replaced,
+                    evicted = ?stored.evicted,
                     "kitty: register_image ok",
                 );
-                // Evicted ids no longer exist in the registry; drop their
-                // placements + mark cells dirty, and prune number→id
-                // entries pointing at them.
-                for evicted in &inserted.evicted {
-                    let dropped = self.image_grid.remove_image(*evicted);
-                    for p in dropped {
+                // PLC-2: re-transmitting an id deletes the old image and
+                // all its placements; the new data shows only once placed.
+                // Evicted images lose their placements too.
+                for gone in stored.replaced.iter().chain(&stored.evicted) {
+                    for p in self.image_grid.remove_image_key(*gone) {
                         mark_placement_dirty(self, &p);
                     }
-                    self.image_number_to_id.retain(|_, id| id != evicted);
                 }
-                // Record this id as the most-recent for its image number
-                // (M11: `d=n`/`d=N` resolution).
-                if image_number != 0 {
-                    self.image_number_to_id.insert(image_number, inserted.id);
-                }
+                self.last_registered_key = Some(key);
                 self.image_revision = self.image_revision.wrapping_add(1);
-                Some(inserted.id)
+                // `0` for an anonymous image: the handler then neither
+                // replies nor names it; `place_image` uses the key above.
+                Some(stored.client_id)
             }
             Err(e) => {
                 tracing::warn!(
@@ -4744,11 +4819,18 @@ impl KittySink for Term {
     }
 
     fn place_image(&mut self, mut placement: Placement) {
-        let image_known = self.image_registry.contains(placement.image_id);
+        // Resolve the stored bytes: by client id, or (anonymous `a=T`,
+        // id 0) the image just registered.
+        placement.key = if placement.image_id == 0 {
+            self.last_registered_key.unwrap_or(0)
+        } else {
+            self.image_store.key_of(placement.image_id).unwrap_or(0)
+        };
+        let image_known = self.image_store.contains_key(placement.key);
         // m5: mark the referenced image most-recently-used so the
         // registry's LRU reflects actual display, not insertion order.
         // No-op when the id isn't resident.
-        self.image_registry.touch(placement.image_id);
+        self.image_store.touch(placement.key);
         tracing::info!(
             target: "kitty",
             image_id = placement.image_id,
@@ -4818,8 +4900,11 @@ impl KittySink for Term {
 
     fn place_relative(
         &mut self,
-        placement: Placement,
+        mut placement: Placement,
     ) -> Result<(), toastty_graphics::image_grid::RelativeError> {
+        // The stored bytes, by client id (A5). Parents stay addressed by
+        // client id.
+        placement.key = self.image_store.key_of(placement.image_id).unwrap_or(0);
         tracing::info!(
             target: "kitty",
             image_id = placement.image_id,
@@ -4938,7 +5023,7 @@ impl KittySink for Term {
             // when no placement of that image survives.
             b'n' | b'N' => {
                 if header.image_number != 0 {
-                    if let Some(&img) = self.image_number_to_id.get(&header.image_number) {
+                    if let Some(img) = self.image_store.client_of_number(header.image_number) {
                         dropped_placements.extend(self.image_grid.remove_image(img));
                         if drop_bytes && !self.image_grid.iter().any(|p| p.image_id == img) {
                             self.remove_image_bytes(img);
@@ -4970,17 +5055,14 @@ impl KittySink for Term {
                 let lo = header.src_x;
                 let hi = header.src_y;
                 if lo <= hi {
+                    // Anonymous images (id 0) are never in an id range
+                    // (PLC-4, as in kitty).
                     dropped_placements.extend(
                         self.image_grid
-                            .remove_where(|p| (lo..=hi).contains(&p.image_id)),
+                            .remove_where(|p| p.image_id != 0 && (lo..=hi).contains(&p.image_id)),
                     );
                     if drop_bytes {
-                        let ids: Vec<u32> = self
-                            .image_registry
-                            .ids()
-                            .filter(|id| (lo..=hi).contains(id))
-                            .collect();
-                        for id in ids {
+                        for id in self.image_store.clients_in(lo, hi) {
                             self.remove_image_bytes(id);
                         }
                     }
@@ -5053,9 +5135,7 @@ impl KittySink for Term {
         // Take registry budget minus the bytes already buffered in the
         // APC reassembly buffer.
         let used_buf = self.apc_buffer.len() as u64;
-        self.image_registry
-            .budget_remaining()
-            .saturating_sub(used_buf)
+        self.image_store.budget_remaining().saturating_sub(used_buf)
     }
 
     fn advance_cursor_after_placement(&mut self, rows: u16, cols: u16, start_col: u16) {
@@ -5108,13 +5188,11 @@ impl KittySink for Term {
     }
 
     fn image_exists(&self, id: u32) -> bool {
-        self.image_registry.contains(id)
+        self.image_store.contains(id)
     }
 
     fn image_dimensions(&self, id: u32) -> Option<(u32, u32)> {
-        self.image_registry
-            .get(id)
-            .map(|img| (img.width, img.height))
+        self.image_store.get(id).map(|img| (img.width, img.height))
     }
 
     fn cursor_col(&self) -> u16 {
@@ -7876,10 +7954,9 @@ mod tests {
         feed(&mut t, SIXEL_3X6);
         assert_eq!(t.image_grid().iter().count(), 1, "one placement expected");
         let p = t.image_grid().iter().next().unwrap();
-        let img = t
-            .image_registry()
-            .get(p.image_id)
-            .expect("image registered");
+        // Sixel images are anonymous: found by key, not by id.
+        assert_eq!(p.image_id, 0);
+        let img = t.image_store().get_key(p.key).expect("image registered");
         assert_eq!(img.width, 3);
         // Sixel encodes pixels in vertical bands of 6; the decoder reports
         // the band-aligned height.
@@ -8302,7 +8379,7 @@ mod tests {
         payload.extend_from_slice(&b64_red_1x1());
         payload.extend_from_slice(b"\x1b\\");
         feed(&mut t, &payload);
-        assert!(t.image_registry().contains(42));
+        assert!(t.image_store().contains(42));
         // OK reply was queued.
         let replies = t.drain_pty_replies();
         assert!(!replies.is_empty());
@@ -8315,7 +8392,7 @@ mod tests {
         // tmux / other APC users — payload doesn't start with 'G'.
         let mut t = Term::new(2, 4, 0);
         feed(&mut t, b"\x1b_tmux passthrough payload\x1b\\");
-        assert_eq!(t.image_registry().len(), 0);
+        assert_eq!(t.image_store().len(), 0);
     }
 
     #[test]
@@ -8341,7 +8418,7 @@ mod tests {
         payload.extend_from_slice(b"\x1b\\");
         feed(&mut t, &payload);
         // Image placed.
-        assert!(t.image_registry().contains(1));
+        assert!(t.image_store().contains(1));
         assert_eq!(t.image_grid().len(), 1);
         // M1: after a cursor-moving placement the reference kitty does
         // `c->x += cols; c->y += rows - 1;`. Cursor started at (0, 0),
@@ -8394,7 +8471,7 @@ mod tests {
         feed(&mut t, b"\x1b_Ga=d,d=A\x1b\\");
         assert_eq!(t.image_grid().len(), 0);
         // Uppercase 'A' also frees the bytes.
-        assert_eq!(t.image_registry().len(), 0);
+        assert_eq!(t.image_store().len(), 0);
     }
 
     #[test]
@@ -8517,7 +8594,7 @@ mod tests {
         payload.extend_from_slice(b64.as_bytes());
         payload.extend_from_slice(b"\x1b\\");
         feed(&mut t, &payload);
-        assert!(t.image_registry().contains(42));
+        assert!(t.image_store().contains(42));
         // Now emit a placeholder run with fg = Indexed256(42).
         // SGR 38;5;42 sets fg; then emit placeholder + first diacritic
         // (image row 0) + second diacritic (image col 0).
@@ -8992,7 +9069,7 @@ mod blocker_delete_tests {
 
         let remaining: Vec<u32> = t.image_grid().iter().map(|p| p.placement_id).collect();
         assert_eq!(remaining, vec![2], "p=1 removed, p=2 survives");
-        assert!(t.image_registry().contains(1), "lowercase keeps bytes");
+        assert!(t.image_store().contains(1), "lowercase keeps bytes");
     }
 
     // ---- B5: d=I frees bytes only when no placements remain ----
@@ -9005,14 +9082,14 @@ mod blocker_delete_tests {
         feed(&mut t, b"\x1b[12;30H");
         place(&mut t, 1, 2, 1, 1);
         assert_eq!(t.image_grid().len(), 2);
-        assert!(t.image_registry().contains(1));
+        assert!(t.image_store().contains(1));
 
         // Delete the p=1 placement with uppercase I. p=2 still
         // references image 1, so bytes must be retained.
         feed(&mut t, b"\x1b_Ga=d,d=I,i=1,p=1,q=2\x1b\\");
         assert_eq!(t.image_grid().len(), 1);
         assert!(
-            t.image_registry().contains(1),
+            t.image_store().contains(1),
             "bytes retained while p=2 still references image 1"
         );
 
@@ -9021,10 +9098,10 @@ mod blocker_delete_tests {
         feed(&mut t, b"\x1b_Ga=d,d=I,i=1,p=2,q=2\x1b\\");
         assert_eq!(t.image_grid().len(), 0);
         assert!(
-            !t.image_registry().contains(1),
+            !t.image_store().contains(1),
             "bytes freed once last placement is gone"
         );
-        assert_eq!(t.image_registry().len(), 0);
+        assert_eq!(t.image_store().len(), 0);
     }
 
     // ---- B6: d=p deletes by cell coords (x=,y=) ----
@@ -9072,23 +9149,23 @@ mod blocker_delete_tests {
         feed(&mut t, b"\x1b_Ga=d,d=r,x=4,y=10,q=2\x1b\\");
         let remaining: Vec<u32> = t.image_grid().iter().map(|p| p.image_id).collect();
         assert_eq!(remaining, vec![12], "only id 12 placement survives");
-        assert!(t.image_registry().contains(5), "lowercase r keeps bytes");
-        assert!(t.image_registry().contains(8), "lowercase r keeps bytes");
-        assert!(t.image_registry().contains(12));
+        assert!(t.image_store().contains(5), "lowercase r keeps bytes");
+        assert!(t.image_store().contains(8), "lowercase r keeps bytes");
+        assert!(t.image_store().contains(12));
 
         // Uppercase R over the same range frees the (already
         // placement-less) image bytes for 5 and 8.
         feed(&mut t, b"\x1b_Ga=d,d=R,x=4,y=10,q=2\x1b\\");
         assert!(
-            !t.image_registry().contains(5),
+            !t.image_store().contains(5),
             "uppercase R frees bytes for id 5"
         );
         assert!(
-            !t.image_registry().contains(8),
+            !t.image_store().contains(8),
             "uppercase R frees bytes for id 8"
         );
         assert!(
-            t.image_registry().contains(12),
+            t.image_store().contains(12),
             "id 12 outside range untouched"
         );
     }
@@ -9267,7 +9344,7 @@ mod blocker_graphics_term_tests {
         let before = t.cursor();
         assert_eq!(before.row, 2);
         assert_eq!(before.col, 3);
-        let registry_before = t.image_registry().len();
+        let registry_before = t.image_store().len();
         let grid_before = t.image_grid().len();
 
         let mut payload = Vec::new();
@@ -9277,12 +9354,9 @@ mod blocker_graphics_term_tests {
         feed(&mut t, &payload);
 
         // Image registered.
-        assert!(
-            t.image_registry().contains(1),
-            "U=1 must register the image"
-        );
+        assert!(t.image_store().contains(1), "U=1 must register the image");
         assert_eq!(
-            t.image_registry().len(),
+            t.image_store().len(),
             registry_before + 1,
             "registry must grow by one"
         );
@@ -9357,10 +9431,7 @@ mod blocker_placeholder_tests {
         payload.extend_from_slice(b64.as_bytes());
         payload.extend_from_slice(b"\x1b\\");
         feed(t, &payload);
-        assert!(
-            t.image_registry().contains(id),
-            "image {id} should register"
-        );
+        assert!(t.image_store().contains(id), "image {id} should register");
     }
 
     /// B10: fg indexed 5 → image id 5; underline 1 → placement_id 1;
@@ -9699,12 +9770,13 @@ mod major_place_tests {
 
     #[test]
     fn m5_unnamed_placements_still_stack() {
-        // p=0 (unnamed) placements must NOT be deduplicated.
+        // p=0 (unnamed) placements must NOT be deduplicated. (A second
+        // `a=T` with the same id would re-transmit it, which deletes the
+        // first placement: PLC-2. So place the second one with `a=p`.)
         let mut t = Term::new(40, 40, 0);
         feed(&mut t, b"\x1b[3;4H");
         transmit_and_place(&mut t, 1, 2, 2, "");
-        feed(&mut t, b"\x1b[7;10H");
-        transmit_and_place(&mut t, 1, 2, 2, "");
+        feed(&mut t, b"\x1b[7;10H\x1b_Ga=p,i=1,c=2,r=2,q=2\x1b\\");
         assert_eq!(
             t.image_grid().len(),
             2,
@@ -9825,7 +9897,7 @@ mod major_delete_tests {
         feed(&mut t, b"\x1b_Ga=d,d=a\x1b\\");
         assert_eq!(t.image_grid().len(), 0);
         assert!(
-            t.image_registry().contains(1),
+            t.image_store().contains(1),
             "lowercase d=a keeps image bytes"
         );
         // Re-place the (still-registered) image, then uppercase d=A:
@@ -9835,7 +9907,7 @@ mod major_delete_tests {
         feed(&mut t, b"\x1b_Ga=d,d=A\x1b\\");
         assert_eq!(t.image_grid().len(), 0);
         assert!(
-            !t.image_registry().contains(1),
+            !t.image_store().contains(1),
             "uppercase d=A frees bytes once no placement remains"
         );
     }
@@ -9850,14 +9922,14 @@ mod major_delete_tests {
         let mut t = Term::new(8, 8, 0);
         transmit_place_numbered(&mut t, 0, 0, 7); // assigned id 1 (older)
         transmit_place_numbered(&mut t, 2, 0, 7); // assigned id 2 (newer → wins)
-        assert!(t.image_registry().contains(1));
-        assert!(t.image_registry().contains(2));
+        assert!(t.image_store().contains(1));
+        assert!(t.image_store().contains(2));
         assert_eq!(t.image_grid().len(), 2);
         // d=n,I=7 deletes the NEWEST (id=2) placement; bytes kept (n).
         feed(&mut t, b"\x1b_Ga=d,d=n,I=7\x1b\\");
         assert!(has_placement_for(&t, 1), "older image placement untouched");
         assert!(!has_placement_for(&t, 2), "newest image placement removed");
-        assert!(t.image_registry().contains(2), "lowercase n keeps bytes");
+        assert!(t.image_store().contains(2), "lowercase n keeps bytes");
     }
 
     #[test]
@@ -9868,8 +9940,8 @@ mod major_delete_tests {
         // d=N,I=7 deletes the newest (id=2) AND frees its bytes.
         feed(&mut t, b"\x1b_Ga=d,d=N,I=7\x1b\\");
         assert!(!has_placement_for(&t, 2));
-        assert!(!t.image_registry().contains(2), "N frees newest bytes");
-        assert!(t.image_registry().contains(1), "older image untouched");
+        assert!(!t.image_store().contains(2), "N frees newest bytes");
+        assert!(t.image_store().contains(1), "older image untouched");
     }
 
     // ---- M12: d=c/C, q/Q, x/X, y/Y, z/Z ----
@@ -9941,18 +10013,15 @@ mod major_delete_tests {
         let mut t = Term::new(8, 8, 0);
         transmit_place_at(&mut t, 2, 0, 1, 0, 0); // row 2
         transmit_place_at(&mut t, 5, 0, 2, 0, 0); // row 5
-        assert!(t.image_registry().contains(1));
+        assert!(t.image_store().contains(1));
         feed(&mut t, b"\x1b_Ga=d,d=Y,y=3\x1b\\"); // row 2 (1-based 3)
         assert!(!has_placement_for(&t, 1));
         assert!(
-            !t.image_registry().contains(1),
+            !t.image_store().contains(1),
             "Y frees bytes for image with no surviving placement"
         );
         assert!(has_placement_for(&t, 2), "row-5 placement kept");
-        assert!(
-            t.image_registry().contains(2),
-            "untouched image keeps bytes"
-        );
+        assert!(t.image_store().contains(2), "untouched image keeps bytes");
     }
 
     #[test]
@@ -9967,7 +10036,7 @@ mod major_delete_tests {
         feed(&mut t, b"\x1b_Ga=d,d=Y,y=3\x1b\\");
         assert_eq!(t.image_grid().len(), 1, "only row-2 placement removed");
         assert!(
-            t.image_registry().contains(1),
+            t.image_store().contains(1),
             "bytes kept while another placement survives"
         );
     }
@@ -10230,7 +10299,7 @@ mod major_medium_term_tests {
         std::fs::write(&path, &raw).unwrap();
 
         let mut t = Term::new(8, 8, 0);
-        let before = t.image_registry().len();
+        let before = t.image_store().len();
 
         // Transmit via file medium: payload is the base64-encoded path.
         let b64_path =
@@ -10243,11 +10312,11 @@ mod major_medium_term_tests {
 
         // The image must now be in the registry.
         assert_eq!(
-            t.image_registry().len(),
+            t.image_store().len(),
             before + 1,
             "t=f transmit must register one image"
         );
-        assert!(t.image_registry().contains(314));
+        assert!(t.image_store().contains(314));
 
         // Place it with an explicit cell span.
         feed(&mut t, b"\x1b_Ga=p,i=314,c=2,r=2\x1b\\");
@@ -10282,10 +10351,7 @@ mod major_relative_tests {
         payload.extend_from_slice(b64.as_bytes());
         payload.extend_from_slice(b"\x1b\\");
         feed(t, &payload);
-        assert!(
-            t.image_registry().contains(id),
-            "image {id} should register"
-        );
+        assert!(t.image_store().contains(id), "image {id} should register");
     }
 
     /// Place an already-transmitted image as a NAMED (absolute) parent at
@@ -10473,13 +10539,13 @@ mod minor_term_tests {
         // Insert images 1 and 2 (both placed). Order: [1, 2].
         place_image(&mut t, 1);
         place_image(&mut t, 2);
-        assert!(t.image_registry().contains(1));
-        assert!(t.image_registry().contains(2));
+        assert!(t.image_store().contains(1));
+        assert!(t.image_store().contains(2));
 
         // Re-place image 1: m5 touch must move it to MRU end => [2, 1].
         // Observe via registry iteration order (oldest first).
         place_image(&mut t, 1);
-        let order: Vec<u32> = t.image_registry().iter().map(|(id, _)| id).collect();
+        let order: Vec<u32> = t.image_store().iter().map(|(id, _)| id).collect();
         assert_eq!(order, vec![2, 1], "re-placing image 1 must mark it MRU");
     }
 
@@ -10494,7 +10560,7 @@ mod minor_term_tests {
         place_image(&mut t, 2);
         // Touch 1 (re-place). Order becomes [2, 1].
         place_image(&mut t, 1);
-        let order: Vec<u32> = t.image_registry().iter().map(|(id, _)| id).collect();
+        let order: Vec<u32> = t.image_store().iter().map(|(id, _)| id).collect();
         assert_eq!(order.first().copied(), Some(2), "2 is the LRU front");
     }
 
@@ -10504,7 +10570,7 @@ mod minor_term_tests {
     fn default_image_cap_is_320_mib() {
         let t = Term::new(24, 80, 0);
         assert_eq!(
-            t.image_registry().cap_bytes(),
+            t.image_store().cap_bytes(),
             320 * 1024 * 1024,
             "default image quota should be 320 MiB"
         );
@@ -10514,7 +10580,7 @@ mod minor_term_tests {
     fn set_image_cap_override_still_works() {
         let mut t = Term::new(24, 80, 0);
         t.set_image_cap(64 * 1024 * 1024);
-        assert_eq!(t.image_registry().cap_bytes(), 64 * 1024 * 1024);
+        assert_eq!(t.image_store().cap_bytes(), 64 * 1024 * 1024);
     }
 }
 
@@ -11256,5 +11322,198 @@ mod placement_size_tests {
         let p = only(&t);
         assert_eq!((p.fit_cols, p.fit_rows), (0, 0));
         assert_eq!((p.cols, p.rows), (1, 1));
+    }
+}
+
+/// A5: per-screen image stores, re-transmission and anonymous images
+/// (PLC-2, PLC-4, PLC-6). See `docs/decisions/image-store.md`.
+#[cfg(test)]
+mod image_store_tests {
+    use super::*;
+    use toastty_parser::Parser;
+
+    fn feed(t: &mut Term, bytes: &[u8]) {
+        let mut p = Parser::new();
+        p.advance(t, bytes);
+    }
+
+    /// Send `a=<action>` for a 1x1 image of `rgba` with extra `keys`.
+    fn send(t: &mut Term, keys: &str, rgba: [u8; 4]) {
+        use base64::Engine;
+        let mut payload = format!("\x1b_G{keys},f=32,s=1,v=1,q=2;").into_bytes();
+        payload.extend_from_slice(
+            base64::engine::general_purpose::STANDARD
+                .encode(rgba)
+                .as_bytes(),
+        );
+        payload.extend_from_slice(b"\x1b\\");
+        feed(t, &payload);
+    }
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const BLUE: [u8; 4] = [0, 0, 255, 255];
+    const MAGENTA: [u8; 4] = [255, 0, 255, 255];
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+
+    fn pixel(t: &Term, id: u32) -> Option<[u8; 4]> {
+        let d = t.image_store().get(id)?;
+        Some([d.pixels[0], d.pixels[1], d.pixels[2], d.pixels[3]])
+    }
+
+    #[test]
+    fn plc2_retransmit_deletes_placements_and_waits_to_be_placed() {
+        // kitty-ref: a=T,i=1 red, then a=t,i=1 blue: nothing is shown.
+        let mut t = Term::new(10, 40, 0);
+        send(&mut t, "a=T,i=1,c=4,r=2,C=1", RED);
+        assert_eq!(t.image_grid().len(), 1);
+        send(&mut t, "a=t,i=1", BLUE);
+        assert!(t.image_grid().is_empty(), "old placement deleted");
+        assert_eq!(pixel(&t, 1), Some(BLUE));
+        // Placing it now shows the new data.
+        feed(&mut t, b"\x1b_Ga=p,i=1,c=4,r=2,q=2\x1b\\");
+        let p = t.image_grid().iter().next().unwrap();
+        assert_eq!(t.image_registry().get(p.key).unwrap().pixels[2], 255);
+    }
+
+    #[test]
+    fn plc2_second_transmit_and_place_leaves_one_copy() {
+        // kitty-ref: a=T,i=1 red, then a=T,i=1 blue elsewhere: one blue
+        // image (was two copies).
+        let mut t = Term::new(10, 40, 0);
+        send(&mut t, "a=T,i=1,c=4,r=2,C=1", RED);
+        feed(&mut t, b"\x1b[1;30H");
+        send(&mut t, "a=T,i=1,c=4,r=2,C=1", BLUE);
+        assert_eq!(t.image_grid().len(), 1);
+        assert_eq!(t.image_grid().iter().next().unwrap().col, 29);
+    }
+
+    #[test]
+    fn plc2_retransmit_gets_a_new_key() {
+        // A re-sent id is new content to the renderer (PLC-7).
+        let mut t = Term::new(10, 40, 0);
+        send(&mut t, "a=T,i=1,c=1,r=1,C=1", RED);
+        let k1 = t.image_grid().iter().next().unwrap().key;
+        send(&mut t, "a=T,i=1,c=1,r=1,C=1", BLUE);
+        let k2 = t.image_grid().iter().next().unwrap().key;
+        assert_ne!(k1, k2);
+        assert!(!t.image_registry().contains(k1));
+    }
+
+    #[test]
+    fn plc4_anonymous_image_survives_id_addressed_commands() {
+        // kitty-ref: an anonymous a=T survives d=R over the whole id
+        // range and a later a=t,i=1.
+        let mut t = Term::new(10, 40, 0);
+        send(&mut t, "a=T,c=4,r=2,C=1", RED);
+        let anon = t.image_grid().iter().next().unwrap().clone();
+        assert_eq!(anon.image_id, 0);
+        assert!(t.image_registry().contains(anon.key));
+        feed(&mut t, b"\x1b_Ga=d,d=R,x=1,y=4294967295,q=2\x1b\\");
+        send(&mut t, "a=t,i=1", BLUE);
+        feed(&mut t, b"\x1b_Ga=d,d=I,i=1,q=2\x1b\\");
+        assert_eq!(t.image_grid().len(), 1, "placement survives");
+        assert!(t.image_registry().contains(anon.key), "bytes survive");
+        // Positional deletes still reach it, and free its bytes.
+        feed(&mut t, b"\x1b_Ga=d,d=A,q=2\x1b\\");
+        assert!(t.image_grid().is_empty());
+        assert!(!t.image_registry().contains(anon.key));
+    }
+
+    #[test]
+    fn plc4_number_without_id_gets_lowest_free_id() {
+        // kitty-ref replies: I=5 -> i=1, I=6 -> i=2, then (after an
+        // explicit i=1 replaced the first) I=7 -> i=3.
+        let mut t = Term::new(10, 40, 0);
+        feed(&mut t, b"\x1b_Ga=t,I=5,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        feed(&mut t, b"\x1b_Ga=t,I=6,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        send(&mut t, "a=t,i=1", RED);
+        let _ = t.drain_pty_replies();
+        feed(&mut t, b"\x1b_Ga=t,I=7,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        let reply = String::from_utf8_lossy(&t.drain_pty_replies()).into_owned();
+        assert!(reply.contains("i=3,I=7"), "got {reply:?}");
+    }
+
+    #[test]
+    fn plc6_alt_delete_by_id_keeps_the_main_screens_image() {
+        // A full-screen previewer deleting its own id must not wipe the
+        // shell's image that happens to use the same id.
+        let mut t = Term::new(10, 40, 0);
+        send(&mut t, "a=T,i=7,c=4,r=2,C=1", MAGENTA);
+        feed(&mut t, b"\x1b[?1049h");
+        assert!(
+            !t.image_store().contains(7),
+            "alt starts with its own store"
+        );
+        send(&mut t, "a=T,i=7,c=4,r=2,C=1", GREEN);
+        assert_eq!(pixel(&t, 7), Some(GREEN));
+        feed(&mut t, b"\x1b_Ga=d,d=I,i=7,q=2\x1b\\");
+        assert!(!t.image_store().contains(7));
+        feed(&mut t, b"\x1b[?1049l");
+        assert_eq!(t.image_grid().len(), 1, "main placement intact");
+        assert_eq!(
+            pixel(&t, 7),
+            Some(MAGENTA),
+            "same-id replace on alt didn't leak"
+        );
+    }
+
+    #[test]
+    fn plc6_main_delete_while_alt_is_up_cant_reach_the_stash() {
+        // Deletes, range deletes and numbers on alt only see alt's store.
+        let mut t = Term::new(10, 40, 0);
+        // `I=9` alone: kitty assigns i=1.
+        feed(
+            &mut t,
+            b"\x1b_Ga=T,I=9,f=32,s=1,v=1,c=2,r=1,C=1,q=2;/wAA/w==\x1b\\",
+        );
+        assert_eq!(t.image_grid().len(), 1);
+        feed(&mut t, b"\x1b[?1049h");
+        feed(&mut t, b"\x1b_Ga=d,d=R,x=1,y=100,q=2\x1b\\");
+        feed(&mut t, b"\x1b_Ga=d,d=N,I=9,q=2\x1b\\");
+        feed(&mut t, b"\x1b_Ga=d,d=A,q=2\x1b\\");
+        feed(&mut t, b"\x1b[?1049l");
+        assert_eq!(t.image_grid().len(), 1);
+        assert!(t.image_store().contains(1));
+        assert_eq!(t.image_store().client_of_number(9), Some(1));
+    }
+
+    #[test]
+    fn plc6_quota_eviction_on_alt_spares_the_main_screens_bytes() {
+        // Each screen has its own quota (kitty: one storage limit per
+        // screen), so filling alt's never evicts main's images.
+        let mut t = Term::new(10, 40, 0);
+        t.set_image_cap(8); // two 1x1 RGBA images per screen
+        send(&mut t, "a=T,i=1,c=1,r=1,C=1", RED);
+        feed(&mut t, b"\x1b[?1049h");
+        for id in 2..6 {
+            send(&mut t, &format!("a=t,i={id}"), BLUE);
+        }
+        assert!(t.image_store().len() <= 2);
+        feed(&mut t, b"\x1b[?1049l");
+        assert_eq!(pixel(&t, 1), Some(RED));
+        assert_eq!(t.image_grid().len(), 1);
+    }
+
+    #[test]
+    fn plc6_cap_changes_apply_to_both_screens() {
+        let mut t = Term::new(10, 40, 0);
+        send(&mut t, "a=T,i=1,c=1,r=1,C=1", RED);
+        feed(&mut t, b"\x1b[?1049h");
+        t.set_image_cap(2); // smaller than any image: evicts everything
+        feed(&mut t, b"\x1b[?1049l");
+        assert!(!t.image_store().contains(1), "stashed store shrank too");
+        assert!(t.image_grid().is_empty(), "and its placement went");
+        assert_eq!(t.image_store().cap_bytes(), 2);
+    }
+
+    #[test]
+    fn keys_are_unique_across_screens() {
+        let mut t = Term::new(10, 40, 0);
+        send(&mut t, "a=T,i=7,c=1,r=1,C=1", RED);
+        let main_key = t.image_grid().iter().next().unwrap().key;
+        feed(&mut t, b"\x1b[?1049h");
+        send(&mut t, "a=T,i=7,c=1,r=1,C=1", GREEN);
+        let alt_key = t.image_grid().iter().next().unwrap().key;
+        assert_ne!(main_key, alt_key, "the renderer can't confuse them");
     }
 }
