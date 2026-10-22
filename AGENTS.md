@@ -215,32 +215,34 @@ couldn't clean up to the user.
 
 ## Attaching images to a PR
 
-`gh` can't upload images into a PR body, so screenshots go on the
-orphan branch `pr-assets`, which holds only images. The PR then embeds
-them by commit-pinned raw URL. This keeps the PNGs out of `main`'s
-history. Use a worktree for it, so your branch's checkout isn't touched:
-
-```sh
-A=.claude/worktrees/pr-assets
-if git ls-remote --exit-code --heads origin pr-assets >/dev/null; then
-  git fetch origin pr-assets && git worktree add "$A" -B pr-assets origin/pr-assets
-else
-  git worktree add --orphan -b pr-assets "$A"
-fi
-mkdir -p "$A/<your-branch>" && cp "$S"/*.png "$A/<your-branch>/"
-git -C "$A" add <your-branch> && git -C "$A" commit -m "assets: <your-branch> screenshots"
-git -C "$A" push origin pr-assets
-SHA=$(git -C "$A" rev-parse HEAD)
-git worktree remove "$A"
-```
-
-Embed each image in the PR body (`gh pr create --body-file …` or
-`gh pr edit <n> --body-file …`):
+Upload screenshots with `gh`'s `--attach` flag (gh 2.102 or newer). It
+works on both `gh pr create` and `gh pr edit`, takes up to 50 files per
+command, and stores the images on GitHub, not in the repo. Reference each
+image in the body file by its relative path; `gh` rewrites the reference
+to the uploaded asset. Run `gh` from the directory holding the images so
+the paths match:
 
 ```markdown
-![after: selection spans the wrapped line](https://raw.githubusercontent.com/EDToaster/toastty/<SHA>/<your-branch>/after.png)
+![after: selection spans the wrapped line](./after.png)
 ```
 
+```sh
+cd "$S"
+gh pr create -R EDToaster/toastty --base main --head <your-branch> \
+    --title "…" --body-file body.md \
+    --attach './before.png#before: selection stops at the wrap' \
+    --attach './after.png#after: selection spans the wrapped line'
+# Add or replace images on an existing PR:
+gh pr edit <n> --attach './after.png#after: selection spans the wrapped line'
+```
+
+The text after `#` is the alt text, used when the body doesn't reference
+the file. An attached file the body doesn't reference is appended to the
+end of the body. If some uploads fail, the PR is still created or edited
+with the rest and `gh` exits non-zero, so check its status.
+
 Give each image a caption saying what it shows and what to look for.
-After posting, run `gh pr view <n> --web` or fetch one image URL and
-check that it returns 200.
+After posting, check that the body's images load: run
+`gh pr view <n> --json body -q .body` and fetch one
+`https://github.com/user-attachments/assets/…` URL, which should return
+200.
