@@ -1274,6 +1274,19 @@ Seen during app testing, not a graphics bug:
   - The one change made: XTVERSION now names toastty's own version,
     `toastty 1.0.0 (kitty 0.42.0)`. The `kitty` brand is kept because
     yazi and other apps substring-match it to enable kitty graphics.
+- [x] **P1 — PTY-1. The shell inherits toastty's ignored signals and signal
+  mask.**
+  - If toastty is launched with SIGINT ignored (e.g. `toastty &` from a
+    script, or a launcher that ignores SIGINT / SIGQUIT), Ctrl+C can't stop
+    foreground jobs, and their `/proc/<pid>/status` shows `SigIgn: 0x6`.
+    `std` only resets SIGPIPE; ignored dispositions and the blocked mask
+    both survive `exec`.
+  - Fix: the PTY child sets every signal back to `SIG_DFL` and clears the
+    blocked mask before `exec` (`child_setup` in `toastty-pty`). Fixed in
+    #46.
+  - kitty 0.49.2 (checked live, launched with SIGINT / SIGQUIT ignored)
+    resets SIGINT but leaves SIGQUIT ignored (`SigIgn: 0x4`). toastty
+    resets everything.
 
 Performance notes (Xvfb, software present; not conclusive):
 

@@ -165,6 +165,7 @@ impl Drop for Pty {
 /// Runs in the forked child between fork and exec. Must only call
 /// async-signal-safe functions.
 fn child_setup(slave_raw: i32, master_raw: i32) -> io::Result<()> {
+    reset_signals();
     // SAFETY: setsid takes no arguments and is always safe to call.
     if unsafe { libc::setsid() } < 0 {
         return Err(io::Error::last_os_error());
@@ -187,6 +188,35 @@ fn child_setup(slave_raw: i32, master_raw: i32) -> io::Result<()> {
     // SAFETY: closing a child-side copy of the master fd we own.
     let _ = unsafe { libc::close(master_raw) };
     Ok(())
+}
+
+/// Give the shell a clean signal state (PTY-1), as kitty and other
+/// terminals do. Ignored dispositions survive `exec`, so a toastty
+/// started with SIGINT / SIGQUIT ignored (`toastty &` from a script, a
+/// launcher that ignores them) would hand that on and Ctrl+C couldn't
+/// stop foreground jobs. `std` only resets SIGPIPE. So set every signal
+/// back to `SIG_DFL` and unblock them all. Runs in the forked child;
+/// `sigaction` / `sigprocmask` are async-signal-safe. Errors (SIGKILL,
+/// SIGSTOP, numbers past the platform's last signal) are ignored.
+fn reset_signals() {
+    // SAFETY: an all-zero `sigaction` is valid; we then set the handler
+    // to SIG_DFL with an empty mask and no flags.
+    let mut dfl: libc::sigaction = unsafe { std::mem::zeroed() };
+    dfl.sa_sigaction = libc::SIG_DFL;
+    // SAFETY: `dfl.sa_mask` is a valid sigset_t to initialise.
+    unsafe { libc::sigemptyset(&raw mut dfl.sa_mask) };
+    // 1..=64 covers Linux's standard and real-time signals (SIGRTMAX is 64).
+    for sig in 1..65 {
+        // SAFETY: `dfl` is a valid sigaction; the old action isn't read.
+        let _ = unsafe { libc::sigaction(sig, &raw const dfl, std::ptr::null_mut()) };
+    }
+    // SAFETY: an all-zero sigset_t is valid storage for sigemptyset.
+    let mut none: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `none` is valid; the child is single-threaded after fork.
+    unsafe {
+        libc::sigemptyset(&raw mut none);
+        libc::sigprocmask(libc::SIG_SETMASK, &raw const none, std::ptr::null_mut());
+    }
 }
 
 fn open_pair(size: WinSize) -> Result<(OwnedFd, OwnedFd)> {
