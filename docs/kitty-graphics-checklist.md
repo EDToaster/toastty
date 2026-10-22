@@ -1070,6 +1070,23 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
   - Fixed in #37. `a=f`/`a=a`/`a=c` on an image that isn't stored reply
     kitty's `ENOENT:Animation command refers to non-existent image with
     id: N and number: M`; with neither `i=` nor `I=` they are silent.
+- [x] **P3 — WIRE-14. Bare C1 bytes and some invalid UTF-8 in plain text
+  print nothing; kitty prints U+FFFD.** Found in the #32 review.
+  - Expected (kitty 0.49.2, checked live): one U+FFFD for each maximal
+    invalid subpart, the same rule as `String::from_utf8_lossy`. Examples:
+    - a bare `0x80`–`0xFF`, so `0x9c` and `0x9b 31m` give `\ufffd`,
+      `\ufffd31m`;
+    - `c0 af` gives 2, `ed a0 80` gives 3, `f4 90 80 80` gives 4;
+    - a truncated `e2 82` + `A` gives `\ufffdA`.
+    - Properly encoded C1 (`c2 9c`, `c2 85`) prints nothing and isn't
+      acted on.
+  - Actual: vte executes a bare `0x80`–`0x9F` as an 8-bit C1 control,
+    which toastty ignores, so it vanished. That also made the longer
+    invalid runs come out short.
+  - Fix: a UTF-8 sanitizer in the parser's ground path hands vte
+    `from_utf8_lossy`-style text. It holds an incomplete trailing sequence
+    across reads, and turns one cut off by ESC into U+FFFD. Fixed in
+    #41.
 
 ## 9. Not implemented
 
