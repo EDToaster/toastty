@@ -49,6 +49,13 @@ pub struct ImageRegistry {
     /// remove. The renderer compares this to its cached value to decide
     /// when to re-sync GPU textures.
     revision: u32,
+    /// Per-image generation, stamped on every insert (including an
+    /// in-place replace under the same id) from `next_generation`. The
+    /// renderer keys its GPU textures on it, so any re-transmit is seen
+    /// as new content regardless of size or pixels.
+    generations: HashMap<u32, u64>,
+    /// Next generation to hand out. Starts at 1, never reused.
+    next_generation: u64,
 }
 
 impl ImageRegistry {
@@ -61,6 +68,8 @@ impl ImageRegistry {
             total_bytes: 0,
             cap_bytes,
             revision: 0,
+            generations: HashMap::new(),
+            next_generation: 1,
         }
     }
 
@@ -111,6 +120,14 @@ impl ImageRegistry {
     #[must_use]
     pub fn get(&self, id: u32) -> Option<&ImageData> {
         self.entries.get(&id)
+    }
+
+    /// The generation `id`'s current data was stored under: unique per
+    /// insert, so a re-transmit under the same id (same size, same
+    /// pixels or not) always yields a new value. `None` if not resident.
+    #[must_use]
+    pub fn generation(&self, id: u32) -> Option<u64> {
+        self.generations.get(&id).copied()
     }
 
     /// Borrow an image by id and mark it MRU.
@@ -196,6 +213,7 @@ impl ImageRegistry {
             self.lru.retain(|x| *x != victim);
             if let Some(victim_data) = self.entries.remove(&victim) {
                 self.total_bytes -= victim_data.byte_size();
+                self.generations.remove(&victim);
                 evicted.push(victim);
             }
         }
@@ -203,6 +221,8 @@ impl ImageRegistry {
         self.total_bytes += need;
         self.lru.push_back(final_id);
         self.entries.insert(final_id, data);
+        self.generations.insert(final_id, self.next_generation);
+        self.next_generation += 1;
         self.revision = self.revision.wrapping_add(1);
         Ok(Inserted {
             id: final_id,
@@ -214,6 +234,7 @@ impl ImageRegistry {
     pub fn remove(&mut self, id: u32) -> Option<ImageData> {
         let data = self.entries.remove(&id)?;
         self.total_bytes -= data.byte_size();
+        self.generations.remove(&id);
         self.lru.retain(|x| *x != id);
         self.revision = self.revision.wrapping_add(1);
         Some(data)
@@ -235,6 +256,7 @@ impl ImageRegistry {
             };
             if let Some(data) = self.entries.remove(&victim) {
                 self.total_bytes -= data.byte_size();
+                self.generations.remove(&victim);
                 evicted.push(victim);
                 self.revision = self.revision.wrapping_add(1);
             }
@@ -526,5 +548,63 @@ mod tests {
         assert!(res.evicted.is_empty());
         assert!(r.contains(1));
         assert_eq!(r.get(1).unwrap().pixels[0], 9);
+    }
+
+    #[test]
+    fn generation_is_unique_per_insert_even_for_identical_replace() {
+        let img = |fill: u8| ImageData {
+            width: 2,
+            height: 2,
+            pixels: vec![fill; 16],
+        };
+        let mut r = ImageRegistry::new(1024);
+        assert_eq!(r.generation(7), None);
+        r.insert(7, img(1)).unwrap();
+        let g1 = r.generation(7).unwrap();
+        // Same id, same size, identical bytes: still a new generation.
+        r.insert(7, img(1)).unwrap();
+        let g2 = r.generation(7).unwrap();
+        assert_ne!(g1, g2);
+        r.insert(8, img(1)).unwrap();
+        let g3 = r.generation(8).unwrap();
+        assert!(g3 != g1 && g3 != g2);
+        r.remove(7);
+        assert_eq!(r.generation(7), None);
+    }
+
+    #[test]
+    fn reused_anonymous_id_gets_a_new_generation() {
+        // Delete-then-anonymous-transmit reuses the lowest free id; the
+        // generation must still differ so the GPU copy is refreshed.
+        let img = ImageData {
+            width: 1,
+            height: 1,
+            pixels: vec![0; 4],
+        };
+        let mut r = ImageRegistry::new(1024);
+        let id = r.insert(0, img.clone()).unwrap().id;
+        let g1 = r.generation(id).unwrap();
+        r.remove(id);
+        let id2 = r.insert(0, img).unwrap().id;
+        assert_eq!(id, id2);
+        assert_ne!(r.generation(id2).unwrap(), g1);
+    }
+
+    #[test]
+    fn evicted_images_lose_their_generation() {
+        let img = ImageData {
+            width: 2,
+            height: 2,
+            pixels: vec![0; 16],
+        };
+        let mut r = ImageRegistry::new(32);
+        r.insert(1, img.clone()).unwrap();
+        r.insert(2, img.clone()).unwrap();
+        let ins = r.insert(3, img).unwrap();
+        assert_eq!(ins.evicted, vec![1]);
+        assert_eq!(r.generation(1), None);
+        r.set_cap(16);
+        assert_eq!(r.generation(2), None);
+        assert!(r.generation(3).is_some());
     }
 }
