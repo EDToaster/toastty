@@ -412,6 +412,10 @@ pub struct Renderer {
     /// A `z < INT32_MIN/2` placement was on screen last frame. Those
     /// frames drop default-bg quads, which needs a full clear.
     below_bg_drawn_last: bool,
+    /// SIZE-12: the last image resolve deferred mip work (per-frame cap
+    /// hit). Keeps frames coming (`next_redraw_deadline`, skip gate)
+    /// until every drawn-downscaled image has its levels.
+    mip_work_pending: bool,
     /// Last viewport offset rendered. When it changes we force a full
     /// clear — partial redraw can't reliably overpaint the previous
     /// frame at the new y-translation (blank cells skip emission, so
@@ -1098,6 +1102,7 @@ impl Renderer {
             rich_instances: Vec::new(),
             rich_drawn_last: false,
             below_bg_drawn_last: false,
+            mip_work_pending: false,
             last_view_offset: (0, 0.0),
             scratch_depth_texture,
             scratch_depth_view,
@@ -1363,8 +1368,13 @@ impl Renderer {
             .then_some(Duration::from_millis(16));
         // SGR blink: only while blinking cells were on screen last frame.
         let text_blink = self.text_blink.next_deadline(Instant::now());
+        // Deferred image mip work: finish it over the next frames.
+        let mips = self.mip_work_pending.then_some(Duration::from_millis(16));
         // Whichever fires first wins. All are `Option<Duration>`.
-        [blink, rgp, chip, text_blink].into_iter().flatten().min()
+        [blink, rgp, chip, text_blink, mips]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Set (or clear) a debug overlay string painted at the top-right
@@ -2307,6 +2317,12 @@ impl Renderer {
         // skip check so animation_phase_rad is current for this
         // frame; the tick itself doesn't bump revision.
         let rgp_animation_active = term.rgp_scene().has_active_animations();
+        // SIZE-12: a frame that finishes deferred mip levels redraws the
+        // images, so repaint everything under them (like RGP animation).
+        if self.mip_work_pending {
+            self.needs_full_clear = true;
+            term.mark_all_dirty();
+        }
         if rgp_animation_active {
             term.tick_rgp_animations(now);
             // The previous frame's 3D pose still sits in the scratch
@@ -2332,6 +2348,7 @@ impl Renderer {
             && !cursor_animation_due
             && !text_blink_due
             && !rgp_animation_active
+            && !self.mip_work_pending
             && !chip_changed
             && !self.needs_full_clear
             && self.debug_overlay.is_none()
@@ -3030,16 +3047,18 @@ impl Renderer {
                 &mut self.image_tex_cache,
                 &mut tmp,
             );
+            self.mip_work_pending = stats.deferred > 0;
             if let Some(t) = t_img
                 && (!tmp.is_empty() || !self.image_tex_cache.is_empty())
             {
                 let ms = t.elapsed().as_secs_f64() * 1000.0;
                 tracing::info!(
                     target: "render_trace",
-                    "images n={} uploaded={} mipped={} evicted={} resident={} ({} KiB) took={ms:.3}ms",
+                    "images n={} uploaded={} mipped={} deferred={} evicted={} resident={} ({} KiB) took={ms:.3}ms",
                     tmp.len(),
                     stats.uploaded,
                     stats.mipped,
+                    stats.deferred,
                     stats.evicted,
                     self.image_tex_cache.len(),
                     self.image_tex_cache.total_bytes() / 1024,
