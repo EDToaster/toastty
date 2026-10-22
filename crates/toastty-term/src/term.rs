@@ -3779,12 +3779,13 @@ impl Term {
                 // resize reports and `TIOCGWINSZ`: whole-cell pixels.
                 2048 => {
                     self.inband_resize_mode = enable;
-                    if enable {
-                        let (w, h) = self.text_area_pixel_size();
-                        let w = u16::try_from(w).unwrap_or(u16::MAX);
-                        let h = u16::try_from(h).unwrap_or(u16::MAX);
-                        let reply = format!("\x1b[48;{};{};{h};{w}t", self.rows, self.cols);
-                        self.pty_replies.extend_from_slice(reply.as_bytes());
+                    let (w, h) = self.text_area_pixel_size();
+                    let w = u16::try_from(w).unwrap_or(u16::MAX);
+                    let h = u16::try_from(h).unwrap_or(u16::MAX);
+                    if let Some(reply) = toastty_protocols::resize_inband::encode_resize_report(
+                        self.rows, self.cols, h, w, enable,
+                    ) {
+                        self.pty_replies.extend_from_slice(&reply);
                     }
                 }
                 // 80 — DECSDM (sixel display mode). SET disables sixel
