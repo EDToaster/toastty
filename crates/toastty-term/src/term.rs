@@ -10187,19 +10187,34 @@ mod major_delete_tests {
     }
 
     #[test]
-    fn number_map_follows_reregistration() {
-        // Re-transmitting an id moves it to the newest slot of its new
-        // number and out of its old one.
+    fn reregistering_by_id_keeps_number_and_age() {
+        // #35 review, matching kitty: re-sending image A (I=7) by `i=A`
+        // keeps its number and its original age, so `d=N,I=7` removes
+        // the newer B first and then A.
         let mut t = Term::new(8, 8, 0);
-        transmit_place_numbered(&mut t, 0, 0, 7); // id 1
-        transmit_place_numbered(&mut t, 2, 0, 7); // id 2
+        transmit_place_numbered(&mut t, 0, 0, 7); // id 1 (A)
+        transmit_place_numbered(&mut t, 2, 0, 7); // id 2 (B)
+        transmit_place_at(&mut t, 4, 0, 1, 0, 0); // re-send A by i=1
         assert_eq!(t.newest_image_for_number(7), Some(2));
-        // Re-register id 1 with no number (i= only): it leaves I=7.
-        transmit_place_at(&mut t, 4, 0, 1, 0, 0);
         feed(&mut t, b"\x1b_Ga=d,d=N,I=7\x1b\\");
-        assert!(!t.image_registry().contains(2));
-        assert!(t.image_registry().contains(1), "id 1 no longer has I=7");
+        assert!(!t.image_registry().contains(2), "B (newest) goes first");
+        assert!(t.image_registry().contains(1));
+        feed(&mut t, b"\x1b_Ga=d,d=N,I=7\x1b\\");
+        assert!(!t.image_registry().contains(1), "then A, which kept I=7");
         assert_eq!(t.newest_image_for_number(7), None);
+    }
+
+    #[test]
+    fn del2_uppercase_f_removes_placements_whose_data_is_gone() {
+        // `d=F,i=N` doesn't need the image data to exist: leftover
+        // placements of an id whose bytes are already gone are removed.
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_at(&mut t, 0, 0, 5, 0, 0);
+        place_again_at(&mut t, 0, 3, 5, 2);
+        t.image_registry.remove(5);
+        assert!(has_placement_for(&t, 5));
+        feed(&mut t, b"\x1b_Ga=d,d=F,i=5\x1b\\");
+        assert!(!has_placement_for(&t, 5));
     }
 
     #[test]
