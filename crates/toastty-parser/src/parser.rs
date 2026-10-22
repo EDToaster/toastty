@@ -889,8 +889,6 @@ mod tests {
         assert_eq!(r.text, "z");
     }
 
-    /// WIRE-13: kitty 0.49.2 ends every string type on BEL. OSC and APC
-    /// already did; DCS, PM and SOS now do too.
     #[test]
     fn dcs_cancel_is_signalled_before_unhook() {
         #[derive(Default)]
@@ -913,6 +911,17 @@ mod tests {
             Parser::new().advance(&mut r, &input);
             assert_eq!(r.0, ["hook", "cancel", "unhook"], "{cancel:#x}");
         }
+        // CAN in a separate read.
+        let mut r = Rec::default();
+        let mut p = Parser::new();
+        p.advance(&mut r, b"\x1bP$qm");
+        p.advance(&mut r, b"\x18");
+        assert_eq!(r.0, ["hook", "cancel", "unhook"], "split");
+        // CAN before the final byte: no hook happened, and vte sends no
+        // unhook, but the cancel still fires (handlers must cope).
+        let mut r = Rec::default();
+        Parser::new().advance(&mut r, b"\x1bP$\x18");
+        assert_eq!(r.0, ["cancel"], "before the final byte");
         // ST and BEL end it normally: no cancel.
         for end in [&b"\x1b\\"[..], b"\x07"] {
             let mut input = b"\x1bP$qm".to_vec();
@@ -923,6 +932,8 @@ mod tests {
         }
     }
 
+    /// WIRE-13: kitty 0.49.2 ends every string type on BEL. OSC and APC
+    /// already did; DCS, PM and SOS now do too.
     #[test]
     fn dcs_ends_on_bel_like_st() {
         let r = parse(b"\x1bP1$rab\x07x");
