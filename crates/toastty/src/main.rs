@@ -285,6 +285,9 @@ struct Toastty {
     /// GPU context + fonts being built on worker threads since `main`;
     /// consumed by `init_impl`.
     preload: Preload,
+    /// The first frame has been drawn and the startup heap churn released
+    /// (`toastty::heap::release_free_memory`).
+    startup_heap_released: bool,
     parser: Parser,
     term: Term,
     pty: Option<Pty>,
@@ -503,6 +506,7 @@ impl Toastty {
             window: None,
             renderer: None,
             preload,
+            startup_heap_released: false,
             parser: Parser::new(),
             term,
             pty: None,
@@ -2904,6 +2908,12 @@ impl App for Toastty {
                             let frame_end = Instant::now();
                             self.stats.frame(frame_start, frame_end);
                             self.ingest.frame_drawn(frame_start, frame_end);
+                            if !self.startup_heap_released {
+                                // Startup is over once the first frame is
+                                // up; drop its freed heap (see `heap`).
+                                self.startup_heap_released = true;
+                                toastty::heap::release_free_memory();
+                            }
                             // Consume the per-cell damage signal so the
                             // next render only re-emits cells that
                             // changed. Clear the BSU timeout-flush

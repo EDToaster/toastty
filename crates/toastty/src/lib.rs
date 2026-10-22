@@ -16,6 +16,7 @@ pub mod config_watcher;
 pub mod focus;
 pub mod font_zoom;
 pub mod geometry;
+pub mod heap;
 pub mod image_cmd;
 pub mod ingest;
 pub mod keyboard;

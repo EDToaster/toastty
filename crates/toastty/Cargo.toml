@@ -46,6 +46,10 @@ toastty-render.workspace = true
 toastty-term.workspace = true
 toastty-window.workspace = true
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+# `malloc_trim` (see `src/heap.rs`).
+libc = "0.2"
+
 [features]
 pprof = ["dep:pprof"]
 
