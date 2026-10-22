@@ -120,10 +120,11 @@ impl vte::Perform for VteRec {
 }
 
 /// Pieces both sides must agree on: text (valid, invalid, bare and
-/// encoded C1), C0 controls, CSI / ESC sequences (complete, or cut by
-/// what follows), DCS, SOS/PM. No OSC (we pass its raw bytes to vte,
-/// which lossy conversion would rewrite), no APC (vte drops it) and no
-/// bare ESC (WIRE-18).
+/// encoded C1), C0 controls, complete CSI / ESC sequences, DCS, SOS/PM.
+/// Left out, because we deliberately differ from vte there: OSC (we pass
+/// its raw bytes to vte, which lossy conversion would rewrite), APC (vte
+/// drops it), and a bare ESC or an unfinished CSI, which a non-ASCII
+/// byte aborts like kitty (WIRE-17, WIRE-18).
 const PIECES: &[&[u8]] = &[
     b"a",
     b"hello ",
@@ -163,8 +164,6 @@ const PIECES: &[&[u8]] = &[
     b"\x1b[1;2H",
     b"\x1b[?25l",
     b"\x1b[38;5;196m",
-    b"\x1b[3",
-    b"\x1b[",
     b"\x1b7",
     b"\x1b(B",
     b"\x1b\\",
@@ -185,6 +184,9 @@ const MORE_PIECES: &[&[u8]] = &[
     b"\x1bPtmux;\x1b\x1b[31m\x1b\\",
     b"\x1bPtmux;\x1b\x1b_Gq=1;x\x1b\x1b\\\x1b\\",
     b"\x1b",
+    b"\x1b[3",
+    b"\x1b[",
+    b"\x1b(",
 ];
 
 fn stream(pieces: &'static [&'static [u8]]) -> impl Strategy<Value = Vec<u8>> {
