@@ -638,7 +638,7 @@ remaining gaps:
 Anything that writes to the PTY can send these commands: `cat` of a file,
 `curl` output, a remote host over ssh.
 
-- [ ] **P0 — SEC-1. `t=t` deletes files outside the temp directory.**
+- [x] **P0 — SEC-1. `t=t` deletes files outside the temp directory.**
   - Spec: "the terminal emulator should only delete the file if it is in a
     known temporary directory, such as `/tmp`, `/dev/shm`, `TMPDIR` … **and**
     the file has the string `tty-graphics-protocol` in its full file path".
@@ -667,7 +667,14 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
     - Require the marker.
     - `lstat` and require a regular file.
     - Add tests for each row above.
-- [ ] **P0 — SEC-2. `t=f` on a FIFO freezes the terminal.**
+  - Fixed in #30. The marker is checked on the sent path and the temp
+    dir on the resolved path, and only the sent entry is unlinked (a
+    final symlink, never its target). This matches kitty live on every
+    row above, plus marked links, `..` inside the temp dir and marked
+    directory symlinks. One check is stricter than kitty: the unlinked
+    entry's own directory must also resolve into a temp dir. See
+    `docs/decisions/kitty-file-medium.md`.
+- [x] **P0 — SEC-2. `t=f` on a FIFO freezes the terminal.**
   - Repro: `mkfifo f`, then `K send i=1,t=f,s=2,v=2,f=32 --path f`.
   - Expected (spec): "terminal emulators **must** refuse to read any
     device/socket/etc. special files … These checks should be made on the
@@ -680,7 +687,10 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
       its late reply lands in the shell as typed text.
   - Cause: `read_file_range` (`handler.rs:763-788`) opens with no file-type
     check, on the PTY thread.
-- [ ] **P0 — SEC-3. `t=f` with no `S=` reads without a limit.**
+  - Fixed in #30. `stat` before `open`, then
+    `open(O_NONBLOCK|O_NOFOLLOW)` and `fstat` (`kitty/medium.rs`). A FIFO
+    now replies EBADF at once.
+- [x] **P0 — SEC-3. `t=f` with no `S=` reads without a limit.**
   - Repro: `t=f` pointing at `/dev/zero`.
   - Actual: toastty's RSS grew past 3 GB in about 2 s, and the test watchdog
     killed it. kitty replies EBADF.
@@ -693,7 +703,10 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
     - Open with `O_NONBLOCK`, then `fstat` again to close the race.
     - Cap reads at the expected decoded size, or at the quota.
     - Reject the pseudo-filesystems.
-- [ ] **P1 — SEC-4. File errors reveal details about local files.**
+  - Fixed in #30. `/proc`, `/sys` and `/dev` are refused (`/dev/shm`
+    stays readable, as in kitty). Reads are capped at `S=`, at
+    `s*v*bpp` for raw pixels, or at the registry cap.
+- [x] **P1 — SEC-4. File errors reveal details about local files.**
   - Expected (spec): the terminal "**must not** allow such a program to use
     the responses … to learn anything about files it cannot read itself …
     all failures to read an image file … must be reported with a single,
@@ -707,14 +720,23 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
     user's local filesystem this way.
   - Cause: `handler.rs:470-505` and the decode-error passthrough in
     `finalize_decoded` (~560-575).
-- [ ] **P1 — SEC-5. zlib decompression (`o=z`) has no size limit.**
+  - Fixed in #30. Every `t=f`/`t=t` failure replies
+    `EBADF:Failed to read image file`, including inflate and decode
+    failures of the bytes read. The reason goes to the debug log.
+  - Divergence (PM decision): kitty replies `EBADPNG:Not a PNG file`
+    for a readable non-PNG file. We reply the uniform EBADF instead,
+    because that reply would reveal a local file's contents.
+- [x] **P1 — SEC-5. zlib decompression (`o=z`) has no size limit.**
   - Repro: `i=1,s=1,v=1,f=32,o=z` with 1 GiB of zeros, compressed.
   - Actual: toastty inflates all of it (RSS 101 MB → 1123 MB) before
     replying EINVAL. A 400 MiB stream peaked at about 1 GB. kitty stops at
     the expected size (`s*v*4`) and uses no extra memory.
   - Cause: `inflate_zlib` (`handler.rs:746-751`) calls `read_to_end` with no
     cap. Use `take(expected + 1)`.
-- [ ] **P1 — SEC-6. No limit on the number of in-flight chunked uploads, and
+  - Fixed in #30. Inflation stops at `s*v*bpp` for raw pixels, or at
+    the registry cap for PNG: `EINVAL:zlib decompress: inflated data
+    exceeds N bytes`.
+- [x] **P1 — SEC-6. No limit on the number of in-flight chunked uploads, and
   abandoned uploads are never freed.**
   - Repro: 16 chunked uploads with different `i=`, each 48 MiB, none
     finished.
@@ -722,11 +744,16 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
   - Cause: `pending` (`handler.rs:418-425`) has a per-upload cap
     (`DEFAULT_PENDING_CAP`, `handler.rs:30`) but no total cap, no count cap
     and no expiry.
-- [ ] **P2 — SEC-7. Oversized PNGs are fully decoded before being rejected.**
+  - Fixed in #30. At most 8 uploads and 128 MiB in flight, with the
+    least recently active other upload evicted silently. An upload with
+    no chunk for 60 s is freed on the next graphics command.
+- [x] **P2 — SEC-7. Oversized PNGs are fully decoded before being rejected.**
   - Repro: a 12000×12000 PNG.
   - Actual: toastty peaks at 1.28 GB RSS, then replies EFBIG. kitty replies
     `ENOMEM: PNG image is too large` straight away.
   - Check the IHDR dimensions against the quota before decoding.
+  - Fixed in #30. The IHDR is read first, and `w*h*4` over the
+    registry cap replies `ENOMEM:PNG image is too large`, as kitty does.
 
 ## 8. Wire format and replies
 

@@ -49,7 +49,7 @@ unicode-segmentation = "=1.13.2"
 
 # Range-pinned utilities.
 mio = "1"
-rustix = { version = "1", features = ["pty", "process", "termios"] }
+rustix = { version = "1", features = ["fs", "pty", "process", "termios"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"

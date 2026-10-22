@@ -1,0 +1,180 @@
+# Decision: Kitty file mediums and upload limits
+
+Date: 2026-10-21. Author: kgp-B (KGP fix programme, PR B1).
+Status: **implemented**. Closes SEC-1 to SEC-7 in
+`docs/kitty-graphics-checklist.md`.
+
+## TL;DR
+
+Anything that can write to the PTY can send a kitty graphics command: `cat`
+of a file, `curl` output, a remote host over ssh. So `t=f` / `t=t` paths
+and every payload are untrusted.
+
+- File reads (`kitty/medium.rs`) resolve the path, then open it race-free
+  by descending from `/` one component at a time with `O_NOFOLLOW`, open
+  the leaf `O_NONBLOCK | O_NOFOLLOW | O_NOCTTY`, and check the *opened fd*
+  with `fstat` (regular file) and `fstatfs` (not a pseudo-filesystem).
+  Reads are bounded.
+- Every file failure replies `EBADF:Failed to read image file`. The real
+  reason goes to the debug log. This removes a *content* oracle only: a
+  successful read, and the `O=` offset, still reveal a file's existence
+  and exact size, which is inherent to `t=f` and the same in kitty.
+- `t=t` deletes only when the entry named contains `tty-graphics-protocol`
+  and both the resolved file and its resolved parent lie in a temp dir.
+  The unlink goes through a pinned directory fd, so it can't be raced out
+  of the temp dir.
+- Decoding is bounded by `KittySink::max_image_bytes()`, which `Term` sets
+  to the registry cap. This bound covers zlib output and the PNG's native
+  decoded size.
+- In-flight chunked uploads have caps on their count and their total
+  bytes, and expire after a TTL.
+
+The target behaviour is kitty 0.49.2, checked live with
+`scripts/kgp-stress/kitty-ref.sh`.
+
+## File reads (SEC-2, SEC-3)
+
+The spec says to check the path *before* opening it, because opening can
+have side effects: a FIFO blocks, and a device may act on open. The first
+cut (reviewed in #30) checked `canonicalize`, then `stat` and `open`,
+which each re-resolve the path — so a directory component swapped for a
+symlink between the calls defeated the checks (a TOCTOU the reviewer
+demonstrated for the delete path). The open is now race-free:
+
+1. `canonicalize` follows symlinks, as the spec requires for reads, and
+   resolves `..`. The result has no symlinks.
+2. Cheap pre-check: refuse `/proc`, `/sys`, `/dev` (except
+   `/dev/shm/<name>`) by path. The `fstatfs` below is the race-free guard.
+3. Descend the canonical path from `/` one component at a time with
+   `openat(O_DIRECTORY | O_NOFOLLOW)` (`open_dir_chain`), plus an `fstat`
+   that each step is a directory. Since the canonical path has no
+   symlinks, a symlink or non-directory in any component means it was
+   swapped after the resolve, and we abort. The final directory fd pins
+   that inode, so later renames can't move the leaf `openat`/`unlinkat`
+   elsewhere.
+   - On Linux and FreeBSD the directories are opened with `O_PATH`, which
+     needs only search (`x`) permission, so a search-only (`--x`)
+     directory on the path works as it does for a plain `open()`.
+   - **Limitation:** rustix has no `O_SEARCH` for macOS, so there the
+     walk opens directories `O_RDONLY` and a search-only directory on the
+     path fails the read (uniform EBADF). Reading through such a
+     directory is rare; the alternative would reintroduce the race.
+4. Open the leaf relative to that fd with
+   `O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_NOCTTY | O_CLOEXEC`. `NONBLOCK`
+   keeps a FIFO from parking the thread, `NOCTTY` keeps a tty from
+   becoming our controlling terminal. `rustix` is now a unix-only
+   dependency of `toastty-graphics` (workspace feature `fs`).
+5. Check the *opened fd*, not the path, so these are race-free: `fstat`
+   must report a regular file, and on Linux `fstatfs` must not report a
+   pseudo-filesystem (proc, sysfs, debugfs, tracefs, securityfs, cgroup,
+   cgroup2, bpf, configfs, efivarfs, pstore, selinuxfs, smackfs,
+   binfmt_misc, fusectl, nsfs). The magic is compared on its low 32 bits,
+   because `f_type` is a signed word and magics with the top bit set
+   arrive sign-extended. `/dev` isn't caught by `fstatfs` — devtmpfs shares its magic with
+   `/tmp` and `/dev/shm` — but a device there is already rejected as "not
+   a regular file", and the path pre-check refuses a regular file directly
+   under `/dev`.
+6. Read `S=` bytes, or to EOF, but never more than the quota. A larger
+   request fails before it allocates. For uncompressed raw pixels with no
+   `S=`, read exactly `s*v*bpp` bytes. kitty does the same: a longer file
+   is fine, a shorter one fails.
+
+The read still runs on the PTY-processing thread. Nothing a client sends
+can block it any more. The only remaining wait is a slow regular file,
+such as one on NFS.
+
+## One error for every file failure (SEC-4)
+
+All of these reply `EBADF:Failed to read image file`:
+
+- a missing path, a directory, no permission, or a symlink loop;
+- a special file or a sensitive tree;
+- a file shorter than `S=` or `s*v*bpp`, or larger than the quota;
+- a bad base64 path or an empty path;
+- any inflate or decode failure of bytes that came from a file.
+
+The last one goes further than kitty. kitty answers `EBADPNG` for a
+readable file that isn't a PNG. That tells a remote client something
+about a local file, so we don't. The PM decided this (spec read strictly).
+Replies for direct (`t=d`) payloads are unchanged.
+
+**Residual, inherent to the protocol (and the same in kitty):** the
+uniform reply hides only *why* a read failed. It does not hide that a file
+exists and is readable — a successful read says so — and a client can
+binary-search a file's exact size with `O=` offsets, since the OK/EBADF
+split is an at-least-N-bytes oracle. Hiding that would break `t=f`, which
+is a legitimate feature. The earlier claim that SEC-4 hides file size was
+wrong; it is corrected here and in the code comments.
+
+## Temp-file deletion (SEC-1)
+
+kitty's rule, from `kitty/utils.py` `is_path_in_temp_dir` and
+`boss.safe_delete_temp_file`, confirmed live:
+
+- The entry removed — `canonicalize(parent)` joined with the leaf name,
+  the leaf not followed — must contain `tty-graphics-protocol`. Checking
+  the resolved entry, not the sent string, means a marker in a component
+  that `..` cancels doesn't count (`<tmp>/m-tty-graphics-protocol/../x`
+  whose real path is `<tmp>/x`). This is one step stricter than kitty,
+  which checks the sent string; the PM's "spec strictly" call covers it.
+- `realpath(sent)` must be under a temp root (kitty's own check: a marked
+  link pointing outside the temp dirs is kept). The roots are `/tmp`,
+  `/dev/shm`, `$TMPDIR` and `std::env::temp_dir()`, all canonicalized, and
+  the comparison is component-wise, so `/tmpfoo` is not under `/tmp`.
+- The sent path's own entry is unlinked. If the sent path is a symlink,
+  only the link is removed, never its target.
+- The file must have opened as a regular file. When it did, the file is
+  deleted even if the read or decode then fails, as kitty does.
+
+Two checks stricter than kitty:
+
+- The resolved parent of the entry must also be under a temp root, so a
+  marked link reached through a parent that resolves out of the temp dirs
+  is kept — we never unlink an entry that lives outside them.
+- The unlink is race-free. The first cut (#30) did
+  `remove_file(canonicalize(parent).join(name))`, which re-resolves the
+  path; the reviewer won that race by swapping a component for a symlink
+  and deleted a file outside every temp dir. Now the parent is reopened
+  with the same component-wise `O_NOFOLLOW` walk as reads, and the entry
+  removed with `unlinkat` relative to the pinned fd, so a swap after the
+  check can't redirect it. A `#[cfg(test)]` hook fires between the check
+  and the `unlinkat`; a regression test swaps the parent for a symlink
+  there and asserts the outside file survives.
+
+## Decode limits (SEC-5, SEC-7)
+
+- `KittySink::max_image_bytes()` is new. Its default is
+  `DEFAULT_MAX_IMAGE_BYTES`, 400 MB, kitty's `MAX_DATA_SZ`. `Term` returns
+  the registry cap, which is 320 MiB by default. The registry evicts to
+  make room, so the whole cap is what one image may use.
+- zlib output stops at `s*v*bpp` for raw formats, or at the quota for PNG
+  or when dimensions are missing. We read `limit + 1` bytes through
+  `Read::take`. Anything over the limit is `EINVAL:zlib decompress:
+  inflated data exceeds N bytes`. When the declared `s*v*bpp` already
+  exceeds the quota, we reply `EFBIG` *before* inflating, so an attacker
+  can't make us inflate up to the cap for free.
+- PNG: a header-only pass builds the decoder and reads its *native*
+  decoded size (`ImageDecoder::total_bytes()`), which accounts for bit
+  depth and channel count — a 16-bit image is not under-counted the way
+  `w*h*4` would. If that exceeds the quota, the reply is `ENOMEM:PNG image
+  is too large`, kitty's literal reply, before any pixel data is decoded.
+  The image crate's own `max_alloc` is set to the quota too, so an image
+  right at the cap is `ENOMEM` rather than a decode error.
+
+## In-flight uploads (SEC-6)
+
+- `MAX_PENDING_UPLOADS = 8`. The spec says a client must finish one
+  upload before it starts another, so the slots only have to absorb
+  abandoned uploads.
+- `DEFAULT_PENDING_TOTAL_CAP = 128 MiB`. This is twice the per-upload
+  cap, so one upload always fits.
+- Starting an upload, or growing one past either cap, evicts the least
+  recently active *other* upload. Order comes from a chunk counter, not
+  the clock.
+- `PENDING_UPLOAD_TTL = 60 s` after the last chunk. Expiry runs at the
+  start of every graphics command.
+- Eviction and expiry send no reply. The client that abandoned the upload
+  isn't listening, and replies that nobody reads end up as typed text in
+  the shell.
+
+How later chunks for an evicted upload are routed is WIRE-9's job (PR B3).
