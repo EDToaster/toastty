@@ -509,3 +509,26 @@ fn compressed_frames_stretch_the_budget() {
     feed(&mut t, &apc("a=a,i=1,c=41", &[]));
     assert_eq!(shown(&t, 1), [39, 216, 0, 255]);
 }
+
+#[test]
+fn the_stashed_screens_animations_wait() {
+    // Merge train (#47 x #42): frames live in the screen's own store. While
+    // the alt screen is up, the primary's animation is stashed with it and
+    // doesn't play (and doesn't wake the event loop); it plays again, frames
+    // intact, once the primary is back.
+    let mut t = term_with_image(R);
+    feed(&mut t, &apc("a=f,i=1,q=2,f=32,s=4,v=2", &solid(G, 4, 2)));
+    feed(&mut t, &apc("a=a,i=1,s=3,r=1,z=40", &[]));
+    let t0 = Instant::now();
+    feed(&mut t, b"\x1b[?1049h");
+    assert!(!t.tick_animations(t0 + Duration::from_secs(1)));
+    assert_eq!(t.next_animation_frame(), None);
+    feed(&mut t, b"\x1b[?1049l");
+    assert_eq!(
+        t.image_registry().frame_count(key(&t, 1)),
+        Some(2),
+        "frames kept"
+    );
+    t.tick_animations(t0);
+    assert!(t.next_animation_frame().is_some());
+}
