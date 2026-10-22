@@ -676,7 +676,7 @@ Done in #28. See
     `ENOENT:Put command refers to non-existent image with id: N and
     number: M` (sent with `q=1`, silent with `q=2`), with no placement and
     no cursor move. Same with `p=`, `U=1`, and after the image is freed.
-- [ ] **P1 — PLC-2. Re-transmitting an existing id keeps its placements,
+- [x] **P1 — PLC-2. Re-transmitting an existing id keeps its placements,
   which then show the new pixels.**
   - Repro: `a=T,i=1` red, then `a=t,i=1` blue.
   - Expected (spec): "the existing image and all its placements must be
@@ -686,6 +686,11 @@ Done in #28. See
     shows two copies.
   - Cause: `register_image` (`term.rs:4591-4650`) replaces the registry entry
     without dropping that id's placements.
+  - Fixed in #WW. Re-transmitting an id deletes the old image and all its
+    placements; the new data shows once placed (kitty-ref: `a=T` red then
+    `a=t` blue shows nothing; a second `a=T` leaves one copy). Each
+    transmission gets a fresh store key. See
+    [`decisions/image-store.md`](decisions/image-store.md).
 - [x] **P1 — PLC-3. `a=p,I=N` is rejected with EINVAL.**
   - Expected (spec): commands that use an image number act on the newest
     image with that number. kitty replies `i=2,I=144;OK`.
@@ -696,7 +701,7 @@ Done in #28. See
     and replies `i=<id>,I=N;OK`. If that image is freed, the next newest
     with the number takes over, as in kitty (`Term::image_number_to_id`
     is now `HashMap<u32, Vec<u32>>`).
-- [ ] **P1 — PLC-4. Anonymous images get small ids other clients can
+- [x] **P1 — PLC-4. Anonymous images get small ids other clients can
   address.**
   - Repro: an anonymous `a=T`, then another program sends `a=t,i=1` or
     `a=d,d=I,i=1..2000`.
@@ -705,6 +710,11 @@ Done in #28. See
   - Cause: `registry.rs:163, 252` (`next_free_id` hands out the lowest free
     id). Allocate from the top of the id space, or keep anonymous images
     out of the id table.
+  - Fixed in #WW. Anonymous images (no `i=`, no `I=`) have no client id at
+    all, so no id or id-range command reaches them (kitty-ref: one survives
+    `d=R,x=1,y=4294967295`, `a=t,i=1` and `d=I,i=1`). Positional deletes
+    still remove them. `I=` without `i=` gets the lowest free id, as in
+    kitty (`I=5` → `i=1`).
 - [x] **P2 — PLC-5. A placement that ends at the right edge clamps the cursor
   to the last column.**
   - Actual: the next text lands hidden under the image. kitty wraps to
@@ -712,17 +722,26 @@ Done in #28. See
   - Cause: `term.rs:4984-5010`.
   - Fixed in #39. The cursor wraps to column 1 of the next line, as in kitty
     (`if (x >= columns) { x = 0; y++; }`).
-- [ ] **P2 — PLC-6. Main and alt screens share one image store.**
+- [x] **P2 — PLC-6. Main and alt screens share one image store.**
   - Repro: `d=I` on the alt screen.
   - Actual: it frees the main screen's image, which is blank after leaving
     alt. kitty keeps a separate store per screen.
   - This bites in practice: a full-screen previewer deleting its own ids
     wipes a shell's icat image that had the same id.
   - Cause: `term.rs:4513, 4854` don't check the stashed main-screen grid.
-- [ ] **P2 — PLC-7. Intermittent: an image was missing after re-sending the
+  - Fixed in #WW. One `ImageStore` per screen (bytes, ids, numbers,
+    quota), swapped with the image grid on screen switches. Deletes
+    (`d=i/I/n/N/r/R`, positional), same-id replacement and quota eviction
+    on one screen can't reach the other. Each screen has its own quota,
+    as in kitty. `d=F` (#35) goes through the same store.
+- [x] **P2 — PLC-7. Intermittent: an image was missing after re-sending the
   same id.**
   - Seen once and not reproduced in 8 more runs.
   - Possibly a renderer race on same-id replacement. Keep an eye on it.
+  - Not reproduced in #WW: 40 live same-id re-sends (20 alternating
+    red/blue, 20 identical), grabbed 0.25 s after each, all showed the
+    right image. Each re-send now gets a fresh store key, so nothing keyed
+    on the id can go stale.
 
 ## 6. Deletion
 
