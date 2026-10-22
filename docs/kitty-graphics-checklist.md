@@ -425,6 +425,16 @@ erasing, scrolling, scrollback and reflow all work for free.
 Done in #28. See
 [`decisions/unicode-placeholders.md`](decisions/unicode-placeholders.md).
 
+- **Deliberate divergence from kitty.** Placeholder cells keep their
+  diacritics in toastty's shared extras table. When scrollback holds
+  more distinct live placeholder cells than its quota (about 49k), the
+  oldest scrollback rows lose their placeholder images: the text stays
+  and the image no longer draws. kitty keeps them.
+  - **Known edge case.** The visible screen and the alt screen are never
+    stripped. If both show huge distinct placeholder images at once (more
+    than about 24.5k distinct cells each), new placeholder cells can
+    still hit the cap and stay blank.
+
 - [x] **P0 — PH-1. Placeholder images don't follow their cells.**
   - Repro:
     - Draw a placeholder image, then write text over some rows, run
