@@ -107,7 +107,8 @@ fn matches_target(ev: &notify::Event, target: &Path) -> bool {
 /// Filter out access / metadata-only notifications so we don't fire a
 /// reload for every `stat` the editor does. Create / Modify(Data) /
 /// Modify(Name) (atomic rename) / Remove are the interesting kinds.
-fn is_payload_event(kind: EventKind) -> bool {
+/// Shared with [`crate::shader_watcher`].
+pub(crate) fn is_payload_event(kind: EventKind) -> bool {
     use notify::event::ModifyKind;
     matches!(
         kind,

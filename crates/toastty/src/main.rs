@@ -17,12 +17,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use pollster::block_on;
-use toastty_config::{Config, ConfigError, ConfigSource, ConfirmClose};
+use toastty_config::{Config, ConfigError, ConfigSource, ConfirmClose, ShaderAnimation};
 use toastty_parser::Parser;
 use toastty_protocols::resize_inband::encode_resize_report;
 use toastty_protocols::synchronized::{BSU_TIMEOUT, should_force_flush};
 use toastty_pty::{Pty, PtySpec, WinSize};
-use toastty_render::{ClosePrompt, DialogButton, RenderOutcome, Renderer};
+use toastty_render::{
+    ClosePrompt, DialogButton, PostAnimation, PostShaderSource, RenderOutcome, Renderer,
+};
 use toastty_term::{
     ClipboardRequest, Pos, SecurityFlags, Selection, SelectionMode, Smoothing, Term,
 };
@@ -52,6 +54,8 @@ use toastty::paste::wrap_for_paste;
 use toastty::perf_stats::PerfStats;
 use toastty::preload::Preload;
 use toastty::pty_log::{Direction, PtyLogger};
+use toastty::shader_files;
+use toastty::shader_watcher::ShaderWatcher;
 use toastty::shell::resolve_command;
 use toastty::theme_bridge::{
     extend_background, extend_background_when, grid_align, scroll_button_corner, theme_from_config,
@@ -411,9 +415,22 @@ struct Toastty {
     /// File-watcher driving hot-reload. `None` if the parent directory
     /// is missing or the watcher couldn't be installed.
     config_watcher: Option<ConfigWatcher>,
-    /// Currently-displayed error banner string. Tracked so we only call
+    /// Currently-displayed error banner string: `config_banner` and
+    /// `shader_banner` joined. Tracked so we only call
     /// `Renderer::set_error_banner` when the contents actually change.
     banner_text: Option<String>,
+    /// Config load / reload error shown in the banner.
+    config_banner: Option<String>,
+    /// `[shader]` load / compile errors shown in the banner.
+    shader_banner: Option<String>,
+    /// Resolved `[shader] paths` the watcher was built for.
+    shader_paths: Vec<std::path::PathBuf>,
+    /// Hot-reload watcher for the shader files. Rebuilt when the
+    /// resolved paths change.
+    shader_watcher: Option<ShaderWatcher>,
+    /// Kept from `init_impl` so a config reload can rebuild
+    /// `shader_watcher`.
+    event_proxy: Option<toastty_window::EventLoopProxy<toastty_window::UserEvent>>,
     /// Most recent config-load error from startup (if any). Promoted to
     /// `banner_text` once the renderer is available in `init_impl`.
     pending_load_error: Option<ConfigError>,
@@ -557,6 +574,11 @@ impl Toastty {
             config_path: Config::default_path(),
             config_watcher: None,
             banner_text: None,
+            config_banner: None,
+            shader_banner: None,
+            shader_paths: Vec::new(),
+            shader_watcher: None,
+            event_proxy: None,
             pending_load_error: load_err,
             close_pending: false,
             close_prompt_press: None,
@@ -1351,6 +1373,8 @@ impl Toastty {
         if let Some(path) = self.config_path.clone() {
             self.config_watcher = ConfigWatcher::spawn(path, handle.event_loop_proxy());
         }
+        self.event_proxy = Some(handle.event_loop_proxy());
+        self.apply_shaders(false);
 
         // Promote any startup config load error to the in-window
         // banner now that the renderer exists.
@@ -1404,6 +1428,7 @@ impl Toastty {
             .set_cursor_default(self.config.cursor.shape, self.config.cursor.blink);
         self.term.set_security(security_flags(self.config.security));
         self.push_rich_env();
+        self.apply_shaders(false);
         // Padding / extend_background / grid_align are safe to live-apply
         // (render + grid only, no surface reconfigure). Push them before the
         // grid sync so the recomputed grid reflects any padding change.
@@ -1423,10 +1448,10 @@ impl Toastty {
 
     /// Re-parse the watched config file and either apply it (clearing
     /// any banner) or surface the error in the banner without
-    /// touching live state.
-    fn reload_config(&mut self) {
+    /// touching live state. Returns whether the new config was applied.
+    fn reload_config(&mut self) -> bool {
         let Some(path) = self.config_path.clone() else {
-            return;
+            return false;
         };
         if !path.exists() {
             // File was deleted: keep running with current settings,
@@ -1436,7 +1461,7 @@ impl Toastty {
                 "config file missing: {}\n(continuing with previous settings; recreate or restart)",
                 path.display()
             )));
-            return;
+            return false;
         }
         match Config::load_from_path(&path) {
             Ok(cfg) => {
@@ -1452,10 +1477,12 @@ impl Toastty {
                 self.apply_config_to_runtime();
                 self.set_banner(None);
                 info!("config reloaded from {}", path.display());
+                true
             }
             Err(e) => {
                 warn!("config reload failed: {e}");
                 self.set_banner_from_error(&e);
+                false
             }
         }
     }
@@ -1474,7 +1501,20 @@ impl Toastty {
         self.set_banner(Some(msg));
     }
 
+    /// Set the config part of the error banner.
     fn set_banner(&mut self, text: Option<String>) {
+        self.config_banner = text;
+        self.refresh_banner();
+    }
+
+    /// Show `config_banner` and `shader_banner` together (either can be
+    /// absent).
+    fn refresh_banner(&mut self) {
+        let text = match (self.config_banner.as_deref(), self.shader_banner.as_deref()) {
+            (Some(c), Some(s)) => Some(format!("{c}\n\n{s}")),
+            (Some(t), None) | (None, Some(t)) => Some(t.to_owned()),
+            (None, None) => None,
+        };
         if self.banner_text == text {
             return;
         }
@@ -1482,6 +1522,75 @@ impl Toastty {
         if let Some(r) = self.renderer.as_mut() {
             r.set_error_banner(self.banner_text.as_deref());
         }
+        if let Some(w) = self.window.as_ref() {
+            w.request_redraw();
+        }
+    }
+
+    /// Load, compile and install the `[shader]` chain, and point the
+    /// shader watcher at its files. Called at startup, on every config
+    /// reload, and (`from_watcher`) when a shader file changes. A failure
+    /// keeps the previous chain running and shows the errors in the
+    /// banner. On a watcher reload a missing file is skipped quietly:
+    /// editors that save by rename briefly remove it, and the
+    /// re-create fires another reload.
+    fn apply_shaders(&mut self, from_watcher: bool) {
+        let base = self
+            .config_path
+            .as_deref()
+            .and_then(std::path::Path::parent);
+        let paths = shader_files::resolve_paths(&self.config.shader.paths, base);
+        // Also retry a watcher that couldn't be installed (e.g. the
+        // shader directory didn't exist yet).
+        if paths != self.shader_paths || (self.shader_watcher.is_none() && !paths.is_empty()) {
+            self.shader_watcher = self
+                .event_proxy
+                .clone()
+                .and_then(|proxy| ShaderWatcher::spawn(&paths, proxy));
+            self.shader_paths.clone_from(&paths);
+        }
+        let Some(r) = self.renderer.as_mut() else {
+            return;
+        };
+        r.set_post_animation(match self.config.shader.animation {
+            ShaderAnimation::Auto => PostAnimation::Auto,
+            ShaderAnimation::Always => PostAnimation::Always,
+            ShaderAnimation::Never => PostAnimation::Never,
+        });
+        let errors: Vec<String> = match shader_files::load(&paths) {
+            Ok(files) => {
+                let sources: Vec<PostShaderSource> = files
+                    .into_iter()
+                    .map(|f| PostShaderSource {
+                        path: f.path,
+                        source: f.source,
+                    })
+                    .collect();
+                match r.set_post_shaders(&sources) {
+                    Ok(()) => Vec::new(),
+                    Err(errs) => errs.iter().map(ToString::to_string).collect(),
+                }
+            }
+            Err(errs) => {
+                if from_watcher && errs.iter().all(|e| e.kind == std::io::ErrorKind::NotFound) {
+                    debug!("shader file missing during reload; waiting for it to reappear");
+                    return;
+                }
+                errs.iter().map(ToString::to_string).collect()
+            }
+        };
+        self.shader_banner = if errors.is_empty() {
+            None
+        } else {
+            for e in &errors {
+                warn!("shader error: {e}");
+            }
+            Some(format!(
+                "shader error\n{}\n(the previous shader keeps running; fix the file and save)",
+                errors.join("\n")
+            ))
+        };
+        self.refresh_banner();
         if let Some(w) = self.window.as_ref() {
             w.request_redraw();
         }
@@ -2919,11 +3028,34 @@ impl App for Toastty {
         if let Event::Mouse { button, state, .. } = &event {
             self.track_button_down(*button, *state);
         }
+        // Shaders can read the pointer (`iMouse`).
+        let pointer = match &event {
+            Event::Mouse { position, .. } | Event::MouseMotion { position, .. } => Some(*position),
+            _ => None,
+        };
+        if let Some(pos) = pointer
+            && let Some(r) = self.renderer.as_mut()
+            && r.has_post_shaders()
+        {
+            #[allow(clippy::cast_possible_truncation)]
+            r.set_pointer(
+                (pos.0 as f32, pos.1 as f32),
+                self.buttons_down.contains(&MouseButton::Left),
+            );
+        }
         // A resize, scale change or config / font reload re-centres the
         // dialog, which can move a button under (or out from under) the
         // still pointer.
         let relayout = matches!(event, Event::Resize { .. } | Event::User);
         let signal = self.dispatch_event(event);
+        let signal = if pointer.is_some()
+            && signal == ControlSignal::Continue
+            && self.post_frame_pending()
+        {
+            ControlSignal::RedrawIn(Duration::ZERO)
+        } else {
+            signal
+        };
         if relayout
             && self.close_pending
             && self.refresh_close_dialog_hover()
@@ -2937,6 +3069,14 @@ impl App for Toastty {
 
 impl Toastty {
     /// Record a mouse button going down or up (see `buttons_down`).
+    /// The shader chain has an input change (pointer, focus) it reads
+    /// and wants a frame for now.
+    fn post_frame_pending(&self) -> bool {
+        self.renderer.as_ref().is_some_and(|r| {
+            r.has_post_shaders() && r.next_redraw_deadline(&self.term) == Some(Duration::ZERO)
+        })
+    }
+
     fn track_button_down(&mut self, button: MouseButton, state: KeyState) {
         match state {
             KeyState::Pressed => {
@@ -3213,9 +3353,15 @@ impl Toastty {
                 if let Some(bytes) = encode_focus(focused, self.term.report_focus()) {
                     self.write_pty(bytes);
                 }
+                // Shaders can read focus (`iFocus`, `iTimeFocus`) and
+                // `animation = "auto"` pauses on blur.
+                if let Some(r) = self.renderer.as_mut() {
+                    r.set_focused(focused);
+                }
                 // Modifier state is unreliable across a focus change
                 // (the release may go to another window).
-                if !focused && self.clear_link_hover() {
+                let hover_cleared = !focused && self.clear_link_hover();
+                if hover_cleared || self.post_frame_pending() {
                     return ControlSignal::RedrawIn(Duration::ZERO);
                 }
                 ControlSignal::Continue
@@ -3295,8 +3441,18 @@ impl Toastty {
                     .config_watcher
                     .as_ref()
                     .is_some_and(ConfigWatcher::take_pending);
-                if should_reload {
-                    self.reload_config();
+                let shaders_changed = self
+                    .shader_watcher
+                    .as_ref()
+                    .is_some_and(ShaderWatcher::take_pending);
+                // An applied config reload re-reads the shaders too; a
+                // failed one doesn't, so the shader change still needs
+                // its own reload.
+                let applied = should_reload && self.reload_config();
+                if shaders_changed && !applied {
+                    self.apply_shaders(true);
+                }
+                if should_reload || shaders_changed {
                     ControlSignal::RedrawIn(Duration::ZERO)
                 } else {
                     ControlSignal::Continue

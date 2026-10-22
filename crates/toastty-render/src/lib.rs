@@ -27,6 +27,9 @@ pub mod chip;
 pub mod color;
 pub mod dialog;
 pub mod image;
+pub mod post;
+#[cfg(test)]
+mod render_tests;
 pub mod rgp;
 pub mod surface_format;
 #[cfg(test)]
@@ -54,6 +57,8 @@ use crate::image::instance::{
     ImageInstance, ImageView, Layer, build_image_instances, classify_layer, split_layers,
 };
 use crate::image::pipeline::ImagePipeline;
+pub use crate::post::{PostAnimation, PostShaderSource, ShaderError};
+use crate::post::{PostChain, PostState};
 use crate::rgp::{GpuAssetCache, Rgp3dPipeline};
 use crate::text::glyph_rasterizer::{DEFAULT_LINE_HEIGHT_RATIO, GlyphRasterizer};
 use crate::text::instance::{CellInstance, CellRenderOpts, Theme};
@@ -466,7 +471,9 @@ impl GpuContext {
 pub struct Renderer {
     device: Device,
     queue: Queue,
-    surface: Surface<'static>,
+    /// Where frames go (the window's swapchain; an offscreen texture in
+    /// this crate's tests).
+    target: Target,
     config: SurfaceConfiguration,
     clear_color: [f32; 4],
     /// Text pipeline lives lazily — `with_font` initializes it; `render`
@@ -666,6 +673,27 @@ pub struct Renderer {
     /// `col_fills` slice handed to the builders. Empty unless
     /// `extend_background.vertical == SolidLine`.
     solid_cols_prev: Vec<bool>,
+    // ----- M13: user post-process shaders ([`crate::post`]) -----
+    /// The installed shader chain. `None` (the default) means no
+    /// post-processing, and then the frame path is exactly the one
+    /// without shaders: none of the post fields below are touched per
+    /// frame. While `Some`, the content renders into the scratch texture
+    /// (never direct), the chain runs from scratch into the swapchain, and
+    /// the UI overlays draw on top in a pass of their own.
+    post: Option<PostChain>,
+    /// Clock, pointer, focus, bell and cursor history behind the post
+    /// uniforms, plus the animation schedule. Kept across chain reloads.
+    post_state: PostState,
+    /// `[shader] animation`.
+    post_animation: PostAnimation,
+    /// The surface can be viewed through a non-sRGB format
+    /// (`DownlevelFlags::SURFACE_VIEW_FORMATS`). Without it the last post
+    /// pass renders into a texture that is copied to the swapchain.
+    surface_view_formats: bool,
+    /// sRGB-encoded `iPalette`, and the (term palette revision, theme
+    /// ANSI colours) it was built for.
+    post_palette: Box<[[f32; 3]; 256]>,
+    post_palette_key: Option<(u32, [[f32; 4]; 16])>,
 }
 
 /// Which corner the scroll-to-bottom button is anchored to. Render-side
@@ -830,12 +858,28 @@ fn premultiplied_color(c: [f32; 4]) -> wgpu::Color {
     }
 }
 
+/// The scratch framebuffer. With `post` it is also sampled by the post
+/// passes, through a non-sRGB view (see [`crate::post`]).
 fn create_scratch(
     device: &Device,
     width: u32,
     height: u32,
     format: TextureFormat,
+    post: bool,
 ) -> (wgpu::Texture, wgpu::TextureView) {
+    let (usage, view_formats) = if post {
+        (
+            TextureUsages::RENDER_ATTACHMENT
+                | TextureUsages::COPY_SRC
+                | TextureUsages::TEXTURE_BINDING,
+            post::linear_view_formats(format),
+        )
+    } else {
+        (
+            TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            Vec::new(),
+        )
+    };
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("toastty-render scratch framebuffer"),
         size: wgpu::Extent3d {
@@ -847,8 +891,8 @@ fn create_scratch(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
-        view_formats: &[],
+        usage,
+        view_formats: &view_formats,
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     (texture, view)
@@ -877,6 +921,138 @@ fn create_scratch_depth(
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     (texture, view)
+}
+
+/// Where the renderer's frames go.
+#[derive(Debug)]
+enum Target {
+    /// The window's swapchain.
+    Surface(Surface<'static>),
+    /// A texture standing in for the swapchain (this crate's tests).
+    #[cfg(test)]
+    Offscreen(wgpu::Texture),
+}
+
+/// One frame being drawn: a swapchain image, or the offscreen target.
+enum Frame {
+    Surface(wgpu::SurfaceTexture),
+    #[cfg(test)]
+    Offscreen(wgpu::Texture),
+}
+
+impl Frame {
+    fn texture(&self) -> &wgpu::Texture {
+        match self {
+            Self::Surface(f) => &f.texture,
+            #[cfg(test)]
+            Self::Offscreen(t) => t,
+        }
+    }
+
+    fn present(self) {
+        match self {
+            Self::Surface(f) => f.present(),
+            #[cfg(test)]
+            Self::Offscreen(_) => {}
+        }
+    }
+}
+
+/// The test target for `config`: what the swapchain would hand out
+/// (format, view formats), readable back.
+#[cfg(test)]
+fn offscreen_target(device: &Device, config: &SurfaceConfiguration) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("toastty-render offscreen target"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: config.format,
+        usage: config.usage | TextureUsages::COPY_SRC,
+        view_formats: &config.view_formats,
+    })
+}
+
+/// sRGB-encode a linear-light colour's RGB (post-shader colour uniforms).
+fn srgb3(c: [f32; 4]) -> [f32; 3] {
+    [
+        crate::color::linear_to_srgb(c[0]),
+        crate::color::linear_to_srgb(c[1]),
+        crate::color::linear_to_srgb(c[2]),
+    ]
+}
+
+/// The bell cell (screen row/col at BEL time, clamped to the grid) as a
+/// post `iBellCursor` rect: `(left, bottom, width, height)` in surface px.
+/// Mapped the way [`crate::text::instance::cursor_pixel_rect`] maps the
+/// cursor, plus the content origin.
+fn bell_cell_rect(term: &Term, cell: (f32, f32), origin: [f32; 2]) -> [f32; 4] {
+    let (rows, cols) = term.size();
+    let (row, col) = term.last_bell_cell();
+    let row = row.min(rows.saturating_sub(1));
+    let col = col.min(cols.saturating_sub(1));
+    let view_pixel = term.view_offset_pixel();
+    let y_translate = if view_pixel > 0.0 {
+        view_pixel - cell.1
+    } else {
+        0.0
+    };
+    let x0 = origin[0] + f32::from(col) * cell.0;
+    let y0 = origin[1] + f32::from(row) * cell.1 + y_translate;
+    [x0, y0 + cell.1, cell.0, cell.1]
+}
+
+/// Everything the post uniforms take from the terminal and theme, except
+/// the palette. Colours are sRGB-encoded; positions are surface px.
+fn post_frame_inputs<'a>(
+    term: &Term,
+    theme: &Theme,
+    cell: (f32, f32),
+    origin: [f32; 2],
+    surface: (u32, u32),
+    cursor_visible: bool,
+) -> post::FrameInputs<'a> {
+    let r = crate::text::instance::cursor_pixel_rect(term, cell);
+    let (rows, cols) = term.size();
+    let cursor = srgb3(theme.cursor);
+    // The glyph under the cursor: black or white, as `fs_glyph` picks.
+    let lum = 0.2126 * theme.cursor[0] + 0.7152 * theme.cursor[1] + 0.0722 * theme.cursor[2];
+    let cursor_text = if lum > 0.5 { [0.0; 3] } else { [1.0; 3] };
+    let style = match term.cursor_shape() {
+        toastty_term::CursorShape::Block => 0,
+        toastty_term::CursorShape::Bar => 2,
+        toastty_term::CursorShape::Underline => 3,
+    };
+    #[allow(clippy::cast_precision_loss)]
+    post::FrameInputs {
+        resolution: [surface.0 as f32, surface.1 as f32],
+        cursor: post::CursorSnap {
+            rect: [r[0] + origin[0], r[3] + origin[1], r[2] - r[0], r[3] - r[1]],
+            color: [cursor[0], cursor[1], cursor[2], theme.cursor[3]],
+            style,
+        },
+        cursor_visible,
+        cell_size: [cell.0, cell.1],
+        grid_rect: [
+            origin[0],
+            origin[1],
+            f32::from(cols) * cell.0,
+            f32::from(rows) * cell.1,
+        ],
+        background: srgb3(theme.bg),
+        foreground: srgb3(theme.fg),
+        cursor_color: cursor,
+        cursor_text,
+        selection_background: srgb3(theme.selection_bg),
+        // Selected cells keep their own foreground.
+        selection_foreground: srgb3(theme.fg),
+        palette: None,
+    }
 }
 
 /// Default cursor blink half-cycle (matches gnome-terminal / kitty).
@@ -1207,16 +1383,38 @@ impl Renderer {
         };
 
         surface.configure(&device, &config);
+        let surface_view_formats = adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS);
 
+        Ok(Self::from_parts(
+            device,
+            queue,
+            Target::Surface(surface),
+            config,
+            surface_view_formats,
+        ))
+    }
+
+    /// The renderer around a configured `target`: everything else starts
+    /// in its initial state.
+    fn from_parts(
+        device: Device,
+        queue: Queue,
+        target: Target,
+        config: SurfaceConfiguration,
+        surface_view_formats: bool,
+    ) -> Self {
         let (scratch_texture, scratch_view) =
-            create_scratch(&device, config.width, config.height, format);
+            create_scratch(&device, config.width, config.height, config.format, false);
         let (scratch_depth_texture, scratch_depth_view) =
             create_scratch_depth(&device, config.width, config.height);
 
-        Ok(Self {
+        Self {
             device,
             queue,
-            surface,
+            target,
             config,
             clear_color: [0.07, 0.07, 0.09, 1.0],
             text: None,
@@ -1281,7 +1479,68 @@ impl Renderer {
             solid_rows_prev: Vec::new(),
             solid_cols_prev: Vec::new(),
             grid_align: GridAlign::TopLeft,
-        })
+            post: None,
+            post_state: PostState::default(),
+            post_animation: PostAnimation::default(),
+            surface_view_formats,
+            post_palette: Box::new([[0.0; 3]; 256]),
+            post_palette_key: None,
+        }
+    }
+
+    /// A renderer drawing into an offscreen texture shaped like the
+    /// swapchain (`Bgra8UnormSrgb`), on the shared test device, so tests
+    /// can drive [`Self::render_term`]. `surface_view_formats: false`
+    /// exercises the post chain's copy fallback. `None` without a GPU.
+    #[cfg(test)]
+    pub(crate) fn headless(width: u32, height: u32, surface_view_formats: bool) -> Option<Self> {
+        let (device, queue) = crate::test_gpu::try_device_and_queue()?;
+        let config = SurfaceConfiguration {
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_DST,
+            format: TextureFormat::Bgra8UnormSrgb,
+            width: width.max(1),
+            height: height.max(1),
+            present_mode: PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: CompositeAlphaMode::Opaque,
+            view_formats: vec![],
+        };
+        let target = Target::Offscreen(offscreen_target(&device, &config));
+        Some(Self::from_parts(
+            device,
+            queue,
+            target,
+            config,
+            surface_view_formats,
+        ))
+    }
+
+    /// The offscreen target's current contents (BGRA rows; tests only).
+    #[cfg(test)]
+    pub(crate) fn read_offscreen(&self) -> Vec<u8> {
+        let Target::Offscreen(t) = &self.target else {
+            panic!("not a headless renderer");
+        };
+        crate::test_gpu::read_texture(&self.device, &self.queue, t)
+    }
+
+    /// The window surface, unless this is a headless test renderer.
+    fn surface(&self) -> Option<&Surface<'static>> {
+        match &self.target {
+            Target::Surface(s) => Some(s),
+            #[cfg(test)]
+            Target::Offscreen(_) => None,
+        }
+    }
+
+    /// Apply `config` to the target (configure the surface, or recreate
+    /// the offscreen texture).
+    fn configure_target(&mut self) {
+        match &mut self.target {
+            Target::Surface(s) => s.configure(&self.device, &self.config),
+            #[cfg(test)]
+            Target::Offscreen(t) => *t = offscreen_target(&self.device, &self.config),
+        }
     }
 
     /// Read-only view of the cached linear-light extended palette
@@ -1533,8 +1792,19 @@ impl Renderer {
         let text_blink = self.text_blink.next_deadline(Instant::now());
         // Deferred image mip work: finish it over the next frames.
         let mips = self.mip_work_pending.then_some(Duration::from_millis(16));
+        // Post shaders: time-driven frames, or zero for a pending event.
+        // None while synchronized output (mode 2026) holds frames back:
+        // `render_term` skips them, so a due tick would spin until ESU.
+        let post = self
+            .post
+            .as_ref()
+            .filter(|_| !term.pause_rendering())
+            .and_then(|chain| {
+                self.post_state
+                    .next_frame_in(Instant::now(), self.post_animation, chain.inputs())
+            });
         // Whichever fires first wins. All are `Option<Duration>`.
-        [blink, rgp, chip, text_blink, mips]
+        [blink, rgp, chip, text_blink, mips, post]
             .into_iter()
             .flatten()
             .min()
@@ -1919,6 +2189,141 @@ impl Renderer {
         }
     }
 
+    /// Append the IME preedit overlay for `preedit` to `instances`.
+    ///
+    /// The in-progress composition string is
+    /// drawn inline starting at the terminal cursor cell, advancing
+    /// cell-by-cell to the right and overlaying whatever grid content
+    /// sits underneath. Rendered underlined (and with the theme's
+    /// cursor color as fg) so it reads as distinct, half-formed text
+    /// until the IME commits it into the grid (or clears it).
+    ///
+    /// We reuse the same cursor-cell anchor the cursor block uses:
+    /// `cursor_pixel_rect` clamps `term.cursor()` into the grid and
+    /// applies the sub-pixel scroll y-translate. We take its left edge
+    /// (x0) for the start column; the cell-top y is recomputed from the
+    /// same clamped row so the underline shapes/underlines align with
+    /// the grid regardless of cursor shape (Underline shifts the rect's
+    /// own y down).
+    ///
+    /// Associated (not `&mut self`) for the same borrow reason as
+    /// [`Self::draw_banner`].
+    #[allow(clippy::too_many_arguments)]
+    fn push_preedit(
+        queue: &Queue,
+        text: &mut TextState,
+        instances: &mut Vec<CellInstance>,
+        preedit: &str,
+        term: &Term,
+        cell_size: (f32, f32),
+        theme: &Theme,
+    ) {
+        let (rows, cols) = term.size();
+        let cell_w = cell_size.0;
+        let cell_h = cell_size.1;
+        let cursor_rect = crate::text::instance::cursor_pixel_rect(term, cell_size);
+        // Cell-top y for the cursor row, mirroring cursor_pixel_rect's
+        // cell_pos: clamp the cursor row into the grid and apply the
+        // same sub-pixel scroll y-translate.
+        let view_pixel = term.view_offset_pixel();
+        let y_translate = if view_pixel > 0.0 {
+            view_pixel - cell_h
+        } else {
+            0.0
+        };
+        let cur_row = u16::min(term.cursor().row, rows.saturating_sub(1));
+        let y0 = f32::from(cur_row) * cell_h + y_translate;
+        // Start column from the cursor rect's left edge (already
+        // clamped + cell-aligned by cursor_pixel_rect).
+        let start_x = cursor_rect[0];
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let start_col = (start_x / cell_w).round() as u16;
+
+        let lg = text
+            .rasterizer
+            .shape_line(queue, preedit, term.grapheme_cluster_mode());
+        let mode_2027 = term.grapheme_cluster_mode();
+        let preedit_fg = theme.cursor;
+        // Walk the composition string char-by-char, advancing the
+        // overlay column by each char's display width so wide CJK
+        // glyphs occupy two cells (matching the shaper's column
+        // assignment, which leaves the continuation column empty).
+        let mut col: u16 = start_col;
+        let mut buf = [0u8; 4];
+        for ch in preedit.chars() {
+            let ch_str = ch.encode_utf8(&mut buf);
+            let width = u16::from(cluster_cell_width(ch_str, mode_2027));
+            // Clip at the right edge: stop emitting once the glyph
+            // (or its trailing continuation cell) would run past the
+            // last column. Don't wrap.
+            if col >= cols || col + width > cols {
+                break;
+            }
+            let pos = [f32::from(col) * cell_w, y0];
+            let span = [f32::from(width) * cell_w, cell_h];
+            // Cover the grid cell underneath so the half-formed glyph
+            // reads cleanly, not mixed with whatever was already
+            // there. Two covers, mirroring the error banner: a bg-pass
+            // quad (FLAG_NO_GLYPH) repaints the cell bg, and a
+            // glyph-pass cover (FLAG_UNDERLINE | FLAG_NO_GLYPH emits a
+            // solid bg) overpaints the term's own glyph for this cell
+            // — which was already emitted earlier under LoadOp::Load.
+            instances.push(CellInstance {
+                pos,
+                size: span,
+                uv_min: [0.0, 0.0],
+                uv_max: [0.0, 0.0],
+                fg: preedit_fg,
+                bg: theme.bg,
+                flags: crate::text::instance::FLAG_NO_GLYPH,
+                pad: [0; 3],
+            });
+            instances.push(CellInstance {
+                pos,
+                size: span,
+                uv_min: [0.0, 0.0],
+                uv_max: [0.0, 0.0],
+                fg: preedit_fg,
+                bg: theme.bg,
+                flags: crate::text::instance::FLAG_UNDERLINE | crate::text::instance::FLAG_NO_GLYPH,
+                pad: [0; 3],
+            });
+            // Underline strip spanning the char's full cell width,
+            // reusing the same machinery a normal underlined cell
+            // emits (FLAG_UNDERLINE, fg-as-bg). This is the preedit's
+            // visual distinction.
+            instances.push(crate::text::instance::underline_instance(
+                pos, span, preedit_fg,
+            ));
+            // The glyph, looked up at this column. `lg` was shaped from
+            // the preedit string alone, so its columns are 0-based
+            // relative to the composition start — subtract `start_col`
+            // to map this absolute grid column back into that space.
+            // (Continuation cells for wide chars are left empty by the
+            // shaper, same as the grid.)
+            if !ch.is_whitespace()
+                && let Some(slot) = lg.get(col - start_col, ch)
+            {
+                let flags = if slot.is_color {
+                    crate::text::instance::FLAG_COLOR_GLYPH
+                } else {
+                    0
+                };
+                instances.push(CellInstance {
+                    pos: [pos[0] + slot.glyph_offset[0], pos[1] + slot.glyph_offset[1]],
+                    size: slot.glyph_size,
+                    uv_min: slot.uv_min,
+                    uv_max: slot.uv_max,
+                    fg: preedit_fg,
+                    bg: theme.bg,
+                    flags,
+                    pad: [0; 3],
+                });
+            }
+            col += width;
+        }
+    }
+
     /// Rich blocks: sync GPU textures for the blocks on screen and
     /// return `(render_row, draw)` for every rendered row that will show
     /// an image slice (block image resident and the row's slice present).
@@ -2126,6 +2531,104 @@ impl Renderer {
         self.preedit.is_some()
     }
 
+    /// Compile and install a post-process shader chain (`[shader] paths`,
+    /// in order). All-or-nothing: if any shader fails, returns every error
+    /// and keeps the current chain. An empty slice turns post-processing
+    /// off.
+    ///
+    /// Switching the chain on or off reconfigures the surface (it needs a
+    /// non-sRGB view format while on) and recreates the scratch texture;
+    /// any change forces a full clear.
+    pub fn set_post_shaders(
+        &mut self,
+        shaders: &[PostShaderSource],
+    ) -> Result<(), Vec<ShaderError>> {
+        if shaders.is_empty() {
+            if self.post.take().is_some() {
+                self.set_post_resources(false);
+            }
+            return Ok(());
+        }
+        let compiled = post::compile_all(shaders)?;
+        let mut chain = PostChain::new(
+            &self.device,
+            &compiled,
+            self.config.format,
+            self.surface_view_formats,
+        )?;
+        if self.post.is_none() {
+            self.set_post_resources(true);
+        }
+        chain.bind_source(&self.device, &self.scratch_texture);
+        if chain.inputs().reads(post::date_mask()) {
+            self.post_state.prepare_date();
+        }
+        self.post = Some(chain);
+        // The new chain's uniform buffer has no palette yet.
+        self.post_palette_key = None;
+        self.post_state.request_frame();
+        self.needs_full_clear = true;
+        Ok(())
+    }
+
+    /// Reconfigure the surface and recreate the scratch texture for
+    /// post-processing on (`on`) or off.
+    fn set_post_resources(&mut self, on: bool) {
+        self.config.view_formats = if on && self.surface_view_formats {
+            post::linear_view_formats(self.config.format)
+        } else {
+            Vec::new()
+        };
+        self.configure_target();
+        let (tex, view) = create_scratch(
+            &self.device,
+            self.config.width,
+            self.config.height,
+            self.config.format,
+            on,
+        );
+        self.scratch_texture = tex;
+        self.scratch_view = view;
+        self.scratch_stale = true;
+        self.needs_full_clear = true;
+        if !on {
+            // Bells aren't observed while off; don't replay them later.
+            self.post_state.reset_bell_tracking();
+        }
+    }
+
+    /// True while a post-process chain is installed.
+    #[must_use]
+    pub fn has_post_shaders(&self) -> bool {
+        self.post.is_some()
+    }
+
+    /// Set when post shaders get time-driven frames (`[shader]
+    /// animation`).
+    pub fn set_post_animation(&mut self, mode: PostAnimation) {
+        if mode != self.post_animation {
+            self.post_animation = mode;
+            self.post_state.request_frame();
+        }
+    }
+
+    /// Window focus, for `iFocus` / `iTimeFocus` and the `auto` animation
+    /// rule (time-reading shaders idle while unfocused). After a change
+    /// that a shader reads, [`Self::next_redraw_deadline`] returns zero.
+    pub fn set_focused(&mut self, focused: bool) {
+        let inputs = self.post.as_ref().map(|c| *c.inputs()).unwrap_or_default();
+        self.post_state
+            .set_focused(focused, Instant::now(), &inputs, self.post_animation);
+    }
+
+    /// Pointer position in physical px (surface space) and button-1 state,
+    /// for `iMouse`. After a change that a shader reads,
+    /// [`Self::next_redraw_deadline`] returns zero.
+    pub fn set_pointer(&mut self, pos: (f32, f32), button1_down: bool) {
+        let inputs = self.post.as_ref().map(|c| *c.inputs()).unwrap_or_default();
+        self.post_state.set_pointer(pos, button1_down, &inputs);
+    }
+
     /// Current theme.
     pub fn theme(&self) -> Theme {
         self.base_theme
@@ -2139,7 +2642,7 @@ impl Renderer {
     pub fn resize(&mut self, width: u32, height: u32) {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
-        self.surface.configure(&self.device, &self.config);
+        self.configure_target();
         // Scratch must match the swapchain dims; recreate. Its contents
         // become undefined → force a full clear on the next frame.
         let (tex, view) = create_scratch(
@@ -2147,9 +2650,13 @@ impl Renderer {
             self.config.width,
             self.config.height,
             self.config.format,
+            self.post.is_some(),
         );
         self.scratch_texture = tex;
         self.scratch_view = view;
+        if let Some(chain) = self.post.as_mut() {
+            chain.bind_source(&self.device, &self.scratch_texture);
+        }
         // Depth attachment shares dims with the color scratch; recreate
         // it for the same reason.
         let (dtex, dview) =
@@ -2347,6 +2854,22 @@ impl Renderer {
         let chip_alpha = self.chip_fade.value(now);
         let chip_changed =
             self.chip_fade.animating(now) || (chip_alpha > 0.0) != self.chip_drawn_last;
+        // Post shaders: note a new BEL, then ask whether the chain wants a
+        // frame (a time-driven tick, or an event it reads).
+        let post_due = if let Some(chain) = self.post.as_ref() {
+            let cell = self.cell_size();
+            let origin = self.content_origin();
+            self.post_state.observe_bell(
+                term.bell_revision(),
+                || bell_cell_rect(term, cell, origin),
+                now,
+                chain.inputs(),
+            );
+            self.post_state
+                .frame_due(now, self.post_animation, chain.inputs())
+        } else {
+            false
+        };
         if term.damage().is_empty()
             && !cursor_animation_due
             && !text_blink_due
@@ -2359,6 +2882,11 @@ impl Renderer {
             && self.close_prompt.is_none()
             && self.preedit.is_none()
         {
+            // Nothing new in the content: at most re-run the post passes
+            // (and the UI on top) over the scratch texture as it is.
+            if post_due {
+                return self.render_post_only(term, now);
+            }
             return Ok(RenderOutcome::Skipped);
         }
 
@@ -2369,7 +2897,9 @@ impl Renderer {
             self.needs_full_clear = true;
             term.mark_all_dirty();
         }
-        if self.rich_chip.is_some() {
+        // (With post shaders the chips and the dialog are drawn in the UI
+        // pass, over a fresh post output, so none of this applies.)
+        if self.rich_chip.is_some() && self.post.is_none() {
             self.needs_full_clear = true;
             term.mark_all_dirty();
         }
@@ -2390,7 +2920,7 @@ impl Renderer {
         // The chip is translucent: compositing it over a LoadOp::Load
         // partial frame would stack on last frame's chip. While it is
         // (or just was) on screen, repaint everything underneath.
-        if chip_alpha > 0.0 || self.chip_drawn_last {
+        if (chip_alpha > 0.0 || self.chip_drawn_last) && self.post.is_none() {
             self.needs_full_clear = true;
             term.mark_all_dirty();
         }
@@ -2399,7 +2929,7 @@ impl Renderer {
         // The close dialog's scrim is translucent and covers the whole
         // window: repaint everything under it each frame it's up (its
         // removal already forces a full clear in `set_close_prompt`).
-        if self.close_prompt.is_some() {
+        if self.close_prompt.is_some() && self.post.is_none() {
             self.needs_full_clear = true;
             term.mark_all_dirty();
         }
@@ -2680,6 +3210,24 @@ impl Renderer {
             tracing::info!(target: "render_trace", "build_instances n={} took={ms:.3}ms", instances.len());
         }
 
+        // Without post shaders the overlays below go into the same draws as
+        // the cells, in this order. With them, everything from `ui_start`
+        // on is UI, drawn after the post passes and never shaded; the IME
+        // preedit is content, so it moves ahead of the overlays.
+        let post_on = self.post.is_some();
+        if post_on && let Some(preedit) = self.preedit.as_deref() {
+            Self::push_preedit(
+                &self.queue,
+                text,
+                &mut instances,
+                preedit,
+                term,
+                cell_size,
+                &theme,
+            );
+        }
+        let ui_start = instances.len();
+
         // Debug overlay (TOASTTY_DEBUG FPS counter, etc). Shape the
         // string fresh each frame and append cell instances aligned to
         // the top-right corner of the viewport. The per-char glyph cache
@@ -2771,126 +3319,16 @@ impl Renderer {
             );
         }
 
-        // IME preedit overlay. The in-progress composition string is
-        // drawn inline starting at the terminal cursor cell, advancing
-        // cell-by-cell to the right and overlaying whatever grid content
-        // sits underneath. Rendered underlined (and with the theme's
-        // cursor color as fg) so it reads as distinct, half-formed text
-        // until the IME commits it into the grid (or clears it).
-        //
-        // We reuse the same cursor-cell anchor the cursor block uses:
-        // `cursor_pixel_rect` clamps `term.cursor()` into the grid and
-        // applies the sub-pixel scroll y-translate. We take its left edge
-        // (x0) for the start column; the cell-top y is recomputed from the
-        // same clamped row so the underline shapes/underlines align with
-        // the grid regardless of cursor shape (Underline shifts the rect's
-        // own y down).
-        if let Some(preedit) = self.preedit.as_deref() {
-            let (rows, cols) = term.size();
-            let cell_w = cell_size.0;
-            let cell_h = cell_size.1;
-            let cursor_rect = crate::text::instance::cursor_pixel_rect(term, cell_size);
-            // Cell-top y for the cursor row, mirroring cursor_pixel_rect's
-            // cell_pos: clamp the cursor row into the grid and apply the
-            // same sub-pixel scroll y-translate.
-            let view_pixel = term.view_offset_pixel();
-            let y_translate = if view_pixel > 0.0 {
-                view_pixel - cell_h
-            } else {
-                0.0
-            };
-            let cur_row = u16::min(term.cursor().row, rows.saturating_sub(1));
-            let y0 = f32::from(cur_row) * cell_h + y_translate;
-            // Start column from the cursor rect's left edge (already
-            // clamped + cell-aligned by cursor_pixel_rect).
-            let start_x = cursor_rect[0];
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let start_col = (start_x / cell_w).round() as u16;
-
-            let lg = text
-                .rasterizer
-                .shape_line(&self.queue, preedit, term.grapheme_cluster_mode());
-            let mode_2027 = term.grapheme_cluster_mode();
-            let preedit_fg = theme.cursor;
-            // Walk the composition string char-by-char, advancing the
-            // overlay column by each char's display width so wide CJK
-            // glyphs occupy two cells (matching the shaper's column
-            // assignment, which leaves the continuation column empty).
-            let mut col: u16 = start_col;
-            let mut buf = [0u8; 4];
-            for ch in preedit.chars() {
-                let ch_str = ch.encode_utf8(&mut buf);
-                let width = u16::from(cluster_cell_width(ch_str, mode_2027));
-                // Clip at the right edge: stop emitting once the glyph
-                // (or its trailing continuation cell) would run past the
-                // last column. Don't wrap.
-                if col >= cols || col + width > cols {
-                    break;
-                }
-                let pos = [f32::from(col) * cell_w, y0];
-                let span = [f32::from(width) * cell_w, cell_h];
-                // Cover the grid cell underneath so the half-formed glyph
-                // reads cleanly, not mixed with whatever was already
-                // there. Two covers, mirroring the error banner: a bg-pass
-                // quad (FLAG_NO_GLYPH) repaints the cell bg, and a
-                // glyph-pass cover (FLAG_UNDERLINE | FLAG_NO_GLYPH emits a
-                // solid bg) overpaints the term's own glyph for this cell
-                // — which was already emitted earlier under LoadOp::Load.
-                instances.push(CellInstance {
-                    pos,
-                    size: span,
-                    uv_min: [0.0, 0.0],
-                    uv_max: [0.0, 0.0],
-                    fg: preedit_fg,
-                    bg: theme.bg,
-                    flags: crate::text::instance::FLAG_NO_GLYPH,
-                    pad: [0; 3],
-                });
-                instances.push(CellInstance {
-                    pos,
-                    size: span,
-                    uv_min: [0.0, 0.0],
-                    uv_max: [0.0, 0.0],
-                    fg: preedit_fg,
-                    bg: theme.bg,
-                    flags: crate::text::instance::FLAG_UNDERLINE
-                        | crate::text::instance::FLAG_NO_GLYPH,
-                    pad: [0; 3],
-                });
-                // Underline strip spanning the char's full cell width,
-                // reusing the same machinery a normal underlined cell
-                // emits (FLAG_UNDERLINE, fg-as-bg). This is the preedit's
-                // visual distinction.
-                instances.push(crate::text::instance::underline_instance(
-                    pos, span, preedit_fg,
-                ));
-                // The glyph, looked up at this column. `lg` was shaped from
-                // the preedit string alone, so its columns are 0-based
-                // relative to the composition start — subtract `start_col`
-                // to map this absolute grid column back into that space.
-                // (Continuation cells for wide chars are left empty by the
-                // shaper, same as the grid.)
-                if !ch.is_whitespace()
-                    && let Some(slot) = lg.get(col - start_col, ch)
-                {
-                    let flags = if slot.is_color {
-                        crate::text::instance::FLAG_COLOR_GLYPH
-                    } else {
-                        0
-                    };
-                    instances.push(CellInstance {
-                        pos: [pos[0] + slot.glyph_offset[0], pos[1] + slot.glyph_offset[1]],
-                        size: slot.glyph_size,
-                        uv_min: slot.uv_min,
-                        uv_max: slot.uv_max,
-                        fg: preedit_fg,
-                        bg: theme.bg,
-                        flags,
-                        pad: [0; 3],
-                    });
-                }
-                col += width;
-            }
+        if !post_on && let Some(preedit) = self.preedit.as_deref() {
+            Self::push_preedit(
+                &self.queue,
+                text,
+                &mut instances,
+                preedit,
+                term,
+                cell_size,
+                &theme,
+            );
         }
 
         // Close dialog text, last so it can be drawn on its own after the
@@ -3044,34 +3482,10 @@ impl Renderer {
         } else {
             None
         };
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.config);
-                // Followup C2: the reconfigured back-buffer has
-                // undefined contents (same invariant as `resize`).
-                // Without flagging a full clear here, the next frame
-                // may pick `LoadOp::Load` and read garbage. The cost
-                // is one extra clear on recovery — cheap.
-                self.needs_full_clear = true;
-                // No frame went out — caller must not clear damage / BSU
-                // force-flushed flag, so report Skipped.
-                return Ok(RenderOutcome::Skipped);
-            }
-            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Validation => {
-                return Err(RenderError::SurfaceLost);
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                // Followup C2: defensively force the next frame to
-                // clear. Timeout means the driver missed its
-                // deadline; Occluded means the window isn't visible.
-                // In both cases the back-buffer's prior contents may
-                // be stale — flagging a full clear avoids any chance
-                // of a LoadOp::Load reading garbage on recovery.
-                self.needs_full_clear = true;
-                return Ok(RenderOutcome::Skipped);
-            }
+        let Some(frame) = self.acquire_frame(now)? else {
+            // No frame went out — caller must not clear damage / BSU
+            // force-flushed flag, so report Skipped.
+            return Ok(RenderOutcome::Skipped);
         };
         if let Some(t) = t_acq {
             let ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -3169,11 +3583,14 @@ impl Renderer {
         // rotation isn't a problem. Partial-redraw frames still target
         // scratch + blit because LoadOp::Load needs the stable
         // previous-frame pixels scratch provides.
-        let render_direct = self.needs_full_clear;
+        //
+        // With post shaders the content always goes to scratch: the post
+        // passes sample it.
+        let render_direct = self.needs_full_clear && !post_on;
         let frame_view = if render_direct {
             Some(
                 frame
-                    .texture
+                    .texture()
                     .create_view(&wgpu::TextureViewDescriptor::default()),
             )
         } else {
@@ -3261,8 +3678,13 @@ impl Renderer {
             }
             let text_ref = self.text.as_ref().expect("text init checked above");
             // The close dialog's glyphs (if any) sit at the end and are
-            // drawn after its panel, below.
-            let inst_count = dialog_glyphs_start;
+            // drawn after its panel, below. With post shaders, the UI
+            // instances (from `ui_start`) are drawn in the UI pass instead.
+            let inst_count = if post_on {
+                ui_start
+            } else {
+                dialog_glyphs_start
+            };
             text_ref
                 .pipeline
                 .render_bg(&mut rp, &text_ref.bind_group, inst_count);
@@ -3326,7 +3748,8 @@ impl Renderer {
             }
 
             // 6. scroll-to-bottom chip, on top of everything.
-            if chip_alpha > 0.0
+            if !post_on
+                && chip_alpha > 0.0
                 && let Some(chip_pipe) = self.chip_pipeline.as_ref()
                 && let Some(geom) = self.scroll_chip_geometry()
             {
@@ -3336,7 +3759,8 @@ impl Renderer {
             }
 
             // 7. rich block "Copy Markdown" chip.
-            if self.close_prompt.is_none()
+            if !post_on
+                && self.close_prompt.is_none()
                 && let Some(chip_pipe) = self.rich_chip_pipeline.as_ref()
                 && let Some(geom) = self.rich_chip_geometry(term)
             {
@@ -3348,7 +3772,8 @@ impl Renderer {
 
             // 8. close dialog, topmost: scrim, shadow, panel, buttons and
             //    icon, then its text on the panel.
-            if let Some((layout, colors)) = close_dialog.as_ref()
+            if !post_on
+                && let Some((layout, colors)) = close_dialog.as_ref()
                 && let Some(ui_pipe) = self.ui_pipeline.as_mut()
             {
                 let rects = dialog::dialog_rects(layout, colors);
@@ -3361,10 +3786,23 @@ impl Renderer {
             }
         }
 
-        // Blit scratch → swapchain only on partial-redraw frames; the
-        // direct path rendered straight into the back-buffer and
-        // doesn't need (and would clobber) the copy.
-        if !render_direct {
+        if post_on {
+            // Post passes (scratch → swapchain), then the UI on top.
+            self.encode_post(&mut encoder, frame.texture(), term, cursor_visible, now);
+            self.encode_ui_pass(
+                &mut encoder,
+                frame.texture(),
+                term,
+                chip_alpha,
+                ui_start..dialog_glyphs_start,
+                close_dialog
+                    .as_ref()
+                    .map(|d| (d, dialog_glyphs_start..instances.len())),
+            );
+        } else if !render_direct {
+            // Blit scratch → swapchain only on partial-redraw frames; the
+            // direct path rendered straight into the back-buffer and
+            // doesn't need (and would clobber) the copy.
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.scratch_texture,
@@ -3373,7 +3811,7 @@ impl Renderer {
                     aspect: wgpu::TextureAspect::All,
                 },
                 wgpu::TexelCopyTextureInfo {
-                    texture: &frame.texture,
+                    texture: frame.texture(),
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
@@ -3397,6 +3835,9 @@ impl Renderer {
         };
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
+        if post_on {
+            self.post_state.end_frame(now);
+        }
         if let Some(t) = t_sub {
             let ms = t.elapsed().as_secs_f64() * 1000.0;
             tracing::info!(target: "render_trace", "submit+present took={ms:.3}ms");
@@ -3423,14 +3864,214 @@ impl Renderer {
         Ok(RenderOutcome::Rendered)
     }
 
+    /// A frame where the content hasn't changed but the post chain wants
+    /// one (an animation tick or an input event it reads): re-run the post
+    /// passes over the scratch texture as it is, then the UI pass. Only the
+    /// chips can be up here; every other overlay forces a full frame.
+    fn render_post_only(
+        &mut self,
+        term: &Term,
+        now: Instant,
+    ) -> Result<RenderOutcome, RenderError> {
+        let Some(frame) = self.acquire_frame(now)? else {
+            return Ok(RenderOutcome::Skipped);
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("toastty-render encoder (post only)"),
+            });
+        let cursor_visible =
+            self.blink.visible && term.cursor_visible() && !term.is_view_scrolled_back();
+        self.encode_post(&mut encoder, frame.texture(), term, cursor_visible, now);
+        let chip_alpha = self.chip_fade.value(now);
+        self.encode_ui_pass(&mut encoder, frame.texture(), term, chip_alpha, 0..0, None);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        frame.present();
+        self.post_state.end_frame(now);
+        Ok(RenderOutcome::Rendered)
+    }
+
+    /// Upload this frame's post uniforms and record the post passes, from
+    /// the scratch texture into `frame`.
+    fn encode_post(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &wgpu::Texture,
+        term: &Term,
+        cursor_visible: bool,
+        now: Instant,
+    ) {
+        let Some(chain) = self.post.as_ref() else {
+            return;
+        };
+        let cell = self.cell_size();
+        let origin = self.content_origin();
+        let theme = self.theme;
+        // `iPalette` is what cells are drawn with: the theme's ANSI 16,
+        // then the term's (OSC 4) 256-colour table.
+        let key = (term.palette_revision(), theme.palette);
+        let palette_changed = self.post_palette_key != Some(key);
+        if palette_changed {
+            for (i, dst) in self.post_palette.iter_mut().enumerate() {
+                #[allow(clippy::cast_possible_truncation)]
+                let c = theme.resolve_indexed256(i as u8, Some(&self.ext_palette));
+                *dst = srgb3(c);
+            }
+            self.post_palette_key = Some(key);
+        }
+        let mut f = post_frame_inputs(
+            term,
+            &theme,
+            cell,
+            origin,
+            (self.config.width, self.config.height),
+            cursor_visible,
+        );
+        f.palette = palette_changed.then_some(&*self.post_palette);
+        let needs_date = chain.inputs().reads(post::date_mask());
+        let u = self.post_state.begin_frame(now, &f, needs_date);
+        chain.write_uniforms(&self.queue, u, palette_changed);
+        chain.encode(encoder, frame);
+    }
+
+    /// The UI pass of a post-processed frame: overlays drawn unshaded on
+    /// the swapchain image after the post passes. `overlay` is the debug
+    /// overlay / error banner instance range; `dialog` the close dialog
+    /// and the instance range of its glyphs.
+    fn encode_ui_pass(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &wgpu::Texture,
+        term: &Term,
+        chip_alpha: f32,
+        overlay: std::ops::Range<usize>,
+        dialog: Option<(
+            &(dialog::DialogLayout, dialog::DialogColors),
+            std::ops::Range<usize>,
+        )>,
+    ) {
+        let view = frame.create_view(&wgpu::TextureViewDescriptor::default());
+        #[allow(clippy::cast_precision_loss)] // viewport in 16k-px range.
+        let viewport = (self.config.width as f32, self.config.height as f32);
+        let scroll_chip = if chip_alpha > 0.0 {
+            self.scroll_chip_geometry()
+        } else {
+            None
+        };
+        let rich_chip = if self.close_prompt.is_none() {
+            self.rich_chip_geometry(term)
+        } else {
+            None
+        };
+        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("toastty-render UI pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            // The overlay pipelines share the content pass's depth format,
+            // and depth-test against what it left, as they did there.
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.scratch_depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        if let Some(text) = self.text.as_ref() {
+            text.pipeline
+                .render_bg_range(&mut rp, &text.bind_group, overlay.clone());
+            text.pipeline
+                .render_glyph_range(&mut rp, &text.bind_group, overlay);
+        }
+        if let (Some(chip_pipe), Some(geom)) = (self.chip_pipeline.as_ref(), scroll_chip) {
+            let colors = chip::chip_colors(self.theme.bg, self.theme.fg, self.chip_hover);
+            let uniform = ChipUniform::new(viewport, &geom, self.ui_scale, chip_alpha, &colors);
+            chip_pipe.render(&self.queue, &mut rp, &uniform);
+        }
+        if let (Some(chip_pipe), Some(geom)) = (self.rich_chip_pipeline.as_ref(), rich_chip) {
+            let colors = chip::chip_colors(self.theme.bg, self.theme.fg, self.rich_chip_hover);
+            let uniform = ChipUniform::new(viewport, &geom, self.ui_scale, 1.0, &colors)
+                .with_icon(chip::pipeline::ICON_COPY);
+            chip_pipe.render(&self.queue, &mut rp, &uniform);
+        }
+        if let Some(((layout, colors), glyphs)) = dialog
+            && let Some(ui_pipe) = self.ui_pipeline.as_mut()
+        {
+            let rects = dialog::dialog_rects(layout, colors);
+            ui_pipe.render(&self.device, &self.queue, &mut rp, &rects, viewport);
+            if let Some(text) = self.text.as_ref() {
+                text.pipeline
+                    .render_glyph_range(&mut rp, &text.bind_group, glyphs);
+            }
+        }
+    }
+
+    /// Acquire the swapchain frame for `render_term`. `Ok(None)` when no
+    /// frame can be drawn now (the caller reports `Skipped`).
+    ///
+    /// Without post shaders a failed acquire forces the next frame to be
+    /// a full clear. With them it doesn't: the scratch texture wasn't
+    /// touched, and the post passes rewrite the whole swapchain image
+    /// anyway. The post schedule counts the frame as dropped instead
+    /// (slowing time-driven frames while occluded).
+    fn acquire_frame(&mut self, now: Instant) -> Result<Option<Frame>, RenderError> {
+        #[cfg(test)]
+        if let Target::Offscreen(t) = &self.target {
+            return Ok(Some(Frame::Offscreen(t.clone())));
+        }
+        let Some(surface) = self.surface() else {
+            return Ok(None);
+        };
+        let occluded = match surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => return Ok(Some(Frame::Surface(t))),
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(RenderError::SurfaceLost);
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                self.configure_target();
+                false
+            }
+            wgpu::CurrentSurfaceTexture::Timeout => false,
+            wgpu::CurrentSurfaceTexture::Occluded => true,
+        };
+        if self.post.is_some() {
+            self.post_state.frame_dropped(now, occluded);
+        } else {
+            // Followup C2: after Outdated the reconfigured back-buffer has
+            // undefined contents (same invariant as `resize`); Timeout
+            // means the driver missed its deadline and Occluded that the
+            // window isn't visible. In all three the back-buffer's prior
+            // contents may be stale, so the next frame must not pick
+            // `LoadOp::Load`. The cost is one extra clear on recovery.
+            self.needs_full_clear = true;
+        }
+        Ok(None)
+    }
+
     /// Render one frame. M4a: just a clear-color pass.
     pub fn render(&mut self) -> Result<(), RenderError> {
-        let frame = match self.surface.get_current_texture() {
+        let Some(surface) = self.surface() else {
+            return Ok(());
+        };
+        let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated => {
                 // Surface size mismatch — reconfigure and try next frame.
-                self.surface.configure(&self.device, &self.config);
+                surface.configure(&self.device, &self.config);
                 return Ok(());
             }
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Validation => {

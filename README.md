@@ -95,6 +95,40 @@ cargo run --release -p molecule-viewer   # run it inside toastty
   <img src="docs/screenshots/molecule.gif" alt="An animated 3D ball-and-stick model of caffeine rotating inside a terminal UI" width="720">
 </p>
 
+### ✨ Post-processing shaders
+
+Run your own fragment shaders over the whole terminal: CRT glass, bloom,
+colour grading, cursor trails. Shaders are written in
+**ShaderToy-style GLSL** (`mainImage`) or **WGSL**, and use the same
+uniforms as Ghostty's custom shaders, so Ghostty shaders work unchanged.
+Several shaders can be chained, and saving a shader file reloads it. A
+broken edit shows its error in the window and the last working shader
+keeps running.
+
+toastty adds a few uniforms of its own. `iBells` and `iTimeBell` fire on
+every BEL, with the cell it rang at, and `iCellSize` / `iGridRect`
+describe the cell grid. The bundled
+[`crt-splitflap.glsl`](examples/shaders/crt-splitflap.glsl) uses them for
+a CRT look where each bell sends a split-flap wave across the screen:
+
+<p align="center">
+  <img src="docs/screenshots/crt-splitflap.gif" alt="toastty with a curved, scanlined CRT shader; after a bell, the character cells flip like split-flap display tiles in a wave spreading out from the cursor" width="720">
+</p>
+
+```toml
+[shader]
+paths = ["~/.config/toastty/shaders/crt-splitflap.glsl"]   # run in order
+animation = "auto"   # "auto" | "always" | "never"
+```
+
+Shaders that don't use time cost nothing when the screen is idle.
+toastty reads which uniforms a shader uses and only draws frames when
+they can change. A shader whose animation is triggered by events can
+declare `const float TOASTTY_EVENT_DURATION = 1.5;` to animate for that
+long after a bell, cursor move or focus change, then go back to idle.
+The full contract is in
+[docs/milestones/m13-user-shaders.md](docs/milestones/m13-user-shaders.md).
+
 ### 🔤 Text that looks right
 
 - **Ligatures** and full font fallback with cosmic-text shaping.
@@ -145,7 +179,8 @@ The full matrix is in [docs/protocols.md](docs/protocols.md), and
 - **Transparent backgrounds**: give the theme background an alpha, e.g.
   `bg = "#1e1e2ecc"`, and only the background goes see-through. Text
   stays opaque.
-- **Config hot reload**: save `config.toml` and the window updates.
+- **Config hot reload**: save `config.toml` (or a shader file) and the
+  window updates.
 - **Close confirmation** only when something other than the shell is running.
 - **Damage-tracked redraws**: frames are only drawn when something changed.
 
@@ -222,7 +257,8 @@ left = 12
 
 Other tables cover the cursor, shell, scrollback and smooth scrolling,
 window size and background extension, the scroll button, selection word
-characters, and the `[security]` switches for OSC 52 and Markdown.
+characters, post-processing `[shader]`s, and the `[security]` switches for
+OSC 52 and Markdown.
 
 ## Keyboard shortcuts
 
@@ -317,10 +353,11 @@ Cargo workspace under `crates/`:
 | `toastty-protocols` | One module per protocol handler |
 | `toastty-graphics` | Kitty graphics, Sixel, RGP decoders |
 | `toastty-markdown` | Markdown → laid-out block (maths, Mermaid, syntax highlighting) |
-| `toastty-render` | wgpu renderer; cosmic-text shaping; image and 3D passes |
+| `toastty-render` | wgpu renderer; cosmic-text shaping; image, 3D and post-process shader passes |
 | `toastty-config` | TOML config loading |
 
-Demos live under `demos/` (`molecule-viewer`).
+Demos live under `demos/` (`molecule-viewer`), example shaders under
+`examples/shaders/`.
 
 ### Development
 

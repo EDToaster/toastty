@@ -29,6 +29,7 @@ mod scroll_button;
 mod scrollback;
 mod security;
 mod selection;
+mod shader;
 mod shell;
 mod text;
 mod theme;
@@ -45,6 +46,7 @@ pub use scroll_button::{ScrollButtonConfig, ScrollButtonPosition};
 pub use scrollback::{ScrollbackConfig, SmoothingFunction};
 pub use security::SecurityConfig;
 pub use selection::{DEFAULT_WORD_CHARS, SelectionConfig};
+pub use shader::{ShaderAnimation, ShaderConfig};
 pub use shell::ShellConfig;
 pub use text::TextConfig;
 pub use theme::ThemeConfig;
@@ -73,6 +75,7 @@ pub struct Config {
     pub scroll_button: ScrollButtonConfig,
     pub selection: SelectionConfig,
     pub text: TextConfig,
+    pub shader: ShaderConfig,
 }
 
 impl Default for Config {
@@ -99,6 +102,7 @@ impl Config {
             scroll_button: ScrollButtonConfig::defaults(),
             selection: SelectionConfig::defaults(),
             text: TextConfig::defaults(),
+            shader: ShaderConfig::defaults(),
         }
     }
 
@@ -244,6 +248,18 @@ mod tests {
         let cfg = Config::parse_str("[text]\nblink = false\n").unwrap();
         assert!(!cfg.text.blink);
         assert!(Config::parse_str("[text]\nnope = 1\n").is_err());
+    }
+
+    #[test]
+    fn shader_parses_and_defaults() {
+        let d = Config::defaults();
+        assert!(d.shader.paths.is_empty());
+        assert_eq!(d.shader.animation, ShaderAnimation::Auto);
+        let cfg =
+            Config::parse_str("[shader]\npaths = [\"a.glsl\"]\nanimation = \"always\"\n").unwrap();
+        assert_eq!(cfg.shader.paths, vec!["a.glsl".to_string()]);
+        assert_eq!(cfg.shader.animation, ShaderAnimation::Always);
+        assert!(Config::parse_str("[shader]\nanimation = \"maybe\"\n").is_err());
     }
 
     #[test]
