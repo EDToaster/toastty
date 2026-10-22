@@ -11,13 +11,19 @@
 /// linear shader output → sRGB-encoded bytes in the swapchain image.
 #[must_use]
 pub fn linear_to_srgb_u8(linear: f32) -> u8 {
+    (linear_to_srgb(linear) * 255.0 + 0.5) as u8
+}
+
+/// Convert a single linear-light channel in `[0, 1]` to its sRGB-encoded
+/// value in `[0, 1]` (clamped).
+#[must_use]
+pub fn linear_to_srgb(linear: f32) -> f32 {
     let l = linear.clamp(0.0, 1.0);
-    let enc = if l <= 0.003_130_8 {
+    if l <= 0.003_130_8 {
         l * 12.92
     } else {
         1.055 * l.powf(1.0 / 2.4) - 0.055
-    };
-    (enc * 255.0 + 0.5) as u8
+    }
 }
 
 /// Convert a linear-light RGBA tuple in `[0, 1]` to a 4-byte BGRA u8
