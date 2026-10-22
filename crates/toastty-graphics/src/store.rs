@@ -38,9 +38,12 @@ pub struct ImageStore {
     by_client: HashMap<u32, ImageKey>,
     /// Key → client id (`0` = anonymous).
     client_of: HashMap<ImageKey, u32>,
-    /// Image number (`I=`) → client id of the most recent image
-    /// transmitted with it (`d=n` / `d=N`, `a=p,I=`).
-    numbers: HashMap<u32, u32>,
+    /// Image number (`I=`) → client ids of the live images transmitted
+    /// with it, oldest first (`d=n` / `d=N`, `d=f` / `d=F`, `a=p,I=`).
+    /// Keeping every id means that once the newest is freed the
+    /// next-newest is still reachable, as in kitty (#35); an image re-sent
+    /// by `i=` keeps its number (#37).
+    numbers: HashMap<u32, Vec<u32>>,
 }
 
 /// Outcome of [`ImageStore::insert`].
@@ -116,7 +119,10 @@ impl ImageStore {
             self.by_client.get(&client_id).copied()
         };
         if let Some(old) = replaced {
-            self.remove_key(old);
+            // Re-sending by `i=` keeps the id's numbers (#37): drop the old
+            // bytes and key, but not the number membership.
+            self.registry.remove(old);
+            self.client_of.remove(&old);
         }
         let inserted = self.registry.insert_with_pinned(key, data, pinned)?;
         for victim in &inserted.evicted {
@@ -126,8 +132,11 @@ impl ImageStore {
         if client_id != 0 {
             self.by_client.insert(client_id, key);
         }
-        if number != 0 {
-            self.numbers.insert(number, client_id);
+        if number != 0 && client_id != 0 {
+            let ids = self.numbers.entry(number).or_default();
+            if !ids.contains(&client_id) {
+                ids.push(client_id);
+            }
         }
         Ok(Stored {
             key,
@@ -152,11 +161,15 @@ impl ImageStore {
         self.client_of.get(&key).copied()
     }
 
-    /// Client id of the most recent image transmitted with number `n`.
+    /// Client id of the newest live image transmitted with number `n`.
     #[must_use]
     pub fn client_of_number(&self, number: u32) -> Option<u32> {
-        let id = *self.numbers.get(&number)?;
-        self.by_client.contains_key(&id).then_some(id)
+        self.numbers
+            .get(&number)?
+            .iter()
+            .rev()
+            .copied()
+            .find(|id| self.by_client.contains_key(id))
     }
 
     /// True iff an image answers to `client_id`.
@@ -276,7 +289,10 @@ impl ImageStore {
             && self.by_client.get(&id) == Some(&key)
         {
             self.by_client.remove(&id);
-            self.numbers.retain(|_, v| *v != id);
+            self.numbers.retain(|_, ids| {
+                ids.retain(|&x| x != id);
+                !ids.is_empty()
+            });
         }
     }
 
@@ -354,8 +370,10 @@ mod tests {
         s.insert(k(3), 1, 0, img(1), &none()).unwrap();
         assert_eq!(s.insert(k(4), 0, 7, img(1), &none()).unwrap().client_id, 3);
         assert_eq!(s.client_of_number(7), Some(3));
-        // i=1 replaced the I=5 image, which took number 5 with it.
-        assert_eq!(s.client_of_number(5), None);
+        // i=1 re-sent the I=5 image; it keeps number 5 (#37's rule,
+        // checked on kitty-ref 0.49.2: `a=t,I=5` -> i=1, `a=t,i=1`, then
+        // `a=p,I=5` replies `i=1,I=5;OK`).
+        assert_eq!(s.client_of_number(5), Some(1));
         s.remove_client(3);
         assert_eq!(s.client_of_number(7), None);
         assert_eq!(s.lowest_free_client_id(), 3);
