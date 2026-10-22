@@ -639,6 +639,9 @@ remaining gaps:
     - `d=F,i=N` deletes every placement of the image (`p=` doesn't scope it)
       and frees its data, even when it has no placements.
     - `d=F,I=N` does the same to the newest image with that number.
+      Repeated deletes then reach the older images with that number, one
+      at a time (same for `d=N`). toastty now keeps every id per number,
+      not just the newest.
     - `d=F` with no `i`/`I`, or with an unknown id, does nothing. So does
       `d=f`.
   - Fix: the new `Term::delete_image_frames` does this. Stack E's
