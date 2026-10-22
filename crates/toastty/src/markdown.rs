@@ -117,6 +117,7 @@ pub fn layout_params(req: &RichLayoutRequest<'_>) -> LayoutParams {
             base_dir: req.base_dir.map(std::path::Path::to_path_buf),
         },
         max_rows: req.max_rows,
+        mono_family: req.mono_family.map(str::to_owned),
     }
 }
 
@@ -227,6 +228,7 @@ mod tests {
             cell_w: 8,
             cell_h: 16,
             font_px: 26.0,
+            mono_family: None,
             palette: palette(),
             allow_local_files: true,
             base_dir: base,
@@ -287,6 +289,44 @@ mod tests {
         assert!(p.resources.allow_local_files);
         assert_eq!(p.resources.base_dir.as_deref(), Some(base));
         assert_eq!(layout_params(&request("md", None)).resources.base_dir, None);
+    }
+
+    #[test]
+    fn params_carry_the_terminal_font_family() {
+        assert_eq!(layout_params(&request("md", None)).mono_family, None);
+        let mut req = request("md", None);
+        req.mono_family = Some("Iosevka Term");
+        assert_eq!(
+            layout_params(&req).mono_family.as_deref(),
+            Some("Iosevka Term")
+        );
+    }
+
+    #[test]
+    fn unknown_font_family_falls_back_to_the_default_face() {
+        let mut req = request("md", None);
+        req.source = "```
+fn main() {}
+```
+";
+        req.cols = 40;
+        req.max_rows = 50;
+        let render = |req: &RichLayoutRequest<'_>| {
+            let mut l = MarkdownLayout::with_renderer(Renderer::hermetic());
+            let out = l.layout(req).unwrap();
+            let img = out.image.unwrap();
+            (out.text, img.paint(0, img.height).unwrap())
+        };
+        let default = render(&req);
+        req.mono_family = Some("No Such Family Mono");
+        assert_eq!(render(&req), default);
+        // A family the engine has is used (the bundled body face here).
+        req.mono_family = Some("Noto Sans");
+        let noto = render(&req);
+        // Its taller line may add a row; the text keeps its columns.
+        let runs = |t: &[Vec<RichTextRun>]| t.iter().flatten().cloned().collect::<Vec<_>>();
+        assert_eq!(runs(&noto.0), runs(&default.0));
+        assert_ne!(noto.1, default.1);
     }
 
     #[test]

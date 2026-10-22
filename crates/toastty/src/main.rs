@@ -862,6 +862,8 @@ impl Toastty {
         };
         self.term.set_rich_env(toastty_term::RichEnv {
             font_px,
+            // Code blocks use the terminal's own face, on its cell grid.
+            mono_family: Some(std::sync::Arc::from(self.config.font.family.as_str())),
             palette: toastty_term::RichPalette {
                 fg: srgb(theme.fg),
                 bg: srgb(theme.bg),

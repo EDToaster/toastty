@@ -5,10 +5,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::{RichLayoutSlot, Term};
 use crate::cell::{Cell, HyperlinkId};
+use crate::extra::{CellExtra, ExtraTable, MAX_GRAPHEME_EXTRA_BYTES};
 use crate::grid::Row;
 use crate::rich::{
     RICH_MAX_ROWS, RichBlockId, RichBlockLayout, RichBlockStore, RichEnv, RichLayout,
@@ -28,15 +30,42 @@ pub(super) fn intern_url(table: &mut Vec<String>, url: &str) -> Option<Hyperlink
     u16::try_from(table.len()).ok().and_then(HyperlinkId::new)
 }
 
+/// Cells a grapheme cluster of block text takes: its Unicode width
+/// capped at 2 (so `❤️` and ZWJ emoji sequences are one 2-cell cluster,
+/// as under DECSET 2027), and 0 for controls and zero-width clusters,
+/// which are dropped. The layout engine places the block's glyphs by the
+/// same rule (`grapheme_cells` in toastty-markdown `layout/grid.rs`), so
+/// the cells line up with the image. Both sides test the same case table
+/// (`block_cluster_cells_matches_the_layout_engine` here,
+/// `grapheme_cell_widths` there); change them together.
+fn block_cluster_cells(g: &str) -> usize {
+    if g.starts_with(char::is_control) {
+        return 0;
+    }
+    UnicodeWidthStr::width(g).min(2)
+}
+
+/// The longest prefix of `s` at most `max` bytes long that ends on a
+/// char boundary.
+fn clip_bytes(s: &str, max: usize) -> &str {
+    let mut end = s.len().min(max);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Build the grid rows for a laid-out block: blank rows tagged
-/// `RichRow { block, index }`, the text runs written into the cells
-/// (clipped to `cols`, wide chars as primary + continuation) and links
-/// stamped as hyperlink ids.
+/// `RichRow { block, index }`, the text runs written into the cells one
+/// grapheme cluster per cell (clipped to `cols`; wide clusters as
+/// primary + continuation; a cluster's trailing codepoints interned into
+/// `extras` like printed graphemes) and links stamped as hyperlink ids.
 pub(crate) fn build_block_rows(
     out: &RichLayout,
     block: RichBlockId,
     cols: u16,
     links: &mut Vec<String>,
+    extras: &mut ExtraTable,
 ) -> Vec<Row> {
     let width = cols as usize;
     let mut rows: Vec<Row> = (0..out.rows)
@@ -49,16 +78,27 @@ pub(crate) fn build_block_rows(
     for (row, runs) in rows.iter_mut().zip(&out.text) {
         for run in runs {
             let mut col = run.col as usize;
-            for ch in run.text.chars() {
-                let w = match UnicodeWidthChar::width(ch) {
-                    Some(1) => 1,
-                    Some(w) if w >= 2 => 2,
-                    // Controls and zero-width marks take no cell.
-                    _ => continue,
+            for g in run.text.graphemes(true) {
+                let w = block_cluster_cells(g);
+                if w == 0 {
+                    // Controls and zero-width clusters take no cell.
+                    continue;
+                }
+                let mut chars = g.chars();
+                let Some(ch) = chars.next() else {
+                    continue;
                 };
                 if col + w > width {
                     break;
                 }
+                let tail = chars.as_str();
+                let extra = if tail.is_empty() {
+                    None
+                } else {
+                    extras.intern(CellExtra::Grapheme(
+                        clip_bytes(tail, MAX_GRAPHEME_EXTRA_BYTES).into(),
+                    ))
+                };
                 // Don't leave half of a wide char behind.
                 if row.cells[col].is_continuation && col > 0 {
                     row.cells[col - 1] = Cell::BLANK;
@@ -66,7 +106,11 @@ pub(crate) fn build_block_rows(
                 if w == 1 && row.cells.get(col + 1).is_some_and(|c| c.is_continuation) {
                     row.cells[col + 1] = Cell::BLANK;
                 }
-                row.cells[col] = Cell { ch, ..Cell::BLANK };
+                row.cells[col] = Cell {
+                    ch,
+                    extra,
+                    ..Cell::BLANK
+                };
                 if w == 2 {
                     row.cells[col + 1] = Cell {
                         ch: '\0',
@@ -112,6 +156,7 @@ fn run_layout(
         cell_w: params.cell_w,
         cell_h: params.cell_h,
         font_px: params.font_px,
+        mono_family: params.mono_family.as_deref(),
         palette: params.palette,
         allow_local_files: params.allow_local_files,
         base_dir: if params.allow_local_files {
@@ -153,7 +198,7 @@ impl Term {
         self.rich_layout.is_some()
     }
 
-    /// Font size + theme palette used for rich blocks. A change marks
+    /// Font size, font family and theme palette used for rich blocks. A change marks
     /// blocks for re-layout on the next [`Term::sync_rich_blocks`].
     pub fn set_rich_env(&mut self, env: RichEnv) {
         if env != self.rich_env {
@@ -164,7 +209,7 @@ impl Term {
 
     #[must_use]
     pub fn rich_env(&self) -> RichEnv {
-        self.rich_env
+        self.rich_env.clone()
     }
 
     /// Stored rich blocks (images, sources). The renderer queries
@@ -229,6 +274,7 @@ impl Term {
             cell_w: u32::from(self.cell_pixel_size.0),
             cell_h: u32::from(self.cell_pixel_size.1),
             font_px: self.rich_env.font_px,
+            mono_family: self.rich_env.mono_family.clone(),
             palette: self.rich_palette(),
             allow_local_files: self.security.markdown_local_files,
         }
@@ -257,7 +303,7 @@ impl Term {
         ) else {
             return;
         };
-        let rows = build_block_rows(&out, id, self.cols, &mut self.hyperlinks);
+        let rows = build_block_rows(&out, id, self.cols, &mut self.hyperlinks, &mut self.extras);
         // The block starts at column 0 of a fresh line.
         if self.cursor.col != 0 {
             let r = self.cursor.row;
@@ -300,6 +346,7 @@ impl Term {
         let store = &mut self.rich_store;
         let layout = &mut self.rich_layout;
         let links = &mut self.hyperlinks;
+        let extras = &mut self.extras;
         let mut relayout = |block: RichBlockId, run: &[Row]| -> Option<Vec<Row>> {
             let b = store.get(block)?;
             if b.frozen {
@@ -324,9 +371,9 @@ impl Term {
             let (kind, source, base) = (b.kind.clone(), b.source.clone(), b.base_dir.clone());
             let slot = layout.as_mut()?;
             let out = run_layout(slot.0.as_mut(), &kind, &source, base.as_deref(), &params)?;
-            let new_rows = build_block_rows(&out, block, cols, links);
+            let new_rows = build_block_rows(&out, block, cols, links, extras);
             let bm = store.get_mut(block)?;
-            bm.params = params;
+            bm.params = params.clone();
             bm.rows = out.rows;
             store.set_image(block, out.image);
             Some(new_rows)
@@ -416,7 +463,7 @@ impl Term {
             .image
             .map(|img| img.with_height(u32::from(rows) * params.cell_h));
         if let Some(b) = self.rich_store.get_mut(id) {
-            b.params = *params;
+            b.params = params.clone();
         }
         self.rich_store.set_image(id, image);
     }

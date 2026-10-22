@@ -1,9 +1,30 @@
 //! Laid-out text and links (pixel space) → per-row [`TextRun`]s and
 //! [`LinkSpan`]s (cell space).
 
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{LinkSpan, TextRun};
+
+/// Cells one grapheme cluster takes when the terminal writes a block's
+/// text into the grid: its Unicode width capped at 2 (so `❤️` and ZWJ
+/// emoji sequences are 2, like DECSET 2027), and 0 for controls and
+/// zero-width clusters, which take no cell. Must match
+/// `block_cluster_cells` in toastty-term (`term/rich_term.rs`); both
+/// sides test the same case table (`grapheme_cell_widths` here,
+/// `block_cluster_cells_matches_the_layout_engine` there), so change
+/// them together.
+pub(crate) fn grapheme_cells(g: &str) -> u32 {
+    if g.starts_with(char::is_control) {
+        return 0;
+    }
+    UnicodeWidthStr::width(g).min(2) as u32
+}
+
+/// Cells `s` takes on the grid ([`grapheme_cells`] summed).
+pub(crate) fn text_cells(s: &str) -> u32 {
+    s.graphemes(true).map(grapheme_cells).sum()
+}
 
 /// A piece of plain text with its pixel position.
 #[derive(Debug, Clone)]
@@ -19,7 +40,7 @@ pub(crate) fn row_of(baseline: f32, cell_h: u32) -> usize {
 }
 
 fn cells(s: &str) -> u16 {
-    u16::try_from(UnicodeWidthStr::width(s)).unwrap_or(u16::MAX)
+    u16::try_from(text_cells(s)).unwrap_or(u16::MAX)
 }
 
 /// Group `frags` by row and turn them into non-overlapping runs in
@@ -176,6 +197,25 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn grapheme_cell_widths() {
+        for (g, w) in [
+            ("a", 1),
+            ("\u{4e2d}", 2),
+            ("e\u{301}", 1),
+            ("\u{2764}\u{fe0f}", 2),
+            ("\u{2764}", 1),
+            ("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}", 2),
+            ("\u{1f1e8}\u{1f1e6}", 2),
+            ("\u{200b}", 0),
+            ("\u{301}", 0),
+            ("\u{1b}", 0),
+        ] {
+            assert_eq!(grapheme_cells(g), w, "{g:?}");
+        }
+        assert_eq!(text_cells("x\u{2764}\u{fe0f}y\u{200b}"), 4);
     }
 
     #[test]

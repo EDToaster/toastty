@@ -156,10 +156,43 @@ make it so:
   at the fitted width that happens only when a tile showing it is painted,
   and is reused by the other tiles.
 
-Release build, demo document (376 rows), sweeping 120 → 40 columns
+Release build, demo document (415 rows), sweeping 120 → 40 columns
 (`cargo run --release -p toastty-markdown --example resize_bench -- doc.md`):
 layout 0.8 ms per width (was 54 ms for layout plus full paint), plus about
 2.4 ms to paint one screen of 50 rows.
+
+### Vertical grid snapping
+
+The text written into each row's cells must sit on the text drawn there,
+or selection highlights and link hit areas drift off the rendered lines.
+So the layout's vertical unit is the cell height:
+
+- Every text line starts on a row boundary and is a whole number of rows
+  tall. Body text, list items, quote lines, table cell lines, footnotes and
+  code are one row each (code lines on consecutive rows, the mono font's
+  ascent + descent box centred in the row like the terminal's own
+  baseline). Headings larger than body text take as many rows as their
+  font box needs (H1–H3 are usually two). A line holding an inline raster
+  (maths, image) that doesn't fit in the text's row grows by whole rows
+  above or below, so the raster is never cut off at the block edge or
+  drawn over a neighbouring line. Inline code boxes stay inside their
+  line's rows.
+- A line's text is reported on the row its baseline falls in: the line's
+  row for one-row lines, a row inside the span for taller ones. Lines never
+  share rows, except the cells of one table row, which are joined into one
+  run per row.
+- Margins are whole rows: one blank row between blocks, none in tight
+  lists. Code blocks, tables, Mermaid diagrams and rules have a padding row
+  at each edge that doubles as that margin; the code panel, table borders
+  and the rule are drawn at sub-row positions inside those rows (a rule
+  next to a panel moves a quarter row so it stays centred). A table is its
+  padding rows, the header lines, a border row after them (when there are
+  body rows) and one row per body line, with alternate body rows striped.
+  H1/H2 get an extra row for their underline. Display maths and diagrams
+  round up to whole rows and are centred in them.
+- When the last line's descender ink (measured from the glyph bitmaps)
+  hangs below the last row, the block gets one more row so it isn't cut
+  off.
 
 ### Implementation notes (v1)
 
@@ -168,9 +201,25 @@ layout 0.8 ms per width (was 54 ms for layout plus full paint), plus about
   `toastty_markdown::Renderer` (and its font database) on the first block.
   `toastty-term` has no dependency on `toastty-markdown`.
 - Layout parameters: `cols` = grid width, the renderer's integral cell size,
-  `font_px` = font size × display scale (including zoom), the theme palette
-  in sRGB with OSC 4 overrides for colours 0–15, `max_rows` = 2000
-  (`RICH_MAX_ROWS`).
+  `font_px` = font size × display scale (including zoom), `mono_family` =
+  the terminal's `font.family`, the theme palette in sRGB with OSC 4
+  overrides for colours 0–15, `max_rows` = 2000 (`RICH_MAX_ROWS`).
+- Code blocks (fenced and indented) sit on the terminal's column grid,
+  so selecting them highlights exactly the drawn glyphs. All monospace
+  text (code blocks and inline code) is shaped in `mono_family` (the
+  engine's default monospace face when its font database lacks that
+  family). In code blocks every grapheme cluster advances exactly
+  `cell_w` per cell it takes, like the terminal's own cluster-width snap:
+  its Unicode width capped at 2, so `❤️`, flags and ZWJ emoji sequences
+  are 2 cells (as under DECSET 2027, whatever the mode), combining marks
+  stay in their base's cell, and controls and zero-width clusters take
+  none. The terminal writes the block's text into the cells by the same
+  rule, one cluster per cell (trailing codepoints as the cell's grapheme
+  tail). A ligature over several clusters takes all their cells. The text
+  starts on the cell boundary nearest the panel's padding, inside list
+  items and quotes too, and long lines wrap at a whole number of cells.
+  Inline code in paragraphs keeps its natural advances. A font family
+  change re-lays blocks out like a font size change does.
 - Re-layout is deferred: geometry and palette changes mark blocks dirty and
   the binary calls `Term::sync_rich_blocks()` once per frame, which re-lays
   out (geometry change) or re-colours (palette only, keeping the row count:

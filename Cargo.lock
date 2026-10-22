@@ -4936,6 +4936,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tiny-skia",
  "tracing",
+ "unicode-segmentation",
  "unicode-width",
 ]
 

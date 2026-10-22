@@ -9,10 +9,24 @@
 //! - `grid`: pixel-space text/links → per-row runs and link spans.
 //!
 //! Everything is laid out in pixels first, so the height is known
-//! before the pixmap is allocated; the height is then snapped up to a
-//! whole number of rows. Every line pitch is at least one cell tall, so
-//! no two lines' baselines share a row and each row's text reads in
-//! order.
+//! before the pixmap is allocated.
+//!
+//! Vertically, everything snaps to the terminal's cell grid, so the
+//! plain text written into each row's cells sits on the text drawn
+//! there (selection highlights and link hit areas match the image):
+//!
+//! - Every text line (paragraph, heading, list item, quote, code, table
+//!   cell, footnote, the truncation note) starts on a row boundary and
+//!   is a whole number of rows tall: one row for body text and code,
+//!   more for large headings and for lines holding a tall inline
+//!   raster. Its text is reported on the row its baseline falls in
+//!   (for one-row lines, the line's row).
+//! - Margins, gaps and padding between blocks are whole rows. Decorations
+//!   (code panels, quote bars, rules, table borders and backgrounds, the
+//!   H1/H2 underline) may sit at sub-row positions inside those rows.
+//! - Block rasters (display maths, Mermaid) take whole rows, centred in
+//!   them; an inline raster (maths, image) taller than its text grows its
+//!   line by whole rows.
 
 // Pixel geometry is small (≤ 32k px, ≤ 2^16 rows), so integer ↔ float
 // casts are exact in practice; short coordinate names (x, y, w, h)
@@ -126,7 +140,12 @@ impl Memo {
 
 /// Per-renderer state reused across renders.
 pub(crate) struct Caches {
+    /// Fonts in use: `default_mono`, or the requested family for code.
     fonts: Fonts,
+    /// The monospace role picked without a requested family.
+    default_mono: fonts::Role,
+    /// `LayoutParams::mono_family` that `fonts.mono` was resolved for.
+    mono_request: Option<String>,
     swash: SwashCache,
     hl: Highlighter,
     memo: Memo,
@@ -145,8 +164,11 @@ impl std::fmt::Debug for Caches {
 
 impl Caches {
     pub(crate) fn new(fs: &mut FontSystem) -> Self {
+        let fonts = fonts::resolve(fs);
         Self {
-            fonts: fonts::resolve(fs),
+            default_mono: fonts.mono.clone(),
+            mono_request: None,
+            fonts,
             swash: SwashCache::new(),
             hl: Highlighter::default(),
             memo: Memo::default(),
@@ -154,6 +176,29 @@ impl Caches {
             math: crate::math::render_math,
             mermaid: MermaidBackend::Real,
         }
+    }
+
+    /// Use the family `family` for code when the font database has it,
+    /// else the default monospace face. Shaped paragraphs are cached by
+    /// content only, so they are dropped when the face changes.
+    fn select_mono(&mut self, fs: &mut FontSystem, family: Option<&str>) {
+        if self.mono_request.as_deref() == family {
+            return;
+        }
+        self.mono_request = family.map(str::to_owned);
+        let mono = family
+            .and_then(|f| fonts::named(fs, f))
+            .unwrap_or_else(|| self.default_mono.clone());
+        if mono.family != self.fonts.mono.family || mono.regular != self.fonts.mono.regular {
+            self.memo.shaped.clear();
+        }
+        self.fonts.mono = mono;
+    }
+
+    /// Family code is currently shaped with.
+    #[cfg(test)]
+    pub(crate) fn mono_family(&self) -> &str {
+        &self.fonts.mono.family
     }
 }
 
@@ -195,13 +240,38 @@ struct Lay<'a> {
     frags: Vec<Frag>,
     link_px: Vec<LinkPx>,
     image_budget: u64,
-    /// Body font size and line pitch.
+    /// Body font size.
     f: f32,
-    line_h: f32,
+    /// Row (cell) height: the unit of all vertical layout.
+    ch: f32,
     /// Display scale relative to a 16 px body font.
     scale: f32,
     /// Stop laying out blocks below this y (truncation).
     y_limit: f32,
+    /// Vertical offset of the next rule from its default spot (see
+    /// [`Lay::blocks`]).
+    rule_shift: f32,
+    /// Every laid-out line, for the grid-snapping tests.
+    #[cfg(test)]
+    boxes: Vec<LineBox>,
+    /// Current block (or table row): lines of one table row share rows.
+    #[cfg(test)]
+    group: usize,
+}
+
+/// A laid-out line's box and the text reported for it (tests only).
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct LineBox {
+    pub top: f32,
+    pub h: f32,
+    pub base: f32,
+    pub text: String,
+    /// "text", "code", "cell" (table) or "atom" (display maths, diagram).
+    pub kind: &'static str,
+    pub group: usize,
+    /// Table column + 1 (0 outside tables).
+    pub cell: usize,
 }
 
 /// A laid-out block: everything but pixels. Paint any band of it with
@@ -218,6 +288,8 @@ pub(crate) struct Laid {
     /// When truncated: rows from here down are cleared and `note` drawn.
     text_rows: u32,
     note: Vec<Op>,
+    #[cfg(test)]
+    pub boxes: Vec<LineBox>,
 }
 
 impl Laid {
@@ -253,7 +325,8 @@ pub(crate) fn layout(
 
     let doc = parse::parse(markdown);
     let f = params.font_px.clamp(4.0, 512.0);
-    let line_h = (cell_h as f32).max((f * 1.2).ceil());
+    let ch = cell_h as f32;
+    caches.select_mono(fs, params.mono_family.as_deref());
     caches.memo.trim();
     let mut lay = Lay {
         fs,
@@ -270,9 +343,14 @@ pub(crate) fn layout(
         link_px: vec![],
         image_budget: MAX_IMAGE_BUDGET,
         f,
-        line_h,
+        ch,
         scale: f / 16.0,
-        y_limit: f32::from(row_cap) * cell_h as f32 + line_h,
+        y_limit: f32::from(row_cap) * ch + ch,
+        rule_shift: 0.0,
+        #[cfg(test)]
+        boxes: vec![],
+        #[cfg(test)]
+        group: 0,
     };
     let pad = params.cell_w as f32;
     let x0 = if width as f32 > pad * 6.0 { pad } else { 0.0 };
@@ -283,6 +361,13 @@ pub(crate) fn layout(
         tight: false,
     };
     let end = lay.blocks(&doc.blocks, x0, inner, 0.0, ctx);
+    // The last line's descenders may hang below the last row; if real
+    // ink would be cut off, add a row.
+    let end = if ink_below(&lay.ops, &mut *lay.fs, &mut caches.swash, end, ch) {
+        end + ch
+    } else {
+        end
+    };
 
     let needed = ((end.ceil() as u64).div_ceil(u64::from(cell_h))).max(1);
     let truncated = needed > u64::from(row_cap);
@@ -311,11 +396,18 @@ pub(crate) fn layout(
             lay.span(base, parse::Style::default()),
         );
         let shaped = Shaped::new(lay.fs, lay.fonts, &para);
-        let lctx = lay.line_ctx(base.size, false, Align::Left, cell_h as f32);
+        let lctx = lay.line_ctx(base.size, false, Align::Left);
         let lines = shaped.break_lines(inner, &lctx);
-        let top = text_rows as f32 * cell_h as f32
-            + ((cell_h as f32 - inline::height(&lines)) / 2.0).floor();
-        let (texts, _) = shaped.emit(&lines, x0, top, inner, &lctx, &mut note, lay.fonts);
+        let top = text_rows as f32 * ch;
+        let (texts, _) = shaped.emit(
+            &lines[..lines.len().min(1)],
+            x0,
+            top,
+            inner,
+            &lctx,
+            &mut note,
+            lay.fonts,
+        );
         let note_text: String = texts.into_iter().map(|t| t.text).collect();
         let col = (x0 / params.cell_w as f32).round() as u16;
         text.push(vec![TextRun {
@@ -338,7 +430,24 @@ pub(crate) fn layout(
             u32::from(rows)
         },
         note,
+        #[cfg(test)]
+        boxes: lay.boxes,
     }
+}
+
+/// Whether any glyph's ink reaches below `end`. Only glyphs whose
+/// baseline is in the last two rows can (a descender is shorter than a
+/// row); their bitmaps are cached for painting anyway.
+fn ink_below(ops: &[Op], fs: &mut FontSystem, swash: &mut SwashCache, end: f32, ch: f32) -> bool {
+    ops.iter().any(|op| match op {
+        Op::Glyph { key, y, .. } if *y as f32 > end - 2.0 * ch => {
+            swash.get_image(fs, *key).as_ref().is_some_and(|img| {
+                let p = img.placement;
+                p.height > 0 && (y - p.top) as f32 + p.height as f32 > end
+            })
+        }
+        _ => false,
+    })
 }
 
 /// Extra rows painted (and cropped) around a band; see [`paint_band`].
@@ -447,38 +556,117 @@ fn heading_scale(level: u8) -> f32 {
     }
 }
 
-impl Lay<'_> {
-    fn gap(&self) -> f32 {
-        (self.f * 0.75).round()
+/// Whether the padding row at a block's top / bottom edge holds a panel
+/// edge (code, table, diagram) drawn through its middle, rather than
+/// blank space (rules, the H1/H2 underline row).
+fn panel_edge(b: &Block, bottom: bool) -> bool {
+    let edge = |blocks: &[Block]| {
+        if bottom {
+            blocks.last()
+        } else {
+            blocks.first()
+        }
+        .is_some_and(|b| panel_edge(b, bottom))
+    };
+    match b {
+        // A list's / footnote's edge is its first / last child's.
+        Block::List { items, .. } => {
+            if bottom { items.last() } else { items.first() }.is_some_and(|i| edge(&i.blocks))
+        }
+        Block::Footnote(_, blocks) => edge(blocks),
+        Block::Rule | Block::Heading(..) => false,
+        _ => {
+            let (lead, trail) = space(b);
+            (if bottom { trail } else { lead }) > 0.0
+        }
     }
+}
 
-    /// (top, bottom) margins of a block.
-    fn margins(&self, b: &Block, ctx: Ctx) -> (f32, f32) {
-        let g = self.gap();
+/// Rows of blank space at the (top, bottom) of a block's own box: the
+/// padding rows code panels, tables and diagrams draw into, the
+/// underline row of H1/H2 and the rows around a rule. They count
+/// towards the margin between blocks (see [`Lay::blocks`]), so a code
+/// panel's padding row doubles as the blank row before it.
+fn space(b: &Block) -> (f32, f32) {
+    match b {
+        Block::Code { .. } | Block::Mermaid(_) | Block::Table { .. } | Block::Rule => (1.0, 1.0),
+        Block::Heading(l, _) if *l <= 2 => (0.0, 1.0),
+        Block::List { items, .. } => (
+            items
+                .first()
+                .and_then(|i| i.blocks.first())
+                .map_or(0.0, |b| space(b).0),
+            items
+                .last()
+                .and_then(|i| i.blocks.last())
+                .map_or(0.0, |b| space(b).1),
+        ),
+        Block::Footnote(_, blocks) => (
+            blocks.first().map_or(0.0, |b| space(b).0),
+            blocks.last().map_or(0.0, |b| space(b).1),
+        ),
+        _ => (0.0, 0.0),
+    }
+}
+
+impl Lay<'_> {
+    /// Blank rows between sibling blocks (and loose list items).
+    const GAP_ROWS: f32 = 1.0;
+
+    /// (top, bottom) margins of a block, in rows.
+    fn margins(b: &Block, ctx: Ctx) -> (f32, f32) {
         match b {
-            Block::Heading(l, _) => {
-                let top = if *l <= 2 { self.f * 1.5 } else { self.f * 1.25 };
-                (top.round(), (self.f * 0.6).round())
-            }
+            // Large headings are taller than their text needs, which
+            // already sets them off from the text above.
+            Block::Heading(..) => (1.0, 1.0),
             Block::Paragraph(_) | Block::List { .. } if ctx.tight => (0.0, 0.0),
-            Block::Rule => ((self.f * 1.1).round(), (self.f * 1.1).round()),
-            _ => (g, g),
+            _ => (Self::GAP_ROWS, Self::GAP_ROWS),
         }
     }
 
+    /// Lay out sibling blocks from `y` (a row boundary); returns the
+    /// bottom y (a row boundary). Adjacent margins collapse to the
+    /// larger one, less any blank rows the blocks already have at that
+    /// edge ([`space`]). A heading keeps its full top margin below a
+    /// panel's (code, table, diagram) padding row, so it isn't crowded
+    /// against the panel edge drawn in it.
     fn blocks(&mut self, blocks: &[Block], x: f32, w: f32, y: f32, ctx: Ctx) -> f32 {
         let mut y = y;
-        let mut prev: Option<f32> = None;
-        for b in blocks {
+        let mut prev: Option<(f32, f32, &Block)> = None;
+        for (i, b) in blocks.iter().enumerate() {
             if y > self.y_limit {
                 break;
             }
-            let (top, bottom) = self.margins(b, ctx);
-            if let Some(pb) = prev {
-                y += pb.max(top);
+            let (top, bottom) = Self::margins(b, ctx);
+            let (lead, trail) = space(b);
+            let after_panel = prev.is_some_and(|p| panel_edge(p.2, true));
+            if let Some((pb, pt, _)) = prev {
+                let pt = if after_panel && matches!(b, Block::Heading(..)) {
+                    0.0
+                } else {
+                    pt
+                };
+                y += (pb.max(top) - pt - lead).max(0.0) * self.ch;
+            }
+            if matches!(b, Block::Rule) {
+                // A panel edge sits half way into its padding row, so
+                // nudge the rule a quarter row away from it to keep the
+                // space on both sides equal. Only siblings count: a rule
+                // at the edge of a list item next to a panel in the
+                // neighbouring item isn't centred.
+                let before_panel = blocks.get(i + 1).is_some_and(|n| panel_edge(n, false));
+                self.rule_shift = (f32::from(u8::from(before_panel))
+                    - f32::from(u8::from(after_panel)))
+                    * self.ch
+                    / 4.0;
+            }
+            #[cfg(test)]
+            {
+                self.group += 1;
             }
             y = self.block(b, x, w, y, ctx);
-            prev = Some(bottom);
+            debug_assert!(y % self.ch < 1e-3, "block {b:?} ends off the row grid");
+            prev = Some((bottom, trail, b));
         }
         y
     }
@@ -506,16 +694,17 @@ impl Lay<'_> {
             Block::Mermaid(src) => self.diagram(src, x, w, y),
             Block::Table { aligns, head, rows } => self.table(aligns, head, rows, x, w, y, ctx),
             Block::Rule => {
+                // Two rows (see `space`), the rule on the line between them.
                 let h = (self.f * 0.25).round().max(2.0);
                 self.ops.push(Op::Rect {
                     x,
-                    y,
+                    y: (y + self.ch + self.rule_shift - h / 2.0).round(),
                     w,
                     h,
                     r: 0.0,
                     color: self.pal.rule,
                 });
-                y + h
+                y + 2.0 * self.ch
             }
             Block::Html(text) => {
                 let mut inl = vec![];
@@ -551,16 +740,28 @@ impl Lay<'_> {
         }
     }
 
-    fn line_ctx(&self, size: f32, mono: bool, align: Align, line_h: f32) -> LineCtx {
+    /// Line metrics for text of `size`. Body-sized (or smaller) text
+    /// takes one row; larger text (headings) as many rows as its
+    /// ascent-plus-descent box needs, rounding down only when the box
+    /// overhangs the rows by less than 40% of a row (it may spill a
+    /// little into the margins around it).
+    fn line_ctx(&self, size: f32, mono: bool, align: Align) -> LineCtx {
         let m = if mono {
             self.fonts.mono.metrics
         } else {
             self.fonts.sans.metrics
         };
+        let (asc, desc) = (m.ascent * size, m.descent * size);
+        let rows = if size <= self.f + 0.01 {
+            1
+        } else {
+            ((asc + desc) / self.ch - 0.4).ceil().max(1.0) as u32
+        };
         LineCtx {
-            line_h,
-            asc: m.ascent * size,
-            desc: m.descent * size,
+            row_h: self.ch,
+            rows,
+            asc,
+            desc,
             preserve_ws: mono,
             align,
         }
@@ -676,9 +877,13 @@ impl Lay<'_> {
                     if let Some(r) = raster {
                         let (w, h) = Self::fit((r.width, r.height), max_w, 1.0);
                         let k = h / r.height as f32;
+                        // Display atoms are centred on their own line, with
+                        // the "baseline" (the row their text is reported
+                        // on) through the middle.
                         let asc = match r.baseline {
-                            Some(b) if !*display => (b as f32 * k).round(),
-                            _ => h,
+                            _ if *display => (h / 2.0).round(),
+                            Some(b) => (b as f32 * k).round(),
+                            None => h,
                         };
                         let raster = Src::Img(r);
                         let atom = Atom {
@@ -800,12 +1005,7 @@ impl Lay<'_> {
         align: Align,
     ) -> f32 {
         let para = self.build_para(inl, base, w);
-        let lctx = self.line_ctx(
-            base.size,
-            false,
-            align,
-            self.line_h.max((base.size * 1.25).ceil()),
-        );
+        let lctx = self.line_ctx(base.size, false, align);
         self.flow(&para, x, w, y, &lctx)
     }
 
@@ -818,12 +1018,50 @@ impl Lay<'_> {
 
     fn emit(&mut self, shaped: &Shaped, lines: &[Line], x: f32, y: f32, w: f32, lctx: &LineCtx) {
         let (texts, links) = shaped.emit(lines, x, y, w, lctx, &mut self.ops, self.fonts);
+        #[cfg(test)]
+        self.record(
+            lines,
+            y,
+            &texts,
+            if lctx.preserve_ws { "code" } else { "text" },
+            0,
+        );
         self.frags.extend(texts.into_iter().map(|t| Frag {
             x: t.x,
             baseline: t.baseline,
             text: t.text,
         }));
         self.push_links(links);
+    }
+
+    #[cfg(test)]
+    fn record(
+        &mut self,
+        lines: &[Line],
+        y: f32,
+        texts: &[inline::LineText],
+        kind: &'static str,
+        cell: usize,
+    ) {
+        let mut top = y;
+        for l in lines {
+            let base = top + l.base;
+            let text = texts
+                .iter()
+                .filter(|t| (t.baseline - base).abs() < 0.5)
+                .map(|t| t.text.as_str())
+                .collect();
+            self.boxes.push(LineBox {
+                top,
+                h: l.h,
+                base,
+                text,
+                kind,
+                group: self.group,
+                cell,
+            });
+            top += l.h;
+        }
     }
 
     fn push_links(&mut self, links: Vec<inline::LinkRect>) {
@@ -855,25 +1093,22 @@ impl Lay<'_> {
             color,
         };
         let para = self.build_para(inl, base, w);
-        let lctx = self.line_ctx(
-            size,
-            false,
-            Align::Left,
-            self.line_h.max((size * 1.25).ceil()),
-        );
+        let lctx = self.line_ctx(size, false, Align::Left);
         let mut y = self.flow(&para, x, w, y, &lctx);
         if level <= 2 {
-            y += (size * 0.2).round();
+            // The underline gets a row of its own (see `space`), drawn
+            // just below the descenders.
             let th = self.scale.round().max(1.0);
+            let off = (size * 0.2).round().min(self.ch - th);
             self.ops.push(Op::Rect {
                 x,
-                y,
+                y: y + off,
                 w,
                 h: th,
                 r: 0.0,
                 color: self.pal.border,
             });
-            y += th;
+            y += self.ch;
         }
         y
     }
@@ -901,12 +1136,12 @@ impl Lay<'_> {
             if y > self.y_limit {
                 break;
             }
-            if i > 0 {
-                y += if tight {
-                    (self.f * 0.15).round()
-                } else {
-                    self.gap()
-                };
+            if i > 0 && !tight {
+                // A blank row, unless the previous item ends / this one
+                // starts with a padding row of its own.
+                let trail = items[i - 1].blocks.last().map_or(0.0, |b| space(b).1);
+                let lead = it.blocks.first().map_or(0.0, |b| space(b).0);
+                y += (Self::GAP_ROWS - trail - lead).max(0.0) * self.ch;
             }
             let marker = match (it.task, start) {
                 (Some(done), _) => Marker::Task(done),
@@ -938,14 +1173,13 @@ impl Lay<'_> {
         let first_frag = self.frags.len();
         let first_op = self.ops.len();
         let end = self.blocks(blocks, cx, (w - indent).max(1.0), y, ctx);
-        let lctx = self.line_ctx(self.f, false, Align::Left, self.line_h);
-        let default_base = y + ((lctx.line_h - lctx.asc - lctx.desc) / 2.0 + lctx.asc).round();
+        let default_base = y + self.line_ctx(self.f, false, Align::Left).text_base();
         let b = self.frags[first_frag..]
             .iter()
             .map(|f| f.baseline)
             .fold(None, |m: Option<f32>, v| Some(m.map_or(v, |m| m.min(v))))
             .unwrap_or(default_base);
-        let end = end.max(y + self.line_h);
+        let end = end.max(y + self.ch);
         let cw = self.p.cell_w as f32;
         let f = self.f;
         let xh = self.fonts.sans.metrics.x_height * f;
@@ -1037,7 +1271,7 @@ impl Lay<'_> {
                 let mut para = Para::default();
                 para.text(&txt, self.span(base, parse::Style::default()));
                 let shaped = self.shape(&para);
-                let lctx = self.line_ctx(size, false, Align::Right, self.line_h);
+                let lctx = self.line_ctx(size, false, Align::Right);
                 let lines = shaped.break_lines(f32::INFINITY, &lctx);
                 let right = cx - (f * 0.4).round();
                 let lw = lines.first().map_or(0.0, |l| l.w);
@@ -1101,9 +1335,6 @@ impl Lay<'_> {
                 };
                 let inl = [Inline::Text(title.into(), parse::Style::default())];
                 yy = self.paragraph(&inl, base, cx, cw, yy, Align::Left);
-                if !blocks.is_empty() {
-                    yy += (self.f * 0.4).round();
-                }
                 (accent, ctx.color)
             }
             None => (
@@ -1120,10 +1351,7 @@ impl Lay<'_> {
             tight: false,
             ..ctx
         };
-        let end = self
-            .blocks(blocks, cx, cw, yy, c)
-            .max(yy)
-            .max(y + self.line_h);
+        let end = self.blocks(blocks, cx, cw, yy, c).max(yy).max(y + self.ch);
         self.ops.push(Op::Rect {
             x,
             y,
@@ -1151,8 +1379,12 @@ impl Lay<'_> {
 
     fn code(&mut self, lang: &str, text: &str, x: f32, w: f32, y: f32) -> f32 {
         let pad_x = (self.p.cell_w as f32).max((self.f * 0.75).round());
-        let pad_y = (self.line_h * 0.5).round();
-        let inner = (w - 2.0 * pad_x).max(1.0);
+        // A padding row above and below the lines (see `space`); the
+        // panel reaches `pad_y` into each.
+        let pad_y = (self.ch * 0.5).round();
+        // Code sits on the terminal's column grid (see `code_grid`).
+        let (tx, inner) = code_grid(x, w, pad_x, self.p.cell_w);
+        let first_frag = self.frags.len();
         let first_op = self.ops.len();
         let key = (lang.to_owned(), text.to_owned(), self.p.theme.clone());
         let lines = if let Some(hit) = self.memo.code.get(&key) {
@@ -1167,8 +1399,8 @@ impl Lay<'_> {
             self.memo.code.insert(key, Arc::clone(&lines));
             lines
         };
-        let lctx = self.line_ctx(self.f, true, Align::Left, self.line_h);
-        let mut cy = y + pad_y;
+        let lctx = self.line_ctx(self.f, true, Align::Left);
+        let mut cy = y + self.ch;
         for toks in lines.iter() {
             if cy > self.y_limit {
                 break;
@@ -1191,29 +1423,48 @@ impl Lay<'_> {
                 };
                 para.text(clip(&t.text, &mut budget), span);
             }
+            para.grid = Some(self.p.cell_w);
             let shaped = self.shape(&para);
             let ls = shaped.break_lines(inner, &lctx);
             if ls.is_empty() {
-                cy += self.line_h;
+                #[cfg(test)]
+                self.boxes.push(LineBox {
+                    top: cy,
+                    h: self.ch,
+                    base: cy + lctx.text_base(),
+                    text: String::new(),
+                    kind: "code",
+                    group: self.group,
+                    cell: 0,
+                });
+                cy += self.ch;
                 continue;
             }
-            self.emit(&shaped, &ls, x + pad_x, cy, inner, &lctx);
+            self.emit(&shaped, &ls, tx, cy, inner, &lctx);
             cy += inline::height(&ls);
         }
-        let end = cy + pad_y;
+        // Every line's text starts on a whole cell, so the grid's column
+        // mapping is exact (no rounding).
+        debug_assert!(
+            self.frags[first_frag..]
+                .iter()
+                .all(|f| f.x.rem_euclid(self.p.cell_w as f32) == 0.0),
+            "code text off the cell grid"
+        );
         let r = (self.f * 0.375).round();
+        let top = y + self.ch - pad_y;
         self.ops.insert(
             first_op,
             Op::Rect {
                 x,
-                y,
+                y: top,
                 w,
-                h: end - y,
+                h: cy + pad_y - top,
                 r,
                 color: self.pal.code_bg,
             },
         );
-        end
+        cy + self.ch
     }
 
     fn display_math(&mut self, tex: &str, x: f32, w: f32, y: f32, ctx: Ctx) -> f32 {
@@ -1230,25 +1481,37 @@ impl Lay<'_> {
             };
             return self.paragraph(&inl, base, x, w, y, Align::Left);
         };
+        // Whole rows, the raster centred in them; the source is reported
+        // on the middle row.
         let (dw, dh) = Self::fit((r.width, r.height), w, 1.0);
-        let pad = (self.f * 0.25).round();
+        let ch = self.ch;
+        let rows = (dh / ch).ceil().max(1.0);
         let ix = x + ((w - dw) / 2.0).floor();
         self.ops.push(Op::Image {
             src: Src::Img(r),
             x: ix,
-            y: y + pad,
+            y: y + ((rows * ch - dh) / 2.0).floor(),
             w: dw,
             h: dh,
         });
-        let h = dh + 2.0 * pad;
-        let rows = (h / self.p.cell_h as f32).floor().max(1.0);
-        let base = y + ((rows / 2.0).floor() + 0.75) * self.p.cell_h as f32;
+        let text = format!("$${}$$", tex.replace('\n', " "));
+        let base = y + ((rows / 2.0).floor() + 0.75) * ch;
+        #[cfg(test)]
+        self.boxes.push(LineBox {
+            top: y,
+            h: rows * ch,
+            base,
+            text: text.clone(),
+            kind: "atom",
+            group: self.group,
+            cell: 0,
+        });
         self.frags.push(Frag {
             x,
-            baseline: base.min(y + h),
-            text: format!("$${}$$", tex.replace('\n', " ")),
+            baseline: base,
+            text,
         });
-        y + h.max(self.line_h)
+        y + rows * ch
     }
 
     fn diagram(&mut self, src: &str, x: f32, w: f32, y: f32) -> f32 {
@@ -1283,17 +1546,31 @@ impl Lay<'_> {
                 return self.code("mermaid", src, x, w, y);
             }
         };
+        // A padding row above and below (see `space`), then whole rows
+        // with the diagram centred in them and its source lines on them.
         let (dw, dh) = Self::fit(size, w, 1.0);
+        let ch = self.ch;
+        let rows = ((dh / ch).ceil() as usize).max(1);
+        let y = y + ch;
         let ix = x + ((w - dw) / 2.0).floor();
         self.ops.push(Op::Image {
             src: src_img,
             x: ix,
-            y,
+            y: y + ((rows as f32 * ch - dh) / 2.0).floor(),
             w: dw,
             h: dh,
         });
-        let ch = self.p.cell_h as f32;
-        let rows = ((dh / ch).floor() as usize).max(1);
+        // The diagram's rows, so tests can check the raster stays in them.
+        #[cfg(test)]
+        self.boxes.push(LineBox {
+            top: y,
+            h: rows as f32 * ch,
+            base: y + ch * 0.75,
+            text: String::new(),
+            kind: "diagram",
+            group: self.group,
+            cell: 0,
+        });
         let lines: Vec<&str> = src.lines().filter(|l| !l.trim().is_empty()).collect();
         for (i, l) in lines.iter().enumerate().take(rows) {
             let text = if i + 1 == rows && lines.len() > rows {
@@ -1305,13 +1582,23 @@ impl Lay<'_> {
             } else {
                 (*l).to_owned()
             };
+            #[cfg(test)]
+            self.boxes.push(LineBox {
+                top: y + ch * i as f32,
+                h: ch,
+                base: y + ch * (i as f32 + 0.75),
+                text: text.clone(),
+                kind: "atom",
+                group: self.group,
+                cell: 0,
+            });
             self.frags.push(Frag {
                 x,
                 baseline: y + ch * (i as f32 + 0.75),
                 text,
             });
         }
-        y + dh.max(self.line_h)
+        y + (rows as f32 + 1.0) * ch
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1332,12 +1619,17 @@ impl Lay<'_> {
             .chain([head.len(), aligns.len()])
             .max()
             .unwrap_or(0);
+        let ch = self.ch;
         if ncols == 0 {
-            return y;
+            // Just the padding rows `space` promises.
+            return y + 2.0 * ch;
         }
         let pad_x = (self.f * 0.75).round();
-        let pad_y = (self.f * 0.375).round();
         let bw = self.scale.round().max(1.0);
+        // A padding row above and below the table and one after the
+        // header, each with a border line through its middle. Body rows
+        // sit on consecutive rows, told apart by stripes.
+        let border_at = |sep_top: f32| sep_top + ((ch - bw) / 2.0).round();
         let empty: Vec<Inline> = vec![];
         let all: Vec<(bool, &[Vec<Inline>])> = std::iter::once((true, head))
             .chain(rows.iter().map(|r| (false, r.as_slice())))
@@ -1393,12 +1685,13 @@ impl Lay<'_> {
                 Some(Alignment::Right) => Align::Right,
                 _ => Align::Left,
             };
-            me.line_ctx(me.f, false, align, me.line_h)
+            me.line_ctx(me.f, false, align)
         };
         let first_op = self.ops.len();
         let mut bg_ops = vec![];
-        let mut row_ys = vec![];
-        let mut ry = y + bw;
+        // y of every horizontal border line, top to bottom.
+        let mut borders = vec![border_at(y)];
+        let mut ry = y + ch;
         let mut body_i = 0usize;
         for (ri, row) in shaped.iter().enumerate() {
             if ri == 0 && skip_head {
@@ -1407,37 +1700,45 @@ impl Lay<'_> {
             if ry > self.y_limit {
                 break;
             }
+            #[cfg(test)]
+            {
+                self.group += 1;
+            }
             let lines: Vec<Vec<Line>> = row
                 .iter()
                 .enumerate()
                 .map(|(c, s)| s.break_lines((widths[c] - 2.0 * pad_x).max(1.0), &lctx_of(self, c)))
                 .collect();
-            let content_h = lines
-                .iter()
-                .map(|l| inline::height(l))
-                .fold(self.line_h, f32::max);
-            let rh = (content_h + 2.0 * pad_y).round();
-            if ri == 0 {
+            let rh = lines.iter().map(|l| inline::height(l)).fold(ch, f32::max);
+            let last = ri + 1 == shaped.len();
+            // The first row's background starts at the border above it,
+            // the last one's ends at the border below.
+            let first = ri == 0 || body_i == 0;
+            let bg_top = if first {
+                borders[borders.len() - 1] + bw
+            } else {
+                ry
+            };
+            let bg_bottom = if last || ri == 0 {
+                border_at(ry + rh)
+            } else {
+                ry + rh
+            };
+            let bg = if ri == 0 {
+                Some(self.pal.table_head_bg)
+            } else {
+                body_i += 1;
+                body_i.is_multiple_of(2).then_some(self.pal.table_stripe_bg)
+            };
+            if let Some(color) = bg {
                 bg_ops.push(Op::Rect {
                     x,
-                    y: ry,
+                    y: bg_top,
                     w: table_w,
-                    h: rh,
+                    h: bg_bottom - bg_top,
                     r: 0.0,
-                    color: self.pal.table_head_bg,
+                    color,
                 });
-            } else {
-                if body_i % 2 == 1 {
-                    bg_ops.push(Op::Rect {
-                        x,
-                        y: ry,
-                        w: table_w,
-                        h: rh,
-                        r: 0.0,
-                        color: self.pal.table_stripe_bg,
-                    });
-                }
-                body_i += 1;
             }
             let mut cx = x + bw;
             let mut per_line: Vec<(f32, Vec<String>)> = vec![];
@@ -1447,15 +1748,17 @@ impl Lay<'_> {
                 let (texts, links) = s.emit(
                     &lines[c],
                     cx + pad_x,
-                    ry + pad_y,
+                    ry,
                     cw,
                     &lctx,
                     &mut self.ops,
                     self.fonts,
                 );
+                #[cfg(test)]
+                self.record(&lines[c], ry, &texts, "cell", c + 1);
                 self.push_links(links);
                 // Line k of every cell shares a baseline (top-aligned).
-                let mut top = ry + pad_y;
+                let mut top = ry;
                 for (k, l) in lines[c].iter().enumerate() {
                     if per_line.len() <= k {
                         per_line.push((top + l.base, vec![String::new(); ncols]));
@@ -1487,37 +1790,35 @@ impl Lay<'_> {
                     });
                 }
             }
-            row_ys.push((ry, rh));
-            ry += rh + bw;
+            if ri == 0 && !last {
+                borders.push(border_at(ry + rh));
+                ry += rh + ch;
+            } else {
+                ry += rh;
+            }
         }
-        let end = ry;
+        borders.push(border_at(ry));
+        let end = ry + ch;
         // Borders: outer frame plus inner lines.
         let bc = self.pal.border;
-        bg_ops.push(Op::Rect {
-            x,
-            y,
-            w: table_w,
-            h: bw,
-            r: 0.0,
-            color: bc,
-        });
-        for &(ry, rh) in &row_ys {
+        for &by in &borders {
             bg_ops.push(Op::Rect {
                 x,
-                y: ry + rh,
+                y: by,
                 w: table_w,
                 h: bw,
                 r: 0.0,
                 color: bc,
             });
         }
+        let (frame_top, frame_bottom) = (borders[0], borders[borders.len() - 1] + bw);
         let mut cx = x;
         for cw in widths.iter().map(Some).chain([None]) {
             bg_ops.push(Op::Rect {
                 x: cx,
-                y,
+                y: frame_top,
                 w: bw,
-                h: end - y,
+                h: frame_bottom - frame_top,
                 r: 0.0,
                 color: bc,
             });
@@ -1528,6 +1829,21 @@ impl Lay<'_> {
         self.ops.splice(first_op..first_op, bg_ops);
         end
     }
+}
+
+/// Where a code block's text goes on the terminal's column grid, for a
+/// panel at `x` that is `w` wide with horizontal padding `pad_x`:
+/// `(text x, text width)`. The text starts on the cell boundary nearest
+/// `x + pad_x` (at least half a cell inside the panel) and is a whole
+/// number of cells wide (at least one), so with cell-snapped advances
+/// every grapheme cluster, including on wrapped continuation lines,
+/// lands exactly on a column and lines wrap at a whole cell.
+fn code_grid(x: f32, w: f32, pad_x: f32, cell_w: u32) -> (f32, f32) {
+    let cw = cell_w.max(1) as f32;
+    let col = ((x + pad_x) / cw).round().max(((x + cw * 0.5) / cw).ceil());
+    let tx = col * cw;
+    let cells = ((x + w - pad_x - tx) / cw).floor().max(1.0);
+    (tx, cells * cw)
 }
 
 /// Take up to `budget` bytes of `t` (on a char boundary).

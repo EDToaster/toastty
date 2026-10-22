@@ -17,6 +17,7 @@ fn params(cols: u16) -> LayoutParams {
         theme: Theme::default(),
         resources: ResourcePolicy::default(),
         max_rows: 2000,
+        mono_family: None,
     }
 }
 

@@ -1,6 +1,7 @@
 //! Render a Markdown file to a PNG with the hermetic fonts.
 //!
 //! `cargo run -p toastty-markdown --example md_render -- in.md out.png [cols] [light]`
+//! (env: `MD_SYSTEM_FONTS=1`, `MD_MONO_FAMILY=<family>`, `MD_MAX_ROWS=<n>`)
 
 use toastty_markdown::{LayoutParams, Renderer, ResourcePolicy, Theme};
 
@@ -49,6 +50,9 @@ fn main() {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(2000),
+        // MD_MONO_FAMILY="JetBrains Mono" lays code out in that family
+        // (with MD_SYSTEM_FONTS=1, any installed one).
+        mono_family: std::env::var("MD_MONO_FAMILY").ok(),
     };
     // MD_SYSTEM_FONTS=1 uses the system fonts (Renderer::new).
     let mut r = if std::env::var_os("MD_SYSTEM_FONTS").is_some() {

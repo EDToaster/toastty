@@ -114,6 +114,15 @@ pub struct LayoutParams {
     /// Hard cap on rows (denial-of-service guard). Content past it is cut and a
     /// "… truncated" line is drawn on the last row.
     pub max_rows: u16,
+    /// The terminal's font family (`font.family`), used for all
+    /// monospace text (code blocks and inline code) so it matches the
+    /// terminal's own text. `None`, or a family the font database
+    /// doesn't have, keeps the default monospace face (the system's
+    /// generic monospace family, else the bundled Fira Mono). Either way
+    /// code-block glyphs advance exactly `cell_w` per cell, so code
+    /// blocks sit on the terminal's column grid; inline code keeps its
+    /// natural advances.
+    pub mono_family: Option<String>,
 }
 
 impl LayoutParams {

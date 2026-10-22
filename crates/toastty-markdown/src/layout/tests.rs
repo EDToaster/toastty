@@ -2,6 +2,10 @@
 //! truncation, image policy and raster placement (with fake maths /
 //! Mermaid backends).
 
+// Vertical geometry is whole pixels (whole rows), so exact float
+// comparisons are what the grid tests mean.
+#![allow(clippy::float_cmp)]
+
 use super::images::tests::{data_png, png};
 use super::style::Palette;
 use crate::{LayoutParams, Raster, RenderedBlock, Renderer, ResourcePolicy, Rgba, TextRun, Theme};
@@ -15,6 +19,7 @@ fn params(cols: u16) -> LayoutParams {
         theme: Theme::default(),
         resources: ResourcePolicy::default(),
         max_rows: 2000,
+        mono_family: None,
     }
 }
 
@@ -240,9 +245,12 @@ fn code_blocks_are_verbatim_on_a_panel() {
     assert_eq!(lines(&b), vec!["fn  x() {", "    y", "}"]);
     assert!(b.rows >= 4);
     let pal = Palette::new(&Theme::default());
-    // Panel is opaque; outside it is transparent.
-    assert_eq!(px(&b, 30, 3), pal.code_bg);
-    assert_eq!(px(&b, 2, 3)[3], 0);
+    // Panel is opaque; outside it is transparent. It starts half way
+    // into the padding row above the first line.
+    assert_eq!(px(&b, 30, 14), pal.code_bg);
+    assert_eq!(px(&b, 30, 8)[3], 0);
+    assert_eq!(px(&b, 2, 14)[3], 0);
+    assert_eq!(lines(&b)[0], b.text[1][0].text, "first line on row 1");
     // Indented lines keep their leading spaces, from the same column.
     assert_eq!(b.text[2][0].col, b.text[1][0].col);
     assert_eq!(b.text[2][0].text, "    y");
@@ -507,7 +515,7 @@ fn mermaid_falls_back_to_source_code_block() {
     let b = render("```mermaid\nnotadiagram\n  A-->B\n```\n");
     assert_eq!(lines(&b), vec!["notadiagram", "  A-->B"]);
     let pal = Palette::new(&Theme::default());
-    assert_eq!(px(&b, 30, 4), pal.code_bg);
+    assert_eq!(px(&b, 30, 26), pal.code_bg);
 }
 
 #[test]
@@ -909,4 +917,1071 @@ fn system_renderer_smoke() {
     let b = r.render("Hello **world** `code`", &params(40)).unwrap();
     assert_eq!(b.rows, 1);
     assert_eq!(lines(&b), vec!["Hello world code"]);
+}
+
+// --- Code blocks on the terminal's column grid -------------------------
+
+/// Realistic terminal geometries: font px, cell w (Fira Mono advance
+/// rounded), cell h (`round(1.2 * f)`).
+const GRIDS: [(f32, u32, u32); 3] = [(26.0, 16, 31), (13.0, 8, 16), (20.0, 12, 24)];
+
+fn grid_params(cols: u16, (f, cw, ch): (f32, u32, u32)) -> LayoutParams {
+    LayoutParams {
+        cols,
+        cell_w: cw,
+        cell_h: ch,
+        font_px: f,
+        ..params(cols)
+    }
+}
+
+/// Pen position (x, baseline y) and subpixel bin of every glyph drawn,
+/// in paint order.
+fn glyph_pens(l: &crate::BlockLayout) -> Vec<(i32, i32, cosmic_text::SubpixelBin)> {
+    l.laid
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            super::paint::Op::Glyph { key, x, y, .. } => Some((*x, *y, key.x_bin)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn lay_out(md: &str, p: &LayoutParams) -> crate::BlockLayout {
+    RENDERER.with(|r| r.borrow_mut().layout(md, p).expect("layout"))
+}
+
+/// The run on some row whose text is exactly `line`: (row, col).
+fn find_run(l: &crate::BlockLayout, line: &str) -> (usize, u16) {
+    let hits: Vec<(usize, u16)> = l
+        .text()
+        .iter()
+        .enumerate()
+        .flat_map(|(r, runs)| runs.iter().map(move |t| (r, t)))
+        .filter(|(_, t)| t.text == line)
+        .map(|(r, t)| (r, t.col))
+        .collect();
+    assert_eq!(hits.len(), 1, "{line:?} in {:#?}", l.text());
+    hits[0]
+}
+
+/// Assert that each code line in `code` is reported as one run whose
+/// grapheme clusters, and the glyphs drawn for them, sit exactly on
+/// columns: the first glyph of the cluster at column `c` has its pen at
+/// exactly `c * cell_w` (no subpixel offset), and any further glyphs of
+/// the cluster (marks, ZWJ parts the font didn't ligate) stay inside its
+/// cells. Whitespace draws no glyph. Returns each line's starting column.
+fn assert_on_grid(l: &crate::BlockLayout, p: &LayoutParams, code: &[&str]) -> Vec<u16> {
+    use cosmic_text::SubpixelBin;
+    let pens = glyph_pens(l);
+    let cw = p.cell_w as i32;
+    code.iter()
+        .map(|line| {
+            let (row, col) = find_run(l, line);
+            // (pen x, cells) of each inked cluster, in order.
+            let mut want = vec![];
+            let mut c = i32::from(col);
+            for g in unicode_segmentation::UnicodeSegmentation::graphemes(*line, true) {
+                let cells = super::grid::grapheme_cells(g) as i32;
+                if cells > 0 && !g.chars().all(char::is_whitespace) {
+                    want.push((c * cw, cells));
+                }
+                c += cells;
+            }
+            let got: Vec<(i32, SubpixelBin)> = pens
+                .iter()
+                .filter(|(_, y, _)| super::grid::row_of(*y as f32, p.cell_h) == row)
+                .map(|&(x, _, bin)| (x, bin))
+                .collect();
+            let ctx = || format!("{line:?} (row {row}, col {col}): want {want:?}, got {got:?}");
+            let mut k = 0;
+            for &(x, bin) in &got {
+                if k < want.len() && x == want[k].0 && bin == SubpixelBin::Zero {
+                    k += 1;
+                    continue;
+                }
+                // Not a cluster start: part of the previous cluster (an
+                // invisible VS16 / ZWJ glyph may sit on its right edge), or
+                // a zero-width cluster's glyph (drawn at the next column).
+                let inside = k > 0 && x >= want[k - 1].0 && x <= want[k - 1].0 + want[k - 1].1 * cw;
+                let zero_width = want.get(k).is_some_and(|w| x == w.0);
+                assert!(inside || zero_width, "stray glyph at {x}: {}", ctx());
+            }
+            assert_eq!(k, want.len(), "missing cluster glyphs: {}", ctx());
+            col
+        })
+        .collect()
+}
+
+#[test]
+fn code_glyphs_sit_on_the_cell_grid() {
+    // Wide CJK char (2 cells), a tab (4 spaces), runs of spaces.
+    let code = ["fn x() {", "    let s = \"\u{4e2d}\u{6587}\";\tz", "}"];
+    let src = format!("```rust\n{}\n```\n", code.join("\n"));
+    for g in GRIDS {
+        let p = grid_params(80, g);
+        let l = lay_out(&src, &p);
+        let want = ["fn x() {", "    let s = \"\u{4e2d}\u{6587}\";    z", "}"];
+        let cols = assert_on_grid(&l, &p, &want);
+        // Top level: panel at column 1, text one cell in.
+        assert_eq!(cols, vec![2, 2, 2], "{g:?}");
+    }
+}
+
+#[test]
+fn code_text_origin_snaps_inside_lists_and_quotes() {
+    let cases = [
+        "- item\n\n  ```\n  abc def\n  x\u{4e2d}y\n  ```\n",
+        "1. one\n2. two\n\n   ```\n   abc def\n   x\u{4e2d}y\n   ```\n",
+        "> quoted\n>\n> ```\n> abc def\n> x\u{4e2d}y\n> ```\n",
+        "> - nested\n>\n>   ```\n>   abc def\n>   x\u{4e2d}y\n>   ```\n",
+        "- outer\n  - inner\n\n    ```\n    abc def\n    x\u{4e2d}y\n    ```\n",
+    ];
+    for g in GRIDS {
+        let p = grid_params(60, g);
+        for src in cases {
+            let l = lay_out(src, &p);
+            let cols = assert_on_grid(&l, &p, &["abc def", "x\u{4e2d}y"]);
+            assert_eq!(cols[0], cols[1], "{src:?} {g:?}");
+            // Indented past the enclosing block's text.
+            assert!(cols[0] >= 4, "{src:?} {g:?}: col {}", cols[0]);
+        }
+    }
+}
+
+#[test]
+fn indented_code_blocks_are_on_the_grid() {
+    for g in GRIDS {
+        let p = grid_params(50, g);
+        let l = lay_out("Para.\n\n    indented\n    co\tde \u{4e2d}!\n", &p);
+        let cols = assert_on_grid(&l, &p, &["indented", "co    de \u{4e2d}!"]);
+        assert_eq!(cols, vec![2, 2]);
+    }
+}
+
+#[test]
+fn long_code_lines_wrap_at_whole_cells() {
+    for g in GRIDS {
+        let (_, cw, _) = g;
+        let p = grid_params(30, g);
+        // The panel spans cols 1..29; text starts at col 2 and the right
+        // padding is at least a cell, so 25 or 26 cells fit.
+        let x0 = cw as f32;
+        let pad_x = (cw as f32).max((g.0 * 0.75).round());
+        let cells =
+            ((x0 + 28.0 * cw as f32 - pad_x - 2.0 * cw as f32) / cw as f32).floor() as usize;
+        // An unbreakable word is split at exactly `cells` columns.
+        let word: String = ('a'..='z').cycle().take(cells * 3 + 5).collect();
+        let l = lay_out(&format!("```\n{word}\n```\n"), &p);
+        let runs: Vec<&TextRun> = l.text().iter().flatten().collect();
+        assert_eq!(runs.len(), 4, "{g:?} {runs:?}");
+        for r in &runs[..3] {
+            assert_eq!((r.col, r.text.len()), (2, cells), "{g:?}");
+        }
+        assert_eq!(runs[3].text.len(), 5);
+        let parts: Vec<String> = runs.iter().map(|r| r.text.clone()).collect();
+        let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+        assert_on_grid(&l, &p, &refs);
+        // Words wrap; continuation lines keep the line's indent, on a cell.
+        let words: Vec<String> = (10..10 + cells).map(|i| format!("w{i}")).collect();
+        let line = format!("    {}", words.join(" "));
+        let l = lay_out(&format!("```\n{line}\n```\n"), &p);
+        let runs: Vec<TextRun> = l.text().iter().flatten().cloned().collect();
+        assert!(runs.len() >= 2, "{runs:?}");
+        assert_eq!(runs[0].col, 2);
+        assert!(runs[0].text.starts_with("    w10 w11"));
+        for r in &runs[1..] {
+            assert_eq!(r.col, 6, "{g:?}: continuation at the indent: {runs:?}");
+            assert!(r.text.starts_with('w'));
+        }
+        for r in &runs {
+            let end = usize::from(r.col) + unicode_width::UnicodeWidthStr::width(r.text.as_str());
+            assert!(end <= 2 + cells, "{g:?}: {r:?} past the wrap width");
+        }
+        let parts: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_on_grid(&l, &p, &parts);
+    }
+}
+
+#[test]
+fn code_grid_origin_and_width() {
+    // Top level at f=26 / 16 px cells: panel at 16, pad 20 → text at 32.
+    assert_eq!(super::code_grid(16.0, 448.0, 20.0, 16), (32.0, 400.0));
+    // Proportional enclosing indent: rounded to the nearest cell...
+    assert_eq!(super::code_grid(62.0, 400.0, 20.0, 16), (80.0, 352.0));
+    // ...but never less than half a cell inside the panel.
+    assert_eq!(super::code_grid(41.0, 400.0, 0.0, 16), (64.0, 368.0));
+    assert_eq!(super::code_grid(40.0, 400.0, 0.0, 16), (48.0, 384.0));
+    // At least one cell wide.
+    assert_eq!(super::code_grid(16.0, 10.0, 20.0, 16), (32.0, 16.0));
+}
+
+#[test]
+fn inline_code_in_paragraphs_is_unchanged() {
+    // Inline code keeps its natural (proportional-context) advances.
+    let p = grid_params(80, GRIDS[0]);
+    let l = lay_out("a `xxxxxxxxxx` b", &p);
+    let xs: Vec<i32> = glyph_pens(&l).iter().map(|g| g.0).collect();
+    let steps: Vec<i32> = xs.windows(2).skip(1).take(8).map(|w| w[1] - w[0]).collect();
+    assert!(steps.iter().any(|&d| d != 16), "{steps:?}");
+}
+
+#[test]
+fn mono_family_picks_the_terminal_font() {
+    let mut r = Renderer::hermetic();
+    let mut p = grid_params(60, GRIDS[0]);
+    let src = "Text `inline`.\n\n```\nabc \u{4e2d} xyz\n```\n";
+    let default = r.render(src, &p).unwrap();
+    assert_eq!(r.cache.mono_family(), "Fira Mono");
+    // A family the database has (any face, even a proportional one, is
+    // forced onto the grid).
+    p.mono_family = Some("noto sans".into());
+    let l = r.layout(src, &p).unwrap();
+    assert_eq!(r.cache.mono_family(), "Noto Sans");
+    assert_on_grid(&l, &p, &["abc \u{4e2d} xyz"]);
+    let noto = r.render(src, &p).unwrap();
+    assert_ne!(noto.image, default.image);
+    assert_eq!(noto.text, default.text);
+    // Back to the default: the shaped cache was not reused across faces.
+    p.mono_family = None;
+    assert_eq!(r.render(src, &p).unwrap(), default);
+    // Unknown family: falls back to the default face, same output.
+    p.mono_family = Some("No Such Mono".into());
+    assert_eq!(r.render(src, &p).unwrap(), default);
+    assert_eq!(r.cache.mono_family(), "Fira Mono");
+    p.mono_family = Some("Fira Mono".into());
+    assert_eq!(r.render(src, &p).unwrap(), default);
+}
+
+/// Every run of `l` that is a piece of one of the `code` lines and
+/// whose text occurs once is on the grid.
+fn assert_all_code_on_grid(l: &crate::BlockLayout, p: &LayoutParams, code: &[&str]) {
+    let texts: Vec<String> = l
+        .text()
+        .iter()
+        .flatten()
+        .map(|t| t.text.clone())
+        .filter(|t| code.iter().any(|c| c.contains(t.as_str())))
+        .collect();
+    let unique: Vec<&str> = texts
+        .iter()
+        .filter(|t| texts.iter().filter(|u| u == t).count() == 1)
+        .map(String::as_str)
+        .collect();
+    assert!(!unique.is_empty());
+    assert_on_grid(l, p, &unique);
+}
+
+#[test]
+fn combining_marks_stay_in_their_cell() {
+    // Precomposable (é) and stacked marks (ạ̈), and a mark after a CJK char.
+    let line = "e\u{301}x a\u{308}\u{323}b \u{4e2d}\u{301}z";
+    for g in GRIDS {
+        let p = grid_params(60, g);
+        let l = lay_out(&format!("```\n{line}\n```\n"), &p);
+        assert_eq!(assert_on_grid(&l, &p, &[line]), vec![2]);
+        assert_eq!(super::grid::text_cells(line), 9);
+    }
+}
+
+#[test]
+fn emoji_sequences_take_their_cluster_width() {
+    // VS16 emoji presentation (2 cells), a ZWJ family (2), a flag (2),
+    // a text-presentation heart (1).
+    let line = "x\u{2764}\u{fe0f}y \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}z \u{1f1e8}\u{1f1e6}! \u{2764}w";
+    for g in GRIDS {
+        let (_, cw, _) = g;
+        let p = grid_params(60, g);
+        let l = lay_out(&format!("```\n{line}\n```\n"), &p);
+        assert_on_grid(&l, &p, &[line]);
+        // `y` right after the 2-cell heart, `z` right after the 2-cell
+        // family (not 6 cells on), `w` after the 1-cell text heart.
+        let (row, col) = find_run(&l, line);
+        let xs: Vec<i32> = glyph_pens(&l)
+            .iter()
+            .filter(|(_, y, _)| super::grid::row_of(*y as f32, p.cell_h) == row)
+            .map(|g| g.0)
+            .collect();
+        let at = |c: u16| (i32::from(col) + i32::from(c)) * cw as i32;
+        for c in [0, 1, 3, 5, 7, 9, 11, 13, 14] {
+            assert!(xs.contains(&at(c)), "{g:?}: nothing at col +{c}: {xs:?}");
+        }
+        assert_eq!(super::grid::text_cells(line), 15);
+    }
+}
+
+#[test]
+fn zero_width_chars_take_no_cell() {
+    let line = "a\u{200b}b\u{200d}c\u{2060}d";
+    for g in GRIDS {
+        let p = grid_params(40, g);
+        let l = lay_out(&format!("```\n{line}\n```\n"), &p);
+        assert_on_grid(&l, &p, &[line]);
+        assert_eq!(super::grid::text_cells(line), 4);
+    }
+}
+
+#[test]
+fn very_narrow_panels_stay_on_the_grid() {
+    // No code character occurs in the list item's text ("item").
+    let code = ["abc dfg", "x\u{4e2d}y \u{2764}\u{fe0f}!", "fn xy() {}"];
+    let src = format!(
+        "- item\n\n  ```\n  {}\n  {}\n  ```\n\n```\n{}\n```\n",
+        code[0], code[1], code[2]
+    );
+    for g in GRIDS {
+        for cols in 1..=9 {
+            let p = grid_params(cols, g);
+            let b = render_with(&src, &p);
+            assert!(b.rows >= 2, "{cols} {g:?}");
+            let l = lay_out(&src, &p);
+            assert_all_code_on_grid(&l, &p, &code);
+        }
+    }
+}
+
+#[test]
+fn ligature_fonts_stay_on_the_grid() {
+    // Needs an installed font with programming ligatures; skipped
+    // otherwise (like `system_renderer_smoke`, it uses system fonts).
+    //
+    // Fonts like Fira Code, JetBrains Mono and Cascadia draw `->` etc.
+    // as contextual alternates, one glyph per character, so this checks
+    // that substituted glyphs stay on the grid. A real font that maps
+    // one glyph onto several grapheme clusters wasn't available to test
+    // (JetBrains Mono: 0 such glyphs); that path of `snap_to_cells` is
+    // covered only by the synthetic
+    // `inline::tests::graphemes_split_over_shaping_clusters_are_one_unit`.
+    // The count is printed so a font that does it shows up here.
+    let mut r = Renderer::new();
+    let candidates = [
+        "Fira Code",
+        "JetBrains Mono",
+        "JetBrainsMono Nerd Font",
+        "Cascadia Code",
+        "Iosevka",
+        "Hasklig",
+    ];
+    let line = "a->b != c === d <= e |> f :: g www ==> h";
+    let mut tried = 0;
+    for family in candidates {
+        let p = LayoutParams {
+            mono_family: Some(family.into()),
+            ..grid_params(80, GRIDS[0])
+        };
+        let l = r.layout(&format!("```\n{line}\n```\n"), &p).unwrap();
+        if !r.cache.mono_family().eq_ignore_ascii_case(family) {
+            continue;
+        }
+        tried += 1;
+        let ligatures = multi_grapheme_glyphs(&mut r, line, &p);
+        eprintln!("ligature_fonts_stay_on_the_grid: {family}: {ligatures} multi-cluster glyphs");
+        assert_on_grid(&l, &p, &[line]);
+    }
+    if tried == 0 {
+        eprintln!("ligature_fonts_stay_on_the_grid: no ligature font installed, skipped");
+    }
+}
+
+/// Glyphs of `line`, shaped as a code-block line with `r`'s current
+/// fonts, that cover more than one grapheme cluster.
+fn multi_grapheme_glyphs(r: &mut Renderer, line: &str, p: &LayoutParams) -> usize {
+    let span = super::inline::SpanInfo {
+        mono: true,
+        size: p.font_px,
+        bold: false,
+        italic: false,
+        color: [255; 4],
+        underline: false,
+        strike: false,
+        boxed: super::inline::Boxed::None,
+        bg: [0; 4],
+        rise: 0.0,
+        link: None,
+    };
+    let mut para = super::inline::Para::default();
+    para.text(line, span);
+    para.grid = Some(p.cell_w);
+    super::inline::Shaped::new(&mut r.fonts, &r.cache.fonts, &para).multi_grapheme_glyphs()
+}
+
+// ---------------------------------------------------------------------
+// Vertical grid snapping: every line sits on whole terminal rows.
+
+/// Layout parameters as the terminal computes them for font size `f`:
+/// cell height `round(1.2 f)` (`DEFAULT_LINE_HEIGHT_RATIO`) and cell
+/// width the rounded advance of the bundled Fira Mono (0.6 em).
+fn term_params(cols: u16, f: f32) -> LayoutParams {
+    LayoutParams {
+        cols,
+        cell_w: ((f * 0.6).round() as u32).max(1),
+        cell_h: ((f * 1.2).round() as u32).max(1),
+        font_px: f,
+        ..params(cols)
+    }
+}
+
+/// Every element type, with edge cases (code / tables / rules first and
+/// last in their containers, wrapping, tall inline rasters).
+fn grid_doc() -> String {
+    let img = data_png(40, 50, [20, 160, 60, 255]);
+    format!(
+        "```\ncode first\n```\n\n\
+# Heading one that is long enough to wrap at narrow widths\n\n\
+Paragraph text that wraps over several lines at most widths, with *italic*, **bold**, \
+`inline code`, ~~struck~~ and [a link](https://example.com) that can wrap too.  \nA hard \
+break, a footnote[^n] and inline maths $a^2+b^2=c^2$ mid line.\n\n\
+## Heading two\n### Heading three\n#### Heading four\n##### Heading five\n###### Heading six\n\n\
+Setext heading\n==============\n\n\
+- tight one\n- tight two\n  - nested tight\n    - deeper\n- three\n\n\
+1. loose one\n\n2. loose two\n\n   with a second paragraph\n\n3. ```\n   code in an item\n   ```\n\n\
+- [x] done\n- [ ] todo\n\n\
+> quoted text\n>\n> > nested quote\n> > ```\n> > code in a quote\n> > ```\n\n\
+> [!NOTE]\n> Alert body.\n\n\
+```rust\nfn main() {{\n    let x = 1;\n\n    // a long comment line that wraps when the window is narrow enough\n    println!(\"{{x}}\");\n}}\n```\n\
+```\nback to back\n```\n\n\
+| Column | Other | Maths |\n|:--|--:|:-:|\n| a | b | $x^2$ |\n| a cell long enough to wrap in a narrow table | d | e |\n\n\
+---\n\n\
+Display maths in a paragraph $$\\sum_i x_i$$ then text.\n\n\
+$$\nE = mc^2\n$$\n\n\
+```math\n\\int_0^1 x\\,dx\n```\n\n\
+Inline image ![pic]({img}) in text, and alone:\n\n![alone]({img})\n\n\
+```mermaid\ngraph TD\n  A-->B\n  B-->C\n```\n\n\
+```mermaid\nbad diagram\n```\n\n\
+<div>raw html</div>\n\n\
+[^n]: The footnote text.\n\n\
+---\n"
+    )
+}
+
+/// A fake diagram whose height is not a whole number of rows.
+fn odd_mermaid(src: &str, max_w: u32, _f: f32, _t: &Theme) -> Result<Raster, String> {
+    if src.contains("bad") {
+        return Err("parse error".into());
+    }
+    Ok(solid(max_w.min(300), 157, None))
+}
+
+thread_local! {
+    static GRID_RENDERER: std::cell::RefCell<Renderer> = std::cell::RefCell::new({
+        let mut r = Renderer::hermetic();
+        r.cache.math = blob_math;
+        r.cache.mermaid = super::MermaidBackend::Fake(odd_mermaid);
+        r
+    });
+}
+
+fn grid_layout(md: &str, p: &LayoutParams) -> super::Laid {
+    grid_layout_with(blob_math, md, p)
+}
+
+fn grid_layout_with(math: super::MathFn, md: &str, p: &LayoutParams) -> super::Laid {
+    GRID_RENDERER.with(|r| {
+        let r = &mut *r.borrow_mut();
+        r.cache.math = math;
+        let laid = super::layout(&mut r.fonts, &mut r.cache, md, p);
+        r.cache.math = blob_math;
+        laid
+    })
+}
+
+/// Vertical ink extent of a glyph op whose baseline is `y` (`None` for
+/// a blank glyph).
+fn glyph_ink(key: cosmic_text::CacheKey, y: i32) -> Option<(f32, f32)> {
+    GRID_RENDERER.with(|r| {
+        let r = &mut *r.borrow_mut();
+        let p = r
+            .cache
+            .swash
+            .get_image(&mut r.fonts, key)
+            .as_ref()?
+            .placement;
+        (p.height > 0).then(|| {
+            let top = (y - p.top) as f32;
+            (top, top + p.height as f32)
+        })
+    })
+}
+
+/// Assert the grid invariants on a layout; returns its line boxes.
+fn check_grid(laid: &super::Laid, p: &LayoutParams) -> Vec<super::LineBox> {
+    let ch = p.cell_h as f32;
+    let ctx = format!(
+        "f {} cell {}x{} cols {}",
+        p.font_px, p.cell_w, p.cell_h, p.cols
+    );
+    let rows = usize::from(laid.rows);
+    assert_eq!(laid.height, laid.cell_h * u32::from(laid.rows), "{ctx}");
+    assert_eq!(laid.text.len(), rows, "{ctx}");
+    // Lines that fit (the rest were cut off by truncation).
+    let text_rows = laid.text_rows as f32 * ch;
+    let boxes: Vec<_> = laid
+        .boxes
+        .iter()
+        .filter(|b| b.top + b.h <= text_rows)
+        .cloned()
+        .collect();
+    assert!(!boxes.is_empty(), "{ctx}");
+    let mut owner: Vec<Option<usize>> = vec![None; rows];
+    for (i, b) in boxes.iter().enumerate() {
+        let what = format!("{ctx}: {b:?}");
+        // Whole rows, from a row boundary.
+        assert_eq!(b.top % ch, 0.0, "line top off the grid: {what}");
+        assert_eq!(b.h % ch, 0.0, "line height not whole rows: {what}");
+        assert!(b.h >= ch, "{what}");
+        // The text is reported on a row inside the line.
+        let r = super::grid::row_of(b.base, p.cell_h);
+        let (r0, r1) = ((b.top / ch) as usize, ((b.top + b.h) / ch) as usize);
+        assert!(
+            r0 <= r && r < r1,
+            "baseline row {r} outside rows {r0}..{r1}: {what}"
+        );
+        if !b.text.is_empty() {
+            assert!(
+                laid.text[r].iter().any(|t| t.text.contains(&b.text)),
+                "row {r} text {:?} lacks the line drawn there: {what}",
+                laid.text[r]
+            );
+        }
+        // No row is shared by two lines, except lines of different
+        // cells of one table row, and a diagram with its source lines.
+        for (row, o) in owner.iter_mut().enumerate().take(r1).skip(r0) {
+            if let Some(j) = *o {
+                let other = &boxes[j];
+                let cells = b.kind == "cell" && other.kind == "cell" && b.cell != other.cell;
+                let diagram = b.kind == "diagram" || other.kind == "diagram";
+                assert!(
+                    b.group == other.group && (cells || diagram),
+                    "row {row} shared by {other:?} and {what}"
+                );
+            }
+            *o = Some(i);
+        }
+    }
+    // Every row with text got it from a line on that row.
+    for (r, runs) in laid.text.iter().enumerate().take(laid.text_rows as usize) {
+        if !runs.is_empty() {
+            assert!(
+                boxes
+                    .iter()
+                    .any(|b| super::grid::row_of(b.base, p.cell_h) == r),
+                "{ctx}: row {r} has text {runs:?} but no line"
+            );
+        }
+    }
+    // Code lines: one row each, on consecutive rows.
+    let mut code = std::collections::BTreeMap::<usize, Vec<&super::LineBox>>::new();
+    for b in boxes.iter().filter(|b| b.kind == "code") {
+        assert_eq!(b.h, ch, "{ctx}: code line taller than a row: {b:?}");
+        code.entry(b.group).or_default().push(b);
+    }
+    for lines in code.values() {
+        for w in lines.windows(2) {
+            assert_eq!(w[1].top, w[0].top + ch, "{ctx}: gap in code {w:?}");
+        }
+    }
+    // Ink: every glyph's baseline is in a line, and its ink stays in the
+    // block and (but for a little descender / accent overhang) in that
+    // line's rows. Rasters and inline code boxes stay inside their line
+    // exactly.
+    let height = laid.height as f32;
+    let line_of = |y: f32| {
+        laid.boxes
+            .iter()
+            .find(|b| b.kind != "diagram" && b.top <= y && y <= b.top + b.h)
+    };
+    let code_bg = Palette::new(&p.theme).inline_code_bg;
+    let slop = 0.2 * ch;
+    for op in &laid.ops {
+        match op {
+            // Rows from `text_rows` down are cleared (truncation).
+            super::paint::Op::Glyph { y, .. } if *y as f32 >= text_rows => {}
+            super::paint::Op::Glyph { key, y, .. } => {
+                let b = line_of(*y as f32)
+                    .unwrap_or_else(|| panic!("{ctx}: glyph at y {y} outside every line"));
+                if let Some((t, btm)) = glyph_ink(*key, *y) {
+                    assert!(
+                        t >= 0.0 && btm <= height,
+                        "{ctx}: glyph ink {t}..{btm} outside the block (0..{height})"
+                    );
+                    assert!(
+                        t >= b.top - slop && btm <= b.top + b.h + slop,
+                        "{ctx}: glyph ink {t}..{btm} spills out of {b:?}"
+                    );
+                }
+            }
+            super::paint::Op::Image { y, h, .. } => {
+                assert!(
+                    *y >= 0.0 && y + h <= height,
+                    "{ctx}: raster {y}+{h} outside the block (0..{height})"
+                );
+                assert!(
+                    boxes.iter().any(|b| b.top <= *y && y + h <= b.top + b.h),
+                    "{ctx}: raster {y}+{h} not inside a line"
+                );
+            }
+            super::paint::Op::Rect { y, h, color, .. } if *color == code_bg => {
+                let b = line_of(y + h / 2.0).expect("inline code box in a line");
+                assert!(
+                    *y >= b.top && y + h <= b.top + b.h,
+                    "{ctx}: inline code box {y}+{h} outside {b:?}"
+                );
+            }
+            _ => {}
+        }
+    }
+    boxes
+}
+
+#[test]
+fn lines_snap_to_the_row_grid_at_every_font_size() {
+    let doc = grid_doc();
+    for f in 10..=40 {
+        for cols in [80, 31] {
+            let p = term_params(cols, f as f32);
+            check_grid(&grid_layout(&doc, &p), &p);
+        }
+    }
+}
+
+#[test]
+fn lines_snap_to_odd_cell_sizes() {
+    let doc = grid_doc();
+    // (font px, cell w, cell h): realistic pairs, the golden params and
+    // cells much taller than the font.
+    for (f, w, h) in [
+        (13.0, 8, 19),
+        (16.0, 10, 22),
+        (16.0, 10, 30),
+        (17.0, 10, 20),
+        (20.0, 12, 24),
+        (26.0, 16, 31),
+        (32.0, 20, 44),
+        (11.5, 7, 14),
+    ] {
+        for cols in [100, 40] {
+            let p = LayoutParams {
+                cell_w: w,
+                cell_h: h,
+                font_px: f,
+                ..params(cols)
+            };
+            check_grid(&grid_layout(&doc, &p), &p);
+        }
+    }
+}
+
+#[test]
+fn truncated_blocks_keep_the_grid() {
+    let doc = grid_doc();
+    for max_rows in [5, 17, 40] {
+        let mut p = term_params(60, 26.0);
+        p.max_rows = max_rows;
+        let laid = grid_layout(&doc, &p);
+        assert_eq!(laid.rows, max_rows);
+        check_grid(&laid, &p);
+        let last = &laid.text[usize::from(max_rows) - 1];
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].text, "\u{2026} truncated");
+    }
+}
+
+#[test]
+fn body_and_code_lines_are_one_row_each() {
+    for f in [13.0, 16.0, 26.0] {
+        let p = term_params(30, f);
+        let ch = p.cell_h as f32;
+        let laid = grid_layout(
+            "Body text long enough to wrap over a few rows here.\n\n```\na\n\nb\nc\n```\n\nafter",
+            &p,
+        );
+        let boxes = check_grid(&laid, &p);
+        assert!(boxes.iter().all(|b| b.h == ch), "{boxes:?}");
+        let para: Vec<_> = boxes.iter().filter(|b| b.kind == "text").collect();
+        let code: Vec<_> = boxes.iter().filter(|b| b.kind == "code").collect();
+        assert!(para.len() >= 3, "{para:?}");
+        // Consecutive rows from row 0.
+        for (i, b) in para[..para.len() - 1].iter().enumerate() {
+            assert_eq!(b.top, i as f32 * ch);
+        }
+        // One padding row (with the panel edge) between the paragraph and
+        // the code, the blank line kept as an empty row, one padding row
+        // after.
+        let last = para[para.len() - 2];
+        assert_eq!(code[0].top, last.top + 2.0 * ch);
+        let texts: Vec<&str> = code.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(texts, ["a", "", "b", "c"]);
+        assert_eq!(para[para.len() - 1].top, code[3].top + 2.0 * ch);
+        // Plus a row for the last line's descenders when they hang below.
+        let last = para[para.len() - 1].top + ch;
+        assert!(laid.rows as f32 * ch == last || laid.rows as f32 * ch == last + ch);
+        // The panel covers the code rows and half of each padding row.
+        let panel = laid
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                super::paint::Op::Rect { y, h, color, .. }
+                    if *color == Palette::new(&Theme::default()).code_bg =>
+                {
+                    Some((*y, *h))
+                }
+                _ => None,
+            })
+            .expect("code panel");
+        assert!(
+            panel.0 > code[0].top - ch && panel.0 < code[0].top,
+            "{panel:?}"
+        );
+        let bottom = panel.0 + panel.1;
+        assert!(bottom > code[3].top + ch && bottom < code[3].top + 2.0 * ch);
+    }
+}
+
+#[test]
+fn code_baseline_matches_the_terminal_cell() {
+    // The terminal centres the mono font's ascent + descent box in the
+    // cell (cosmic-text's line layout); code lines do the same.
+    for f in 10..=40 {
+        let p = term_params(40, f as f32);
+        let laid = grid_layout("```\nx\n```", &p);
+        let b = &laid.boxes[0];
+        let fonts = RENDERER.with(|r| r.borrow().cache.fonts.mono.metrics);
+        let (asc, desc) = (fonts.ascent * f as f32, fonts.descent * f as f32);
+        let term = (p.cell_h as f32 - (asc + desc)) / 2.0 + asc;
+        assert!(
+            (b.base - b.top - term).abs() <= 0.5,
+            "f {f}: base {} vs terminal {term}",
+            b.base - b.top
+        );
+    }
+}
+
+#[test]
+fn headings_take_whole_rows_and_spacing_is_whole_rows() {
+    let p = term_params(80, 16.0);
+    let ch = p.cell_h as f32;
+    let laid = grid_layout(
+        "para\n\n# One\n\npara\n\n## Two\n### Three\n\n#### Four\n\npara\n\n---\n\npara",
+        &p,
+    );
+    let boxes = check_grid(&laid, &p);
+    let row = |t: &str| {
+        let b = boxes.iter().find(|b| b.text == t).unwrap();
+        ((b.top / ch) as usize, (b.h / ch) as usize)
+    };
+    // para; blank; H1 (2 rows); underline row; para; blank; H2 (2 rows);
+    // underline row; H3 (2 rows); blank; H4 (1 row); blank; para; rule (2
+    // rows); para.
+    assert_eq!(row("One"), (2, 2));
+    let paras: Vec<usize> = boxes
+        .iter()
+        .filter(|b| b.text == "para")
+        .map(|b| (b.top / ch) as usize)
+        .collect();
+    assert_eq!(paras, [0, 5, 15, 18]);
+    assert_eq!(row("Two"), (7, 2));
+    assert_eq!(row("Three"), (10, 2));
+    assert_eq!(row("Four"), (13, 1));
+    assert_eq!(laid.rows, 19);
+    // The underlines sit in their own rows; the rule on the line between
+    // its two rows.
+    let rects: Vec<(f32, Rgba)> = laid
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            super::paint::Op::Rect { y, color, .. } => Some((*y, *color)),
+            _ => None,
+        })
+        .collect();
+    let pal = Palette::new(&Theme::default());
+    let rows_of = |c: Rgba| -> Vec<usize> {
+        rects
+            .iter()
+            .filter(|r| r.1 == c)
+            .map(|r| (r.0 / ch) as usize)
+            .collect()
+    };
+    assert_eq!(rows_of(pal.border), [4, 9]);
+    let rule = rects.iter().find(|r| r.1 == pal.rule).unwrap().0;
+    assert!((rule - 17.0 * ch).abs() <= 2.0, "rule at {rule}");
+    // Below a code panel a heading keeps a blank row.
+    let laid = grid_layout("```\nx\n```\n## After", &p);
+    let boxes = check_grid(&laid, &p);
+    assert_eq!(boxes[1].text, "After");
+    assert_eq!(boxes[1].top, 4.0 * ch, "{boxes:?}");
+}
+
+#[test]
+fn tall_inline_rasters_add_whole_rows() {
+    fn tall(_: &str, _: bool, f: f32, _: Rgba) -> Result<Raster, String> {
+        // 3 em tall, baseline in the middle: overhangs above and below.
+        let h = (f * 3.0) as u32;
+        Ok(solid(20, h, Some(h / 2)))
+    }
+    for f in [13.0, 16.0, 26.0] {
+        let p = term_params(80, f);
+        let ch = p.cell_h as f32;
+        let laid = grid_layout_with(tall, "before\n\nab $x$ cd\n\nafter", &p);
+        let boxes = check_grid(&laid, &p);
+        let line = boxes.iter().find(|b| b.text.contains("$x$")).unwrap();
+        assert!(line.h >= 3.0 * ch, "{line:?}");
+        // The text sits in its row where a body line would put it.
+        let tb = (line.base - line.top) % ch;
+        let plain = boxes.iter().find(|b| b.text == "before").unwrap();
+        assert_eq!(tb, plain.base - plain.top);
+        // The raster is inside the line.
+        let img = laid
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                super::paint::Op::Image { y, h, .. } => Some((*y, *h)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            img.0 >= line.top && img.0 + img.1 <= line.top + line.h,
+            "{img:?} {line:?}"
+        );
+    }
+}
+
+#[test]
+fn rasters_on_the_first_line_are_not_clipped() {
+    // Images just taller than the text's ascent, on the block's first
+    // line (they used to reach above y = 0) and on later lines.
+    for (f, cw, ch) in [
+        (16.0, 10, 19),
+        (13.0, 8, 16),
+        (16.0, 10, 22),
+        (26.0, 16, 31),
+    ] {
+        let p = LayoutParams {
+            cell_w: cw,
+            cell_h: ch,
+            font_px: f,
+            ..params(60)
+        };
+        for h in 10..=40 {
+            let img = data_png(30, h, [200, 40, 40, 255]);
+            let md = format!("![a]({img}) text\n\nmore ![b]({img}) text and more text\n");
+            check_grid(&grid_layout(&md, &p), &p);
+        }
+    }
+}
+
+#[test]
+fn body_text_has_no_trailing_row_at_terminal_cell_sizes() {
+    for f in 10..=72 {
+        let p = term_params(60, f as f32);
+        let ctx = format!("f {f} cell {}", p.cell_h);
+        // Descenders need no extra row at 1x sizes (bigger ones may).
+        if f <= 26 {
+            assert_eq!(grid_layout("para", &p).rows, 1, "{ctx}");
+        }
+        assert_eq!(grid_layout("a lot of text", &p).rows, 1, "{ctx}");
+        assert_eq!(grid_layout("- a\n- b", &p).rows, 2, "{ctx}");
+        assert_eq!(grid_layout("one\n\ntwo `code`", &p).rows, 3, "{ctx}");
+    }
+}
+
+#[test]
+fn table_body_rows_are_one_row_each() {
+    let pal = Palette::new(&Theme::default());
+    for f in [13.0, 16.0, 26.0] {
+        let p = term_params(60, f);
+        let ch = p.cell_h as f32;
+        let laid = grid_layout(
+            "| a | b |\n|--|--|\n| 1 | 2 |\n| 3 | 4 |\n| 5 | 6 |\n| 7 | 8 |\n",
+            &p,
+        );
+        check_grid(&laid, &p);
+        // Padding row, header, border row, 4 body rows, padding row.
+        assert_eq!(laid.rows, 8);
+        let rows: Vec<&str> = laid
+            .text
+            .iter()
+            .map(|r| r.first().map_or("", |t| t.text.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            ["", "a | b", "", "1 | 2", "3 | 4", "5 | 6", "7 | 8", ""]
+        );
+        // Three horizontal borders, each through the middle of its row.
+        let borders: Vec<f32> = laid
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                super::paint::Op::Rect { y, w, color, .. } if *color == pal.border && *w > 20.0 => {
+                    Some(*y)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(borders.len(), 3, "{borders:?}");
+        for (by, row) in borders.iter().zip([0.0, 2.0, 7.0]) {
+            assert!((by - (row + 0.5) * ch).abs() <= 1.0, "{borders:?}");
+        }
+        // Stripes on the 2nd and 4th body rows, the last reaching the
+        // bottom border.
+        let stripes: Vec<(f32, f32)> = laid
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                super::paint::Op::Rect { y, h, color, .. } if *color == pal.table_stripe_bg => {
+                    Some((*y, *h))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stripes.len(), 2);
+        assert_eq!(stripes[0], (4.0 * ch, ch));
+        assert_eq!(stripes[1].0, 6.0 * ch);
+        assert!((stripes[1].0 + stripes[1].1 - borders[2]).abs() < 0.5);
+    }
+}
+
+#[test]
+fn rules_next_to_panels_are_centred() {
+    let pal = Palette::new(&Theme::default());
+    for f in [13.0, 16.0, 26.0] {
+        let p = term_params(60, f);
+        let ch = p.cell_h as f32;
+        for md in [
+            "para\n\n---\n\npara",
+            "| a |\n|--|\n| b |\n\n---\n\npara",
+            "para\n\n---\n\n```\nx\n```",
+            "```\nx\n```\n\n---\n\n```\ny\n```",
+        ] {
+            let laid = grid_layout(md, &p);
+            check_grid(&laid, &p);
+            let rects: Vec<(f32, f32, Rgba)> = laid
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    super::paint::Op::Rect { y, h, color, .. } => Some((*y, *h, *color)),
+                    _ => None,
+                })
+                .collect();
+            let rule = rects.iter().find(|r| r.2 == pal.rule).unwrap();
+            let mid = rule.0 + rule.1 / 2.0;
+            // The nearest visible edge above / below: a panel edge or
+            // border line, else the neighbouring text line's row edge.
+            let edges: Vec<f32> = rects
+                .iter()
+                .filter(|r| r.2 == pal.code_bg || r.2 == pal.border)
+                .flat_map(|r| [r.0, r.0 + r.1])
+                .chain(laid.boxes.iter().flat_map(|b| [b.top, b.top + b.h]))
+                .collect();
+            let above = edges
+                .iter()
+                .filter(|&&e| e < mid)
+                .fold(f32::MIN, |a, &e| a.max(e));
+            let below = edges
+                .iter()
+                .filter(|&&e| e > mid)
+                .fold(f32::MAX, |a, &e| a.min(e));
+            let (up, down) = (mid - above, below - mid);
+            assert!(
+                (up - down).abs() <= 2.0 && up >= ch,
+                "{md:?} f {f}: {up} px to the edge above, {down} px below"
+            );
+        }
+    }
+}
+
+#[test]
+fn last_line_descenders_are_not_clipped() {
+    // Documents ending in descenders, in every context a last line can
+    // be in, at every size up to 3x zoom: no ink below the block.
+    let docs = [
+        "gjpqy",
+        "- gjpqy",
+        "1. gjpqy",
+        "> gjpqy",
+        "> > gjpqy",
+        "*gjpqy*",
+        "**gjpqy**",
+        "[gjpqy](u)",
+        "`gjpqy`",
+        "### gjpqy",
+        "###### gjpqy",
+        "| a |\n|--|\n| gjpqy |",
+        "x[^1]\n\n[^1]: gjpqy",
+        // A footnote reference on the first line stays inside the block.
+        "[^1]x\n\n[^1]: gjpqy",
+        "- [ ] gjpqy",
+    ];
+    for f in 10..=72 {
+        let p = term_params(60, f as f32);
+        for md in docs {
+            let laid = grid_layout(md, &p);
+            check_grid(&laid, &p);
+            let height = laid.height as f32;
+            for op in &laid.ops {
+                match op {
+                    super::paint::Op::Glyph { key, y, .. } => {
+                        if let Some((_, bottom)) = glyph_ink(*key, *y) {
+                            assert!(
+                                bottom <= height,
+                                "{md:?} f {f}: ink to {bottom} of {height}"
+                            );
+                        }
+                    }
+                    super::paint::Op::Rect { y, h, .. } => {
+                        assert!(
+                            y + h <= height,
+                            "{md:?} f {f}: rect to {} of {height}",
+                            y + h
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rule_nudge_looks_into_lists() {
+    let pal = Palette::new(&Theme::default());
+    let p = term_params(60, 16.0);
+    let ch = p.cell_h as f32;
+    // Where the (last) rule's middle sits in its row, in rows.
+    let rule_at = |md: &str| {
+        let laid = grid_layout(md, &p);
+        check_grid(&laid, &p);
+        let (y, h) = laid
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                super::paint::Op::Rect { y, h, color, .. } if *color == pal.rule => Some((*y, *h)),
+                _ => None,
+            })
+            .next_back()
+            .unwrap();
+        ((y + h / 2.0) % ch) / ch
+    };
+    // A list ending in a heading or a rule has no panel edge: the rule
+    // stays on the line between its rows.
+    for md in ["- # Big\n\n---", "- item\n\n  ***\n\n---", "---\n\n- # Big"] {
+        let at = rule_at(md);
+        assert!(!(0.1..=0.9).contains(&at), "{md:?}: rule at {at}");
+    }
+    // A list ending / starting with a code block does: nudged a quarter row.
+    let at = rule_at("- x\n\n  ```\n  y\n  ```\n\n---");
+    assert!((at - 0.75).abs() < 0.1, "after a list's code panel: {at}");
+    let at = rule_at("---\n\n- ```\n  y\n  ```");
+    assert!((at - 0.25).abs() < 0.1, "before a list's code panel: {at}");
+    // A heading after a list ending in an H2 keeps the underline row as
+    // its margin; after a list ending in code it gets a blank row.
+    let top_of = |md: &str| {
+        let laid = grid_layout(md, &p);
+        let b = laid.boxes.iter().find(|b| b.text == "After").unwrap();
+        b.top / ch
+    };
+    let h2 = top_of("- ## Big\n\n## After");
+    let code = top_of("- ```\n  y\n  ```\n\n## After");
+    assert_eq!(h2, 3.0, "two heading rows + underline row");
+    assert_eq!(code, 4.0, "padding row, code, padding row, blank row");
 }

@@ -11,7 +11,10 @@ use cosmic_text::{
     Wrap, fontdb,
 };
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use super::fonts::Fonts;
+use super::grid::grapheme_cells;
 use super::paint::{Op, Src};
 use crate::Rgba;
 
@@ -70,6 +73,11 @@ pub(crate) enum Piece {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Para {
     pub pieces: Vec<Piece>,
+    /// Lay the text on a cell grid this many pixels wide (code blocks):
+    /// every grapheme cluster advances exactly `cell_w` per terminal
+    /// cell it takes (see [`grapheme_cells`]), so it lands on the same
+    /// column the terminal writes it into.
+    pub grid: Option<u32>,
 }
 
 impl Para {
@@ -87,6 +95,68 @@ impl Para {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.pieces.is_empty()
+    }
+}
+
+/// Force each cluster of `glyphs` to advance exactly `cell_w` times
+/// the cells the terminal gives its text, the way the terminal's
+/// cluster-width snap does for its own text. A unit is a run of glyphs
+/// whose source ranges touch the same grapheme clusters (a shaping
+/// cluster, a ligature over several graphemes, or a grapheme the shaper
+/// split over several glyphs); it takes the sum of its graphemes'
+/// [`grapheme_cells`]. The whole advance goes on the unit's first glyph
+/// and the others keep their shaped offsets from the unit start (scaled
+/// to the new width) with no advance of their own, so pen positions stay
+/// whole cells and a line break can never split a unit.
+fn snap_to_cells(glyphs: &mut [Glyph], text: &str, cell_w: f32) {
+    let (Some(lo), Some(hi)) = (
+        glyphs.iter().map(|g| g.start).min(),
+        glyphs.iter().map(|g| g.end).max(),
+    ) else {
+        return;
+    };
+    let Some(src) = text.get(lo..hi) else {
+        return;
+    };
+    // (start byte, cells) of each grapheme in `lo..hi`.
+    let graphemes: Vec<(usize, u32)> = src
+        .grapheme_indices(true)
+        .map(|(i, g)| (lo + i, grapheme_cells(g)))
+        .collect();
+    let index = |b: usize| graphemes.partition_point(|g| g.0 <= b).saturating_sub(1);
+    let span = |g: &Glyph| (index(g.start), index(g.end.saturating_sub(1).max(g.start)));
+    let mut i = 0;
+    while i < glyphs.len() {
+        let (mut a, mut b) = span(&glyphs[i]);
+        let mut j = i + 1;
+        while j < glyphs.len() {
+            let (s, e) = span(&glyphs[j]);
+            if s > b || e < a {
+                break;
+            }
+            (a, b) = (a.min(s), b.max(e));
+            j += 1;
+        }
+        let cells: u32 = graphemes[a..=b].iter().map(|g| g.1).sum();
+        let target = cells as f32 * cell_w;
+        let natural: f32 = glyphs[i..j].iter().map(|g| g.w).sum();
+        let k = if natural > f32::EPSILON {
+            target / natural
+        } else {
+            0.0
+        };
+        let mut off = 0.0;
+        for (n, g) in glyphs[i..j].iter_mut().enumerate() {
+            let w = g.w * k;
+            if n == 0 {
+                g.w = target;
+            } else {
+                g.x_off += off - target;
+                g.w = 0.0;
+            }
+            off += w;
+        }
+        i = j;
     }
 }
 
@@ -124,16 +194,54 @@ enum Tok {
 }
 
 /// Vertical metrics and wrapping behaviour of a run of lines.
+///
+/// Lines snap to the terminal grid: a line is a whole number of rows
+/// (`row_h` each) tall, so stacking lines from a row boundary keeps
+/// every line top on a row boundary. A line of plain text is `rows`
+/// rows; a line holding an inline raster taller than the text grows by
+/// whole rows above and/or below.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LineCtx {
-    /// Minimum line pitch.
-    pub line_h: f32,
+    /// Row (cell) height in px.
+    pub row_h: f32,
+    /// Rows a line of plain text takes (>= 1).
+    pub rows: u32,
     /// Ascent / descent of the run's main font at its size, in px.
     pub asc: f32,
     pub desc: f32,
     /// Keep runs of spaces (code); otherwise they collapse to one.
     pub preserve_ws: bool,
     pub align: Align,
+}
+
+impl LineCtx {
+    /// Height of a plain text line: `rows` whole rows.
+    pub(crate) fn text_h(&self) -> f32 {
+        self.rows as f32 * self.row_h
+    }
+
+    /// Baseline offset from the top of a plain text line: the font's
+    /// ascent + descent box centred in the line. Code rounds it, like
+    /// the terminal places its own baseline in a cell; proportional text
+    /// rounds down, which centres its caps better and keeps descenders
+    /// inside the row (the font box's descent is deeper than real ink).
+    /// Clamped so the baseline always falls in the line's own rows
+    /// (`grid::row_of`).
+    pub(crate) fn text_base(&self) -> f32 {
+        let h = self.text_h();
+        let b = (h - (self.asc + self.desc)) / 2.0 + self.asc;
+        let b = if self.preserve_ws {
+            b.round()
+        } else {
+            b.floor()
+        };
+        b.clamp(1.0, h)
+    }
+}
+
+/// Whole rows of `row_h` needed for `px`, ignoring the first `slack` px.
+fn rows_for(px: f32, row_h: f32, slack: f32) -> f32 {
+    ((px - slack) / row_h).ceil().max(0.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,9 +323,10 @@ impl Shaped {
     pub(crate) fn new(fs: &mut FontSystem, fonts: &Fonts, para: &Para) -> Self {
         let mut s = Shaped::default();
         let mut group: Vec<(usize, usize)> = vec![]; // (text start, span)
+        let grid = para.grid.map(|c| c as f32);
         let flush = |s: &mut Shaped, group: &mut Vec<(usize, usize)>, fs: &mut FontSystem| {
             if !group.is_empty() {
-                s.shape_group(fs, fonts, group);
+                s.shape_group(fs, fonts, group, grid);
                 group.clear();
             }
         };
@@ -249,7 +358,13 @@ impl Shaped {
         s
     }
 
-    fn shape_group(&mut self, fs: &mut FontSystem, fonts: &Fonts, group: &[(usize, usize)]) {
+    fn shape_group(
+        &mut self,
+        fs: &mut FontSystem,
+        fonts: &Fonts,
+        group: &[(usize, usize)],
+        grid: Option<f32>,
+    ) {
         let end_of = |i: usize| group.get(i + 1).map_or(self.text.len(), |g| g.0);
         let first = self.spans[group[0].1];
         let mut buf = Buffer::new_empty(Metrics::new(first.size, first.size * 1.2));
@@ -303,8 +418,11 @@ impl Shaped {
                 });
             }
         }
-        // Box padding at span boundaries.
         let n = self.glyphs.len();
+        if let Some(cell_w) = grid {
+            snap_to_cells(&mut self.glyphs[g0..n], &self.text, cell_w);
+        }
+        // Box padding at span boundaries.
         for i in g0..n {
             let sp = self.glyphs[i].span;
             let info = self.spans[sp];
@@ -345,6 +463,20 @@ impl Shaped {
                 self.toks.push(Tok::Word(s..i));
             }
         }
+    }
+
+    /// Glyphs whose source text covers more than one grapheme cluster
+    /// (ligatures such as `->` in Fira Code).
+    #[cfg(test)]
+    pub(crate) fn multi_grapheme_glyphs(&self) -> usize {
+        self.glyphs
+            .iter()
+            .filter(|g| {
+                self.text
+                    .get(g.start..g.end)
+                    .is_some_and(|t| t.graphemes(true).nth(1).is_some())
+            })
+            .count()
     }
 
     fn width(&self, r: &std::ops::Range<usize>) -> f32 {
@@ -451,7 +583,10 @@ impl Shaped {
                             let split = w > width && cur.items.is_empty();
                             for gi in r.clone() {
                                 let a = self.glyphs[gi].adv();
-                                if split && !cur.items.is_empty() && x + a > width + 0.01 {
+                                // Zero-advance glyphs (marks, the tail of
+                                // a cell-snapped cluster) never start a line.
+                                if split && a > 0.0 && !cur.items.is_empty() && x + a > width + 0.01
+                                {
                                     push(&mut lines, &mut cur, &mut x);
                                     after_wrap = true;
                                 }
@@ -503,25 +638,35 @@ impl Shaped {
         if !cur.items.is_empty() {
             push(&mut lines, &mut cur, &mut x);
         }
-        // Vertical metrics.
-        let leading = (ctx.line_h - (ctx.asc + ctx.desc)).max(0.0);
+        // Vertical metrics, in whole rows. Plain text takes `ctx.rows`
+        // rows with the baseline at `ctx.text_base()`. An inline raster
+        // must fit inside its line's rows (it would otherwise be cut off
+        // at the block edge or run into the neighbouring line's text), so
+        // the line grows by whole rows above / below as needed. A display
+        // atom gets a line of its own, centred in the rows it needs.
+        let row_h = ctx.row_h;
+        let text_h = ctx.text_h();
+        let tb = ctx.text_base();
         for l in &mut lines {
-            let (mut asc, mut desc) = (ctx.asc, ctx.desc);
+            if l.center
+                && let Some(PlacedKind::Atom(a)) = l.items.first().map(|p| p.kind)
+            {
+                let at = &self.atoms[a];
+                l.h = rows_for(at.h, row_h, 0.5).max(1.0) * row_h;
+                let top = ((l.h - at.h) / 2.0).floor().max(0.0);
+                l.base = (top + at.asc).clamp(1.0, l.h);
+                continue;
+            }
+            let (mut above, mut below) = (0.0f32, 0.0f32);
             for p in &l.items {
                 if let PlacedKind::Atom(a) = p.kind {
                     let at = &self.atoms[a];
-                    asc = asc.max(at.asc);
-                    desc = desc.max(at.h - at.asc);
+                    above = above.max(rows_for(at.asc - tb, row_h, 0.5));
+                    below = below.max(rows_for(at.h - at.asc - (text_h - tb), row_h, 0.5));
                 }
             }
-            let tall = asc > ctx.asc + 0.5 || desc > ctx.desc + 0.5;
-            let pad = if tall {
-                (leading / 2.0).max(ctx.line_h * 0.1)
-            } else {
-                leading / 2.0
-            };
-            l.h = (asc + desc + 2.0 * pad).max(ctx.line_h).ceil();
-            l.base = ((l.h - asc - desc) / 2.0 + asc).round();
+            l.h = text_h + (above + below) * row_h;
+            l.base = above * row_h + tb;
         }
         lines
     }
@@ -555,6 +700,7 @@ impl Shaped {
         let mut links = vec![];
         let mut top = y;
         for line in lines {
+            let bottom = top + line.h;
             let ox = x + Self::line_offset(line, width, ctx.align);
             let base = top + line.base;
             // Boxes first so glyphs draw over them.
@@ -582,7 +728,10 @@ impl Shaped {
                 };
                 let a = (m.ascent * info.size).max(info.size * 0.9);
                 let d = (m.descent * info.size).max(info.size * 0.22);
-                let (bx, by, bw, bh) = (ox + x0, base - a - 1.0, x1 - x0, a + d + 2.0);
+                // Kept inside the line's rows, so the boxes of wrapped
+                // lines never overlap.
+                let by = (base - a - 1.0).max(top);
+                let (bx, bw, bh) = (ox + x0, x1 - x0, (base + d + 1.0).min(bottom) - by);
                 match info.boxed {
                     Boxed::Code => ops.push(Op::Rect {
                         x: bx,
@@ -621,14 +770,25 @@ impl Shaped {
                     PlacedKind::Glyph(gi) => {
                         let g = &self.glyphs[gi];
                         let info = &self.spans[g.span];
+                        // On the block's first row a raised glyph
+                        // (footnote reference) would poke out of the top
+                        // of the block: raise it only as far as its
+                        // ascent still fits.
+                        let rise = if top < 0.5 && info.rise > 0.0 {
+                            let m = if info.mono {
+                                fonts.mono.metrics
+                            } else {
+                                fonts.sans.metrics
+                            };
+                            info.rise.min((base - m.ascent * info.size).max(0.0))
+                        } else {
+                            info.rise
+                        };
                         let (key, gx, gy) = CacheKey::new(
                             g.font_id,
                             g.id,
                             g.size,
-                            (
-                                ox + p.x + g.lead + g.x_off,
-                                (base - info.rise - g.y_off).trunc(),
-                            ),
+                            (ox + p.x + g.lead + g.x_off, (base - rise - g.y_off).trunc()),
                             g.weight,
                             g.flags,
                         );
@@ -824,6 +984,7 @@ pub(crate) fn para_key(para: &Para) -> u128 {
         let mut h = std::hash::DefaultHasher::new();
         seed.hash(&mut h);
         para.pieces.len().hash(&mut h);
+        para.grid.hash(&mut h);
         for p in &para.pieces {
             match p {
                 Piece::Text(t, s) => {
@@ -845,4 +1006,84 @@ pub(crate) fn para_key(para: &Para) -> u128 {
         out = (out << 64) | u128::from(h.finish());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn glyph(start: usize, end: usize, w: f32) -> Glyph {
+        Glyph {
+            start,
+            end,
+            w,
+            x_off: 0.0,
+            y_off: 0.0,
+            font_id: fontdb::ID::dummy(),
+            id: 1,
+            size: 16.0,
+            weight: Weight::NORMAL,
+            flags: CacheKeyFlags::empty(),
+            span: 0,
+            lead: 0.0,
+            trail: 0.0,
+        }
+    }
+
+    #[test]
+    fn clusters_snap_to_whole_cells() {
+        // "a", "中" (2 cells), "e" + combining acute as one two-glyph
+        // cluster, a lone zero-width space.
+        let text = "a\u{4e2d}e\u{301}\u{200b}";
+        let mut gs = [
+            glyph(0, 1, 9.6),
+            glyph(1, 4, 15.0),
+            glyph(4, 7, 9.6),
+            glyph(4, 7, 2.4),
+            glyph(7, 10, 0.0),
+        ];
+        snap_to_cells(&mut gs, text, 10.0);
+        let adv: Vec<f32> = gs.iter().map(|g| g.w).collect();
+        assert_eq!(adv, [10.0, 20.0, 10.0, 0.0, 0.0]);
+        // The mark keeps its shaped offset from the cluster start
+        // (scaled to the cell): drawn at start + 9.6 * 10/12 = start + 8,
+        // i.e. at pen (start + 10) + x_off.
+        assert!((gs[3].x_off - (8.0 - 10.0)).abs() < 1e-4, "{}", gs[3].x_off);
+        assert!(gs[2].x_off.abs() < 1e-6);
+    }
+
+    #[test]
+    fn graphemes_split_over_shaping_clusters_are_one_unit() {
+        // A family emoji shaped without an emoji font: one glyph per
+        // codepoint, each its own shaping cluster. The grapheme is 2
+        // cells, all on the first glyph.
+        let text = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}z";
+        let mut gs = [
+            glyph(0, 4, 8.0),
+            glyph(4, 7, 0.0),
+            glyph(7, 11, 8.0),
+            glyph(11, 14, 0.0),
+            glyph(14, 18, 8.0),
+            glyph(18, 19, 8.0),
+        ];
+        snap_to_cells(&mut gs, text, 10.0);
+        let adv: Vec<f32> = gs.iter().map(|g| g.w).collect();
+        assert_eq!(adv, [20.0, 0.0, 0.0, 0.0, 0.0, 10.0]);
+        // ❤ + VS16: emoji presentation, 2 cells.
+        let text = "x\u{2764}\u{fe0f}y";
+        let mut gs = [
+            glyph(0, 1, 8.0),
+            glyph(1, 4, 9.0),
+            glyph(4, 7, 0.0),
+            glyph(7, 8, 8.0),
+        ];
+        snap_to_cells(&mut gs, text, 10.0);
+        let adv: Vec<f32> = gs.iter().map(|g| g.w).collect();
+        assert_eq!(adv, [10.0, 20.0, 0.0, 10.0]);
+        // A ligature glyph over two graphemes ("->") takes both cells.
+        let mut gs = [glyph(0, 2, 7.0), glyph(2, 3, 9.6)];
+        snap_to_cells(&mut gs, "->x", 10.0);
+        let adv: Vec<f32> = gs.iter().map(|g| g.w).collect();
+        assert_eq!(adv, [20.0, 10.0]);
+    }
 }
