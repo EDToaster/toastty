@@ -1017,6 +1017,7 @@ impl Toastty {
                 self.ingest.frame_requested(parse_start);
                 ControlSignal::Yield
             }
+            ingest::Outcome::Defer => ControlSignal::Defer,
             ingest::Outcome::AwaitEsu => {
                 // `handle_pty_bytes` fires the watchdog when more bytes
                 // arrive after it; this covers BSU-then-silence.

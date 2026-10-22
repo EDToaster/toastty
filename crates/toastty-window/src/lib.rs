@@ -317,8 +317,9 @@ fn schedule(sig: ControlSignal, is_redraw: bool, redraw_at: Option<Instant>, now
                 redraw_at,
             }
         }
-        // Yield redraws now exactly like RedrawIn(0); the resumed
-        // PtyReady is the Runner's business (see `Runner::resume_pty`).
+        // Yield redraws now exactly like RedrawIn(0), Defer polls
+        // without a redraw; the resumed PtyReady is the Runner's business
+        // (see `Runner::resume_pty`).
         // Duration::ZERO means "wake immediately" — under
         // ControlFlow::WaitUntil(now), winit's EventLoopWaker re-arms
         // the CFRunLoopTimer every iteration because Instant::now()
@@ -330,6 +331,11 @@ fn schedule(sig: ControlSignal, is_redraw: bool, redraw_at: Option<Instant>, now
         ControlSignal::Yield => Plan {
             flow: Flow::Poll,
             redraw_now: true,
+            redraw_at,
+        },
+        ControlSignal::Defer => Plan {
+            flow: Flow::Poll,
+            redraw_now: false,
             redraw_at,
         },
         ControlSignal::RedrawIn(d) if d.is_zero() => Plan {
@@ -364,10 +370,11 @@ struct Runner<'a, A: App> {
     /// When the next scheduled redraw is due (from a
     /// `ControlSignal::RedrawIn`), if any.
     redraw_at: Option<Instant>,
-    /// The app answered `ControlSignal::Yield`: it stopped parsing PTY
-    /// output so a frame could be drawn. Until `about_to_wait` (which
-    /// every platform runs after the iteration's `RedrawRequested`)
-    /// delivers the resuming `Event::PtyReady`, reader wakes are dropped.
+    /// The app answered `ControlSignal::Yield` (or `Defer`): it stopped
+    /// parsing PTY output so a frame could be drawn (or input handled).
+    /// Until `about_to_wait` (which every platform runs after the
+    /// iteration's `RedrawRequested`) delivers the resuming
+    /// `Event::PtyReady`, reader wakes are dropped.
     resume_pty: bool,
 }
 
@@ -376,7 +383,7 @@ impl<A: App> Runner<'_, A> {
         let is_redraw = matches!(ev, Event::Redraw);
         let sig = self.app.event(ev);
         self.last_status = sig;
-        if sig == ControlSignal::Yield {
+        if matches!(sig, ControlSignal::Yield | ControlSignal::Defer) {
             self.resume_pty = true;
         }
         self.apply_control(sig, is_redraw, event_loop);
@@ -1084,6 +1091,20 @@ mod tests {
         assert_eq!(plan.flow, Flow::Poll);
         assert!(plan.redraw_now);
         assert_eq!(plan.redraw_at, pending);
+    }
+
+    #[test]
+    fn defer_polls_without_redrawing() {
+        let now = Instant::now();
+        let pending = Some(now + ms(300));
+        assert_eq!(
+            schedule(ControlSignal::Defer, false, pending, now),
+            Plan {
+                flow: Flow::Poll,
+                redraw_now: false,
+                redraw_at: pending,
+            }
+        );
     }
 
     #[test]

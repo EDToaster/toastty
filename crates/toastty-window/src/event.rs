@@ -250,4 +250,8 @@ pub enum ControlSignal {
     /// frame (winit hands out every queued user event before it gets to
     /// `RedrawRequested`).
     Yield,
+    /// Like [`Yield`](Self::Yield) without the redraw: let the loop
+    /// handle input, then deliver [`Event::PtyReady`] again. Returned
+    /// while mode 2026 holds frames back, when a redraw would be skipped.
+    Defer,
 }

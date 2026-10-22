@@ -42,6 +42,12 @@ const MIN_PARSE: Duration = Duration::from_millis(1);
 /// come at least every ~33 ms of parsing.
 const MAX_MIN_PARSE: Duration = Duration::from_micros(33_333);
 
+/// Longest stretch of parsing while mode 2026 holds frames back before
+/// returning to the event loop anyway (without a redraw, which would be
+/// skipped). A flood inside one long synchronized update otherwise keeps
+/// input, resize and close waiting until the 1 s BSU watchdog.
+const MAX_HELD_PARSE: Duration = Duration::from_micros(33_333);
+
 /// How long a requested frame may hold up parsing. Redraws arrive within
 /// the same loop iteration on every platform winit supports, so this only
 /// guards against one that never comes: parsing then carries on as if no
@@ -117,6 +123,10 @@ impl Ingest {
         any_parsed: bool,
         sync_paused: bool,
     ) -> Step {
+        if any_parsed && sync_paused && now.saturating_duration_since(parse_start) >= MAX_HELD_PARSE
+        {
+            return Step::Stop(Stop::Defer);
+        }
         let frame_due = self.should_yield(now, parse_start);
         if !frame_due {
             Step::Parse
@@ -167,6 +177,9 @@ pub enum Step {
 pub enum Stop {
     /// To draw a frame: answer `ControlSignal::Yield`.
     Yield,
+    /// To let input through while mode 2026 holds the frame: answer
+    /// `ControlSignal::Defer`.
+    Defer,
 }
 
 /// What a finished `PtyReady` pass answers.
@@ -178,6 +191,9 @@ pub enum Outcome {
     Idle,
     /// Redraw, then resume parsing (`ControlSignal::Yield`).
     Yield,
+    /// Resume parsing after the loop's other events, without a redraw
+    /// (`ControlSignal::Defer`).
+    Defer,
     /// Drained mid synchronized update: wake at the BSU watchdog deadline
     /// rather than redraw a frame `render_term` would skip.
     AwaitEsu,
@@ -197,6 +213,7 @@ pub fn outcome(finished: bool, any_parsed: bool, stop: Option<Stop>, sync_paused
     match stop {
         _ if finished => Outcome::Closed,
         Some(Stop::Yield) => Outcome::Yield,
+        Some(Stop::Defer) => Outcome::Defer,
         None if !any_parsed => Outcome::Idle,
         None if sync_paused => Outcome::AwaitEsu,
         None => Outcome::Redraw,
@@ -315,6 +332,26 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(ing.step(t0, t0, true, true), Step::Parse);
         assert_eq!(ing.step(t0 + ms(5), t0, true, true), Step::ParseToEsu);
+    }
+
+    #[test]
+    fn a_long_synchronized_update_returns_to_the_loop_without_a_frame() {
+        let ing = Ingest::default();
+        let t0 = Instant::now();
+        assert_eq!(ing.step(t0 + ms(20), t0, true, true), Step::ParseToEsu);
+        assert_eq!(
+            ing.step(t0 + MAX_HELD_PARSE, t0, true, true),
+            Step::Stop(Stop::Defer)
+        );
+        // Still never before the first slice.
+        assert_eq!(
+            ing.step(t0 + MAX_HELD_PARSE, t0, false, true),
+            Step::ParseToEsu
+        );
+        assert_eq!(
+            outcome(false, false, Some(Stop::Defer), true),
+            Outcome::Defer
+        );
     }
 
     #[test]
