@@ -115,11 +115,22 @@ a CRT look where each bell sends a split-flap wave across the screen:
   <img src="docs/screenshots/crt-splitflap.gif" alt="toastty with a curved, scanlined CRT shader; after a bell, the character cells flip like split-flap display tiles in a wave spreading out from the cursor" width="720">
 </p>
 
+Shaders are plain files, not built in. Copy one next to your config and
+list it; relative paths are relative to the config file's directory:
+
+```sh
+mkdir -p ~/.config/toastty/shaders
+cp examples/shaders/*.glsl ~/.config/toastty/shaders/
+```
+
 ```toml
 [shader]
-paths = ["~/.config/toastty/shaders/crt-splitflap.glsl"]   # run in order
+paths = ["shaders/crt-splitflap.glsl"]   # run in order
 animation = "auto"   # "auto" | "always" | "never"
 ```
+
+[`cursor-glow.glsl`](examples/shaders/cursor-glow.glsl) is a smaller
+example: a subtle warm glow around the cursor.
 
 Shaders that don't use time cost nothing when the screen is idle.
 toastty reads which uniforms a shader uses and only draws frames when
