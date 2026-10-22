@@ -27,6 +27,9 @@ use super::instance::ImageInstance;
 /// so the slight trilinear softness is the accepted trade-off.
 pub(super) const LOD_BIAS: f32 = 0.0;
 
+/// Downscale ratios up to `1 + ONE_TO_ONE_SLACK` count as 1:1.
+pub(super) const ONE_TO_ONE_SLACK: f32 = 1e-4;
+
 /// How much `inst` shrinks its source rect of a `width × height`
 /// texture: the larger of the per-axis source-px / drawn-px ratios.
 /// `<= 1` means 1:1 or upscaled.
@@ -41,11 +44,16 @@ pub(super) fn draw_ratio(inst: &ImageInstance, width: u32, height: u32) -> f32 {
 
 /// Levels a draw at `ratio` samples with [`LOD_BIAS`]: trilinear reads
 /// `floor(lod)` and the level after it, so `floor(lod) + 2`, capped at
-/// the full chain. 1 when the biased LOD is <= 0 (level 0 only).
+/// the full chain. 1 when the biased LOD is <= 0 (level 0 only), and for
+/// ratios within [`ONE_TO_ONE_SLACK`] of 1:1, so float noise in the drawn
+/// size doesn't allocate a 2-level chain for a 1:1 draw.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // lod > 0 and < 32 here.
 pub(super) fn needed_levels(ratio: f32, width: u32, height: u32) -> u32 {
+    if ratio.is_nan() || ratio <= 1.0 + ONE_TO_ONE_SLACK {
+        return 1;
+    }
     let lod = ratio.log2() + LOD_BIAS;
-    if lod.is_nan() || lod <= 0.0 {
+    if lod <= 0.0 {
         return 1;
     }
     (lod.floor() as u32 + 2).min(full_mip_count(width, height))
@@ -401,6 +409,14 @@ mod tests {
             1
         );
         assert_eq!(needed_levels(1.0, 64, 64), 1);
+        // Float noise at 1:1 (review of #34): no needless 2-level chain.
+        assert_eq!(needed_levels(1.000_01, 64, 64), 1);
+        assert_eq!(needed_levels(1.0 + ONE_TO_ONE_SLACK, 64, 64), 1);
+        assert_eq!(needed_levels(1.001, 64, 64), 2);
+        assert_eq!(needed_levels(f32::NAN, 64, 64), 1);
+        // A 1:1 draw whose box is a hair small after float rounding.
+        let noisy = inst(16.0 - 1e-5, 8.0);
+        assert_eq!(needed_levels(draw_ratio(&noisy, 16, 8), 16, 8), 1);
         assert_eq!(needed_levels(1.3, 64, 64), 2);
         assert_eq!(needed_levels(2.0, 640, 360), 3);
         assert_eq!(needed_levels(128.0 / 20.0, 128, 128), 4);
