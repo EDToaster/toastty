@@ -1957,9 +1957,10 @@ impl Term {
                 sel.contains(line_id, col) || wide_partner_selected(sel, row, line_id, col)
             };
             let len = row.cells.len();
-            if let (Some(lo), Some(hi)) =
-                ((0..len).find(|&i| selected(i)), (0..len).rev().find(|&i| selected(i)))
-            {
+            if let (Some(lo), Some(hi)) = (
+                (0..len).find(|&i| selected(i)),
+                (0..len).rev().find(|&i| selected(i)),
+            ) {
                 let mut col = lo;
                 while col <= hi {
                     if Some(col) == pad_col {
@@ -4844,7 +4845,8 @@ impl KittySink for Term {
             .iter()
             .map(|p| p.key)
             .chain(
-                self.images.virtual_placements
+                self.images
+                    .virtual_placements
                     .iter()
                     .filter_map(|v| self.images.store.key_of(v.image_id)),
             )
@@ -11282,7 +11284,10 @@ mod minor_term_tests {
             if !stay {
                 feed(&mut t, b"\x1b[?1047h");
             }
-            t.image_grid().iter().find(|p| p.image_id == 7).map(|p| t.prows(p))
+            t.image_grid()
+                .iter()
+                .find(|p| p.image_id == 7)
+                .map(|p| t.prows(p))
         };
         assert_eq!(rows_after(false), rows_after(true));
     }

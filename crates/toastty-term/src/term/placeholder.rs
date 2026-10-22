@@ -350,7 +350,9 @@ impl Term {
     /// The virtual placement `run` draws, if it exists right now.
     #[must_use]
     pub fn resolve_placeholder(&self, run: &PlaceholderRun) -> Option<&VirtualPlacement> {
-        self.images.virtual_placements.find(run.image_id, run.placement_id)
+        self.images
+            .virtual_placements
+            .find(run.image_id, run.placement_id)
     }
 
     /// Top-left `(row, col)` of the placeholder cells on the visible
