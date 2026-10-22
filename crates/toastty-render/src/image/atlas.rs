@@ -2,61 +2,102 @@
 //!
 //! Architecture choice (M11a, pre-approved): texture-per-image, NOT a
 //! packed atlas. Each `Texture` is sized for its source image; no
-//! shelf packing. The cache holds up to [`Self::MAX_ACTIVE`] textures
-//! and uses LRU eviction; that limit matches `wgpu::Limits::downlevel
-//! _defaults().max_sampled_textures_per_shader_stage` so we never blow
-//! past the binding budget.
+//! shelf packing. Each image draw binds exactly one texture, so the
+//! number of resident textures is not tied to any per-stage binding
+//! limit.
+//!
+//! Residency is demand-driven (SIZE-8): an image is uploaded the first
+//! frame one of its placements is drawn, never just because it was
+//! transmitted. GPU memory is bounded by a byte budget
+//! ([`ImageTextureCache::DEFAULT_BUDGET_BYTES`]); when the resident set
+//! exceeds it, the textures drawn least recently are dropped. Textures
+//! drawn in the current frame are never evicted, so a working set larger
+//! than the budget still renders in full (memory then tracks the
+//! working set, not the budget), and nothing is re-uploaded per frame.
+//!
+//! [`ImageRegistry`]: toastty_term::ImageRegistry
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 /// Bookkeeping for one image's GPU texture.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageTexEntry {
-    /// Index into [`ImageTextureCache::textures`].
+    /// Index into the pipeline's texture slots.
     pub texture_index: usize,
     /// Pixel dimensions of the source image.
     pub width: u32,
     pub height: u32,
-    /// Content version we synced from the registry — bumped on
-    /// re-upload so the cache can detect re-uses with stale content.
-    pub content_hash: u32,
+    /// Registry generation of the data we uploaded
+    /// (`ImageRegistry::generation`). A mismatch means the id was
+    /// re-transmitted since, whatever its size or pixels.
+    pub generation: u64,
 }
 
-/// LRU cache of `wgpu::Texture` keyed by Kitty image id.
+impl ImageTexEntry {
+    /// GPU bytes held by this entry's texture (RGBA8, no mips).
+    #[must_use]
+    pub fn byte_size(&self) -> u64 {
+        u64::from(self.width.max(1)) * u64::from(self.height.max(1)) * 4
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    entry: ImageTexEntry,
+    /// Frame number of the last draw that used this texture.
+    last_used: u64,
+}
+
+/// Byte-budgeted cache of image textures keyed by kitty image id, with
+/// LRU-by-last-draw eviction.
 ///
-/// The cache only tracks *metadata* — actual `wgpu::Texture` storage
-/// lives on [`super::pipeline::ImagePipeline`] (so unit tests of the
-/// cache logic don't need a GPU).
-#[derive(Debug, Default)]
+/// The cache only tracks *metadata*; the `wgpu::Texture`s live on
+/// [`super::pipeline::ImagePipeline`] (so unit tests of the cache logic
+/// don't need a GPU).
+#[derive(Debug)]
 pub struct ImageTextureCache {
-    entries: HashMap<u32, ImageTexEntry>,
-    /// MRU at the back, LRU at the front.
-    lru: VecDeque<u32>,
-    /// Maximum number of active textures. wgpu's
-    /// `downlevel_defaults` allows 16 sampled textures per shader
-    /// stage; we keep one slot for the text mask + one for the text
-    /// color, leaving 14 for images. Round down to 14 to be safe.
-    max_active: usize,
+    entries: HashMap<u32, Slot>,
+    /// Sum of [`ImageTexEntry::byte_size`] over `entries`.
+    total_bytes: u64,
+    /// Soft cap on `total_bytes`. Only textures not drawn this frame
+    /// are evicted to meet it.
+    budget_bytes: u64,
+    /// Current frame number, bumped by [`Self::begin_frame`].
+    frame: u64,
+}
+
+impl Default for ImageTextureCache {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_BUDGET_BYTES)
+    }
 }
 
 impl ImageTextureCache {
-    /// Sensible default cap (14).
-    pub const DEFAULT_MAX_ACTIVE: usize = 14;
+    /// Default GPU budget for resident image textures: 256 MiB, a bit
+    /// under the 320 MiB CPU-side registry quota (kitty's default).
+    pub const DEFAULT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
-    /// Fresh cache with `max_active` slots.
+    /// Fresh cache with a `budget_bytes` soft cap.
     #[must_use]
-    pub fn new(max_active: usize) -> Self {
+    pub fn new(budget_bytes: u64) -> Self {
         Self {
             entries: HashMap::new(),
-            lru: VecDeque::new(),
-            max_active: max_active.max(1),
+            total_bytes: 0,
+            budget_bytes,
+            frame: 0,
         }
     }
 
-    /// Maximum number of textures the cache will hold concurrently.
+    /// The soft byte cap.
     #[must_use]
-    pub fn max_active(&self) -> usize {
-        self.max_active
+    pub fn budget_bytes(&self) -> u64 {
+        self.budget_bytes
+    }
+
+    /// Bytes held by resident textures.
+    #[must_use]
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
     }
 
     /// Number of resident entries.
@@ -71,82 +112,89 @@ impl ImageTextureCache {
         self.entries.is_empty()
     }
 
-    /// Iterate `(image_id, entry)` in resident order.
-    pub fn iter(&self) -> impl Iterator<Item = (u32, ImageTexEntry)> + '_ {
-        self.entries.iter().map(|(k, v)| (*k, *v))
+    /// Start a new frame. Entries touched after this count as "in use"
+    /// and are exempt from [`Self::evict_over_budget`].
+    pub fn begin_frame(&mut self) {
+        self.frame += 1;
     }
 
-    /// Lookup without LRU touch.
+    /// Iterate `(image_id, entry)` in arbitrary order.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, ImageTexEntry)> + '_ {
+        self.entries.iter().map(|(k, v)| (*k, v.entry))
+    }
+
+    /// Lookup without marking the entry used.
     #[must_use]
     pub fn get(&self, id: u32) -> Option<ImageTexEntry> {
-        self.entries.get(&id).copied()
+        self.entries.get(&id).map(|s| s.entry)
     }
 
-    /// Lookup + bump LRU.
-    pub fn get_mut_touch(&mut self, id: u32) -> Option<ImageTexEntry> {
-        let entry = self.entries.get(&id).copied()?;
-        self.lru.retain(|x| *x != id);
-        self.lru.push_back(id);
-        Some(entry)
+    /// Lookup and mark the entry used this frame.
+    pub fn get_touch(&mut self, id: u32) -> Option<ImageTexEntry> {
+        let frame = self.frame;
+        let slot = self.entries.get_mut(&id)?;
+        slot.last_used = frame;
+        Some(slot.entry)
     }
 
-    /// Bump `id` to MRU without retrieving the value.
-    pub fn touch(&mut self, id: u32) {
-        if self.entries.contains_key(&id) {
-            self.lru.retain(|x| *x != id);
-            self.lru.push_back(id);
-        }
-    }
-
-    /// Predict the ids that `insert(id, _)` would evict, without
-    /// mutating the cache. Caller uses this to release GPU slots
-    /// *before* allocating the new one, so the underlying storage
-    /// can stay bounded at `max_active` rather than spiking to
-    /// `max_active + 1` mid-insert.
-    #[must_use]
-    pub fn peek_evictions_for_insert(&self, id: u32) -> Vec<u32> {
-        if self.entries.contains_key(&id) {
-            return Vec::new();
-        }
-        let needed = (self.entries.len() + 1).saturating_sub(self.max_active);
-        self.lru.iter().take(needed).copied().collect()
-    }
-
-    /// Insert (or replace) `id`'s entry. Returns the evicted ids (if
-    /// any) — the caller is responsible for dropping the matching
-    /// `wgpu::Texture` from external storage.
-    pub fn insert(&mut self, id: u32, entry: ImageTexEntry) -> Vec<u32> {
-        let mut evicted = Vec::new();
-        // Replace path: drop the prior LRU position.
-        if self.entries.contains_key(&id) {
-            self.lru.retain(|x| *x != id);
-        } else {
-            // Evict until we have a slot.
-            while self.entries.len() >= self.max_active {
-                let Some(victim) = self.lru.pop_front() else {
-                    break;
-                };
-                self.entries.remove(&victim);
-                evicted.push(victim);
-            }
-        }
-        self.entries.insert(id, entry);
-        self.lru.push_back(id);
-        evicted
+    /// Insert (or replace) `id`'s entry, marked used this frame.
+    /// Returns the replaced entry, if any: the caller frees its texture.
+    /// Never evicts; call [`Self::evict_over_budget`] once the frame's
+    /// working set is resident.
+    pub fn insert(&mut self, id: u32, entry: ImageTexEntry) -> Option<ImageTexEntry> {
+        let prior = self.entries.insert(
+            id,
+            Slot {
+                entry,
+                last_used: self.frame,
+            },
+        );
+        self.total_bytes += entry.byte_size();
+        prior.map(|s| {
+            self.total_bytes -= s.entry.byte_size();
+            s.entry
+        })
     }
 
     /// Remove `id` if present. Returns its prior entry.
     pub fn remove(&mut self, id: u32) -> Option<ImageTexEntry> {
-        let e = self.entries.remove(&id)?;
-        self.lru.retain(|x| *x != id);
-        Some(e)
+        let s = self.entries.remove(&id)?;
+        self.total_bytes -= s.entry.byte_size();
+        Some(s.entry)
     }
 
-    /// Drop every entry. Returns the dropped ids in insertion order.
-    pub fn clear(&mut self) -> Vec<u32> {
-        let out: Vec<u32> = self.lru.drain(..).collect();
-        self.entries.clear();
-        out
+    /// While over budget, drop the least recently drawn entries that
+    /// were not used this frame. Returns the evicted `(id, entry)`s: the
+    /// caller frees their textures.
+    pub fn evict_over_budget(&mut self) -> Vec<(u32, ImageTexEntry)> {
+        if self.total_bytes <= self.budget_bytes {
+            return Vec::new();
+        }
+        let frame = self.frame;
+        let mut candidates: Vec<(u64, u32)> = self
+            .entries
+            .iter()
+            .filter(|(_, s)| s.last_used != frame)
+            .map(|(id, s)| (s.last_used, *id))
+            .collect();
+        // Oldest first; tie-break by id so eviction is deterministic.
+        candidates.sort_unstable();
+        let mut evicted = Vec::new();
+        for (_, id) in candidates {
+            if self.total_bytes <= self.budget_bytes {
+                break;
+            }
+            if let Some(e) = self.remove(id) {
+                evicted.push((id, e));
+            }
+        }
+        evicted
+    }
+
+    /// Drop every entry. Returns the dropped entries.
+    pub fn clear(&mut self) -> Vec<(u32, ImageTexEntry)> {
+        self.total_bytes = 0;
+        self.entries.drain().map(|(id, s)| (id, s.entry)).collect()
     }
 }
 
@@ -154,102 +202,126 @@ impl ImageTextureCache {
 mod tests {
     use super::*;
 
-    fn entry(idx: usize) -> ImageTexEntry {
+    /// An entry of exactly `bytes` bytes (`bytes / 4` × 1 pixels).
+    fn entry(idx: usize, bytes: u32) -> ImageTexEntry {
         ImageTexEntry {
             texture_index: idx,
-            width: 2,
-            height: 2,
-            content_hash: 0,
+            width: bytes / 4,
+            height: 1,
+            generation: 0,
         }
     }
 
     #[test]
     fn empty_cache() {
-        let c = ImageTextureCache::new(4);
+        let c = ImageTextureCache::new(400);
         assert!(c.is_empty());
         assert_eq!(c.len(), 0);
-        assert_eq!(c.max_active(), 4);
+        assert_eq!(c.total_bytes(), 0);
+        assert_eq!(c.budget_bytes(), 400);
     }
 
     #[test]
-    fn insert_under_cap_does_not_evict() {
-        let mut c = ImageTextureCache::new(4);
-        for id in 1..=3 {
-            assert!(c.insert(id, entry(id as usize)).is_empty());
+    fn insert_tracks_bytes_and_never_evicts() {
+        let mut c = ImageTextureCache::new(100);
+        // 500 entries, far past any entry-count limit and the byte
+        // budget: all stay resident until an explicit eviction.
+        for id in 0..500u32 {
+            assert!(c.insert(id, entry(id as usize, 40)).is_none());
         }
-        assert_eq!(c.len(), 3);
+        assert_eq!(c.len(), 500);
+        assert_eq!(c.total_bytes(), 500 * 40);
     }
 
     #[test]
-    fn insert_over_cap_evicts_oldest() {
-        let mut c = ImageTextureCache::new(2);
-        assert!(c.insert(1, entry(0)).is_empty());
-        assert!(c.insert(2, entry(1)).is_empty());
-        let evicted = c.insert(3, entry(2));
-        assert_eq!(evicted, vec![1]);
+    fn replace_returns_prior_and_adjusts_bytes() {
+        let mut c = ImageTextureCache::new(1000);
+        c.insert(1, entry(0, 40));
+        let prior = c.insert(1, entry(9, 80)).unwrap();
+        assert_eq!(prior.texture_index, 0);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.total_bytes(), 80);
+        assert_eq!(c.get(1).unwrap().texture_index, 9);
+    }
+
+    #[test]
+    fn remove_and_clear_release_bytes() {
+        let mut c = ImageTextureCache::new(1000);
+        c.insert(1, entry(0, 40));
+        c.insert(2, entry(1, 40));
+        assert_eq!(c.remove(1).unwrap().texture_index, 0);
+        assert_eq!(c.total_bytes(), 40);
+        assert!(c.remove(1).is_none());
+        assert_eq!(c.clear().len(), 1);
+        assert!(c.is_empty());
+        assert_eq!(c.total_bytes(), 0);
+    }
+
+    #[test]
+    fn under_budget_evicts_nothing() {
+        let mut c = ImageTextureCache::new(100);
+        c.insert(1, entry(0, 40));
+        c.begin_frame();
+        c.insert(2, entry(1, 40));
+        assert!(c.evict_over_budget().is_empty());
         assert_eq!(c.len(), 2);
-        assert!(c.get(1).is_none());
     }
 
     #[test]
-    fn touch_promotes_to_mru() {
-        let mut c = ImageTextureCache::new(2);
-        c.insert(1, entry(0));
-        c.insert(2, entry(1));
-        // Touch id=1; now LRU = [2, 1]
-        c.touch(1);
-        let evicted = c.insert(3, entry(2));
-        // 2 evicted, not 1.
+    fn over_budget_evicts_least_recently_drawn() {
+        let mut c = ImageTextureCache::new(100);
+        // Frame 1: insert 1, 2. Frame 2: draw 1 only. Frame 3: insert 3.
+        c.begin_frame();
+        c.insert(1, entry(0, 40));
+        c.insert(2, entry(1, 40));
+        c.begin_frame();
+        assert!(c.get_touch(1).is_some());
+        c.begin_frame();
+        c.insert(3, entry(2, 40));
+        let evicted: Vec<u32> = c.evict_over_budget().iter().map(|e| e.0).collect();
+        // 2 was drawn longest ago; evicting it brings 120 -> 80 bytes.
         assert_eq!(evicted, vec![2]);
         assert!(c.get(1).is_some());
+        assert!(c.get(3).is_some());
+        assert_eq!(c.total_bytes(), 80);
     }
 
     #[test]
-    fn replace_keeps_size() {
-        let mut c = ImageTextureCache::new(2);
-        c.insert(1, entry(0));
-        c.insert(2, entry(1));
-        let evicted = c.insert(1, entry(99));
-        assert!(evicted.is_empty());
-        assert_eq!(c.len(), 2);
-        assert_eq!(c.get(1).unwrap().texture_index, 99);
+    fn entries_drawn_this_frame_are_never_evicted() {
+        // Working set larger than the budget: everything drawn this
+        // frame stays, so a re-draw next frame needs no re-upload.
+        let mut c = ImageTextureCache::new(100);
+        c.begin_frame();
+        for id in 0..10u32 {
+            c.insert(id, entry(id as usize, 40));
+        }
+        assert!(c.evict_over_budget().is_empty());
+        assert_eq!(c.len(), 10);
+        // Next frame draws the same ten: all hits, nothing evicted.
+        c.begin_frame();
+        for id in 0..10u32 {
+            assert!(c.get_touch(id).is_some());
+        }
+        assert!(c.evict_over_budget().is_empty());
+        // A frame that draws only two lets the other eight go.
+        c.begin_frame();
+        c.get_touch(3);
+        c.get_touch(7);
+        let evicted = c.evict_over_budget();
+        assert_eq!(c.total_bytes(), 80);
+        assert_eq!(evicted.len(), 8);
+        assert!(c.get(3).is_some() && c.get(7).is_some());
     }
 
     #[test]
-    fn remove_drops_entry_and_lru() {
-        let mut c = ImageTextureCache::new(2);
-        c.insert(1, entry(0));
-        c.insert(2, entry(1));
-        let removed = c.remove(1).unwrap();
-        assert_eq!(removed.texture_index, 0);
-        assert_eq!(c.len(), 1);
-        // Re-insert is not flagged as evicting anything.
-        assert!(c.insert(3, entry(2)).is_empty());
-    }
-
-    #[test]
-    fn repeated_inserts_past_cap_evict_in_lru_order() {
-        // 2-slot cap; insert ids 1..=5 in order. Each insert past
-        // the cap must evict exactly one id, and they must come out
-        // in LRU order (1, 2, 3) so the caller can free the slot.
-        let mut c = ImageTextureCache::new(2);
-        assert!(c.insert(1, entry(10)).is_empty());
-        assert!(c.insert(2, entry(11)).is_empty());
-        assert_eq!(c.insert(3, entry(12)), vec![1]);
-        assert_eq!(c.insert(4, entry(13)), vec![2]);
-        assert_eq!(c.insert(5, entry(14)), vec![3]);
-        assert_eq!(c.len(), 2);
-        assert!(c.get(4).is_some());
-        assert!(c.get(5).is_some());
-    }
-
-    #[test]
-    fn clear_returns_all_ids() {
-        let mut c = ImageTextureCache::new(2);
-        c.insert(1, entry(0));
-        c.insert(2, entry(1));
-        let ids = c.clear();
-        assert_eq!(ids.len(), 2);
-        assert!(c.is_empty());
+    fn get_does_not_count_as_a_draw() {
+        let mut c = ImageTextureCache::new(40);
+        c.begin_frame();
+        c.insert(1, entry(0, 40));
+        c.begin_frame();
+        c.insert(2, entry(1, 40));
+        let _ = c.get(1);
+        let evicted: Vec<u32> = c.evict_over_budget().iter().map(|e| e.0).collect();
+        assert_eq!(evicted, vec![1]);
     }
 }

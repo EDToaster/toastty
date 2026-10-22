@@ -302,7 +302,7 @@ UVs at draw time. Don't patch each item separately.
     - The clamp at `term.rs:4717-4725` trims cells but not `src_rect`.
     - In pending-wrap state the image is squashed into the last column
       (`term.rs:4685`).
-- [ ] **P0 — SIZE-8. At most 14 images render; the rest silently disappear.**
+- [x] **P0 — SIZE-8. At most 14 images render; the rest silently disappear.**
   - Repro:
     - 20, 40 or 500 placements of distinct images, e.g. a grid of
       `kitten icat --place` calls.
@@ -321,6 +321,20 @@ UVs at draw time. Don't patch each item separately.
       cache.
     - The cap is tied to the per-stage texture limit, but each draw binds
       only one texture, so that limit doesn't apply.
+  - Fix: images upload on their first draw, never on transmit. The cache
+    is held to a 256 MiB byte budget, evicting the textures drawn least
+    recently. Textures drawn this frame are never evicted, so nothing
+    re-uploads per frame. Fixed in #24.
+  - Also fixed in #24 (found in review):
+    - Re-sending an id at the same size kept the old pixels when the
+      first and last 8 pixels matched, because the GPU copy was keyed on a
+      partial content fingerprint. It is now keyed on a per-insert
+      registry generation. This also covers delete-then-anonymous-send
+      reusing the lowest free id.
+    - An image wider or taller than the GPU's `max_texture_dimension_2d`
+      (e.g. a 20000×4 `a=T`) crashed toastty with a wgpu validation panic.
+      It is now box-downscaled on the CPU by the smallest integer factor
+      that fits, keeping the aspect ratio, and a warning is logged.
 - [ ] **P1 — SIZE-9. Images with z below INT32_MIN/2 are invisible.**
   - Repro: `K send a=T,i=1,z=-1073741825 --png img.png` over default and
     `\e[41m` cells.
@@ -815,7 +829,7 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
 | `kitten icat --place` / `--align` | works, ~1 row too tall (SIZE-13) | works |
 | `kitten icat --scale-up` | wrong aspect ratio (SIZE-1, SIZE-13) | works |
 | `kitten icat` animated GIF | still frame + text injected into the shell (WIRE-3) | animates |
-| More than 14 images, or 500 tiny ones | only 14 visible (SIZE-8) | all visible |
+| More than 14 images, or 500 tiny ones | only 14 visible (SIZE-8, fixed in #24) | all visible |
 | `kitten icat --unicode-placeholder` | wrong scale; ghosts when cells change (PH-1, PH-2) | works |
 | `kitten icat --clear`, `toastty image` | work | work |
 | yazi preview: navigation, resize, quit | works | works |

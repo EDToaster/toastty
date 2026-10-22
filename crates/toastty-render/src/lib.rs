@@ -299,7 +299,8 @@ pub struct Renderer {
     /// [`Renderer::with_font_ex`] so headless tests that don't touch
     /// images can construct a `Renderer` without paying the cost.
     image_pipeline: Option<ImagePipeline>,
-    /// CPU-side mirror of the texture cache.
+    /// CPU-side mirror of the texture cache: which kitty images are
+    /// resident, byte-budgeted with LRU-by-last-draw eviction.
     image_tex_cache: ImageTextureCache,
     /// Last `Term::image_revision` we synced.
     image_revision_seen: u32,
@@ -995,7 +996,7 @@ impl Renderer {
             scratch_texture,
             scratch_view,
             image_pipeline: None,
-            image_tex_cache: ImageTextureCache::new(ImageTextureCache::DEFAULT_MAX_ACTIVE),
+            image_tex_cache: ImageTextureCache::default(),
             image_revision_seen: u32::MAX,
             image_instances_below_bg: Vec::new(),
             image_instances_below: Vec::new(),
@@ -2129,18 +2130,14 @@ impl Renderer {
         }
 
         // M11a: image-content sync. If the term's image revision has
-        // advanced, re-sync GPU textures and force a full clear for
-        // this frame (the pragmatic shortcut from the milestone plan —
-        // partial redraw with images is not supported in M11a).
+        // advanced, drop textures of deleted / replaced images and force
+        // a full clear for this frame (the pragmatic shortcut from the
+        // milestone plan — partial redraw with images is not supported
+        // in M11a). Uploads happen on demand when instances are built.
         if term.image_revision() != self.image_revision_seen
             && let Some(image_pipeline) = self.image_pipeline.as_mut()
         {
-            image_pipeline.sync_registry(
-                &self.device,
-                &self.queue,
-                term.image_registry(),
-                &mut self.image_tex_cache,
-            );
+            image_pipeline.sync_registry(term.image_registry(), &mut self.image_tex_cache);
             self.image_revision_seen = term.image_revision();
             self.needs_full_clear = true;
             // Mark every row dirty so the partial-redraw path falls back
@@ -2860,20 +2857,45 @@ impl Renderer {
         }
 
         // M11a: build image instances split by z sign. We clear the
-        // existing vecs and rebuild every frame — the count of images
-        // is small (<= 14) so this is cheap.
+        // existing vecs and rebuild every frame (cheap: one instance per
+        // placement). Resolving binds each instance to its texture,
+        // uploading images on their first draw (SIZE-8); it runs even
+        // with no placements so undrawn textures can be evicted.
         self.image_instances_below_bg.clear();
         self.image_instances_below.clear();
         self.image_instances_above.clear();
-        if !term.image_grid().is_empty() {
+        if let Some(image_pipeline) = self.image_pipeline.as_mut() {
+            let t_img = trace.then(std::time::Instant::now);
             let mut tmp: Vec<ImageInstance> = Vec::new();
-            build_image_instances(
-                &mut tmp,
-                term.image_grid(),
+            if !term.image_grid().is_empty() {
+                build_image_instances(
+                    &mut tmp,
+                    term.image_grid(),
+                    term.image_registry(),
+                    cell_size,
+                );
+            }
+            let stats = image_pipeline.resolve_kitty_textures(
+                &self.device,
+                &self.queue,
                 term.image_registry(),
-                &self.image_tex_cache,
-                cell_size,
+                &mut self.image_tex_cache,
+                &mut tmp,
             );
+            if let Some(t) = t_img
+                && (!tmp.is_empty() || !self.image_tex_cache.is_empty())
+            {
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                tracing::info!(
+                    target: "render_trace",
+                    "images n={} uploaded={} evicted={} resident={} ({} KiB) took={ms:.3}ms",
+                    tmp.len(),
+                    stats.uploaded,
+                    stats.evicted,
+                    self.image_tex_cache.len(),
+                    self.image_tex_cache.total_bytes() / 1024,
+                );
+            }
             let (below_bg, below, above) = split_layers(&tmp);
             self.image_instances_below_bg.extend_from_slice(below_bg);
             self.image_instances_below.extend_from_slice(below);
