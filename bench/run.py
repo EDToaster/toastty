@@ -521,6 +521,42 @@ class Bench:
     def scroll_wheel_big(self):
         return self._scroll(width=2560, height=1400)
 
+    def _paced(self, mode: str, frames: int = 300, **cfg):
+        runs = []
+        for _ in range(self.reps):
+            t = self.launch(
+                ["python3", str(HERE / "paced.py"), "--mode", mode, "--frames", str(frames)],
+                blink=False,
+                **cfg,
+            )
+            st = t.wait(120)
+            # Drop the first frames (startup, the initial clear) so only
+            # the paced repaints count.
+            frame_ms = [x / 1000 for x in st["frame_us"]][5:]
+            runs.append(
+                {
+                    "frames": st["frames"],
+                    "frame_ms_p50": pct(frame_ms, 50),
+                    "frame_ms_p99": pct(frame_ms, 99),
+                    "frame_ms_mean": statistics.fmean(frame_ms) if frame_ms else float("nan"),
+                    "cpu_s": (st["utime_ticks"] + st["stime_ticks"]) / CLK_TCK,
+                    "render_s": sum(frame_ms) / 1000,
+                }
+            )
+        return median_runs(runs)
+
+    def paced_text(self):
+        return self._paced("text")
+
+    def paced_text_big(self):
+        return self._paced("text", width=2560, height=1400)
+
+    def paced_tui(self):
+        return self._paced("tui")
+
+    def paced_tui_big(self):
+        return self._paced("tui", width=2560, height=1400)
+
     def close(self):
         self.display.close()
 
@@ -539,6 +575,10 @@ SCENARIOS = [
     "key_latency",
     "scroll_wheel",
     "scroll_wheel_big",
+    "paced_text",
+    "paced_text_big",
+    "paced_tui",
+    "paced_tui_big",
 ]
 
 
