@@ -142,7 +142,7 @@ pub struct LineRemap {
     /// on, oldest first (non-decreasing).
     new_ids: Vec<i64>,
     /// Where each old row and each new row sit in their logical lines
-    /// (see [`LineRemap::map_with_offset`]).
+    /// (see [`LineRemap::map_cell`]).
     pos: crate::reflow::ReflowMap,
     /// New line id = `top + flat index - shift`.
     top: i64,
@@ -171,38 +171,32 @@ impl LineRemap {
         }
     }
 
-    /// [`Self::map`], keeping a sub-line position stable across repeated
-    /// reflows. A row in the middle of a soft-wrapped line has no fixed
-    /// identity: after a rewrap, the row holding its first cell usually
-    /// starts earlier in the line, so following row starts alone drifts
-    /// an anchor towards the line start on every width change. `hint` is
-    /// the content offset (within its logical line) the caller anchored
-    /// at last time; when it still lies inside the old row it is used
-    /// instead of the row's start, and the offset used is returned to
-    /// pass back next time. A 20 → 30 → 20 column round trip lands on the
-    /// original row.
+    /// Where the cell at `(line, col)` before the reflow went: the line
+    /// id and column of the same content cell after it. The cell is taken
+    /// as an offset into its logical (soft-wrapped) line, so a placement
+    /// follows its text across rows when the line rewraps, both down a row
+    /// when the window narrows (a `C=1` image at column 70 of a 90-cell
+    /// line lands on the next row at 58 columns) and back up when it
+    /// widens. Round trips are exact. Rows that weren't reflowed as text
+    /// (rich blocks, rows past the reflowed span) keep the column and map
+    /// by [`Self::map`].
     #[must_use]
-    pub fn map_with_offset(&self, line: i64, hint: Option<u32>) -> (i64, Option<u32>) {
-        let k = line - self.old_first;
-        let Ok(k) = usize::try_from(k) else {
-            return (self.map(line), None);
+    pub fn map_cell(&self, line: i64, col: u16) -> (i64, u16) {
+        let fallback = (self.map(line), col);
+        let Ok(k) = usize::try_from(line - self.old_first) else {
+            return fallback;
         };
         let Some(&Some((l, s))) = self.pos.in_pos.get(k) else {
-            return (self.map(line), None);
+            return fallback;
         };
-        // The old row covers offsets `s..end` of logical line `l`.
-        let end = match self.pos.in_pos.get(k + 1) {
-            Some(&Some((l2, s2))) if l2 == l => Some(s2),
-            _ => None,
-        };
-        let off = match hint {
-            Some(h) if h >= s && end.is_none_or(|e| h < e) => h,
-            _ => s,
-        };
+        let off = s + u32::from(col);
         match self.pos.out_row(l, off) {
             #[allow(clippy::cast_possible_wrap)]
-            Some(f) => (self.top + f as i64 - self.shift, Some(off)),
-            None => (self.map(line), None),
+            Some((f, start)) => (
+                self.top + f as i64 - self.shift,
+                u16::try_from(off - start).unwrap_or(u16::MAX),
+            ),
+            None => fallback,
         }
     }
 }

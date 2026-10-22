@@ -5335,7 +5335,7 @@ fn line_i64(id: u64) -> i64 {
 /// [`LineRemap`] so each placement follows its text, then drop those whose
 /// text left `grid`'s history. Returns `true` if any were dropped.
 fn remap_images(images: &mut ImageGrid, remap: &crate::grid::LineRemap, grid: &Grid) -> bool {
-    images.map_anchors(|l, off| remap.map_with_offset(l, off));
+    images.map_anchors(|l, c| remap.map_cell(l, c));
     evict_unretained(images, grid)
 }
 
@@ -11060,6 +11060,21 @@ mod placement_resize_tests {
         feed(&mut t, b"\x1b[3;5H\x1bM");
         assert_eq!(rows_of(&t, 1), 3..7);
         assert_eq!(rows_of(&t, 2), 4..9);
+    }
+
+    #[test]
+    fn image_mid_line_follows_its_text_to_the_next_row() {
+        // #39 review: a C=1 image at column 70 of a 90-cell line used to
+        // stay at column 70, off the grid, when narrowed to 58 columns.
+        let mut t = Term::new(10, 100, 100);
+        feed(&mut t, &[b'A'; 90]);
+        feed(&mut t, b"\x1b[1;71H");
+        place(&mut t, 2, 1, ",C=1");
+        assert_eq!((rows(&t), only(&t).col), (0..1, 70));
+        t.resize(10, 58);
+        assert_eq!((rows(&t), only(&t).col), (1..2, 12), "on the same 'A'");
+        t.resize(10, 100);
+        assert_eq!((rows(&t), only(&t).col), (0..1, 70), "and back");
     }
 
     #[test]
