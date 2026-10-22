@@ -37,6 +37,12 @@ pub(crate) fn try_device_and_queue() -> Option<(Device, Queue)> {
         .ok()
     })
     .clone()
+    .or_else(|| {
+        // Make the skip visible (`--nocapture`): a GPU test that returns
+        // early locks nothing.
+        eprintln!("skipping GPU test: no wgpu adapter available");
+        None
+    })
 }
 
 /// The shared test device. Panics when no adapter is available.

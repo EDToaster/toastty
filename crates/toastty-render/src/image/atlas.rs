@@ -20,16 +20,17 @@
 use std::collections::HashMap;
 
 /// Bookkeeping for one image's GPU texture.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageTexEntry {
     /// Index into the pipeline's texture slots.
     pub texture_index: usize,
     /// Pixel dimensions of the source image.
     pub width: u32,
     pub height: u32,
-    /// Content fingerprint we uploaded from the registry. A mismatch
-    /// on the next registry sync means the image was replaced in place.
-    pub content_hash: u32,
+    /// Registry generation of the data we uploaded
+    /// (`ImageRegistry::generation`). A mismatch means the id was
+    /// re-transmitted since, whatever its size or pixels.
+    pub generation: u64,
 }
 
 impl ImageTexEntry {
@@ -207,7 +208,7 @@ mod tests {
             texture_index: idx,
             width: bytes / 4,
             height: 1,
-            content_hash: 0,
+            generation: 0,
         }
     }
 
