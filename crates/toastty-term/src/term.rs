@@ -40,6 +40,8 @@ use toastty_parser::{Params, Perform};
 pub use toastty_protocols::clipboard::{ClipboardTarget, ClipboardTargets};
 
 mod placeholder;
+#[cfg(test)]
+mod relative_tests;
 mod rich_term;
 mod vt;
 
@@ -726,7 +728,7 @@ impl Term {
             &mut self.images
         };
         let dropped = remap_images(&mut screen.grid, remap, &self.primary);
-        screen.release(&dropped, false);
+        screen.release(&dropped, &[], Free::NONE);
         !dropped.is_empty()
     }
 
@@ -766,7 +768,7 @@ impl Term {
         let g = self.active_grid();
         let (first, last) = (oldest_line_of(g), line_i64(g.bottom_id()));
         let dropped = self.images.grid.retain_lines(first, last);
-        self.drop_placements(&dropped, false);
+        self.drop_placements(&dropped, &[], Free::NONE);
     }
 
     /// Scroll the image placements of the margin region `top..=bot` by
@@ -797,7 +799,7 @@ impl Term {
         // Placements may have moved without being dropped; the renderer
         // rebuilds image instances every frame and the rows were marked,
         // so only a drop needs the revision bump.
-        self.drop_placements(&dropped, false);
+        self.drop_placements(&dropped, &[], Free::NONE);
     }
 
     /// Full-screen scroll up by one on the active grid: the top row goes
@@ -919,15 +921,15 @@ impl Term {
         let evicted = self.images.store.set_cap(cap_bytes);
         if let Some(s) = self.stashed_images.as_mut() {
             for key in s.store.set_cap(cap_bytes) {
-                let dropped = s.grid.remove_image_key(key);
-                s.release(&dropped, false);
+                let (mut dropped, cascaded) = s.grid.remove_where_split(|p| p.key == key);
+                dropped.extend(cascaded.iter().cloned());
+                s.release(&dropped, &cascaded, Free::CHILDREN);
             }
             s.prune_virtual();
         }
         self.prune_virtual_placements();
         for key in evicted {
-            let dropped = self.images.grid.remove_image_key(key);
-            self.drop_placements(&dropped, false);
+            self.drop_image_key(key);
         }
     }
 
@@ -2152,7 +2154,7 @@ impl Term {
                 .shift_lines(top_line_of(&self.alt) - alt_top);
             let dropped = evict_unretained(&mut self.images.grid, &self.alt);
             changed |= !dropped.is_empty();
-            self.images.release(&dropped, false);
+            self.images.release(&dropped, &[], Free::NONE);
         }
         if changed {
             self.image_revision = self.image_revision.wrapping_add(1);
@@ -3328,11 +3330,15 @@ impl Term {
                     self.images.grid.clear()
                 } else {
                     let top_line = self.image_top_line();
+                    // Relative children aren't cleared themselves: they go
+                    // with their parent (kitty-ref: a child on screen
+                    // whose parent is in the history survives ESC[2J,
+                    // image and all).
                     self.images
                         .grid
-                        .remove_where(|p| p.screen_rows(top_line).end > 0)
+                        .remove_where(|p| p.parent.is_none() && p.screen_rows(top_line).end > 0)
                 };
-                self.drop_placements(&dropped, false);
+                self.drop_placements(&dropped, &[], Free::NONE);
                 // PLC-8: kitty's clear then frees every image left with
                 // no placement, never-placed ones included, so after it
                 // `a=p` on such an id gets ENOENT and `I=` hands out the
@@ -4692,18 +4698,30 @@ impl Perform for Term {
 impl Term {
     /// Finish removing `dropped` from the active screen's grid: mark
     /// their cells, bump the image revision and settle the store
-    /// ([`ScreenImages::release`]; `free_bytes` for an uppercase delete).
-    /// Every path that removes placements from the active grid calls
-    /// this.
-    fn drop_placements(&mut self, dropped: &[Placement], free_bytes: bool) {
+    /// ([`ScreenImages::release`]). `cascaded` lists the relative
+    /// children among `dropped` that went because their parent did
+    /// (REL-2); `free` says which images the removal frees. Every path
+    /// that removes placements from the active grid calls this.
+    fn drop_placements(&mut self, dropped: &[Placement], cascaded: &[Placement], free: Free) {
         if dropped.is_empty() {
             return;
         }
         for p in dropped {
             mark_placement_dirty(self, p);
         }
-        self.images.release(dropped, free_bytes);
+        self.images.release(dropped, cascaded, free);
         self.image_revision = self.image_revision.wrapping_add(1);
+    }
+
+    /// Remove every placement of the image stored under `key` (its bytes
+    /// were just replaced or evicted), with the relative children that
+    /// hang off them. kitty frees those children's images too (REL-2;
+    /// kitty-ref: re-transmitting or quota-evicting a parent's image
+    /// leaves `a=p` on the child's id with ENOENT).
+    fn drop_image_key(&mut self, key: ImageKey) {
+        let (mut dropped, cascaded) = self.images.grid.remove_where_split(|p| p.key == key);
+        dropped.extend(cascaded.iter().cloned());
+        self.drop_placements(&dropped, &cascaded, Free::CHILDREN);
     }
 
     /// Free the active screen's image answering to client `id` (and its
@@ -4738,7 +4756,9 @@ impl Term {
         &mut self,
         header: &toastty_graphics::kitty::header::Header,
         uppercase: bool,
-    ) -> Vec<Placement> {
+        dropped: &mut Vec<Placement>,
+        cascaded: &mut Vec<Placement>,
+    ) {
         // `i=` is taken as is: removing placements / bytes of an id that
         // has neither is a no-op, and leftover placements of an id whose
         // data is already gone get cleaned up.
@@ -4750,15 +4770,234 @@ impl Term {
             None
         };
         let Some(img) = target else {
-            return Vec::new();
+            return;
         };
-        // Single-frame rule.
+        // Single-frame rule: every placement (virtual ones too) and the
+        // bytes, like `d=I` with no survivor.
         if !uppercase {
-            return Vec::new();
+            return;
         }
-        let dropped = self.images.grid.remove_image(img);
-        self.remove_image_bytes(img);
-        dropped
+        self.delete_by_image(img, 0, true, dropped, cascaded);
+    }
+
+    /// `d=i`/`d=I` (and `d=n`/`d=N` once the number is resolved): remove
+    /// image `img`'s placements (only placement `pid` when non-zero).
+    /// Uppercase frees the bytes, but only when no placement of the image
+    /// survives (B5).
+    fn delete_by_image(
+        &mut self,
+        img: u32,
+        pid: u32,
+        drop_bytes: bool,
+        dropped: &mut Vec<Placement>,
+        cascaded: &mut Vec<Placement>,
+    ) {
+        let removed = self
+            .images
+            .grid
+            .remove_where_split(|p| p.image_id == img && (pid == 0 || p.placement_id == pid));
+        take_split(dropped, cascaded, removed);
+        // Virtual (`U=1`) placements have no position on screen, so only
+        // the id-based selectors (`i`, `n`, `r`, `f` and capitals) reach
+        // them (#28).
+        if self
+            .images
+            .virtual_placements
+            .remove_where(|v| v.image_id == img && (pid == 0 || v.placement_id == pid))
+        {
+            self.image_revision = self.image_revision.wrapping_add(1);
+        }
+        if drop_bytes
+            && !self.images.grid.iter().any(|p| p.image_id == img)
+            && !self.images.virtual_placements.contains_image(img)
+        {
+            self.remove_image_bytes(img);
+        }
+    }
+
+    /// `d=r`/`d=R`: remove the placements of every image id in `ids`;
+    /// uppercase also frees those images' bytes (B7).
+    fn delete_id_range(
+        &mut self,
+        ids: std::ops::RangeInclusive<u32>,
+        drop_bytes: bool,
+        dropped: &mut Vec<Placement>,
+        cascaded: &mut Vec<Placement>,
+    ) {
+        // Anonymous images (id 0) are never in an id range (PLC-4, as in
+        // kitty).
+        let removed = self
+            .images
+            .grid
+            .remove_where_split(|p| p.image_id != 0 && ids.contains(&p.image_id));
+        take_split(dropped, cascaded, removed);
+        if self
+            .images
+            .virtual_placements
+            .remove_where(|v| ids.contains(&v.image_id))
+        {
+            self.image_revision = self.image_revision.wrapping_add(1);
+        }
+        if drop_bytes {
+            for id in self.images.store.clients_in(*ids.start(), *ids.end()) {
+                self.remove_image_bytes(id);
+            }
+        }
+    }
+
+    /// The removal half of a kitty delete: remove the placements
+    /// `spec_byte` selects into `dropped` (the cascaded children also into
+    /// `cascaded`) and free the bytes the id-like selectors free inline.
+    /// Returns whether the caller still has to run the survivor sweep
+    /// (uppercase selectors that don't free bytes themselves).
+    fn delete_select(
+        &mut self,
+        spec_byte: u8,
+        header: &toastty_graphics::kitty::header::Header,
+        drop_bytes: bool,
+        dropped: &mut Vec<Placement>,
+        cascaded: &mut Vec<Placement>,
+    ) -> bool {
+        // Cell/selector keys carry 1-based coordinates in the lowercase
+        // `x=`/`y=` keys (header.src_x / src_y) per spec; convert to the
+        // grid's 0-based rows/cols (the B6 convention). `z=` carries the
+        // z-index for q/z.
+        let sel_col = header.src_x.saturating_sub(1) as u16;
+        let sel_row = header.src_y.saturating_sub(1) as u16;
+        let sel_z = header.z;
+        // Cell selectors address screen cells; placements are anchored to
+        // line ids, so translate through the screen's top line.
+        let top_line = self.image_top_line();
+        // For uppercase selectors that don't free bytes inline, this
+        // flag drives a post-removal survivor sweep (free bytes for
+        // images left with no placement). Set false by arms that do
+        // their own byte handling.
+        let mut needs_survivor_sweep = drop_bytes;
+        match spec_byte {
+            // `a` / `A` — delete all placements *visible on screen* (the
+            // active screen's rows `0..self.rows`). M10: this is NOT
+            // "everything"; only placements intersecting the viewport.
+            // Uppercase `A` frees bytes for images left without any
+            // surviving placement (survivor sweep below).
+            b'a' | b'A' => {
+                let rows = i64::from(self.rows);
+                take_split(
+                    dropped,
+                    cascaded,
+                    self.images.grid.remove_where_split(|p| {
+                        let r = p.screen_rows(top_line);
+                        r.start < rows && r.end > 0
+                    }),
+                );
+            }
+            // `i` / `I` — by image id (provided via `i=`). When `p=` is
+            // also given (non-zero), scope to that single placement;
+            // otherwise drop every placement of the image. (B4)
+            b'i' | b'I' if header.image_id != 0 => {
+                let (img, pid) = (header.image_id, header.placement_id);
+                self.delete_by_image(img, pid, drop_bytes, dropped, cascaded);
+                needs_survivor_sweep = false;
+            }
+            // `n` / `N` — by image *number* (provided via `I=`).
+            // Resolve the number to the most-recently-registered id
+            // (M11), then delete its placements; `N` also frees bytes
+            // when no placement of that image survives.
+            b'n' | b'N' => {
+                if header.image_number != 0
+                    && let Some(img) = self.newest_image_for_number(header.image_number)
+                {
+                    self.delete_by_image(img, 0, drop_bytes, dropped, cascaded);
+                }
+                needs_survivor_sweep = false;
+            }
+            // `p` / `P` — by CELL coordinates. The cell is specified via
+            // the lowercase `x=` / `y=` keys (parsed into `src_x` /
+            // `src_y`), 1-based per the spec ("x=1,y=1 is the top left
+            // cell"). Internal screen rows / columns are 0-based, so
+            // convert by subtracting 1. (B6)
+            b'p' | b'P' => {
+                take_split(
+                    dropped,
+                    cascaded,
+                    self.images
+                        .grid
+                        .remove_where_split(|p| p.covers(top_line, sel_row, sel_col)),
+                );
+                // Uppercase `P` frees bytes for any image that lost its
+                // last placement. (B6, same rule as B5) — handled by the
+                // shared survivor sweep below.
+            }
+            // `r` / `R` — by image-id RANGE (kitty 0.33+). Delete all
+            // images whose id is in `[x, y]` inclusive, where the
+            // lowercase `x=` / `y=` keys carry the id bounds (parsed into
+            // `src_x` / `src_y`). Lowercase removes placements; uppercase
+            // `R` additionally frees image bytes. (B7)
+            b'r' | b'R' if header.src_x <= header.src_y => {
+                let ids = header.src_x..=header.src_y;
+                self.delete_id_range(ids, drop_bytes, dropped, cascaded);
+                needs_survivor_sweep = false;
+            }
+            // `c` / `C` — placements intersecting the CURRENT CURSOR cell.
+            b'c' | b'C' => {
+                let row = self.cursor.row;
+                let col = self.cursor.col.min(self.cols.saturating_sub(1));
+                take_split(
+                    dropped,
+                    cascaded,
+                    self.images
+                        .grid
+                        .remove_where_split(|p| p.covers(top_line, row, col)),
+                );
+            }
+            // `q` / `Q` — placements intersecting cell (sel_col, sel_row)
+            // AND having z-index == `z=`.
+            b'q' | b'Q' => {
+                take_split(
+                    dropped,
+                    cascaded,
+                    self.images.grid.remove_where_split(|p| {
+                        p.covers(top_line, sel_row, sel_col) && p.z == sel_z
+                    }),
+                );
+            }
+            // `x` / `X` — placements intersecting COLUMN sel_col.
+            b'x' | b'X' => {
+                take_split(
+                    dropped,
+                    cascaded,
+                    self.images
+                        .grid
+                        .remove_where_split(|p| p.col_range().contains(&sel_col)),
+                );
+            }
+            // `y` / `Y` — placements intersecting ROW sel_row. The real
+            // "delete by row" selector (B7 moved `r/R` to id-range).
+            b'y' | b'Y' => {
+                take_split(
+                    dropped,
+                    cascaded,
+                    self.images
+                        .grid
+                        .remove_where_split(|p| p.on_row(top_line, sel_row)),
+                );
+            }
+            // `z` / `Z` — placements with z-index == `z=`.
+            b'z' | b'Z' => {
+                take_split(
+                    dropped,
+                    cascaded,
+                    self.images.grid.remove_where_split(|p| p.z == sel_z),
+                );
+            }
+            // `f` / `F` — delete animation frames (DEL-2, #35); see
+            // [`Term::delete_image_frames`].
+            b'f' | b'F' => {
+                self.delete_image_frames(header, drop_bytes, dropped, cascaded);
+                needs_survivor_sweep = false;
+            }
+            _ => {}
+        }
+        needs_survivor_sweep
     }
 
     /// Register a decoded sixel image and place it at the cursor, then
@@ -4879,8 +5118,7 @@ impl KittySink for Term {
                 // all its placements; the new data shows only once placed.
                 // Evicted images lose their placements too.
                 for gone in stored.replaced.iter().chain(&stored.evicted) {
-                    let dropped = self.images.grid.remove_image_key(*gone);
-                    self.drop_placements(&dropped, false);
+                    self.drop_image_key(*gone);
                 }
                 self.last_registered_key = Some(key);
                 self.image_revision = self.image_revision.wrapping_add(1);
@@ -4958,26 +5196,29 @@ impl KittySink for Term {
         // In the pending-wrap state (`col == cols`) kitty puts the image
         // past the right edge, where it is cropped away (kitty-ref), and
         // the cursor then wraps (`advance_cursor_after_placement`).
-        placement.col = self.cursor.col.min(self.cols);
+        placement.col = i32::from(self.cursor.col.min(self.cols));
         placement.clip_rows = 0..placement.rows;
         // M5: re-emitting the same `(image_id, placement_id)` must
         // REPLACE the prior placement, not stack on top of it. Per spec:
         // "If you send two placements with the same image id and
         // placement id the second one will replace the first." Only
         // applies when BOTH ids are non-zero (a named placement);
-        // unnamed (`p=0`) placements always accumulate.
-        if placement.image_id != 0 && placement.placement_id != 0 {
-            let img = placement.image_id;
-            let pid = placement.placement_id;
-            let old = self
+        // unnamed (`p=0`) placements always accumulate. `upsert`
+        // replaces in place, so the placement's relative children stay
+        // attached and follow it to its new position (REL-3).
+        if placement.image_id != 0
+            && placement.placement_id != 0
+            && let Some(old) = self
                 .images
                 .grid
-                .remove_where(|p| p.image_id == img && p.placement_id == pid);
-            self.drop_placements(&old, false);
+                .find(placement.image_id, placement.placement_id)
+                .cloned()
+        {
+            mark_placement_dirty(self, &old);
         }
         // Mark dirty BEFORE consuming `placement` into the grid.
         mark_placement_dirty(self, &placement);
-        self.images.grid.add(placement);
+        self.images.grid.upsert(placement);
         self.image_revision = self.image_revision.wrapping_add(1);
     }
 
@@ -5001,21 +5242,24 @@ impl KittySink for Term {
             "kitty: place_relative",
         );
         // M5 replace rule: a named (image_id, placement_id) re-emission
-        // replaces the prior placement of the same pair.
-        if placement.image_id != 0 && placement.placement_id != 0 {
-            let img = placement.image_id;
-            let pid = placement.placement_id;
-            let old = self
-                .images
-                .grid
-                .remove_where(|p| p.image_id == img && p.placement_id == pid);
-            self.drop_placements(&old, false);
-        }
-        // `add_relative` validates the parent ref and rebases the child's
-        // cell ranges onto the parent origin + (H, V). On error nothing is
-        // inserted.
+        // replaces the prior placement of the same pair. `add_relative`
+        // validates the parent reference *first* and only then replaces
+        // in place, so a rejected re-placement keeps the old placement
+        // and its children (REL-1). It rebases the child onto the parent
+        // origin + (H, V).
+        let old = (placement.image_id != 0 && placement.placement_id != 0)
+            .then(|| {
+                self.images
+                    .grid
+                    .find(placement.image_id, placement.placement_id)
+                    .cloned()
+            })
+            .flatten();
         match self.images.grid.add_relative(placement) {
             Ok(handle) => {
+                if let Some(old) = old {
+                    mark_placement_dirty(self, &old);
+                }
                 // The placement was rebased inside `add_relative`; re-read
                 // it to mark the resolved cells dirty.
                 let resolved = self
@@ -5052,6 +5296,8 @@ impl KittySink for Term {
         // Treat empty / unknown specs the same as `a` (all).
         let spec_byte = if delete.byte == 0 { b'a' } else { delete.byte };
         let mut dropped_placements = Vec::new();
+        // Children that went because their parent did (REL-2).
+        let mut cascaded: Vec<Placement> = Vec::new();
         let drop_bytes = delete.free_bytes();
         let spec_char = (spec_byte as char).to_string();
         tracing::info!(
@@ -5063,178 +5309,13 @@ impl KittySink for Term {
             cell_y = header.cell_y,
             "kitty: delete_image",
         );
-        // Cell/selector keys carry 1-based coordinates in the lowercase
-        // `x=`/`y=` keys (header.src_x / src_y) per spec; convert to the
-        // grid's 0-based rows/cols (the B6 convention). `z=` carries the
-        // z-index for q/z.
-        let sel_col = header.src_x.saturating_sub(1) as u16;
-        let sel_row = header.src_y.saturating_sub(1) as u16;
-        let sel_z = header.z;
-        // Cell selectors address screen cells; placements are anchored to
-        // line ids, so translate through the screen's top line.
-        let top_line = self.image_top_line();
-        // For uppercase selectors that don't free bytes inline, this
-        // flag drives a post-removal survivor sweep (free bytes for
-        // images left with no placement). Set false by arms that do
-        // their own byte handling.
-        let mut needs_survivor_sweep = drop_bytes;
-        // Virtual (`U=1`) placements have no position on screen, so only
-        // the id-based selectors (`i`, `n`, `r` and capitals) reach them;
-        // the positional ones leave placeholder images alone (spec,
-        // "Unicode placeholders").
-        let mut virtual_dropped = false;
-        match spec_byte {
-            // `a` / `A` — delete all placements *visible on screen* (the
-            // active screen's rows `0..self.rows`). M10: this is NOT
-            // "everything"; only placements intersecting the viewport.
-            // Uppercase `A` frees bytes for images left without any
-            // surviving placement (survivor sweep below).
-            b'a' | b'A' => {
-                let rows = i64::from(self.rows);
-                dropped_placements.extend(self.images.grid.remove_where(|p| {
-                    let r = p.screen_rows(top_line);
-                    r.start < rows && r.end > 0
-                }));
-            }
-            // `i` / `I` — by image id (provided via `i=`). When `p=` is
-            // also given (non-zero), scope to that single placement;
-            // otherwise drop every placement of the image. (B4)
-            b'i' | b'I' => {
-                if header.image_id != 0 {
-                    let img = header.image_id;
-                    let pid = header.placement_id;
-                    if pid != 0 {
-                        dropped_placements.extend(
-                            self.images
-                                .grid
-                                .remove_where(|p| p.image_id == img && p.placement_id == pid),
-                        );
-                        virtual_dropped |= self
-                            .images
-                            .virtual_placements
-                            .remove_where(|v| v.image_id == img && v.placement_id == pid);
-                    } else {
-                        dropped_placements.extend(self.images.grid.remove_image(img));
-                        virtual_dropped |= self.images.virtual_placements.remove_image(img);
-                    }
-                    // Uppercase frees the bytes, but only when no
-                    // placement of this image survives. (B5)
-                    if drop_bytes
-                        && !self.images.grid.iter().any(|p| p.image_id == img)
-                        && !self.images.virtual_placements.contains_image(img)
-                    {
-                        self.remove_image_bytes(img);
-                    }
-                    needs_survivor_sweep = false;
-                }
-            }
-            // `n` / `N` — by image *number* (provided via `I=`).
-            // Resolve the number to the most-recently-registered id
-            // (M11), then delete its placements; `N` also frees bytes
-            // when no placement of that image survives.
-            b'n' | b'N' => {
-                if header.image_number != 0 {
-                    if let Some(img) = self.newest_image_for_number(header.image_number) {
-                        dropped_placements.extend(self.images.grid.remove_image(img));
-                        virtual_dropped |= self.images.virtual_placements.remove_image(img);
-                        if drop_bytes && !self.images.grid.iter().any(|p| p.image_id == img) {
-                            self.remove_image_bytes(img);
-                        }
-                    }
-                }
-                needs_survivor_sweep = false;
-            }
-            // `p` / `P` — by CELL coordinates. The cell is specified via
-            // the lowercase `x=` / `y=` keys (parsed into `src_x` /
-            // `src_y`), 1-based per the spec ("x=1,y=1 is the top left
-            // cell"). Internal screen rows / columns are 0-based, so
-            // convert by subtracting 1. (B6)
-            b'p' | b'P' => {
-                dropped_placements.extend(
-                    self.images
-                        .grid
-                        .remove_where(|p| p.covers(top_line, sel_row, sel_col)),
-                );
-                // Uppercase `P` frees bytes for any image that lost its
-                // last placement. (B6, same rule as B5) — handled by the
-                // shared survivor sweep below.
-            }
-            // `r` / `R` — by image-id RANGE (kitty 0.33+). Delete all
-            // images whose id is in `[x, y]` inclusive, where the
-            // lowercase `x=` / `y=` keys carry the id bounds (parsed into
-            // `src_x` / `src_y`). Lowercase removes placements; uppercase
-            // `R` additionally frees image bytes. (B7)
-            b'r' | b'R' => {
-                let lo = header.src_x;
-                let hi = header.src_y;
-                if lo <= hi {
-                    // Anonymous images (id 0) are never in an id range
-                    // (PLC-4, as in kitty).
-                    dropped_placements.extend(
-                        self.images
-                            .grid
-                            .remove_where(|p| p.image_id != 0 && (lo..=hi).contains(&p.image_id)),
-                    );
-                    virtual_dropped |= self
-                        .images
-                        .virtual_placements
-                        .remove_where(|v| (lo..=hi).contains(&v.image_id));
-                    if drop_bytes {
-                        for id in self.images.store.clients_in(lo, hi) {
-                            self.remove_image_bytes(id);
-                        }
-                    }
-                    needs_survivor_sweep = false;
-                }
-            }
-            // `c` / `C` — placements intersecting the CURRENT CURSOR cell.
-            b'c' | b'C' => {
-                let row = self.cursor.row;
-                let col = self.cursor.col.min(self.cols.saturating_sub(1));
-                dropped_placements.extend(
-                    self.images
-                        .grid
-                        .remove_where(|p| p.covers(top_line, row, col)),
-                );
-            }
-            // `q` / `Q` — placements intersecting cell (sel_col, sel_row)
-            // AND having z-index == `z=`.
-            b'q' | b'Q' => {
-                dropped_placements.extend(
-                    self.images
-                        .grid
-                        .remove_where(|p| p.covers(top_line, sel_row, sel_col) && p.z == sel_z),
-                );
-            }
-            // `x` / `X` — placements intersecting COLUMN sel_col.
-            b'x' | b'X' => {
-                dropped_placements.extend(
-                    self.images
-                        .grid
-                        .remove_where(|p| p.col_range().contains(&sel_col)),
-                );
-            }
-            // `y` / `Y` — placements intersecting ROW sel_row. The real
-            // "delete by row" selector (B7 moved `r/R` to id-range).
-            b'y' | b'Y' => {
-                dropped_placements.extend(
-                    self.images
-                        .grid
-                        .remove_where(|p| p.on_row(top_line, sel_row)),
-                );
-            }
-            // `z` / `Z` — placements with z-index == `z=`.
-            b'z' | b'Z' => {
-                dropped_placements.extend(self.images.grid.remove_where(|p| p.z == sel_z));
-            }
-            // `f` / `F` — delete animation frames (DEL-2); see
-            // [`Term::delete_image_frames`].
-            b'f' | b'F' => {
-                dropped_placements.extend(self.delete_image_frames(header, drop_bytes));
-                needs_survivor_sweep = false;
-            }
-            _ => {}
-        }
+        let needs_survivor_sweep = self.delete_select(
+            spec_byte,
+            header,
+            drop_bytes,
+            &mut dropped_placements,
+            &mut cascaded,
+        );
         tracing::info!(
             target: "kitty",
             spec = %spec_char,
@@ -5245,9 +5326,19 @@ impl KittySink for Term {
         // `Z`) free image bytes for any image left with no surviving
         // placement after the removals above (mirrors the B5 rule). Any
         // delete frees an anonymous image's bytes with its last
-        // placement (PLC-8).
-        self.drop_placements(&dropped_placements, needs_survivor_sweep);
-        if drop_bytes || virtual_dropped {
+        // placement (PLC-8). REL-2: kitty 0.49.2 frees a cascaded child's
+        // image on the id-like deletes (`i`/`I`, `n`/`N`, `r`/`R`, `z`/`Z`,
+        // `q`/`Q`) even in lowercase; a lowercase positional delete (`a`,
+        // `p`, `x`, `y`, `c`) keeps it (all checked on kitty-ref).
+        let free = Free {
+            orphans: needs_survivor_sweep,
+            children: matches!(
+                spec_byte.to_ascii_lowercase(),
+                b'i' | b'n' | b'r' | b'z' | b'q' | b'f'
+            ),
+        };
+        self.drop_placements(&dropped_placements, &cascaded, free);
+        if drop_bytes {
             self.image_revision = self.image_revision.wrapping_add(1);
         }
     }
@@ -5493,6 +5584,46 @@ impl RgpSink for Term {
     }
 }
 
+/// Collect a split removal: everything into `dropped` (for dirty marking
+/// and the survivor sweep), the cascaded children also into `cascaded`.
+fn take_split(
+    dropped: &mut Vec<Placement>,
+    cascaded: &mut Vec<Placement>,
+    removed: (Vec<Placement>, Vec<Placement>),
+) {
+    let (direct, children) = removed;
+    dropped.extend(direct);
+    dropped.extend(children.iter().cloned());
+    cascaded.extend(children);
+}
+
+/// Which images a placement removal frees, besides anonymous ones (those
+/// always go with their last placement, PLC-8). kitty's rules differ by
+/// what removed the placements.
+#[derive(Debug, Clone, Copy, Default)]
+struct Free {
+    /// Every image left with no placement (uppercase deletes).
+    orphans: bool,
+    /// The image of each relative child that went because its parent did,
+    /// once it has no placement left (REL-2): the id-like deletes, and a
+    /// parent's image being re-transmitted or evicted. Not lowercase
+    /// positional deletes, nor a parent leaving the history.
+    children: bool,
+}
+
+impl Free {
+    /// Only anonymous images.
+    const NONE: Self = Self {
+        orphans: false,
+        children: false,
+    };
+    /// Also cascaded children's images.
+    const CHILDREN: Self = Self {
+        orphans: false,
+        children: true,
+    };
+}
+
 /// Mark the on-screen cells under `p`'s shown part dirty.
 /// One screen's images, swapped as a unit on a screen switch: the
 /// placements, the virtual (`U=1`) placements Unicode placeholder cells
@@ -5541,22 +5672,28 @@ impl ScreenImages {
 
     /// Settle the store after `dropped` left the grid. An image left
     /// with no placement loses its bytes when it is anonymous (nothing
-    /// can place it again, as in kitty; PLC-8) or when `free_bytes` (an
-    /// uppercase delete) asks for it. Every placement removal ends here,
-    /// so what a removal implies for the rest of the screen (REL-2's
-    /// child cascade, #28's virtual placements) belongs here too.
-    fn release(&mut self, dropped: &[Placement], free_bytes: bool) {
+    /// can place it again, as in kitty; PLC-8), when `free.orphans` (an
+    /// uppercase delete) asks for it, or when it belongs to one of the
+    /// relative children in `cascaded` (also in `dropped`) and
+    /// `free.children` asks for that (REL-2). Every placement removal
+    /// ends here, so what a removal implies for the rest of the screen
+    /// (#28's virtual placements next) belongs here too.
+    fn release(&mut self, dropped: &[Placement], cascaded: &[Placement], free: Free) {
         if dropped.is_empty() {
             return;
         }
         let placed = self.placed_keys();
-        let mut seen: Vec<ImageKey> = Vec::new();
+        let children: std::collections::HashSet<ImageKey> = if free.children {
+            cascaded.iter().map(|p| p.key).collect()
+        } else {
+            std::collections::HashSet::new()
+        };
         for p in dropped {
-            if seen.contains(&p.key) || placed.contains(&p.key) {
+            if placed.contains(&p.key) || !self.store.contains_key(p.key) {
                 continue;
             }
-            seen.push(p.key);
-            if free_bytes || self.store.client_of(p.key) == Some(0) {
+            let anonymous = self.store.client_of(p.key) == Some(0);
+            if anonymous || free.orphans || children.contains(&p.key) {
                 self.store.remove_key(p.key);
             }
         }
@@ -5604,6 +5741,7 @@ impl ScreenImages {
     }
 }
 
+/// Mark the on-screen cells under `p`'s shown part dirty.
 fn mark_placement_dirty(t: &mut Term, p: &Placement) {
     let rows = t.screen_rows_clamped(p);
     let cols = p.col_range();
