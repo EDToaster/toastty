@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 
-use super::decode::{DecodeError, decode};
-use super::header::{Action, Compression, DeleteSpec, Format, Header, Quiet, Transmission};
+use super::decode::{DecodeError, decode, raw_len};
+use super::header::{Action, Compression, DeleteSpec, Header, Quiet, Transmission};
 use super::medium::{self, FileError, FileRequest};
 use super::reply::{ErrorCode, encode_error, encode_ok};
 use crate::image_grid::{Placement, RelativeError, SrcRect};
@@ -48,6 +48,11 @@ pub const DEFAULT_PENDING_TOTAL_CAP: usize = 2 * DEFAULT_PENDING_CAP;
 /// An upload that receives no chunk for this long is abandoned, and its
 /// buffer freed on the next graphics command (SEC-6).
 pub const PENDING_UPLOAD_TTL: Duration = Duration::from_mins(1);
+
+/// Extra compressed bytes past `s*v*bpp` that kitty buffers for an
+/// `o=z` raw upload before replying `EFBIG:Too much data`. Measured on
+/// kitty 0.49.2 (a 1x1 RGBA upload takes ~1027 compressed bytes).
+const COMPRESSED_DATA_SLACK: u64 = 1024;
 
 /// Decoded-image quota for sinks that don't report one
 /// ([`KittySink::max_image_bytes`]). kitty's per-image `MAX_DATA_SZ`.
@@ -145,13 +150,26 @@ pub trait KittySink {
 
     /// True iff the host's image registry holds an entry for `id`.
     ///
-    /// Consulted on `a=q` (Query) so the handler can reply with
-    /// [`ErrorCode::Enoent`] when the queried image is not present
-    /// rather than falsely confirming "yes, we have it". Default
-    /// returns `false` so existing test sinks see the conservative
-    /// answer without having to override the method.
+    /// `a=p` and the animation actions reply ENOENT for an image that
+    /// isn't stored (PLC-1, WIRE-12), before placing anything or moving
+    /// the cursor. Default `false`.
     fn image_exists(&self, _id: u32) -> bool {
         false
+    }
+
+    /// The id of the newest stored image with number `number` (`I=`), or
+    /// `None`. Commands that name an image by number act on the newest
+    /// one with that number (PLC-3). Default `None`.
+    fn image_id_for_number(&self, _number: u32) -> Option<u32> {
+        None
+    }
+
+    /// The id the host would give an image sent without `i=` right now.
+    /// kitty allocates the id before validating a transmit, so a failed
+    /// `I=`-only transmit still reports it (`i=4,I=156;ENODATA:…`).
+    /// Default `0` (no id in the reply).
+    fn next_image_id(&self) -> u32 {
+        0
     }
 
     /// Pixel dimensions `(width, height)` of a registered image, or `None`
@@ -268,25 +286,20 @@ impl KittyHandler {
         sink: &mut S,
     ) -> Result<(), HandlerError> {
         self.expire_pending(Instant::now());
-        let header = match super::header::parse(header_bytes) {
-            Ok(h) => h,
-            Err(e) => {
-                // B9: a malformed header must produce an EINVAL reply
-                // (subject to quiet), not be silently swallowed. The
-                // parse failed so we don't have a `Header` to read the
-                // id from — best-effort recover `i=`/`I=` by scanning
-                // the raw header for those keys (kitty parses all keys
-                // then validates, echoing the id in the EINVAL reply).
-                // If no id is recoverable the reply stays silent, in
-                // line with the "anonymous requests get no reply" rule.
-                emit_bad_header_einval(header_bytes, sink);
-                return Err(HandlerError::BadHeader(e));
-            }
-        };
+        // WIRE-6: kitty 0.49.2 drops a malformed header (unknown key, bad
+        // number, bad enum value) without a reply, even when it carries
+        // `i=`. A reply nobody reads ends up as typed text in the shell,
+        // so we do the same.
+        let header = super::header::parse(header_bytes).map_err(HandlerError::BadHeader)?;
         // B8: specifying both `i=` and `I=` in any command is an error.
         // Reply EINVAL (respecting quiet) and perform no action.
         if header.image_id != 0 && header.image_number != 0 {
-            reply_error_if_verbose(&header, sink, ErrorCode::Einval, "both i= and I= specified");
+            reply_error_if_verbose(
+                &header,
+                sink,
+                ErrorCode::Einval,
+                "Must not specify both image id and image number",
+            );
             return Ok(());
         }
         self.dispatch(header, body, sink);
@@ -322,22 +335,17 @@ impl KittyHandler {
                 // action) but is NOT consulted by `a=q`.
                 self.handle_query(header, body, sink);
             }
-            Action::Frame | Action::Animate => {
-                // Animation: pre-approved Enotsup.
-                reply_error_if_verbose(&header, sink, ErrorCode::Enotsup, "animation");
-            }
-            Action::Compose => {
-                reply_error_if_verbose(&header, sink, ErrorCode::Enotsup, "composition");
+            Action::Frame | Action::Animate | Action::Compose => {
+                self.handle_animation(&header, sink);
             }
         }
     }
 
     #[allow(clippy::needless_pass_by_value, clippy::unused_self)]
     fn handle_query<S: KittySink>(&mut self, header: Header, body: &[u8], sink: &mut S) {
-        // Empty body: app is probing for protocol support, not testing
-        // a specific payload. Reply OK directly.
-        if body.is_empty() {
-            reply_ok_if_verbose(&header, sink);
+        // kitty answers a query only when it carries `i=`: an anonymous
+        // or `I=`-only query is silent, success or failure (WIRE-7).
+        if header.image_id == 0 {
             return;
         }
         if !matches!(header.transmission, Transmission::Direct) {
@@ -345,19 +353,10 @@ impl KittyHandler {
             return;
         }
         // Decode and validate. Same pipeline as `finalize_transmit`
-        // but we discard the result (Query must not store/display).
-        let decoded = match decode_base64(body) {
-            Ok(d) => d,
-            Err(e) => {
-                reply_error_if_verbose(
-                    &header,
-                    sink,
-                    ErrorCode::Einval,
-                    &format!("bad base64: {e}"),
-                );
-                return;
-            }
-        };
+        // but we discard the result (Query must not store/display). An
+        // empty body is not special: like kitty it fails the dimension
+        // or data checks (`EINVAL:Zero width/height not allowed`).
+        let decoded = decode_base64(body);
         match decode_payload(&header, decoded, sink.max_image_bytes()) {
             Ok(_) => reply_ok_if_verbose(&header, sink),
             Err(e) => reply_error_if_verbose(&header, sink, e.code, &e.detail),
@@ -403,7 +402,13 @@ impl KittyHandler {
         let has_route = header.image_id != 0 || self.active_upload_id.is_some();
 
         // Continuation: append to the existing pending buffer.
-        if has_route && let Some(pending) = self.pending.get(&key) {
+        if has_route && let Some(pending) = self.pending.get_mut(&key) {
+            // WIRE-8: a `q=` on a continuation chunk applies to the whole
+            // upload, as in kitty. `q=0` can't be told apart from no `q=`,
+            // so it never lowers an earlier chunk's quietness.
+            if header.quiet != Quiet::Verbose {
+                pending.head.quiet = header.quiet;
+            }
             // Compare critical header fields. Mismatches → Einval and
             // abandon the upload. Skip the check when the continuation
             // chunk was routed via `active_upload_id` (its header is
@@ -486,18 +491,7 @@ impl KittyHandler {
         // base64-decode. Kitty uses standard base64; whitespace is
         // tolerated by some clients but not all. We use the lenient
         // decoder that accepts standard alphabet, no padding required.
-        let decoded = match decode_base64(&b64_buf) {
-            Ok(d) => d,
-            Err(e) => {
-                reply_error_if_verbose(
-                    &header,
-                    sink,
-                    ErrorCode::Einval,
-                    &format!("bad base64: {e}"),
-                );
-                return;
-            }
-        };
+        let decoded = decode_base64(&b64_buf);
         // After base64 decode, direct and medium transmissions converge:
         // `decoded` is the raw (still possibly zlib-compressed) payload.
         self.finalize_decoded(header, decoded, PayloadSource::Direct, sink);
@@ -620,7 +614,7 @@ impl KittyHandler {
                     // holds (its size, whether it is a PNG).
                     PayloadSource::File => reply_file_error(&header, sink, &e.detail),
                     PayloadSource::Direct => {
-                        reply_error_if_verbose(&header, sink, e.code, &e.detail);
+                        reply_transmit_error(&header, sink, e.code, &e.detail);
                     }
                 }
                 return;
@@ -631,7 +625,7 @@ impl KittyHandler {
         // we can build the placement after the borrow ends.
         let (img_w, img_h) = (img.width, img.height);
         let Some(final_id) = sink.register_image(header.image_id, header.image_number, img) else {
-            reply_error_if_verbose(&header, sink, ErrorCode::Efbig, "registry full");
+            reply_transmit_error(&header, sink, ErrorCode::Efbig, "registry full");
             return;
         };
 
@@ -670,10 +664,16 @@ impl KittyHandler {
 
     #[allow(clippy::needless_pass_by_value, clippy::unused_self)]
     fn handle_place<S: KittySink>(&mut self, header: Header, sink: &mut S) {
-        if header.image_id == 0 {
-            reply_error_if_verbose(&header, sink, ErrorCode::Einval, "place requires i=");
+        // PLC-1 / PLC-3: resolve `i=`, or the newest image with `I=`, and
+        // refuse an image that isn't stored (kitty: ENOENT, sent even with
+        // `q=1`) before anything is placed or the cursor moves. From here
+        // on `header.image_id` is the resolved id, so an `I=` placement
+        // replies `i=<id>,I=<n>;OK` like kitty.
+        let Some(id) = resolve_image(&header, sink, "Put") else {
             return;
-        }
+        };
+        let mut header = header;
+        header.image_id = id;
         // B12: `U=1` is a virtual placement — register-only, no visible
         // placement at the cursor and no cursor motion. The image was
         // already transmitted; the placeholder pipeline (handled
@@ -749,10 +749,28 @@ impl KittyHandler {
         reply_ok_if_verbose_with_id(&header, sink, header.image_id);
     }
 
+    /// DEL-1: kitty never replies to `a=d`, even with `i=` and `q=0`, so
+    /// neither do we. A client that doesn't read replies would otherwise
+    /// get them on stdin.
     #[allow(clippy::needless_pass_by_value, clippy::unused_self)]
     fn handle_delete<S: KittySink>(&mut self, header: Header, sink: &mut S) {
         sink.delete_image(header.delete, &header);
-        reply_ok_if_verbose(&header, sink);
+    }
+
+    /// `a=f` / `a=a` / `a=c` (WIRE-3, WIRE-12). Animation isn't
+    /// implemented yet: on a stored image the command is accepted
+    /// silently, so the still first frame stays up and nothing lands in
+    /// the shell (kitty doesn't answer `kitten icat`'s `a=a` commands
+    /// either). On an image that isn't stored it gets kitty's ENOENT.
+    ///
+    /// An implementation reads the keys under their animation meaning
+    /// with [`Header::frame`], [`Header::animation`] and
+    /// [`Header::composition`].
+    #[allow(clippy::unused_self)]
+    fn handle_animation<S: KittySink>(&mut self, header: &Header, sink: &mut S) {
+        let Some(_id) = resolve_image(header, sink, "Animation") else {
+            return;
+        };
     }
 }
 
@@ -779,8 +797,12 @@ fn headers_continuation_compatible(first: &Header, next: &Header) -> bool {
     first.image_id == next.image_id
 }
 
-fn decode_base64(input: &[u8]) -> Result<Vec<u8>, String> {
-    // Strip whitespace (some clients wrap lines).
+/// Decode a base64 payload. Whitespace is stripped (some clients wrap
+/// lines) and padding is optional. Data that still doesn't decode is
+/// treated as empty, the way kitty's decoder drops bad input, so the
+/// reply is about the missing data (`ENODATA:Insufficient image data:
+/// 0 < N`) rather than the encoding.
+fn decode_base64(input: &[u8]) -> Vec<u8> {
     let cleaned: Vec<u8> = input
         .iter()
         .copied()
@@ -789,7 +811,10 @@ fn decode_base64(input: &[u8]) -> Result<Vec<u8>, String> {
     base64::engine::general_purpose::STANDARD
         .decode(&cleaned)
         .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&cleaned))
-        .map_err(|e| e.to_string())
+        .unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "kitty: undecodable base64 payload");
+            Vec::new()
+        })
 }
 
 /// Where a payload's bytes came from. File payloads get SEC-4's uniform
@@ -809,88 +834,136 @@ struct PayloadError {
     detail: String,
 }
 
+impl From<DecodeError> for PayloadError {
+    fn from(e: DecodeError) -> Self {
+        Self {
+            code: e.code(),
+            detail: e.to_string(),
+        }
+    }
+}
+
 /// Inflate (`o=z`) and decode (`f=`) a payload, within `quota` bytes of
-/// decoded image.
+/// decoded image. Codes and messages follow kitty 0.49.2 (WIRE-7).
 fn decode_payload(header: &Header, data: Vec<u8>, quota: u64) -> Result<ImageData, PayloadError> {
+    // kitty checks `f=` and the dimensions before it looks at the data.
+    let expected = raw_len(header.format, header.source_width, header.source_height)?;
     let raw = match header.compression {
         Compression::None => data,
         Compression::Zlib => {
-            // SEC-5: never inflate past what the image can use: exactly
-            // `s*v*bpp` for raw pixels, the quota for PNG. When the
-            // declared raw size already exceeds the quota, reject before
-            // inflating at all, so an attacker can't make us do the work
-            // of inflating up to the cap (reviewer item 6).
-            if raw_pixel_bytes(header).is_some_and(|n| n > quota) {
-                return Err(PayloadError {
-                    code: ErrorCode::Efbig,
-                    detail: "declared image size exceeds the image budget".into(),
-                });
+            if let Some(n) = expected
+                && data.len() as u64 > n.saturating_add(COMPRESSED_DATA_SLACK)
+            {
+                return Err(DecodeError::TooMuchData.into());
             }
-            let limit = raw_pixel_bytes(header).map_or(quota, |n| n.min(quota));
-            inflate_zlib(&data, limit).map_err(|e| PayloadError {
+            // The size the stream must inflate to: `s*v*bpp` for raw
+            // pixels; for PNG the spec requires `S=` (the PNG's own size)
+            // with compression, and kitty holds the stream to it.
+            let inflated = expected.unwrap_or(u64::from(header.size));
+            let mismatch = || PayloadError {
                 code: ErrorCode::Einval,
-                detail: format!("zlib decompress: {e}"),
-            })?
+                detail: "Image data size post inflation does not match expected size".into(),
+            };
+            if inflated == 0 {
+                return Err(mismatch());
+            }
+            // SEC-5: never inflate past what the image can use. When the
+            // declared size already exceeds the quota, reject before
+            // inflating at all (reviewer item 6 on #30); kitty replies
+            // EFBIG:Too much data for an over-cap image.
+            if inflated > quota {
+                return Err(DecodeError::TooMuchData.into());
+            }
+            let out = inflate_zlib(&data, inflated).map_err(|e| PayloadError {
+                code: ErrorCode::Einval,
+                detail: format!("Failed to inflate image data with error: {}", e.zlib_name()),
+            })?;
+            if out.len() as u64 != inflated {
+                return Err(mismatch());
+            }
+            out
         }
     };
-    decode(
+    Ok(decode(
         header.format,
         &raw,
         header.source_width,
         header.source_height,
         quota,
-    )
-    .map_err(|e| PayloadError {
-        code: match e {
-            DecodeError::BadPng(_) => ErrorCode::Ebadf,
-            DecodeError::PngTooLarge { .. } => ErrorCode::Enomem,
-            DecodeError::LengthMismatch { .. } | DecodeError::MissingDims { .. } => {
-                ErrorCode::Einval
-            }
-        },
-        detail: e.to_string(),
-    })
+    )?)
 }
 
-/// `s * v * bytes-per-pixel` for raw formats with both dimensions set;
-/// `None` for PNG (sized by its own header) or missing dimensions.
-fn raw_pixel_bytes(header: &Header) -> Option<u64> {
-    let bpp = match header.format {
-        Format::Rgb24 => 3,
-        Format::Rgba32 => 4,
-        Format::Png => return None,
-    };
-    if header.source_width == 0 || header.source_height == 0 {
-        return None;
+/// Why [`inflate_zlib`] failed, named after the zlib status kitty
+/// reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InflateError {
+    /// Corrupt stream or bad checksum.
+    Data,
+    /// The stream ended early, or goes on past the output limit.
+    Buf,
+}
+
+impl InflateError {
+    fn zlib_name(self) -> &'static str {
+        match self {
+            InflateError::Data => "Z_DATA_ERROR",
+            InflateError::Buf => "Z_BUF_ERROR",
+        }
     }
-    Some(u64::from(header.source_width) * u64::from(header.source_height) * bpp)
 }
 
-/// Inflate a zlib stream, failing as soon as the output would pass
-/// `limit` bytes (SEC-5), so a small bomb can't allocate gigabytes.
-fn inflate_zlib(input: &[u8], limit: u64) -> Result<Vec<u8>, String> {
-    use std::io::Read;
+/// Inflate a zlib stream into at most `limit` bytes (SEC-5), so a small
+/// bomb can't allocate gigabytes. Like kitty inflating into a buffer of
+/// the expected size:
+/// - output that doesn't fit, or a stream cut off before its end (for
+///   example a missing checksum), is `Z_BUF_ERROR`;
+/// - a corrupt stream is `Z_DATA_ERROR`;
+/// - bytes after the end of the stream are ignored.
+fn inflate_zlib(input: &[u8], limit: u64) -> Result<Vec<u8>, InflateError> {
+    use flate2::{Decompress, FlushDecompress, Status};
+    let mut z = Decompress::new(true);
     let mut out = Vec::new();
-    flate2::read::ZlibDecoder::new(input)
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut out)
-        .map_err(|e| e.to_string())?;
-    if out.len() as u64 > limit {
-        return Err(format!("inflated data exceeds {limit} bytes"));
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let left = limit - out.len() as u64;
+        let room = usize::try_from(left).unwrap_or(usize::MAX).min(chunk.len());
+        // Once `limit` bytes are out, probe with one byte of room: any
+        // more output means the stream is longer than the image.
+        let full = room == 0;
+        let dst = &mut chunk[..room.max(1)];
+        let (in0, out0) = (z.total_in(), z.total_out());
+        let consumed = usize::try_from(in0).unwrap_or(usize::MAX).min(input.len());
+        let status = z
+            .decompress(&input[consumed..], dst, FlushDecompress::None)
+            .map_err(|_| InflateError::Data)?;
+        let produced = usize::try_from(z.total_out() - out0).unwrap_or(usize::MAX);
+        if full && produced > 0 {
+            return Err(InflateError::Buf);
+        }
+        out.extend_from_slice(&dst[..produced]);
+        match status {
+            Status::StreamEnd => return Ok(out),
+            Status::BufError => return Err(InflateError::Buf),
+            Status::Ok if produced == 0 && z.total_in() == in0 => return Err(InflateError::Buf),
+            Status::Ok => {}
+        }
     }
-    Ok(out)
 }
 
 /// Read the file a `t=f` / `t=t` command names. `body` is the base64
 /// path. See [`medium::read_image_file`] for the policy.
 fn read_medium_file(header: &Header, body: &[u8], quota: u64) -> Result<Vec<u8>, FileError> {
-    let path_bytes = decode_base64(body).map_err(|e| FileError(format!("bad base64 path: {e}")))?;
+    // Undecodable base64 becomes an empty path, which fails like any other.
+    let path_bytes = decode_base64(body);
     let path = path_from_bytes(path_bytes);
     // Uncompressed raw pixels need exactly `s*v*bpp` bytes: read that
     // much and no more. A longer file is fine (kitty ignores the tail), a
     // shorter one fails. Otherwise read `S=` bytes, or to EOF.
     let size = match (header.size, header.compression) {
-        (0, Compression::None) => raw_pixel_bytes(header).unwrap_or(0),
+        (0, Compression::None) => raw_len(header.format, header.source_width, header.source_height)
+            .ok()
+            .flatten()
+            .unwrap_or(0),
         (size, _) => u64::from(size),
     };
     medium::read_image_file(&FileRequest {
@@ -924,7 +997,60 @@ fn reply_file_error<S: KittySink>(header: &Header, sink: &mut S, reason: &dyn st
         %reason,
         "kitty: file medium failed"
     );
-    reply_error_if_verbose(header, sink, ErrorCode::Ebadf, medium::FILE_READ_ERROR);
+    reply_transmit_error(header, sink, ErrorCode::Ebadf, medium::FILE_READ_ERROR);
+}
+
+/// Error reply for a transmit (`a=t` / `a=T`). kitty creates the image
+/// before validating it, so an `I=`-only transmit that fails still
+/// reports the id it was given: `i=4,I=156;ENODATA:…` (WIRE-7).
+fn reply_transmit_error<S: KittySink>(
+    header: &Header,
+    sink: &mut S,
+    code: ErrorCode,
+    detail: &str,
+) {
+    if header.image_id == 0 && header.image_number != 0 {
+        let mut header = header.clone();
+        header.image_id = sink.next_image_id();
+        reply_error_if_verbose(&header, sink, code, detail);
+    } else {
+        reply_error_if_verbose(header, sink, code, detail);
+    }
+}
+
+/// PLC-1 / PLC-3 / WIRE-12: the stored image a command refers to: `i=`,
+/// or the newest image with number `I=`.
+///
+/// A command naming neither is ignored silently (there is no id to reply
+/// to). One naming an image that isn't stored gets kitty's ENOENT, which
+/// `q=1` doesn't suppress:
+/// `i=5;ENOENT:Put command refers to non-existent image with id: 5 and
+/// number: 0`. `command` is kitty's word for the action (`Put`,
+/// `Animation`).
+fn resolve_image<S: KittySink>(header: &Header, sink: &mut S, command: &str) -> Option<u32> {
+    if header.image_id == 0 && header.image_number == 0 {
+        return None;
+    }
+    let id = if header.image_id != 0 {
+        Some(header.image_id)
+    } else {
+        sink.image_id_for_number(header.image_number)
+    };
+    if let Some(id) = id
+        && sink.image_exists(id)
+    {
+        return Some(id);
+    }
+    reply_error_if_verbose(
+        header,
+        sink,
+        ErrorCode::Enoent,
+        &format!(
+            "{command} command refers to non-existent image with id: {} and number: {}",
+            header.image_id, header.image_number
+        ),
+    );
+    None
 }
 
 fn default_placement_from_header(
@@ -1012,60 +1138,6 @@ fn default_placement_from_header(
     }
 }
 
-/// Emit an EINVAL reply for a header that failed to parse (B9).
-///
-/// Because parsing failed we have no [`Header`]; recover the `i=` /
-/// `I=` identifiers by scanning the raw header bytes for those keys so
-/// the reply can echo them (matching reference kitty, which parses all
-/// keys then validates and replies EINVAL with the id). If neither is
-/// recoverable there is nothing to correlate a reply against, so we
-/// stay silent — consistent with the anonymous-no-reply rule.
-///
-/// `q=` cannot be honored reliably from a malformed header, so we only
-/// suppress when an explicit `q=2` (Silent) is recoverable; otherwise
-/// we reply. A best-effort scan keeps this simple and robust.
-fn emit_bad_header_einval<S: KittySink>(header_bytes: &[u8], sink: &mut S) {
-    let s = match std::str::from_utf8(header_bytes) {
-        Ok(s) => s.strip_prefix('G').unwrap_or(s),
-        Err(_) => return,
-    };
-    let mut image_id = 0u32;
-    let mut image_number = 0u32;
-    let mut placement_id = 0u32;
-    let mut quiet = Quiet::Verbose;
-    for pair in s.split(',') {
-        if let Some((key, value)) = pair.split_once('=') {
-            match key.trim() {
-                "i" => image_id = value.trim().parse().unwrap_or(image_id),
-                "I" => image_number = value.trim().parse().unwrap_or(image_number),
-                "p" => placement_id = value.trim().parse().unwrap_or(placement_id),
-                "q" => {
-                    quiet = match value.trim() {
-                        "2" => Quiet::Silent,
-                        "1" => Quiet::NoOk,
-                        _ => Quiet::Verbose,
-                    };
-                }
-                _ => {}
-            }
-        }
-    }
-    if matches!(quiet, Quiet::Silent) {
-        return;
-    }
-    // Anonymous request (no id to echo) → no reply.
-    if image_id == 0 && image_number == 0 {
-        return;
-    }
-    sink.queue_reply(&encode_error(
-        image_id,
-        image_number,
-        placement_id,
-        ErrorCode::Einval,
-        "malformed header",
-    ));
-}
-
 fn reply_ok_if_verbose<S: KittySink>(header: &Header, sink: &mut S) {
     reply_ok_if_verbose_with_id(header, sink, header.image_id);
 }
@@ -1141,6 +1213,10 @@ mod tests {
         replies: Vec<Vec<u8>>,
         budget: u64,
         assign_next: u32,
+        /// `I=` → newest id, like `Term::image_number_to_id`.
+        numbers: std::collections::HashMap<u32, u32>,
+        deleted: Vec<u32>,
+        cursor_advances: usize,
     }
 
     impl MockSink {
@@ -1157,7 +1233,7 @@ mod tests {
         fn register_image(
             &mut self,
             id_request: u32,
-            _image_number: u32,
+            image_number: u32,
             data: ImageData,
         ) -> Option<u32> {
             let id = if id_request == 0 {
@@ -1168,15 +1244,30 @@ mod tests {
                 id_request
             };
             self.registered.push((id, data));
+            if image_number != 0 {
+                self.numbers.insert(image_number, id);
+            }
             Some(id)
         }
         fn image_exists(&self, id: u32) -> bool {
-            self.registered.iter().any(|(rid, _)| *rid == id)
+            !self.deleted.contains(&id) && self.registered.iter().any(|(rid, _)| *rid == id)
+        }
+        fn image_id_for_number(&self, number: u32) -> Option<u32> {
+            self.numbers.get(&number).copied()
+        }
+        fn next_image_id(&self) -> u32 {
+            self.assign_next
         }
         fn place_image(&mut self, placement: Placement) {
             self.placements.push(placement);
         }
+        fn advance_cursor_after_placement(&mut self, _rows: u16, _cols: u16, _start_col: u16) {
+            self.cursor_advances += 1;
+        }
         fn delete_image(&mut self, delete: DeleteSpec, header: &Header) {
+            if delete.free_bytes() {
+                self.deleted.push(header.image_id);
+            }
             self.deletes.push((delete, header.clone()));
         }
         fn queue_reply(&mut self, bytes: &[u8]) {
@@ -1437,23 +1528,21 @@ mod tests {
         assert!(joined.contains(";OK"), "must reply OK, got {joined:?}");
     }
 
+    /// The first chunk's header governs the upload; a different `f=` on
+    /// a continuation is ignored, as in kitty. The 6 bytes are within
+    /// kitty's 10-byte slack for a 1x1 RGBA image, so it succeeds.
     #[test]
-    fn chunked_header_mismatch_is_einval() {
+    fn chunked_continuation_keys_are_ignored() {
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
         h.process(b"Ga=t,f=32,s=1,v=1,i=7,m=1", b"AAAA", &mut sink)
             .unwrap();
-        // Second chunk with mismatched format.
         h.process(b"Ga=t,f=24,s=1,v=1,i=7,m=0", b"BBBB", &mut sink)
             .unwrap();
-        // Reply should be EINVAL; upload abandoned.
-        assert_eq!(sink.registered.len(), 0);
+        assert_eq!(sink.registered.len(), 1);
+        assert_eq!(sink.registered[0].1.pixels.len(), 4);
         assert_eq!(h.pending_uploads(), 0);
-        assert!(
-            sink.replies
-                .iter()
-                .any(|r| { std::str::from_utf8(r).is_ok_and(|s| s.contains("EINVAL")) })
-        );
+        assert_eq!(sink.replies, vec![b"\x1b_Gi=7;OK\x1b\\".to_vec()]);
     }
 
     #[test]
@@ -1470,16 +1559,70 @@ mod tests {
         );
     }
 
+    /// WIRE-12: kitty answers an animation command on an image that
+    /// isn't stored with ENOENT (not ENOTSUP).
     #[test]
-    fn animate_action_replies_enotsup() {
+    fn animation_on_unknown_image_replies_enoent() {
+        for (cmd, header) in [
+            ("a=f", &b"Ga=f,i=1"[..]),
+            ("a=a", b"Ga=a,i=1,s=3"),
+            ("a=c", b"Ga=c,i=1,C=2"),
+        ] {
+            let mut h = KittyHandler::new();
+            let mut sink = MockSink::with_budget(1 << 30);
+            h.process(header, b"", &mut sink).unwrap();
+            assert_eq!(
+                sink.replies,
+                vec![
+                    b"\x1b_Gi=1;ENOENT:Animation command refers to non-existent image with id: 1 and number: 0\x1b\\"
+                        .to_vec()
+                ],
+                "{cmd}"
+            );
+        }
+        // By number, and with q=1 (errors still go out); q=2 is silent.
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
-        h.process(b"Ga=a,i=1", b"", &mut sink).unwrap();
-        assert!(
-            sink.replies
-                .iter()
-                .any(|r| { std::str::from_utf8(r).is_ok_and(|s| s.contains("ENOTSUP")) })
+        h.process(b"Ga=f,I=603,q=1", b"", &mut sink).unwrap();
+        h.process(b"Ga=a,i=4,q=2", b"", &mut sink).unwrap();
+        h.process(b"Ga=f", b"", &mut sink).unwrap();
+        assert_eq!(
+            sink.replies,
+            vec![
+                b"\x1b_GI=603;ENOENT:Animation command refers to non-existent image with id: 0 and number: 603\x1b\\"
+                    .to_vec()
+            ]
         );
+    }
+
+    /// WIRE-3: until animation is implemented, `a=f`/`a=a`/`a=c` on a
+    /// stored image are silent no-ops, so `kitten icat anim.gif` gets no
+    /// ENOTSUP replies injected into the shell. The image is untouched.
+    #[test]
+    fn animation_on_stored_image_is_silent() {
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        h.process(
+            b"Ga=t,f=32,s=1,v=1,i=9,q=2",
+            b64_red_pixel().as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
+        for header in [
+            &b"Ga=f,i=9,f=32,s=1,v=1"[..],
+            b"Ga=a,i=9,s=3,v=1",
+            b"Ga=a,i=9,c=1",
+            b"Ga=c,i=9,r=1,c=1",
+            b"Ga=c,i=9,C=2",
+            b"Ga=f,m=1",
+        ] {
+            h.process(header, b64_red_pixel().as_bytes(), &mut sink)
+                .unwrap();
+        }
+        assert!(sink.replies.is_empty(), "{:?}", sink.replies);
+        assert_eq!(sink.registered.len(), 1);
+        assert!(sink.placements.is_empty());
+        assert_eq!(h.pending_uploads(), 0);
     }
 
     #[test]
@@ -1513,19 +1656,22 @@ mod tests {
         );
     }
 
+    /// PLC-3: `a=p,I=N` with no stored image numbered N replies kitty's
+    /// ENOENT. (kitty writes this reply with a stray leading comma,
+    /// `\x1b_G,I=9;…`; we leave it out.)
     #[test]
-    fn place_without_id_but_with_image_number_still_replies_einval() {
-        // Sanity: when the client did give us an identifier (`I=`),
-        // the reply suppression doesn't apply — they get to know
-        // their place command was rejected.
+    fn place_by_unknown_image_number_replies_enoent() {
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
         h.process(b"Ga=p,I=9", b"", &mut sink).unwrap();
-        assert!(
-            sink.replies
-                .iter()
-                .any(|r| { std::str::from_utf8(r).is_ok_and(|s| s.contains("EINVAL")) })
+        assert_eq!(
+            sink.replies,
+            vec![
+                b"\x1b_GI=9;ENOENT:Put command refers to non-existent image with id: 0 and number: 9\x1b\\"
+                    .to_vec()
+            ]
         );
+        assert!(sink.placements.is_empty());
     }
 
     #[test]
@@ -1569,25 +1715,49 @@ mod tests {
         assert!(matches!(err, HandlerError::BadHeader(_)));
     }
 
+    /// WIRE-7: an empty `a=q` is validated like any other (kitty:
+    /// `EINVAL:Zero width/height not allowed`), and a query is answered
+    /// only when it carries `i=`.
     #[test]
-    fn query_with_empty_body_replies_ok() {
-        // Per kitty spec, `a=q` is "transmit + test" — apps probing
-        // for protocol support send a tiny (often 1x1) payload and
-        // expect OK if the terminal understands kitty graphics. A
-        // body-less query (some tools emit this as a bare protocol
-        // probe) also gets OK.
-        let mut h = KittyHandler::new();
-        let mut sink = MockSink::with_budget(1 << 30);
-        h.process(b"Ga=q,i=42", b"", &mut sink).unwrap();
-        let joined: String = sink
-            .replies
-            .iter()
-            .map(|r| String::from_utf8_lossy(r).into_owned())
-            .collect();
-        assert!(
-            joined.contains(";OK"),
-            "empty-body query should reply OK, got {joined:?}",
-        );
+    fn query_replies_like_kitty() {
+        let px = b64_red_pixel();
+        let cases: [(&[u8], &[u8], &str); 7] = [
+            (
+                b"Ga=q,i=42",
+                b"",
+                "\x1b_Gi=42;EINVAL:Zero width/height not allowed\x1b\\",
+            ),
+            (
+                b"Ga=q,i=43,f=32,s=1,v=1",
+                b"",
+                "\x1b_Gi=43;ENODATA:Insufficient image data: 0 < 4\x1b\\",
+            ),
+            (
+                b"Ga=q,i=44,f=32,s=2,v=2",
+                px.as_bytes(),
+                "\x1b_Gi=44;ENODATA:Insufficient image data: 4 < 16\x1b\\",
+            ),
+            (
+                b"Ga=q,i=45,f=32,s=1,v=1",
+                px.as_bytes(),
+                "\x1b_Gi=45;OK\x1b\\",
+            ),
+            (b"Ga=q,I=150,f=32,s=1,v=1", px.as_bytes(), ""),
+            (b"Ga=q,I=151,f=32,s=2,v=2", px.as_bytes(), ""),
+            (b"Ga=q,f=32,s=1,v=1", px.as_bytes(), ""),
+        ];
+        for (header, body, want) in cases {
+            let mut h = KittyHandler::new();
+            let mut sink = MockSink::with_budget(1 << 30);
+            h.process(header, body, &mut sink).unwrap();
+            let got: String = sink
+                .replies
+                .iter()
+                .map(|r| String::from_utf8_lossy(r).into_owned())
+                .collect();
+            assert_eq!(got, want, "{}", String::from_utf8_lossy(header));
+            assert!(sink.registered.is_empty(), "Query must not store");
+        }
     }
 
     #[test]
@@ -1610,7 +1780,7 @@ mod tests {
 
     #[test]
     fn query_with_garbage_body_replies_error() {
-        // Body that is valid base64 of garbage PNG bytes → Ebadf
+        // Body that is valid base64 of garbage PNG bytes → EBADPNG
         // (PNG decoder rejects). The base64 layer succeeds first.
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
@@ -1622,12 +1792,13 @@ mod tests {
             .iter()
             .map(|r| String::from_utf8_lossy(r).into_owned())
             .collect();
-        assert!(joined.contains("EBADF"), "got {joined:?}");
+        assert_eq!(joined, "\x1b_Gi=99;EBADPNG:Not a PNG file\x1b\\");
     }
 
     #[test]
     fn query_known_image_returns_ok() {
-        // Transmit id=7 first, then query it — must reply OK.
+        // Transmit id=7 first, then query the same id with a payload:
+        // the query tests the payload, not the registry (no ENOENT).
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
         let body = b64_red_pixel();
@@ -1635,7 +1806,8 @@ mod tests {
             .unwrap();
         // Drop the transmit reply so we only inspect query replies.
         sink.replies.clear();
-        h.process(b"Ga=q,i=7", b"", &mut sink).unwrap();
+        h.process(b"Ga=q,i=7,f=32,s=1,v=1", body.as_bytes(), &mut sink)
+            .unwrap();
         let joined: String = sink
             .replies
             .iter()
@@ -1662,6 +1834,254 @@ mod tests {
                 .any(|r| { std::str::from_utf8(r).is_ok_and(|s| s.contains("EFBIG")) })
         );
         assert_eq!(h.pending_uploads(), 0);
+    }
+
+    fn joined(sink: &MockSink) -> String {
+        sink.replies
+            .iter()
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .collect()
+    }
+
+    fn enoent_put(id: u32, number: u32) -> String {
+        format!(
+            "ENOENT:Put command refers to non-existent image with id: {id} and number: {number}"
+        )
+    }
+
+    /// PLC-1: `a=p` on an id that isn't stored replies kitty's ENOENT —
+    /// also with `q=1`, silent only with `q=2` — and places nothing and
+    /// doesn't move the cursor. Same with `p=`, with `U=1`, and after the
+    /// image is freed.
+    #[test]
+    fn plc1_place_unknown_id_replies_enoent() {
+        let cases: [(&[u8], String); 5] = [
+            (
+                b"Ga=p,i=143999",
+                format!("\x1b_Gi=143999;{}\x1b\\", enoent_put(143999, 0)),
+            ),
+            (
+                b"Ga=p,i=143998,q=1",
+                format!("\x1b_Gi=143998;{}\x1b\\", enoent_put(143998, 0)),
+            ),
+            (b"Ga=p,i=143997,q=2", String::new()),
+            (
+                b"Ga=p,i=143996,p=5",
+                format!("\x1b_Gi=143996,p=5;{}\x1b\\", enoent_put(143996, 0)),
+            ),
+            (
+                b"Ga=p,i=143995,U=1",
+                format!("\x1b_Gi=143995;{}\x1b\\", enoent_put(143995, 0)),
+            ),
+        ];
+        for (header, want) in cases {
+            let mut h = KittyHandler::new();
+            let mut sink = MockSink::with_budget(1 << 30);
+            h.process(header, b"", &mut sink).unwrap();
+            assert_eq!(joined(&sink), want, "{}", String::from_utf8_lossy(header));
+            assert!(sink.placements.is_empty());
+            assert_eq!(sink.cursor_advances, 0);
+        }
+    }
+
+    #[test]
+    fn plc1_place_freed_id_replies_enoent() {
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        let px = b64_red_pixel();
+        h.process(b"Ga=t,i=500,f=32,s=1,v=1,q=2", px.as_bytes(), &mut sink)
+            .unwrap();
+        h.process(b"Ga=d,d=I,i=500", b"", &mut sink).unwrap();
+        h.process(b"Ga=p,i=500", b"", &mut sink).unwrap();
+        assert_eq!(
+            joined(&sink),
+            format!("\x1b_Gi=500;{}\x1b\\", enoent_put(500, 0))
+        );
+        assert!(sink.placements.is_empty());
+        // A stored image still places and replies OK.
+        h.process(b"Ga=t,i=501,f=32,s=1,v=1,q=2", px.as_bytes(), &mut sink)
+            .unwrap();
+        sink.replies.clear();
+        h.process(b"Ga=p,i=501,C=1", b"", &mut sink).unwrap();
+        assert_eq!(joined(&sink), "\x1b_Gi=501;OK\x1b\\");
+        assert_eq!(sink.placements.len(), 1);
+    }
+
+    /// PLC-3: `a=p,I=N` places the newest image numbered N and replies
+    /// with its id, like kitty's `i=1,I=144;OK`.
+    #[test]
+    fn plc3_place_by_number_uses_newest_image() {
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        let px = b64_red_pixel();
+        h.process(b"Ga=t,I=144,f=32,s=1,v=1", px.as_bytes(), &mut sink)
+            .unwrap();
+        h.process(b"Ga=t,I=144,f=32,s=1,v=1", px.as_bytes(), &mut sink)
+            .unwrap();
+        h.process(b"Ga=p,I=144,C=1", b"", &mut sink).unwrap();
+        assert_eq!(
+            joined(&sink),
+            "\x1b_Gi=1,I=144;OK\x1b\\\x1b_Gi=2,I=144;OK\x1b\\\x1b_Gi=2,I=144;OK\x1b\\"
+        );
+        assert_eq!(sink.placements.len(), 1);
+        assert_eq!(sink.placements[0].image_id, 2);
+    }
+
+    /// DEL-1: kitty never replies to a delete, even with `i=` and `q=0`.
+    #[test]
+    fn del1_delete_sends_no_reply() {
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        h.process(
+            b"Ga=t,i=149,f=32,s=1,v=1,q=2",
+            b64_red_pixel().as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
+        for header in [
+            &b"Ga=d,d=i,i=148"[..],
+            b"Ga=d,d=I,i=149,q=0",
+            b"Ga=d,d=n,I=150",
+            b"Ga=d",
+        ] {
+            h.process(header, b"", &mut sink).unwrap();
+        }
+        assert!(sink.replies.is_empty(), "{}", joined(&sink));
+        assert_eq!(sink.deletes.len(), 4);
+        // Both i= and I= is still an error kitty reports.
+        h.process(b"Ga=d,d=i,i=791,I=791", b"", &mut sink).unwrap();
+        assert_eq!(
+            joined(&sink),
+            "\x1b_Gi=791,I=791;EINVAL:Must not specify both image id and image number\x1b\\"
+        );
+    }
+
+    /// WIRE-7: transmit errors use kitty's codes and messages, and an
+    /// `I=`-only failure reports the id kitty would have allocated.
+    #[test]
+    fn wire7_transmit_errors_match_kitty() {
+        let px = b64_red_pixel();
+        let b64 = |n: usize| base64::engine::general_purpose::STANDARD.encode(vec![0u8; n]);
+        let cases: Vec<(&str, String, &str)> = vec![
+            (
+                "a=t,i=720,f=32,s=2,v=2",
+                px.clone(),
+                "i=720;ENODATA:Insufficient image data: 4 < 16",
+            ),
+            (
+                "a=t,i=721,f=32,s=1,v=1",
+                b64(16),
+                "i=721;EFBIG:Too much data",
+            ),
+            ("a=t,i=780,f=32,s=1,v=1", b64(14), "i=780;OK"),
+            (
+                "a=t,i=722,f=100",
+                "bm90IGEgcG5nIGF0IGFsbA==".into(),
+                "i=722;EBADPNG:Not a PNG file",
+            ),
+            (
+                "a=t,i=727,f=32",
+                px.clone(),
+                "i=727;EINVAL:Zero width/height not allowed",
+            ),
+            (
+                "a=t,i=728,f=32,s=1",
+                px.clone(),
+                "i=728;EINVAL:Zero width/height not allowed",
+            ),
+            (
+                "a=t,i=729,f=32,s=1,v=1",
+                "!!!!".into(),
+                "i=729;ENODATA:Insufficient image data: 0 < 4",
+            ),
+            (
+                "a=t,i=730,f=32,s=1,v=1",
+                String::new(),
+                "i=730;ENODATA:Insufficient image data: 0 < 4",
+            ),
+            (
+                "a=t,i=731,I=731,f=32,s=1,v=1",
+                px.clone(),
+                "i=731,I=731;EINVAL:Must not specify both image id and image number",
+            ),
+            (
+                "a=t,I=156,f=32,s=2,v=2",
+                px.clone(),
+                "i=1,I=156;ENODATA:Insufficient image data: 4 < 16",
+            ),
+            (
+                "a=T,I=4301,f=32,s=2,v=2",
+                px.clone(),
+                "i=1,I=4301;ENODATA:Insufficient image data: 4 < 16",
+            ),
+            (
+                "a=t,I=800,f=100",
+                "anVuaw==".into(),
+                "i=1,I=800;EBADPNG:PNG data is truncated: not enough bytes to satisfy read request",
+            ),
+            ("a=t,I=157,f=32,s=1,v=1", px.clone(), "i=1,I=157;OK"),
+            ("a=t,f=32,s=2,v=2", px.clone(), ""),
+        ];
+        for (keys, body, want) in cases {
+            let mut h = KittyHandler::new();
+            let mut sink = MockSink::with_budget(1 << 30);
+            h.process(format!("G{keys}").as_bytes(), body.as_bytes(), &mut sink)
+                .unwrap();
+            let want = if want.is_empty() {
+                String::new()
+            } else {
+                format!("\x1b_G{want}\x1b\\")
+            };
+            assert_eq!(joined(&sink), want, "{keys}");
+        }
+    }
+
+    /// WIRE-8: a `q=` on a continuation chunk applies to the upload, the
+    /// way kitty behaves: the latest non-zero `q=` wins.
+    #[test]
+    fn wire8_quiet_on_continuation_chunks() {
+        let px = b64_red_pixel();
+        let (a, b) = px.split_at(4);
+        let cases: [(&[&[u8]], &str, &str, &str); 7] = [
+            (&[b"Ga=t,i=760,f=32,s=1,v=1,m=1", b"Gm=0,q=2"], a, b, ""),
+            (&[b"Ga=t,i=761,f=32,s=1,v=1,m=1", b"Gm=0,q=1"], a, b, ""),
+            (&[b"Ga=t,i=762,f=32,s=1,v=1,q=2,m=1", b"Gm=0,q=0"], a, b, ""),
+            (&[b"Ga=t,i=763,f=32,s=1,v=1,q=2,m=1", b"Gm=0"], a, b, ""),
+            (
+                &[b"Ga=t,i=764,f=32,s=2,v=2,m=1", b"Gm=0,q=1"],
+                a,
+                b,
+                "\x1b_Gi=764;ENODATA:Insufficient image data: 4 < 16\x1b\\",
+            ),
+            (&[b"Ga=t,i=765,f=32,s=2,v=2,m=1", b"Gm=0,q=2"], a, b, ""),
+            (
+                &[b"Ga=t,i=767,f=32,s=1,v=1,m=1", b"Gm=0"],
+                a,
+                b,
+                "\x1b_Gi=767;OK\x1b\\",
+            ),
+        ];
+        for (headers, first, last, want) in cases {
+            let mut h = KittyHandler::new();
+            let mut sink = MockSink::with_budget(1 << 30);
+            h.process(headers[0], first.as_bytes(), &mut sink).unwrap();
+            h.process(headers[1], last.as_bytes(), &mut sink).unwrap();
+            assert_eq!(
+                joined(&sink),
+                want,
+                "{}",
+                String::from_utf8_lossy(headers[0])
+            );
+        }
+        // q=2 on a middle chunk.
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::with_budget(1 << 30);
+        h.process(b"Ga=t,i=766,f=32,s=1,v=1,m=1", a.as_bytes(), &mut sink)
+            .unwrap();
+        h.process(b"Gm=1,q=2", b"", &mut sink).unwrap();
+        h.process(b"Gm=0", b.as_bytes(), &mut sink).unwrap();
+        assert!(sink.replies.is_empty(), "{}", joined(&sink));
+        assert_eq!(sink.registered.len(), 1);
     }
 
     fn start_upload(h: &mut KittyHandler, sink: &mut MockSink, id: u32, body: &[u8]) {
@@ -1823,6 +2243,9 @@ mod blocker_graphics_tests {
             self.registered.push((id, data));
             Some(id)
         }
+        fn image_exists(&self, id: u32) -> bool {
+            self.registered.iter().any(|(rid, _)| *rid == id)
+        }
         fn place_image(&mut self, placement: Placement) {
             self.placements.push(placement);
         }
@@ -1869,71 +2292,66 @@ mod blocker_graphics_tests {
         );
     }
 
-    // ----- B9: malformed header replies EINVAL (id recoverable) -----
+    // ----- WIRE-6: malformed headers get no reply (kitty 0.49.2) -----
 
+    /// Every case kitty 0.49.2 drops silently, even with `i=`/`I=` and
+    /// `q=0`. Nothing is registered either.
     #[test]
-    fn b9_malformed_header_with_id_replies_einval() {
-        let mut h = KittyHandler::new();
-        let mut sink = RecordingSink::new();
-        // `f=999` is not a valid format enum → BadEnum on parse.
-        let err = h
-            .process(
-                b"Ga=t,i=1,f=999,s=1,v=1",
-                b64_red_pixel().as_bytes(),
-                &mut sink,
-            )
-            .unwrap_err();
-        assert!(matches!(err, HandlerError::BadHeader(_)));
-        let joined = sink.joined_replies();
-        assert!(joined.contains("EINVAL"), "expected EINVAL, got {joined:?}");
-        // Best-effort id recovery: the reply echoes the scanned i=1.
-        assert!(
-            joined.contains("i=1"),
-            "reply should echo recovered i=, got {joined:?}"
-        );
-        assert!(
-            sink.registered.is_empty(),
-            "malformed header must not register"
-        );
+    fn wire6_malformed_header_is_silent() {
+        for header in [
+            &b"Ga=t,i=700,f=32,s=abc,v=1"[..],
+            b"Ga=t,i=701,f=32,s=,v=1",
+            b"Ga=t,i=702,f=32,s=1,v=1,q=3",
+            b"Ga=t,i=703,f=32,s=1,v=1,m=2",
+            b"Ga=X,i=704",
+            b"Ga=X,I=7",
+            b"Ga=t,i=705,t=x,f=32,s=1,v=1",
+            b"Ga=t,i=706,o=y,f=32,s=1,v=1",
+            b"Ga=T,i=707,x=-5,f=32,s=1,v=1",
+            b"Ga=t,i=742,f=32,s=1,v=1,W=5",
+            b"Ga=t,i=-1,f=32,s=1,v=1",
+            b"Ga=t,,i=802,f=32,s=1,v=1",
+            b"Ga=t, i=4102,f=32,s=1,v=1",
+            b"Ga=t,i=4101,f=32,s=1,v=1,",
+        ] {
+            let mut h = KittyHandler::new();
+            let mut sink = RecordingSink::new();
+            let err = h
+                .process(header, b64_red_pixel().as_bytes(), &mut sink)
+                .unwrap_err();
+            assert!(matches!(err, HandlerError::BadHeader(_)));
+            assert!(
+                sink.replies.is_empty(),
+                "{}: got {:?}",
+                String::from_utf8_lossy(header),
+                sink.joined_replies()
+            );
+            assert!(sink.registered.is_empty());
+            assert_eq!(h.pending_uploads(), 0);
+        }
     }
 
+    /// kitty accepts an out-of-range `z=` that still fits 32 bits, and an
+    /// unknown `f=` number is a reply-worthy error, not a parse error.
     #[test]
-    fn b9_malformed_header_with_image_number_replies_einval() {
+    fn wire6_kitty_accepts_these() {
         let mut h = KittyHandler::new();
         let mut sink = RecordingSink::new();
-        // `a=X` is an invalid action enum.
-        h.process(b"Ga=X,I=7", b"", &mut sink).unwrap_err();
-        let joined = sink.joined_replies();
-        assert!(joined.contains("EINVAL"), "expected EINVAL, got {joined:?}");
-        assert!(
-            joined.contains("I=7"),
-            "reply should echo recovered I=, got {joined:?}"
-        );
-    }
-
-    #[test]
-    fn b9_malformed_header_without_id_is_silent() {
-        let mut h = KittyHandler::new();
-        let mut sink = RecordingSink::new();
-        // Invalid action and no recoverable i=/I=.
-        h.process(b"Ga=X,f=999", b"", &mut sink).unwrap_err();
-        assert!(
-            sink.replies.is_empty(),
-            "malformed header with no id must stay silent, got {:?}",
-            sink.joined_replies()
-        );
-    }
-
-    #[test]
-    fn b9_malformed_header_silenced_by_q2() {
-        let mut h = KittyHandler::new();
-        let mut sink = RecordingSink::new();
-        // Has a recoverable id but q=2 (Silent) suppresses the reply.
-        h.process(b"Ga=X,i=3,q=2", b"", &mut sink).unwrap_err();
-        assert!(
-            sink.replies.is_empty(),
-            "q=2 must silence the EINVAL reply, got {:?}",
-            sink.joined_replies()
+        h.process(
+            b"Ga=T,i=708,z=2147483648,f=32,s=1,v=1",
+            b64_red_pixel().as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
+        h.process(
+            b"Ga=t,i=4112,f=8,s=1,v=1",
+            b64_red_pixel().as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(
+            sink.joined_replies(),
+            "\x1b_Gi=708;OK\x1b\\\x1b_Gi=4112;EINVAL:Unknown image format: 8\x1b\\"
         );
     }
 
@@ -1970,6 +2388,12 @@ mod blocker_graphics_tests {
     fn b12_place_with_u1_is_virtual() {
         let mut h = KittyHandler::new();
         let mut sink = RecordingSink::new();
+        h.process(
+            b"Ga=t,f=32,s=1,v=1,i=5,q=2",
+            b64_red_pixel().as_bytes(),
+            &mut sink,
+        )
+        .unwrap();
         // a=p with U=1 — no visible placement, no cursor advance.
         h.process(b"Ga=p,i=5,U=1", b"", &mut sink).unwrap();
         assert!(
@@ -2529,20 +2953,29 @@ mod major_medium_tests {
         assert!(!inside.exists());
     }
 
-    /// SEC-5: a zlib bomb stops at the expected `s*v*bpp` size instead of
-    /// being inflated in full first.
+    /// SEC-5: a zlib bomb never inflates past the expected `s*v*bpp`
+    /// size. kitty refuses compressed data more than ~1 KiB past the
+    /// expected size outright (`EFBIG:Too much data`), and stops a
+    /// smaller stream at the expected size (`Z_BUF_ERROR`).
     #[test]
     fn zlib_bomb_stops_at_expected_size() {
         let bomb = zlib(&vec![0u8; 16 << 20]);
         assert!(bomb.len() < 64 * 1024);
         let sink = run("Ga=t,f=32,s=1,v=1,o=z,i=3", &b64(&bomb), None);
-        assert_eq!(
-            replies_joined(&sink),
-            "\x1b_Gi=3;EINVAL:zlib decompress: inflated data exceeds 4 bytes\x1b\\"
-        );
-        // Same for `a=q`.
-        let sink = run("Ga=q,f=32,s=1,v=1,o=z,i=3", &b64(&bomb), None);
-        assert!(replies_joined(&sink).contains("exceeds 4 bytes"));
+        assert_eq!(replies_joined(&sink), "\x1b_Gi=3;EFBIG:Too much data\x1b\\");
+        let small_bomb = zlib(&vec![0u8; 1 << 20]);
+        assert!(small_bomb.len() < 400 + 1024);
+        for action in ["t", "q"] {
+            let sink = run(
+                &format!("Ga={action},f=32,s=10,v=10,o=z,i=3"),
+                &b64(&small_bomb),
+                None,
+            );
+            assert_eq!(
+                replies_joined(&sink),
+                "\x1b_Gi=3;EINVAL:Failed to inflate image data with error: Z_BUF_ERROR\x1b\\"
+            );
+        }
     }
 
     /// SEC-5, reviewer item 6: when the declared raw size already exceeds
@@ -2552,29 +2985,107 @@ mod major_medium_tests {
     fn zlib_over_quota_declared_size_rejected_before_inflating() {
         let bomb = zlib(&vec![0u8; 4 << 20]);
         let sink = run("Ga=t,f=32,s=1000,v=1000,o=z,i=7", &b64(&bomb), Some(1024));
-        assert_eq!(
-            replies_joined(&sink),
-            "\x1b_Gi=7;EFBIG:declared image size exceeds the image budget\x1b\\"
-        );
+        assert_eq!(replies_joined(&sink), "\x1b_Gi=7;EFBIG:Too much data\x1b\\");
     }
 
-    /// SEC-5: `f=100,o=z` has no `s*v`, so the quota bounds it.
+    /// SEC-5: `f=100,o=z` has no `s*v`; its `S=` is bounded by the quota.
     #[test]
     fn zlib_png_is_bounded_by_quota() {
         let z = zlib(&vec![0u8; 1 << 20]);
-        let sink = run("Ga=t,f=100,o=z,i=4", &b64(&z), Some(1024));
+        // `S=` over the quota: refused before inflating.
+        let sink = run("Ga=t,f=100,o=z,S=1048576,i=4", &b64(&z), Some(1024));
+        assert_eq!(replies_joined(&sink), "\x1b_Gi=4;EFBIG:Too much data\x1b\\");
+        // Within the quota, the stream is held to `S=`: a longer stream
+        // stops at `S=` bytes (kitty: Z_BUF_ERROR).
+        let sink = run("Ga=t,f=100,o=z,S=1000,i=4", &b64(&z), Some(1024));
         assert_eq!(
             replies_joined(&sink),
-            "\x1b_Gi=4;EINVAL:zlib decompress: inflated data exceeds 1024 bytes\x1b\\"
+            "\x1b_Gi=4;EINVAL:Failed to inflate image data with error: Z_BUF_ERROR\x1b\\"
         );
+    }
+
+    /// The spec requires `S=` (the PNG's size) with `f=100,o=z`; kitty
+    /// holds the inflated stream to it (checked live on 0.49.2).
+    #[test]
+    fn zlib_png_needs_s_like_kitty() {
+        use image::ImageEncoder;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&[255, 0, 0, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let z = b64(&zlib(&png));
+        let n = png.len();
+        let mismatch = "EINVAL:Image data size post inflation does not match expected size";
+        let zbuf = "EINVAL:Failed to inflate image data with error: Z_BUF_ERROR";
+        for (keys, want) in [
+            (format!(",S={n}"), "OK"),
+            (String::new(), mismatch),
+            (format!(",S={}", n + 10), mismatch),
+            (format!(",S={}", n - 10), zbuf),
+            (",S=1".to_string(), zbuf),
+        ] {
+            let sink = run(&format!("Ga=t,f=100,o=z{keys},i=9"), &z, None);
+            assert_eq!(
+                replies_joined(&sink),
+                format!("\x1b_Gi=9;{want}\x1b\\"),
+                "{keys}"
+            );
+        }
+    }
+
+    /// WIRE-7: zlib failures carry kitty's messages.
+    #[test]
+    fn zlib_errors_match_kitty() {
+        let px = [255u8, 0, 0, 255];
+        let full = zlib(&px);
+        let no_checksum = &full[..full.len() - 4];
+        let mut trailing = full.clone();
+        trailing.extend_from_slice(&[0u8; 8]);
+        let cases: [(&str, Vec<u8>, &str); 6] = [
+            (
+                "f=32,s=1,v=1",
+                no_checksum.to_vec(),
+                "EINVAL:Failed to inflate image data with error: Z_BUF_ERROR",
+            ),
+            (
+                "f=32,s=1,v=1",
+                b"garbage!".to_vec(),
+                "EINVAL:Failed to inflate image data with error: Z_DATA_ERROR",
+            ),
+            (
+                "f=32,s=1,v=1",
+                zlib(&[0u8; 8]),
+                "EINVAL:Failed to inflate image data with error: Z_BUF_ERROR",
+            ),
+            (
+                "f=32,s=2,v=2",
+                zlib(&[0u8; 4]),
+                "EINVAL:Image data size post inflation does not match expected size",
+            ),
+            ("f=32,s=1,v=1", trailing, "OK"),
+            ("f=32,s=1,v=1", full, "OK"),
+        ];
+        for (keys, data, want) in cases {
+            let sink = run(&format!("Ga=t,{keys},o=z,i=5"), &b64(&data), None);
+            assert_eq!(
+                replies_joined(&sink),
+                format!("\x1b_Gi=5;{want}\x1b\\"),
+                "{keys} {data:?}"
+            );
+        }
     }
 
     #[test]
     fn inflate_zlib_limit_is_exact() {
         let z = zlib(&[1, 2, 3, 4]);
         assert_eq!(inflate_zlib(&z, 4).unwrap(), vec![1, 2, 3, 4]);
-        assert!(inflate_zlib(&z, 3).is_err());
+        assert_eq!(inflate_zlib(&z, 3), Err(InflateError::Buf));
         assert_eq!(inflate_zlib(&z, u64::MAX).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(inflate_zlib(&z[..z.len() - 4], 4), Err(InflateError::Buf));
+        assert_eq!(inflate_zlib(b"garbage!", 4), Err(InflateError::Data));
+        assert_eq!(inflate_zlib(b"", 4), Err(InflateError::Buf));
+        let big = zlib(&vec![9u8; 200_000]);
+        assert_eq!(inflate_zlib(&big, 200_000).unwrap().len(), 200_000);
     }
 
     /// SEC-7: an oversized PNG is refused from its IHDR, before decoding,

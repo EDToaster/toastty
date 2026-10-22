@@ -247,9 +247,11 @@ impl ImageRegistry {
         self.lru.push_back(id);
     }
 
-    /// Lowest 1-based id not currently resident. Worst case is O(n) but
-    /// `n` is small.
-    fn next_free_id(&self) -> u32 {
+    /// The id an insert with id `0` would get right now: the lowest
+    /// 1-based id not currently resident. Worst case is O(n) but `n` is
+    /// small.
+    #[must_use]
+    pub fn next_free_id(&self) -> u32 {
         let mut candidate = 1u32;
         loop {
             if !self.entries.contains_key(&candidate) {
