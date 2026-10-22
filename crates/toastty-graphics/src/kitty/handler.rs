@@ -160,6 +160,13 @@ pub trait KittySink {
         0
     }
 
+    /// The image `id` was sent with the transient usage hint (`N=1`):
+    /// the host may evict it before other images under storage pressure
+    /// (spec "Usage hints"). Called right after a successful
+    /// [`KittySink::register_image`]. Default: ignore the hint, which the
+    /// spec allows.
+    fn mark_transient(&mut self, _id: u32) {}
+
     /// Pixel dimensions `(width, height)` of a registered image, or `None`
     /// if not registered. Consulted by `a=p` (`handle_place`) so a
     /// standalone placement of an already-transmitted image can derive its
@@ -335,7 +342,7 @@ impl KittyHandler {
         }
         if !matches!(header.transmission, Transmission::Direct) {
             self.abort_loading("file query");
-            reply_error_if_verbose(&header, sink, ErrorCode::Enotsup, "transmission medium");
+            self.query_medium(&header, body, sink);
             return;
         }
         // During an upload a direct query is, to kitty, more of that
@@ -395,6 +402,42 @@ impl KittyHandler {
             Ok(_) => reply_ok_if_verbose(&header, sink),
             Err(e) if !e.silent => reply_error_if_verbose(&header, sink, e.code, &e.detail),
             Err(_) => {}
+        }
+    }
+
+    /// WIRE-1: `a=q` with `t=f` / `t=t`, as kitty 0.49.2 answers it.
+    ///
+    /// The format and dimensions are checked first, before the file is
+    /// touched (`EINVAL:Zero width/height not allowed`, which says nothing
+    /// about the file). Then the file goes through the hardened
+    /// [`medium::read_image_file`] path, `t=t` deletion rule included, and
+    /// every failure from there on, decode errors too, is the uniform
+    /// `EBADF:Failed to read image file` (SEC-4). Nothing is stored.
+    ///
+    /// `t=s` still replies ENOTSUP; shared memory comes in its own PR.
+    #[allow(clippy::unused_self)]
+    fn query_medium<S: KittySink>(&mut self, header: &Header, body: &[u8], sink: &mut S) {
+        match header.transmission {
+            Transmission::File | Transmission::TempFile => {
+                if let Err(e) = check_medium_header(header) {
+                    if !e.silent {
+                        reply_error_if_verbose(header, sink, e.code, &e.detail);
+                    }
+                    return;
+                }
+                let quota = sink.max_image_bytes();
+                let result = read_medium_file(header, body, quota).and_then(|raw| {
+                    decode_payload(header, raw, quota).map_err(|e| FileError(e.detail))
+                });
+                match result {
+                    Ok(_) => reply_ok_if_verbose(header, sink),
+                    Err(e) => reply_file_error(header, sink, &e),
+                }
+            }
+            Transmission::Shared => {
+                reply_error_if_verbose(header, sink, ErrorCode::Enotsup, "transmission medium");
+            }
+            Transmission::Direct => unreachable!("direct queries handled by the caller"),
         }
     }
 
@@ -568,6 +611,14 @@ impl KittyHandler {
         match header.transmission {
             Transmission::Direct => unreachable!("direct handled by caller"),
             Transmission::File | Transmission::TempFile => {
+                // kitty checks the format and dimensions before it touches
+                // the file, and replies about the command, not the file.
+                if let Err(e) = check_medium_header(&header) {
+                    if !e.silent {
+                        reply_transmit_error(&header, sink, e.code, &e.detail);
+                    }
+                    return;
+                }
                 let raw = match read_medium_file(&header, body, sink.max_image_bytes()) {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -640,6 +691,10 @@ impl KittyHandler {
             reply_transmit_error(&reply_head, sink, ErrorCode::Efbig, "registry full");
             return;
         };
+        // §9: `N` is a bitmask; bit 0 is "transient".
+        if header.usage_hint & 1 != 0 {
+            sink.mark_transient(final_id);
+        }
 
         // If the action also says "place", emit a default placement at
         // the cursor. The host's adapter uses the cursor's current
@@ -988,6 +1043,13 @@ fn inflate_zlib(input: &[u8], limit: u64) -> Result<Vec<u8>, InflateError> {
             Status::Ok => {}
         }
     }
+}
+
+/// kitty's checks on a file-medium command before the file is opened:
+/// a known `f=`, and for raw pixels both dimensions within 0 < d <= 10000.
+fn check_medium_header(header: &Header) -> Result<(), PayloadError> {
+    raw_len(header.format, header.source_width, header.source_height)?;
+    Ok(())
 }
 
 /// Read the file a `t=f` / `t=t` command names. `body` is the base64
@@ -2571,16 +2633,16 @@ mod tests {
     }
 
     #[test]
-    fn medium_query_still_enotsup() {
-        // M6: Query (`a=q`) with a non-direct medium remains ENOTSUP —
-        // only transmit (`a=t`/`a=T`) gained file/temp support.
+    fn shm_query_still_enotsup() {
+        // `a=q,t=s` keeps its ENOTSUP until shared memory lands (its own
+        // PR); `t=f` / `t=t` queries are WIRE-1, tested with the mediums.
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
-        h.process(b"Ga=q,t=f,i=1", b"L3RtcC94", &mut sink).unwrap();
-        assert!(
-            sink.replies
-                .iter()
-                .any(|r| { std::str::from_utf8(r).is_ok_and(|s| s.contains("ENOTSUP")) })
+        h.process(b"Ga=q,t=s,f=32,s=1,v=1,i=1", b"L2tncEI=", &mut sink)
+            .unwrap();
+        assert_eq!(
+            sink.replies,
+            vec![b"\x1b_Gi=1;ENOTSUP:transmission medium\x1b\\".to_vec()]
         );
     }
 }
@@ -3058,6 +3120,7 @@ mod major_medium_tests {
         placements: Vec<Placement>,
         replies: Vec<Vec<u8>>,
         quota: Option<u64>,
+        transient: Vec<u32>,
     }
 
     impl KittySink for MockSink {
@@ -3080,6 +3143,9 @@ mod major_medium_tests {
         }
         fn max_image_bytes(&self) -> u64 {
             self.quota.unwrap_or(DEFAULT_MAX_IMAGE_BYTES)
+        }
+        fn mark_transient(&mut self, id: u32) {
+            self.transient.push(id);
         }
     }
 
@@ -3442,6 +3508,117 @@ mod major_medium_tests {
         let sink = run("Ga=t,t=f,f=32,s=1,v=1,o=z,i=9", &b64_path(&p), None);
         assert_eq!(replies_joined(&sink), "\x1b_Gi=9;OK\x1b\\");
         assert_eq!(sink.registered[0].1.pixels, vec![1, 2, 3, 255]);
+    }
+
+    /// WIRE-1, as measured on kitty 0.49.2: `a=q` with `t=f`/`t=t` reads
+    /// through the hardened path, answers OK or the uniform EBADF, never
+    /// stores, and `t=t` deletes under the SEC-1 rule.
+    #[test]
+    fn wire1_file_medium_queries() {
+        let d = TestDir::new("wire1");
+        let px = [255u8, 0, 0, 255];
+        let ok = d.path("q.rgba");
+        std::fs::write(&ok, px).unwrap();
+        let cases: [(&str, std::path::PathBuf, &str); 6] = [
+            (
+                "Ga=q,i=401,t=f,f=32,s=1,v=1",
+                ok.clone(),
+                "\x1b_Gi=401;OK\x1b\\",
+            ),
+            (
+                "Ga=q,i=402,t=f,f=32,s=1,v=1",
+                d.path("nope"),
+                "\x1b_Gi=402;EBADF:Failed to read image file\x1b\\",
+            ),
+            (
+                "Ga=q,i=403,t=f,f=32,s=2,v=2",
+                ok.clone(),
+                "\x1b_Gi=403;EBADF:Failed to read image file\x1b\\",
+            ),
+            (
+                "Ga=q,i=408,t=f,f=32",
+                ok.clone(),
+                "\x1b_Gi=408;EINVAL:Zero width/height not allowed\x1b\\",
+            ),
+            ("Ga=q,i=409,t=f,f=32,s=1,v=1,q=1", ok.clone(), ""),
+            ("Ga=q,I=407,t=f,f=32,s=1,v=1", ok.clone(), ""),
+        ];
+        for (header, path, want) in cases {
+            let sink = run(header, &b64_path(&path), None);
+            assert_eq!(replies_joined(&sink), want, "{header}");
+            assert!(sink.registered.is_empty(), "a query never stores");
+        }
+        assert!(ok.exists(), "t=f queries never delete");
+
+        // t=t: the marked file (TestDir names carry the marker) is deleted
+        // after an OK and after a failed decode; queries without `i=`
+        // leave it alone.
+        let marked = d.path("m1.rgba");
+        std::fs::write(&marked, px).unwrap();
+        let sink = run("Ga=q,i=404,t=t,f=32,s=1,v=1", &b64_path(&marked), None);
+        assert_eq!(replies_joined(&sink), "\x1b_Gi=404;OK\x1b\\");
+        assert!(!marked.exists());
+        std::fs::write(&marked, px).unwrap();
+        let sink = run("Ga=q,i=406,t=t,f=32,s=2,v=2", &b64_path(&marked), None);
+        assert_eq!(
+            replies_joined(&sink),
+            format!("\x1b_Gi=406;{FILE_ERR}\x1b\\")
+        );
+        assert!(!marked.exists());
+        for header in ["Ga=q,t=t,f=32,s=1,v=1", "Ga=q,I=412,t=t,f=32,s=1,v=1"] {
+            std::fs::write(&marked, px).unwrap();
+            let sink = run(header, &b64_path(&marked), None);
+            assert!(sink.replies.is_empty(), "{header}");
+            assert!(marked.exists(), "{header}: an ignored query keeps the file");
+        }
+        // An unmarked temp file is answered and kept.
+        let plain =
+            std::env::temp_dir().join(format!("toastty-wire1-plain-{}.rgba", std::process::id()));
+        std::fs::write(&plain, px).unwrap();
+        let sink = run("Ga=q,i=405,t=t,f=32,s=1,v=1", &b64_path(&plain), None);
+        assert_eq!(replies_joined(&sink), "\x1b_Gi=405;OK\x1b\\");
+        assert!(plain.exists());
+        std::fs::remove_file(&plain).ok();
+    }
+
+    /// kitty checks the format and dimensions of a file-medium transmit
+    /// before it opens the file, so a bad command leaves a marked `t=t`
+    /// file in place and gets an EINVAL that says nothing about the file.
+    #[test]
+    fn file_medium_header_is_checked_before_the_file() {
+        let d = TestDir::new("precheck");
+        let marked = d.path("m.rgba");
+        for (header, want) in [
+            (
+                "Ga=t,i=414,t=t,f=32",
+                "\x1b_Gi=414;EINVAL:Zero width/height not allowed\x1b\\",
+            ),
+            (
+                "Ga=t,i=415,t=t,f=8,s=1,v=1",
+                "\x1b_Gi=415;EINVAL:Unknown image format: 8\x1b\\",
+            ),
+        ] {
+            std::fs::write(&marked, [255u8, 0, 0, 255]).unwrap();
+            let sink = run(header, &b64_path(&marked), None);
+            assert_eq!(replies_joined(&sink), want, "{header}");
+            assert!(marked.exists(), "{header}: the file is not touched");
+        }
+    }
+
+    /// §9 usage hints: `N=1` (bit 0 of the bitmask) marks the stored
+    /// image transient; other values don't.
+    #[test]
+    fn usage_hint_marks_transient() {
+        let px = b64(&[255, 0, 0, 255]);
+        for (header, want) in [
+            ("Ga=t,i=410,f=32,s=1,v=1,N=1", vec![410]),
+            ("Ga=t,i=411,f=32,s=1,v=1,N=3", vec![411]),
+            ("Ga=t,i=412,f=32,s=1,v=1,N=2", vec![]),
+            ("Ga=t,i=413,f=32,s=1,v=1", vec![]),
+        ] {
+            let sink = run(header, &px, None);
+            assert_eq!(sink.transient, want, "{header}");
+        }
     }
 
     /// SEC-1: a temp file without the marker is read but kept.

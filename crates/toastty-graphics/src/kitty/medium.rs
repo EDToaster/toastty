@@ -59,8 +59,8 @@ pub(super) struct FileRequest<'a> {
     /// `O=`: byte offset to start reading at.
     pub(super) offset: u64,
     /// Bytes to read; `0` means "to end of file". A file shorter than a
-    /// non-zero `size` is an error (the spec lists "smaller than the
-    /// client claimed" among the failures).
+    /// non-zero `size` is read to its end, as kitty does; if that is too
+    /// little data, decoding fails with the same uniform error.
     pub(super) size: u64,
     /// Hard cap on the bytes read. A request (or, with `size == 0`, a
     /// file) larger than this fails without reading anything.
@@ -312,17 +312,13 @@ fn reject_pseudo_fs(_fd: &impl std::os::fd::AsFd, _canonical: &Path) -> Result<(
 fn read_bounded(opened: &OpenedFile, req: &FileRequest<'_>) -> Result<Vec<u8>, FileError> {
     use std::io::{Read, Seek, SeekFrom};
     let available = opened.len.saturating_sub(req.offset);
+    // A file shorter than `S=` is read as far as it goes, as kitty does:
+    // `kitten icat --detect-support` sends a 3-byte file with `S=47`.
+    // Too little data is then the decoder's (uniform) error.
     let want = if req.size == 0 {
         available
-    } else if req.size > available {
-        return Err(FileError(format!(
-            "{}: file is shorter than S={} at O={}",
-            opened.canonical.display(),
-            req.size,
-            req.offset
-        )));
     } else {
-        req.size
+        req.size.min(available)
     };
     if want == 0 {
         return Err(FileError(format!(
@@ -623,11 +619,21 @@ mod tests {
     }
 
     #[test]
-    fn file_shorter_than_size_is_an_error() {
+    /// kitty reads a file shorter than `S=` to its end (icat's detection
+    /// probe relies on it); nothing at all past `O=` is an error.
+    fn file_shorter_than_size_is_read_to_its_end() {
         let sb = Sandbox::new("short");
         let p = write_file(&sb.home.join("img.rgba"), &[1, 2, 3]);
-        assert!(read_image_file_with_roots(&req(&p, 0, 4, false), &sb.roots()).is_err());
+        assert_eq!(
+            read_image_file_with_roots(&req(&p, 0, 47, false), &sb.roots()).unwrap(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            read_image_file_with_roots(&req(&p, 1, 47, false), &sb.roots()).unwrap(),
+            vec![2, 3]
+        );
         assert!(read_image_file_with_roots(&req(&p, 3, 0, false), &sb.roots()).is_err());
+        assert!(read_image_file_with_roots(&req(&p, 3, 4, false), &sb.roots()).is_err());
     }
 
     #[test]
@@ -1014,12 +1020,12 @@ mod tests {
     }
 
     /// kitty deletes a `t=t` file even when the read fails after the open
-    /// (here: shorter than `S=`).
+    /// (here: nothing left past `O=`).
     #[test]
     fn failed_read_of_regular_temp_file_still_deletes() {
         let sb = Sandbox::new("short-del");
         let f = write_file(&sb.tmp.join("tty-graphics-protocol-short"), &[1, 2]);
-        let r = req(&f, 0, 4, true);
+        let r = req(&f, 2, 4, true);
         assert!(read_image_file_with_roots(&r, &sb.roots()).is_err());
         assert!(!exists(&f));
     }

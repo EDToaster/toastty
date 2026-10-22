@@ -146,6 +146,12 @@ impl ImageStore {
         })
     }
 
+    /// Mark the image stored under `key` transient (`N=1`): under storage
+    /// pressure it is evicted before other images without placements.
+    pub fn set_transient(&mut self, key: ImageKey) {
+        self.registry.set_transient(key, true);
+    }
+
     /// Key of the image answering to `client_id`, if any.
     #[must_use]
     pub fn key_of(&self, client_id: u32) -> Option<ImageKey> {
