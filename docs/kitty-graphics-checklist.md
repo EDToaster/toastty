@@ -645,7 +645,14 @@ Done in #28. See
     - freed on `d=i/I`, `n/N`, `r/R`, `z/Z`, `q/Q` (lowercase too), and on
       every uppercase delete;
     - kept on lowercase `d=a`, `p`, `x`, `y`, `c`, and when the parent
-      leaves the history.
+      leaves the history;
+    - freed when the parent's image is re-transmitted or evicted by the
+      quota (kitty-ref: `a=p` on the child's id gets ENOENT, while an
+      unrelated newer image stays).
+  - `ESC[2J` doesn't clear a relative child by itself: it goes with its
+    parent. kitty-ref: a child on screen whose parent is in the history
+    survives `ESC[2J` with its image; a child in the history whose parent
+    is on screen goes, and both images are freed (PLC-8).
     The "freed even on lowercase `d=i`" above is that rule's id-like
     half.
 - [x] **P1 — REL-3. Children don't follow a parent moved by re-sending the

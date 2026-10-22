@@ -222,6 +222,18 @@ an `ImageView { top_line, scroll_px, clip }`:
       delete.
     - **Image kept:** lowercase `d=a`, `d=p`, `d=x`, `d=y` and `d=c`, and a
       parent leaving the history.
+    - **Also freed** when the parent's image is re-transmitted or evicted
+      by the quota (kitty-ref, ENOENT for the child afterwards).
+    - All of this is decided in one place, `ScreenImages::release` (see
+      `image-store.md`), from the `Free` rule each removal path passes:
+      `orphans` for uppercase deletes, `children` for the id-like
+      deletes, re-transmission, quota eviction and cap changes. Every
+      path, on either screen, goes through it.
+  - **`ESC[2J`.** Relative children aren't cleared themselves; they go
+    with their parent. kitty-ref: a child on screen whose parent is in
+    the history survives `ESC[2J`, image and all, while a child in the
+    history whose parent is on screen goes with it (and PLC-8 frees both
+    images).
     - A child deleted directly keeps its image on a lowercase delete
       (REL-2).
   - **Margin scrolls.** Relative children don't scroll on their own. They
