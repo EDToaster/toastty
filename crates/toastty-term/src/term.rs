@@ -4676,6 +4676,13 @@ impl Perform for Term {
         }
     }
 
+    fn dcs_cancel(&mut self) {
+        // CAN / SUB aborted the DCS (WIRE-15): drop the pending query or
+        // sixel so the `unhook` vte sends next does nothing.
+        self.dcs_query = None;
+        self.sixel_pending = None;
+    }
+
     fn unhook(&mut self) {
         if let Some(q) = self.dcs_query.take() {
             let reply = q.reply(&self.query_state());
@@ -8610,6 +8617,33 @@ mod tests {
             "got height {}",
             img.height
         );
+    }
+
+    #[test]
+    fn dcs_cancelled_by_can_or_sub_is_not_acted_on() {
+        // WIRE-15: xterm aborts a DCS on CAN / SUB. kitty treats them as
+        // data and so never answers a query cut off by one either; we
+        // keep xterm's cancel (see WIRE-13).
+        for cancel in [0x18u8, 0x1A] {
+            let mut t = Term::new(8, 8, 0);
+            let mut q = b"\x1bP$qm".to_vec();
+            q.push(cancel);
+            q.extend_from_slice(b"\x1bP+q544e");
+            q.push(cancel);
+            feed(&mut t, &q);
+            assert!(t.drain_pty_replies().is_empty(), "{cancel:#x}: no reply");
+            // A sixel cut off by CAN / SUB isn't placed.
+            let mut sixel = SIXEL_3X6[..SIXEL_3X6.len() - 2].to_vec();
+            sixel.push(cancel);
+            feed(&mut t, &sixel);
+            assert_eq!(t.image_grid().iter().count(), 0, "{cancel:#x}: no image");
+            // The next DCS works normally.
+            feed(&mut t, b"\x1bP$qm\x1b\\");
+            let reply = t.drain_pty_replies();
+            assert!(reply.starts_with(b"\x1bP1$r"), "{cancel:#x}");
+            feed(&mut t, SIXEL_3X6);
+            assert_eq!(t.image_grid().iter().count(), 1, "{cancel:#x}");
+        }
     }
 
     #[test]
