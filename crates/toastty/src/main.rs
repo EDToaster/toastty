@@ -1147,6 +1147,10 @@ impl Toastty {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("renderer init failed: {e}");
+                // Nothing will take the preloaded fonts now; join the
+                // workers and free the font database instead of holding
+                // it for the rest of the (renderer-less) session.
+                self.preload = Preload::default();
                 return None;
             }
         };
