@@ -27,6 +27,10 @@ pub struct ShaderFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShaderFileError {
     pub path: PathBuf,
+    /// The I/O error kind. On a watcher-triggered reload the caller can
+    /// skip `NotFound`: editors that save by rename briefly remove the
+    /// file.
+    pub kind: std::io::ErrorKind,
     pub message: String,
 }
 
@@ -96,6 +100,7 @@ pub fn load(paths: &[PathBuf]) -> Result<Vec<ShaderFile>, Vec<ShaderFileError>> 
             }),
             Err(e) => errors.push(ShaderFileError {
                 path: path.clone(),
+                kind: e.kind(),
                 message: e.to_string(),
             }),
         }
@@ -214,12 +219,14 @@ mod tests {
         let errs = load(&[missing.clone(), ok, not_utf8.clone()]).unwrap_err();
         assert_eq!(errs.len(), 2);
         assert_eq!(errs[0].path, missing);
+        assert_eq!(errs[0].kind, std::io::ErrorKind::NotFound);
         let shown = errs[0].to_string();
         assert!(
             shown.starts_with(&format!("{}: No such file", missing.display())),
             "{shown}"
         );
         assert_eq!(errs[1].path, not_utf8);
+        assert_eq!(errs[1].kind, std::io::ErrorKind::InvalidData);
         // A directory is not a shader file either.
         let errs = load(&[dir.path().to_path_buf()]).unwrap_err();
         assert_eq!(errs.len(), 1);

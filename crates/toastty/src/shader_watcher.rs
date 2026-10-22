@@ -9,11 +9,16 @@
 //!
 //! When the path list changes (config reload), the binary drops the old
 //! watcher and spawns a new one; that's one inotify instance, so cheap.
-//! Paths are matched literally: a symlinked shader is reloaded when the
-//! link changes, not when its target is edited in another directory.
+//!
+//! Each parent directory is canonicalized before watching: inotify gives
+//! two spellings of one directory (a stowed `~/.config/toastty` symlink,
+//! `a/../b`) the same watch, and notify then reports every event under
+//! whichever spelling was added last. The file name itself is kept as
+//! is, so a symlinked shader is reloaded when the link changes, not when
+//! its target is edited in another directory.
 
 use std::collections::{BTreeSet, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -48,22 +53,12 @@ impl ShaderWatcher {
         paths: &[PathBuf],
         proxy: EventLoopProxy<toastty_window::UserEvent>,
     ) -> Option<Self> {
-        let dirs: Vec<PathBuf> = parent_dirs(paths)
-            .into_iter()
-            .filter(|d| {
-                let ok = d.is_dir();
-                if !ok {
-                    debug!(dir = ?d, "shader dir missing — not watching");
-                }
-                ok
-            })
-            .collect();
+        let WatchSet { dirs, targets } = watch_set(paths);
         if dirs.is_empty() {
             return None;
         }
         let pending = Arc::new(AtomicBool::new(false));
         let pending_for_cb = Arc::clone(&pending);
-        let targets: HashSet<PathBuf> = paths.iter().cloned().collect();
 
         let mut watcher =
             match notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
@@ -108,33 +103,44 @@ impl ShaderWatcher {
     }
 }
 
-/// Distinct parent directories of `paths`, sorted. A bare relative file
-/// name has an empty parent, which means the CWD.
-fn parent_dirs(paths: &[PathBuf]) -> BTreeSet<PathBuf> {
-    paths
-        .iter()
-        .filter_map(|p| p.parent())
-        .map(|d| {
-            if d.as_os_str().is_empty() {
-                PathBuf::from(".")
-            } else {
-                d.to_path_buf()
+/// What to watch and what to match, spelled the way notify reports
+/// events: absolute, with the parent directory canonicalized.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WatchSet {
+    /// Distinct canonical parent directories.
+    dirs: BTreeSet<PathBuf>,
+    /// `canonical parent / file name` for each path.
+    targets: HashSet<PathBuf>,
+}
+
+/// Build the [`WatchSet`] for `paths`. Relative paths are made absolute
+/// against the CWD (notify does the same for the watch). Paths whose
+/// parent directory doesn't exist are skipped.
+fn watch_set(paths: &[PathBuf]) -> WatchSet {
+    let mut set = WatchSet::default();
+    for path in paths {
+        let Ok(abs) = std::path::absolute(path) else {
+            continue;
+        };
+        let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
+            continue;
+        };
+        match std::fs::canonicalize(parent) {
+            Ok(dir) => {
+                set.targets.insert(dir.join(name));
+                set.dirs.insert(dir);
             }
-        })
-        .collect()
+            Err(e) => debug!(dir = ?parent, "shader dir not watchable: {e}"),
+        }
+    }
+    set
 }
 
 /// True when `ev` is a payload event (see
 /// [`crate::config_watcher`]) touching one of `targets`. Siblings in a
 /// watched directory are ignored.
 fn is_relevant(ev: &notify::Event, targets: &HashSet<PathBuf>) -> bool {
-    is_payload_event(ev.kind) && ev.paths.iter().any(|p| matches(p, targets))
-}
-
-/// Exact match, plus `./name` for targets that are bare relative names
-/// (their directory is watched as `.`, so events arrive as `./name`).
-fn matches(p: &Path, targets: &HashSet<PathBuf>) -> bool {
-    targets.contains(p) || p.strip_prefix(".").is_ok_and(|rest| targets.contains(rest))
+    is_payload_event(ev.kind) && ev.paths.iter().any(|p| targets.contains(p))
 }
 
 #[cfg(test)]
@@ -155,18 +161,81 @@ mod tests {
         paths.iter().map(PathBuf::from).collect()
     }
 
+    #[cfg(unix)]
     #[test]
-    fn parent_dirs_are_distinct() {
-        let paths: Vec<PathBuf> = ["/a/x.glsl", "/a/y.wgsl", "/b/z.glsl", "rel.glsl"]
-            .iter()
-            .map(PathBuf::from)
-            .collect();
-        let dirs: Vec<PathBuf> = parent_dirs(&paths).into_iter().collect();
+    fn watch_set_canonicalizes_parent_and_dedups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(tmp.path()).unwrap().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = real.parent().unwrap().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let paths = vec![
+            real.join("a.glsl"),
+            link.join("b.glsl"),
+            real.join("sub/../c.glsl"),
+            real.join("missing/d.glsl"),
+        ];
+        std::fs::create_dir(real.join("sub")).unwrap();
+        let set = watch_set(&paths);
+        assert_eq!(set.dirs.into_iter().collect::<Vec<_>>(), vec![real.clone()]);
         assert_eq!(
-            dirs,
-            vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from(".")]
+            set.targets,
+            ["a.glsl", "b.glsl", "c.glsl"]
+                .iter()
+                .map(|n| real.join(n))
+                .collect()
         );
-        assert!(parent_dirs(&[]).is_empty());
+        assert_eq!(watch_set(&[]), WatchSet::default());
+    }
+
+    #[test]
+    fn watch_set_makes_relative_paths_absolute() {
+        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let set = watch_set(&[PathBuf::from("x.glsl")]);
+        assert_eq!(set.dirs.into_iter().collect::<Vec<_>>(), vec![cwd.clone()]);
+        assert!(set.targets.contains(&cwd.join("x.glsl")));
+    }
+
+    /// Real notify watcher: writes through a symlinked spelling of the
+    /// directory must match the canonical targets.
+    #[cfg(unix)]
+    #[test]
+    fn real_events_match_targets() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(tmp.path()).unwrap().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = real.parent().unwrap().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let target = link.join("x.glsl");
+        let set = watch_set(&[target.clone(), real.join("y.glsl")]);
+
+        let (tx, rx) = mpsc::channel();
+        let mut w = notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        })
+        .unwrap();
+        for dir in &set.dirs {
+            w.watch(dir, RecursiveMode::NonRecursive).unwrap();
+        }
+        std::fs::write(link.join("sibling.txt"), "x").unwrap();
+        std::fs::write(&target, "void mainImage() {}").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_sibling = false;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let ev = rx.recv_timeout(left).expect("no event for target").unwrap();
+            if ev.paths.iter().any(|p| p.ends_with("sibling.txt")) {
+                saw_sibling = true;
+                assert!(!is_relevant(&ev, &set.targets), "{ev:?}");
+            } else if is_relevant(&ev, &set.targets) {
+                break;
+            }
+        }
+        assert!(saw_sibling, "sibling write should arrive first");
     }
 
     #[test]
@@ -207,12 +276,5 @@ mod tests {
             &ev(EventKind::Access(AccessKind::Read), &["/a/x.glsl"]),
             &t
         ));
-    }
-
-    #[test]
-    fn bare_relative_target_matches_dot_prefixed_event() {
-        let t = targets(&["x.glsl"]);
-        assert!(is_relevant(&ev(EventKind::Any, &["./x.glsl"]), &t));
-        assert!(!is_relevant(&ev(EventKind::Any, &["./y.glsl"]), &t));
     }
 }
