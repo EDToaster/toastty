@@ -68,8 +68,9 @@ fn has_below_cell_bg_placements(
     grid.iter().any(|p| {
         classify_layer(p.z) == Layer::BelowCellBg
             && registry.contains(p.image_id)
-            && !p.col_range.is_empty()
-            && !p.row_range.is_empty()
+            && p.cols != 0
+            && p.rows != 0
+            && !p.clip_rows.is_empty()
     })
 }
 
@@ -4015,16 +4016,11 @@ mod below_cell_bg_tests {
     #[test]
     fn below_cell_bg_detection_uses_the_kitty_band() {
         use toastty_term::{ImageGrid, Placement, SrcRect};
-        let place = |z: i32| Placement {
-            image_id: 1,
-            placement_id: 0,
-            row_range: 0..1,
-            col_range: 0..1,
-            src_rect: SrcRect::FULL,
-            z,
-            pix_offset: (0, 0),
-            parent: None,
-            rel_offset: (0, 0),
+        let place = |z: i32| {
+            let mut p = Placement::new(1, 1, 1);
+            p.src_rect = SrcRect::FULL;
+            p.z = z;
+            p
         };
         let mut reg = toastty_term::ImageRegistry::new(1024);
         reg.insert(
@@ -4051,16 +4047,13 @@ mod below_cell_bg_tests {
     #[test]
     fn below_cell_bg_detection_ignores_placements_that_never_draw() {
         use toastty_term::{ImageData, ImageGrid, ImageRegistry, Placement, SrcRect};
-        let place = |id: u32, rows: std::ops::Range<u16>, cols: std::ops::Range<u16>| Placement {
-            image_id: id,
-            placement_id: 0,
-            row_range: rows,
-            col_range: cols,
-            src_rect: SrcRect::FULL,
-            z: i32::MIN,
-            pix_offset: (0, 0),
-            parent: None,
-            rel_offset: (0, 0),
+        let place = |id: u32, rows: std::ops::Range<u16>, cols: std::ops::Range<u16>| {
+            let mut p = Placement::new(id, rows.end - rows.start, cols.end - cols.start);
+            p.line = i64::from(rows.start);
+            p.col = cols.start;
+            p.src_rect = SrcRect::FULL;
+            p.z = i32::MIN;
+            p
         };
         let mut reg = ImageRegistry::new(1024);
         reg.insert(
