@@ -34,6 +34,10 @@ use super::reply::ErrorCode;
 /// to 14 bytes, 10x10 up to 410.
 pub const RAW_DATA_SLACK: usize = 10;
 
+/// Largest width or height kitty accepts for raw pixels (measured on
+/// 0.49.2: 10000 is fine, 10001 is `EINVAL:Image too large, …`).
+pub const MAX_RAW_DIM: u32 = 10_000;
+
 /// kitty's message for a PNG that ends early.
 const PNG_TRUNCATED: &str = "PNG data is truncated: not enough bytes to satisfy read request";
 
@@ -47,6 +51,9 @@ pub enum DecodeError {
     /// Width or height is zero for a raw format.
     #[error("Zero width/height not allowed")]
     MissingDims,
+    /// Width or height over [`MAX_RAW_DIM`] for a raw format.
+    #[error("Image too large, width or height greater than 10000")]
+    DimsTooLarge,
     /// Fewer raw bytes than `width * height * bpp`.
     #[error("Insufficient image data: {got} < {expected}")]
     InsufficientData { got: usize, expected: usize },
@@ -67,7 +74,9 @@ impl DecodeError {
     #[must_use]
     pub fn code(&self) -> ErrorCode {
         match self {
-            DecodeError::UnknownFormat(_) | DecodeError::MissingDims => ErrorCode::Einval,
+            DecodeError::UnknownFormat(_)
+            | DecodeError::MissingDims
+            | DecodeError::DimsTooLarge => ErrorCode::Einval,
             DecodeError::InsufficientData { .. } => ErrorCode::Enodata,
             DecodeError::TooMuchData => ErrorCode::Efbig,
             DecodeError::BadPng(_) => ErrorCode::Ebadpng,
@@ -87,6 +96,9 @@ pub fn raw_len(format: Format, w: u32, h: u32) -> Result<Option<u64>, DecodeErro
     };
     if w == 0 || h == 0 {
         return Err(DecodeError::MissingDims);
+    }
+    if w > MAX_RAW_DIM || h > MAX_RAW_DIM {
+        return Err(DecodeError::DimsTooLarge);
     }
     Ok(Some(u64::from(w) * u64::from(h) * bpp))
 }
