@@ -11154,6 +11154,53 @@ mod major_medium_term_tests {
         assert!(path.exists(), "t=f must leave the file intact");
         std::fs::remove_file(&path).ok();
     }
+
+    /// WIRE-2 round trip: `a=q,t=s` then `a=T,t=s` (what `kitten icat
+    /// --transfer-mode=memory` sends) through the parser. The query is
+    /// answered OK and stores nothing; the transmit registers and places
+    /// the image; both objects are unlinked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kitty_t_s_shared_memory_query_and_transmit() {
+        struct Shm(std::path::PathBuf);
+        impl Drop for Shm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let raw: Vec<u8> = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        let pid = std::process::id();
+        let mk = |tag: &str| {
+            let name = format!("toastty-term-shm-{tag}-{pid}");
+            let shm = Shm(std::path::Path::new("/dev/shm").join(&name));
+            std::fs::write(&shm.0, &raw).unwrap();
+            let body = base64::engine::general_purpose::STANDARD.encode(format!("/{name}"));
+            (shm, body)
+        };
+        let (query, query_body) = mk("q");
+        let (image, image_body) = mk("T");
+
+        let mut t = Term::new(8, 8, 0);
+        let before = t.image_registry().len();
+        feed(
+            &mut t,
+            format!("\x1b_Ga=q,f=32,s=2,v=2,i=31,t=s;{query_body}\x1b\\").as_bytes(),
+        );
+        assert_eq!(t.drain_pty_replies(), b"\x1b_Gi=31;OK\x1b\\");
+        assert_eq!(t.image_registry().len(), before, "a=q stores nothing");
+        assert!(!query.0.exists(), "a=q,t=s must unlink the object");
+
+        feed(
+            &mut t,
+            format!("\x1b_Ga=T,f=32,s=2,v=2,i=315,t=s,S=16,q=2;{image_body}\x1b\\").as_bytes(),
+        );
+        assert!(t.drain_pty_replies().is_empty());
+        assert!(t.image_registry().contains(315));
+        assert_eq!(t.image_grid().len(), 1, "a=T must place the image");
+        assert!(!image.0.exists(), "t=s must unlink the object");
+    }
 }
 
 /// M13: relative placements (`P=`/`Q=`/`H=`/`V=`) driven end-to-end

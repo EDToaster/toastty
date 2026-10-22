@@ -2,7 +2,8 @@
 
 Date: 2026-10-21. Author: kgp-B (KGP fix programme, PR B1).
 Status: **implemented**. Closes SEC-1 to SEC-7 in
-`docs/kitty-graphics-checklist.md`.
+`docs/kitty-graphics-checklist.md`. B4b extends it to shared memory
+(`t=s`, WIRE-2) on Linux; see [Shared memory](#shared-memory-ts-wire-2).
 
 ## TL;DR
 
@@ -183,3 +184,80 @@ Superseded by B3 (#44), which follows kitty's loading model:
   just to find it's too big.
 - B1's count cap, global byte cap and LRU eviction are gone; with one
   slot they no longer mean anything.
+
+## Shared memory (`t=s`, WIRE-2)
+
+Added in B4b. The body of a `t=s` command is a base64 POSIX shm name.
+The spec: the name starts with `/` and has no other `/`, and the terminal
+"must read the data from the memory object and then unlink and close
+it". `O=` and `S=` work as for files. The code is
+`medium::read_shm_object`.
+
+**Linux** (glibc and musl implement `shm_open("/x")` as
+`open("/dev/shm/x")`, so an object is a file in that tmpfs):
+
+1. Validate the name: a leading `/`, no other `/`, not empty, `.` or
+   `..`, no NUL, at most 255 bytes after the `/` (`NAME_MAX`). Anything
+   else fails before any syscall.
+2. Open `/dev/shm` (`O_PATH | O_DIRECTORY`), then the leaf relative to
+   that fd with `O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY |
+   O_CLOEXEC`. A symlink fails the open (kitty's `shm_open` refuses
+   symlinks too), a FIFO can't block it.
+3. `fstat` the opened fd and require a regular file.
+4. Read the `O=`/`S=` range with the same bounded `read`s as `t=f`,
+   capped at the image quota. Like a file (B4a, #49), an object shorter
+   than `S=` is read to its end and the decoder judges the data. We never
+   `mmap` the object, so a client that truncates it while we read gets a
+   short read (EBADF), not a `SIGBUS` in the terminal.
+5. `unlinkat` the leaf relative to the same directory fd. This happens
+   whenever step 3 passed, even if the read or the later decode fails:
+   the object is the client's hand-off, as kitty does. A symlink, a
+   directory or a FIFO is never unlinked.
+
+Every failure, including a bad name and a decode failure, replies the
+uniform `EBADF:Failed to read image file` (SEC-4), with the reason in the
+debug log.
+
+**`a=q,t=s`** (how `kitten icat --detect-support` finds `memory`) goes
+through B4a's medium-query path (WIRE-1): the header is checked first,
+then the object is read, decoded and unlinked exactly like a transmit,
+the reply is `OK` or EBADF, and nothing is stored. Without `i=` the
+query is ignored and the object is left alone, as in kitty (WIRE-7).
+
+**Measured on kitty 0.49.2** (`scripts/kgp-stress/kitty-ref.sh`):
+
+| Command | kitty | toastty |
+|---|---|---|
+| `a=q,i=31,t=s` good PNG | `OK`, unlinked | same |
+| `a=q,i=32,t=s` missing | `EBADF:Failed to read image file` | same |
+| `a=q,i=33,t=s` not a PNG | `EBADPNG:Not a PNG file`, unlinked | `EBADF:…`, unlinked (SEC-4) |
+| `a=q,t=s` without `i=` | no reply, object kept | same |
+| `a=t,t=s,S=` larger than the object | `OK`, unlinked | same |
+| `a=t,t=s,O=` past the end | `EBADPNG:PNG data is truncated…`, unlinked | `EBADF:…`, unlinked (SEC-4) |
+| `a=t,t=s,f=32,s=2,v=2`, 8-byte object | `EBADF:…`, unlinked | same |
+| `a=t,t=s` symlink | `EBADF:…`, link kept | same |
+| `a=t,t=s` directory | `EBADF:…`, kept | same |
+| `a=t,t=s` name without `/`, or `/a/b` | `EBADF:…` | same |
+| `a=T,t=s` good PNG | displayed, `OK`, unlinked | same |
+
+One deliberate difference, from reading SEC-4 strictly: decode failures
+are EBADF, not kitty's `EBADPNG`. That matches what `t=f` already does.
+
+**mpv.** `mpv --vo=kitty --vo-kitty-use-shm=yes` (mpv 0.41.0) sends the
+shm name *without* the leading `/` (`mpv-kitty-0x…`). kitty 0.49.2
+refuses it ("POSIX SHM names must start with /" in its log, once per
+frame) and shows nothing; toastty refuses it the same way, following
+the spec. mpv unlinks its own object on exit, so nothing leaks in
+either terminal. Accepting slash-less names would be a one-line
+leniency; it is not done here because both the spec and kitty refuse
+them.
+
+**Not Linux.** macOS shm objects can't be read with `read(2)`; the only
+way in is `mmap`, which is `unsafe`, and `toastty-graphics` is
+`#![forbid(unsafe_code)]`. So off Linux, `t=s` validates the name,
+`shm_unlink`s it (`rustix::shm::unlink`, safe) so a client that ignores
+the reply doesn't leak the object, and replies the uniform EBADF. A
+client that probes with `a=q,t=s` (icat's `--detect-support`) then falls
+back to `t=t`/`t=d` on its own. **Pending a PM/user decision:** whether to
+read macOS shm through a small audited `unsafe` `mmap` (in a separate
+crate, or by lifting the forbid for one module), or to leave it as is.
