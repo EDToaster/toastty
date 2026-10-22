@@ -4806,6 +4806,7 @@ impl Term {
             .remove_where(|v| v.image_id == img && (pid == 0 || v.placement_id == pid))
         {
             self.image_revision = self.image_revision.wrapping_add(1);
+            self.refresh_virtual_parents();
         }
         if drop_bytes
             && !self.images.grid.iter().any(|p| p.image_id == img)
@@ -4837,6 +4838,7 @@ impl Term {
             .remove_where(|v| ids.contains(&v.image_id))
         {
             self.image_revision = self.image_revision.wrapping_add(1);
+            self.refresh_virtual_parents();
         }
         if drop_bytes {
             for id in self.images.store.clients_in(*ids.start(), *ids.end()) {
@@ -5255,6 +5257,8 @@ impl KittySink for Term {
                     .cloned()
             })
             .flatten();
+        // REL-5: a virtual parent's origin comes from its placeholder cells.
+        self.refresh_virtual_parents();
         match self.images.grid.add_relative(placement) {
             Ok(handle) => {
                 if let Some(old) = old {

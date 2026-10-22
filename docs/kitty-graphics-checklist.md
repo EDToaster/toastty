@@ -671,9 +671,9 @@ Done in #28. See
     kitty puts the children at (5,27)/(9,20); toastty at (7,32)/(11,25).
   - Cause: `ImageGrid::find` (`image_grid.rs:139-145`) returns the most
     recent tile.
-  - Fixed in #40 against the placeholder tiles still on this stack.
-    Once #28 lands, the origin comes from `Term::placeholder_origin` (a
-    `TODO(#28)` marks the spot).
+  - Fixed in #40. On the merge train (with #28) the origin comes from
+    `Term::placeholder_origin`, through the grid's virtual-parent
+    snapshot; a child goes with its virtual parent.
 - [x] **P2 — REL-6. Negative `H`/`V` offsets are clamped to column/row 0.**
   - Expected: kitty lets the child go partly off-screen and clips it.
   - Cause: `offset_origin` (`image_grid.rs:538-545`).
