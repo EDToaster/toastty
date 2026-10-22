@@ -234,7 +234,7 @@ binary requests a redraw after any PTY input).
 
 ## Demo
 
-`examples/shaders/crt-splitflap.glsl`: a static CRT look (barrel
+`examples/shaders/splitflap.glsl` + `crt.glsl`: a static CRT look (barrel
 curvature, scanlines, aperture mask, vignette) plus, on each BEL, a
 split-flap wave. Starting at the bell's cell, cells flip like a
 departure-board tile in a ring that spreads outward. Overlapping bells

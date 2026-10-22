@@ -108,8 +108,9 @@ keeps running.
 toastty adds a few uniforms of its own. `iBells` and `iTimeBell` fire on
 every BEL, with the cell it rang at, and `iCellSize` / `iGridRect`
 describe the cell grid. The bundled
-[`crt-splitflap.glsl`](examples/shaders/crt-splitflap.glsl) uses them for
-a CRT look where each bell sends a split-flap wave across the screen:
+[`splitflap.glsl`](examples/shaders/splitflap.glsl) uses them for
+a split-flap wave across the screen on each bell. Chained with
+[`crt.glsl`](examples/shaders/crt.glsl) it gives a CRT look:
 
 <p align="center">
   <img src="docs/screenshots/crt-splitflap.gif" alt="toastty with a curved, scanlined CRT shader; after a bell, the character cells flip like split-flap display tiles in a wave spreading out from the cursor" width="720">
@@ -125,7 +126,7 @@ cp examples/shaders/*.glsl ~/.config/toastty/shaders/
 
 ```toml
 [shader]
-paths = ["shaders/crt-splitflap.glsl"]   # run in order
+paths = ["shaders/splitflap.glsl", "shaders/crt.glsl"]   # run in order
 animation = "auto"   # "auto" | "always" | "never"
 ```
 
