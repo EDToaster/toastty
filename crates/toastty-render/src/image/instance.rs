@@ -176,7 +176,7 @@ pub fn build_image_instances(
         if placement.cols == 0 || placement.rows == 0 || placement.clip_rows.is_empty() {
             continue;
         }
-        let Some(image) = registry.get(placement.image_id) else {
+        let Some(image) = registry.get(placement.key) else {
             continue;
         };
         // What part of the image is shown (spec defaults + intersection
@@ -242,7 +242,10 @@ pub fn build_image_instances(
             uv_max: uv1,
             texture_index: UNRESOLVED_TEXTURE,
             z: placement.z,
-            image_id: placement.image_id,
+            // The store key (#42), not the client id: the texture step
+            // (#24) looks the bytes up by it. Equal-z ties therefore break
+            // by key (transmission order) rather than by client id.
+            image_id: placement.key,
             _pad: [0; 1],
         });
     }

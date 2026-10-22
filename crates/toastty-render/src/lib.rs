@@ -67,7 +67,7 @@ fn has_below_cell_bg_placements(
 ) -> bool {
     grid.iter().any(|p| {
         classify_layer(p.z) == Layer::BelowCellBg
-            && registry.contains(p.image_id)
+            && registry.contains(p.key)
             && p.cols != 0
             && p.rows != 0
             && !p.clip_rows.is_empty()

@@ -308,17 +308,23 @@ impl Term {
         self.collect_extras()
     }
 
-    /// Drop image `id`'s virtual placements on *both* screens. Called
-    /// whenever the image's bytes are replaced or freed (re-transmit,
-    /// eviction, byte-freeing delete). The registry is shared between the
-    /// screens, so a placement left in the stashed table would otherwise
-    /// apply its old `c`/`r` to whatever image later reuses the id.
+    /// Drop image `id`'s virtual placements. Called whenever the image's
+    /// bytes are replaced or freed (re-transmit, byte-freeing delete). With
+    /// per-screen image stores (#42) this is the active screen's table
+    /// only: the other screen's `i=id` is a different image.
     pub(super) fn forget_virtual_placements(&mut self, id: u32) {
-        let mut dropped = self.virtual_placements.remove_image(id);
-        if let Some(stashed) = self.stashed_virtual_placements.as_mut() {
-            dropped |= stashed.remove_image(id);
-        }
+        let dropped = self.virtual_placements.remove_image(id);
         if dropped {
+            self.image_revision = self.image_revision.wrapping_add(1);
+            self.refresh_virtual_parents();
+        }
+    }
+
+    /// Drop the virtual placements whose image left this screen's store
+    /// (quota eviction).
+    pub(super) fn prune_virtual_placements(&mut self) {
+        let store = &self.image_store;
+        if self.virtual_placements.remove_where(|v| !store.contains(v.image_id)) {
             self.image_revision = self.image_revision.wrapping_add(1);
             self.refresh_virtual_parents();
         }

@@ -66,7 +66,12 @@ pub fn build_placeholder_instances(
             let Some(vp) = term.resolve_placeholder(run) else {
                 continue;
             };
-            let Some(image) = registry.get(run.image_id) else {
+            // Placeholder cells name the client id; the bytes and the
+            // texture are keyed by the store key (#42).
+            let Some(key) = term.image_store().key_of(run.image_id) else {
+                continue;
+            };
+            let Some(image) = registry.get(key) else {
                 continue;
             };
             pieces.clear();
@@ -94,7 +99,7 @@ pub fn build_placeholder_instances(
                     // Bound by `ImagePipeline::resolve_kitty_textures`.
                     texture_index: 0,
                     z: vp.z,
-                    image_id: run.image_id,
+                    image_id: key,
                     _pad: [0; 1],
                 };
                 let key = MergeKey::of(&inst);
@@ -268,7 +273,7 @@ mod tests {
         assert!(approx(i.pos, [0.0, 35.0]), "{:?}", i.pos);
         assert!(approx(i.size, [60.0, 30.0]), "{:?}", i.size);
         assert!(approx(i.uv_min, [0.0, 0.0]) && approx(i.uv_max, [1.0, 1.0]));
-        assert_eq!(i.image_id, 42);
+        assert_eq!(Some(i.image_id), t.image_store().key_of(42), "store key (#42)");
     }
 
     #[test]
@@ -345,11 +350,8 @@ mod tests {
         let mut out = vec![other];
         build_placeholder_instances(&mut out, &t, CELL, LAYOUT, None);
         assert_eq!(out.len(), 2);
-        assert_eq!(
-            (out[0].image_id, out[1].image_id),
-            (42, 1),
-            "z 0 before z 5"
-        );
+        assert_eq!(out[0].z, 0, "z 0 before z 5");
+        assert_eq!(out[1].image_id, 1);
     }
 
     #[test]

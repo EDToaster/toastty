@@ -44,8 +44,14 @@ use std::ops::Range;
 /// A single image placement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placement {
-    /// Source image id (matches `ImageRegistry`).
+    /// The image's client id (kitty's `i=`); `0` for an anonymous image.
+    /// Deletes, parents and tie-breaks address placements by it.
     pub image_id: u32,
+    /// Key of the stored bytes in the screen's `ImageStore` (unique per
+    /// transmission, across both screens). The renderer looks images up
+    /// by it. `Placement::new` defaults it to `image_id`; the host sets
+    /// the real key when it places the image.
+    pub key: u32,
     /// Stable per-image placement id. Kitty's `p=` field; zero means
     /// "unnamed".
     pub placement_id: u32,
@@ -123,6 +129,7 @@ impl Placement {
     pub fn new(image_id: u32, rows: u16, cols: u16) -> Self {
         Self {
             image_id,
+            key: image_id,
             placement_id: 0,
             line: 0,
             col: 0,
@@ -674,6 +681,11 @@ impl ImageGrid {
     /// placements so the caller can mark cells dirty.
     pub fn remove_image(&mut self, image_id: u32) -> Vec<Placement> {
         self.remove_where(|p| p.image_id == image_id)
+    }
+
+    /// Drop every placement showing the image stored under `key`.
+    pub fn remove_image_key(&mut self, key: u32) -> Vec<Placement> {
+        self.remove_where(|p| p.key == key)
     }
 
     /// Drop every placement whose shown part intersects screen `row`.

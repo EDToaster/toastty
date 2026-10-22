@@ -81,9 +81,9 @@ fn rel2_deleting_a_parent_deletes_the_group_and_frees_child_images() {
         "{:?}",
         t.image_grid().iter().collect::<Vec<_>>()
     );
-    assert!(t.image_registry().contains(1));
-    assert!(!t.image_registry().contains(2));
-    assert!(!t.image_registry().contains(3));
+    assert!(t.image_store().contains(1));
+    assert!(!t.image_store().contains(2));
+    assert!(!t.image_store().contains(3));
 }
 
 #[test]
@@ -95,8 +95,8 @@ fn rel2_deleting_a_child_directly_keeps_its_image() {
     // child's image stays (kitty: a direct lowercase delete).
     assert!(t.image_grid().find(2, 1).is_none());
     assert!(t.image_grid().find(3, 1).is_none());
-    assert!(t.image_registry().contains(2));
-    assert!(!t.image_registry().contains(3));
+    assert!(t.image_store().contains(2));
+    assert!(!t.image_store().contains(3));
     assert_eq!(at(&t, 1, 1), Some((2, 4)));
 }
 
@@ -278,7 +278,7 @@ fn p_without_q_binds_to_the_oldest_placement_once() {
     assert!(at(&t, 2, 1).is_none(), "the child went with its parent");
     assert!(at(&t, 1, 2).is_some());
     // (kitty-ref probes with `a=p,i=2`: ENOENT.)
-    assert!(!t.image_registry().contains(2), "child image freed");
+    assert!(!t.image_store().contains(2), "child image freed");
 }
 
 #[test]
@@ -293,8 +293,8 @@ fn p_without_q_child_image_is_freed_by_a_lowercase_id_delete() {
     assert!(cmd(&mut t, "a=p,i=2,p=1,P=41,H=6,c=2,r=1").contains("OK"));
     cmd(&mut t, "a=d,d=i,i=41");
     assert!(t.image_grid().is_empty());
-    assert!(!t.image_registry().contains(2));
-    assert!(t.image_registry().contains(41), "lowercase: parent's kept");
+    assert!(!t.image_store().contains(2));
+    assert!(t.image_store().contains(41), "lowercase: parent's kept");
 }
 
 /// Family with the parent at cell (5, 3) and z=3; returns after `del`
@@ -311,7 +311,7 @@ fn child_image_kept_after(del: &str) -> bool {
         at(&t, 2, 1).is_none(),
         "{del}: the child went with its parent"
     );
-    t.image_registry().contains(2)
+    t.image_store().contains(2)
 }
 
 #[test]
@@ -343,7 +343,7 @@ fn cascaded_child_image_freeing_matches_kitty_per_delete() {
     cmd(&mut t, "a=p,i=2,p=1,P=1,Q=1,H=40,c=2,r=1");
     cmd(&mut t, "a=d,d=c");
     assert!(at(&t, 2, 1).is_none());
-    assert!(t.image_registry().contains(2), "d=c keeps it");
+    assert!(t.image_store().contains(2), "d=c keeps it");
 }
 
 #[test]
@@ -362,7 +362,7 @@ fn cascaded_child_image_freed_by_number_delete() {
     assert!(cmd(&mut t, "a=p,i=41,p=1,P=1,Q=1,H=25,c=2,r=1").contains("OK"));
     cmd(&mut t, "a=d,d=n,I=50");
     assert!(t.image_grid().is_empty());
-    assert!(!t.image_registry().contains(41));
+    assert!(!t.image_store().contains(41));
 }
 
 #[test]
@@ -378,7 +378,7 @@ fn a_parent_leaving_history_keeps_the_childs_image() {
     feed(&mut t, b"\x1b[10;1H");
     feed(&mut t, &[b'\n'; 20]);
     assert!(t.image_grid().is_empty());
-    assert!(t.image_registry().contains(1) && t.image_registry().contains(2));
+    assert!(t.image_store().contains(1) && t.image_store().contains(2));
 }
 
 #[test]
