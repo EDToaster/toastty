@@ -1444,14 +1444,37 @@ Seen during app testing, not a graphics bug:
       `CSI 27;1:3u`.
     - kitty's report-text (16) without 8 (undefined in the spec) half
       disambiguates; toastty treats it as legacy.
-- [ ] **P2 — KBD-2. Keypad keys and modifier keys don't use kitty's own key
+- [x] **P2 — KBD-2. Keypad keys and modifier keys don't use kitty's own key
   codes.** Found while checking KBD-1.
   - kitty sends KP_Enter as `CSI 57414 u` under disambiguate, and keypad
     digits as `CSI 57400 u` (and so on) under report-all.
   - Under report-all, kitty also reports presses and releases of the
     modifier keys themselves (`CSI 57441;2u` for Shift).
-  - toastty sends the main-keyboard codes and no modifier-key events,
-    because the encoder doesn't get the physical key.
+  - toastty sent the main-keyboard codes and no modifier-key events,
+    because the encoder didn't get the physical key.
+  - Fix: the encoder now gets the physical key and the unmodified key
+    (`KeyContext`). Checked live against kitty 0.49.2 for flags 0, 1, 2,
+    3, 8, 10, 24 and 31 (keypad, NumLock on and off, modifiers) and for
+    0, 1, 3, 5, 7, 8, 11 and 31 (the #43 review set). Fixed in #53.
+    - Keypad keys use kitty's codes under 1 / 8, and their legacy forms
+      under 2 alone, as kitty does. KP_Begin is always `CSI E`, legacy mode
+      included.
+    - Modifier and lock keys are reported under report-all. A press sets
+      the key's bit; on release the bit stays while the other side is still
+      held (spec).
+    - A character key's code is the unmodified key: shift+1 is `CSI 49;2u`,
+      and `49:33` with report-alternates.
+    - A release is reported as the key that was pressed (the NumLock-on
+      KP_1 release is no longer End). A release whose press never arrived
+      as a key event (an input method consumed it, e.g. a dead key's `e`)
+      is dropped.
+  - Known differences:
+    - ctrl+KP_Add / ctrl+KP_Subtract are toastty's font-zoom shortcuts.
+    - In legacy mode (no flags) kitty sends ctrl+keypad digits as
+      `CSI 5740x;5u`; toastty sends the digit.
+    - Dead-key / input-method compositions are sent as plain text even
+      under report-all (winit delivers them as input-method commits). kitty
+      under Xvfb didn't compose, so there was nothing to compare against.
 
 Performance notes (Xvfb, software present; not conclusive):
 
