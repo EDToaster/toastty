@@ -7605,6 +7605,22 @@ mod tests {
     }
 
     #[test]
+    fn dcs_queries_terminated_by_bel_are_answered() {
+        // WIRE-13: kitty 0.49.2 ends a DCS on BEL and answers it exactly
+        // as if it ended on ST (checked live).
+        let mut t = Term::new(4, 10, 0);
+        feed(&mut t, b"\x1bP+q536D756C78\x07");
+        assert_eq!(t.drain_pty_replies(), b"\x1bP0+r536D756C78\x1b\\");
+        feed(&mut t, b"\x1bP$qm\x07");
+        let reply = t.drain_pty_replies();
+        assert!(reply.starts_with(b"\x1bP1$r"), "{reply:?}");
+        // PM / SOS bodies ending in BEL print nothing.
+        feed(&mut t, b"\x1b^hidden\x07\x1bXhidden\x07ok");
+        let row: String = t.row(0).cells.iter().map(|c| c.ch).collect();
+        assert_eq!(row.trim_end(), "ok");
+    }
+
+    #[test]
     fn xtgettcap_unknown_and_invalid() {
         let mut t = Term::new(4, 10, 0);
         feed(&mut t, b"\x1bP+q536D756C78\x1b\\");
