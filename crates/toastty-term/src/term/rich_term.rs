@@ -334,14 +334,15 @@ impl Term {
     }
 
     /// Reflow the primary grid, re-laying out every intact block whose
-    /// geometry differs from the current parameters.
+    /// geometry differs from the current parameters. Returns the new
+    /// cursor and how the retained rows were renumbered.
     pub(super) fn reflow_primary(
         &mut self,
         rows: u16,
         cols: u16,
         cap: usize,
         cursor: (u16, u16),
-    ) -> (u16, u16) {
+    ) -> ((u16, u16), crate::grid::LineRemap) {
         let params = self.rich_params(cols);
         let store = &mut self.rich_store;
         let layout = &mut self.rich_layout;
@@ -379,7 +380,7 @@ impl Term {
             Some(new_rows)
         };
         self.primary
-            .resize_reflow_with(rows, cols, cap, cursor, &mut relayout)
+            .resize_reflow_mapped(rows, cols, cap, cursor, &mut relayout)
     }
 
     /// Free blocks with no tagged rows left in the primary grid or its
@@ -473,7 +474,10 @@ impl Term {
     fn relayout_rich_in_place(&mut self) {
         let cap = self.rows as usize + self.scrollback as usize;
         let cursor = self.primary_reflow_cursor();
-        let reflowed = self.reflow_primary(self.rows, self.cols, cap, cursor);
+        let (reflowed, remap) = self.reflow_primary(self.rows, self.cols, cap, cursor);
+        if self.remap_primary_images(&remap) {
+            self.image_revision = self.image_revision.wrapping_add(1);
+        }
         self.store_primary_reflow_cursor(reflowed);
         if !self.alt_active {
             self.clamp_cursor();
