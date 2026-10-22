@@ -5508,6 +5508,28 @@ mod tests {
     }
 
     #[test]
+    fn invalid_utf8_and_bare_c1_print_replacement_characters() {
+        // WIRE-14: kitty 0.49.2 shows one U+FFFD per maximal invalid
+        // subpart, bare C1 bytes included; encoded C1 (`\xc2\x9c`) is
+        // a control and prints nothing. Checked live.
+        let mut t = Term::new(2, 40, 0);
+        feed(
+            &mut t,
+            b"[\x9c][\x80\x9f][\xc2\x9c][\xf4\x90\x80\x80][\xe2\x82\xac]",
+        );
+        assert_eq!(
+            row_text(&t, 0),
+            "[\u{FFFD}][\u{FFFD}\u{FFFD}][][\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}][\u{20AC}]"
+        );
+        // A sequence split across reads still decodes.
+        let mut t = Term::new(2, 8, 0);
+        let mut p = Parser::new();
+        p.advance(&mut t, b"a\xe2\x82");
+        p.advance(&mut t, b"\xacb");
+        assert_eq!(row_text(&t, 0), "a\u{20AC}b");
+    }
+
+    #[test]
     fn erase_display_modes() {
         // mode 0 — cursor to end
         let mut t = Term::new(3, 5, 0);

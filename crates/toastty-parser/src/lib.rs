@@ -19,6 +19,7 @@
 
 mod parser;
 mod perform;
+mod utf8;
 
 pub use parser::{MAX_OSC_LEN, MAX_PASSTHROUGH_LEN, Parser};
 pub use perform::{BufferingApcHandler, Perform};

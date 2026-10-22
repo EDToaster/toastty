@@ -1,4 +1,5 @@
 use crate::perform::{Perform, VteAdapter};
+use crate::utf8::Utf8Sanitizer;
 
 /// State of the APC pre-scanner that sits in front of `vte`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -77,6 +78,9 @@ struct Scanner {
     apc: ApcState,
     /// OSC payload cap; [`MAX_OSC_LEN`] outside tests.
     max_osc_len: usize,
+    /// Rewrites invalid UTF-8 in ground text to U+FFFD the way kitty
+    /// does, before vte sees it (WIRE-14).
+    utf8: Utf8Sanitizer,
 }
 
 impl Scanner {
@@ -85,7 +89,17 @@ impl Scanner {
             vte: vte::Parser::default(),
             apc: ApcState::default(),
             max_osc_len,
+            utf8: Utf8Sanitizer::default(),
         }
+    }
+
+    /// Hand ground text to vte through the UTF-8 sanitizer. `cut_by_esc`
+    /// says an ESC follows directly (see [`Utf8Sanitizer::feed`]).
+    fn feed_ground<P: Perform + ?Sized>(&mut self, perform: &mut P, text: &[u8], cut_by_esc: bool) {
+        let vte = &mut self.vte;
+        self.utf8.feed(text, cut_by_esc, &mut |b| {
+            vte.advance(&mut VteAdapter { inner: perform }, b);
+        });
     }
 
     /// Feed bytes through the scanner. With `detect_tmux`, stops right
@@ -101,17 +115,15 @@ impl Scanner {
         while !bytes.is_empty() {
             match self.apc {
                 ApcState::Ground => {
-                    // Scan for next ESC. Everything before is normal vte input.
+                    // Scan for next ESC. Everything before is normal vte
+                    // input, cleaned of invalid UTF-8 first.
                     if let Some(pos) = memchr::memchr(0x1B, bytes) {
-                        if pos > 0 {
-                            self.vte
-                                .advance(&mut VteAdapter { inner: perform }, &bytes[..pos]);
-                        }
+                        self.feed_ground(perform, &bytes[..pos], true);
                         // Don't feed the ESC to vte yet — peek the next byte.
                         self.apc = ApcState::AfterEsc;
                         bytes = &bytes[pos + 1..];
                     } else {
-                        self.vte.advance(&mut VteAdapter { inner: perform }, bytes);
+                        self.feed_ground(perform, bytes, false);
                         return None;
                     }
                 }
