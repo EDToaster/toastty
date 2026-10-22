@@ -146,6 +146,21 @@ impl ImageStore {
         })
     }
 
+    /// The registry, for animation-frame commands (#47): frames live with
+    /// the image they belong to. Keys a frame command evicts must be
+    /// handed to [`Self::forget_evicted`].
+    pub fn frames_mut(&mut self) -> &mut ImageRegistry<ImageKey> {
+        &mut self.registry
+    }
+
+    /// Drop the id / number bookkeeping of keys the registry evicted on
+    /// its own (a frame command making room).
+    pub fn forget_evicted(&mut self, keys: &[ImageKey]) {
+        for &key in keys {
+            self.forget_key(key);
+        }
+    }
+
     /// Mark the image stored under `key` transient (`N=1`): under storage
     /// pressure it is evicted before other images without placements.
     pub fn set_transient(&mut self, key: ImageKey) {

@@ -850,6 +850,10 @@ remaining gaps:
       `d=f`.
   - Fix: the new `Term::delete_image_frames` does this. Stack E's
     animation-frame work hooks in there. Fixed in #35.
+  - #35 handles single-frame images. #47 (animation) adds frame
+    deletes with the same `delete_image_frames` hook: `r=` picks the frame
+    (0 = root, past the end = last), and `d=F` with frames left deletes a
+    frame, not the image (kitty).
 - [x] **P2 — DEL-3. A delete during a chunked upload doesn't abort it.**
   - Expected (spec): the upload is aborted. kitty replies ENOENT to the
     remaining chunks.
@@ -1054,6 +1058,9 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
     frame and nothing reaches the shell. Divergence until then: kitty
     answers `a=f` without `q=` with `i=N,r=<frame>;OK`, and `a=c` with
     frame-composition errors.
+  - #47 implements animation with kitty's replies: `a=f` answers
+    `i=N,r=<frame>;OK`, `a=c` answers OK or its errors, and `a=a` stays
+    silent.
 - [x] **P2 — WIRE-4. Base64 is decoded over the joined buffer, not per
   chunk.**
   - Repro: chunks each padded with `=` (`…m=1;AQIDBA==` then `m=0;BQY=`).
@@ -1305,8 +1312,28 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
 
 ## 9. Not implemented
 
-- [ ] **P1 — Animation** (`a=f` frames, `a=a` control, `a=c` composition,
+- [x] **P1 — Animation** (`a=f` frames, `a=a` control, `a=c` composition,
   `d=f/F`).
+  - Fixed in #47. Frames (root, `c=` base, `r=` edit, `x/y/s/v`
+    rectangles, `z=` gaps, `X=1`, `Y=`), control (`s=1/2/3`, `r=`+`z=`,
+    `c=`, `v=` loops), composition (`c/r/x/y/w/h/X/Y`, `C=1`) and
+    `d=f`/`d=F` follow kitty 0.49.2. Every reply is byte-identical to
+    kitty's on 52 probed cases (bar the leading comma); 34 pixel cases
+    match. `kitten icat` GIFs animate at their own speed and loop count,
+    with transparency and disposal. See
+    `docs/decisions/kitty-animation.md`.
+  - Frames are stored LZ4-compressed in their own budget (2× the image
+    quota). An 800×600, 300-frame GIF plays all its frames at no
+    measurable RSS cost; a dithered photographic GIF compresses 3.6×.
+  - Divergences:
+    - frames live in RAM in a 2× budget (kitty: a 5× on-disk cache);
+    - deleting a base frame keeps it as a hidden base, so its dependents
+      keep their pixels (kitty leaves them stale);
+    - editing a frame under the one on display redraws it at once (kitty
+      keeps the old pixels until the frame changes).
+  - Frame work and memory are bounded: frame commands are O(1) in the frame
+    count, each frame is charged a fixed overhead, and a delete allocates
+    nothing (#47 review).
   - Clients degrade to a still first frame, except for the reply-injection
     bug in WIRE-3.
   - Needed for animated images in `kitten icat` and other clients that use
@@ -1338,7 +1365,7 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
 | `kitten icat --detect-support` | `memory` on Linux (WIRE-1, WIRE-2) | `memory` |
 | `kitten icat --place` / `--align` | works, ~1 row too tall (SIZE-13) | works |
 | `kitten icat --scale-up` | wrong aspect ratio (SIZE-1, SIZE-13) | works |
-| `kitten icat` animated GIF | still frame + text injected into the shell (WIRE-3) | animates |
+| `kitten icat` animated GIF | animates (#47; was a still frame + text injected into the shell, WIRE-3) | animates |
 | More than 14 images, or 500 tiny ones | only 14 visible (SIZE-8, fixed in #24) | all visible |
 | `kitten icat --unicode-placeholder` | wrong scale; ghosts when cells change (PH-1, PH-2) | works |
 | `kitten icat --clear`, `toastty image` | work | work |
