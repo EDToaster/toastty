@@ -688,3 +688,18 @@ fn low_yield_sweeps_back_off_exponentially() {
     assert!(t.intern_extra(g(7)).is_some());
     assert_eq!(t.extras_gc_streak, 0);
 }
+
+#[test]
+fn virtual_placements_follow_the_47_1047_alt_screen() {
+    // #27 x #28: 47 / 1047 keep the alt screen's images between visits,
+    // virtual placements included; 1049 clears them.
+    let mut t = Term::new(6, 10, 0);
+    feed(&mut t, b"\x1b[?47h");
+    transmit(&mut t, "a=T,i=2,U=1", 4, 2);
+    feed(&mut t, b"\x1b[?47l");
+    assert!(!t.virtual_placements().contains_image(2), "not on main");
+    feed(&mut t, b"\x1b[?1047h");
+    assert!(t.virtual_placements().contains_image(2), "back with the alt text");
+    feed(&mut t, b"\x1b[?1047l\x1b[?1049h");
+    assert!(!t.virtual_placements().contains_image(2), "1049 starts fresh");
+}
