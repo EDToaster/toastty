@@ -48,7 +48,7 @@ use crate::chip::ChipFade;
 use crate::chip::pipeline::{ChipPipeline, ChipUniform};
 use crate::image::atlas::ImageTextureCache;
 use crate::image::instance::{
-    ImageInstance, Layer, build_image_instances, classify_layer, split_layers,
+    ImageInstance, ImageView, Layer, build_image_instances, classify_layer, split_layers,
 };
 use crate::image::pipeline::ImagePipeline;
 use crate::rgp::{GpuAssetCache, Rgp3dPipeline};
@@ -2942,11 +2942,25 @@ impl Renderer {
             let t_img = trace.then(std::time::Instant::now);
             let mut tmp: Vec<ImageInstance> = Vec::new();
             if !term.image_grid().is_empty() {
+                // Placements are anchored to line ids: place them against
+                // the live screen's top line and shift them by the same
+                // scrollback offset text gets (`(L + view_lines) * cell_h +
+                // view_pixel` for logical row L), then crop to the content
+                // area.
+                #[allow(clippy::cast_precision_loss)]
+                let scroll_px =
+                    term.view_offset_lines() as f32 * cell_size.1 + term.view_offset_pixel();
+                let view = ImageView {
+                    top_line: term.image_top_line(),
+                    scroll_px,
+                    clip: [0.0, 0.0, content_dims.0, content_dims.1],
+                };
                 build_image_instances(
                     &mut tmp,
                     term.image_grid(),
                     term.image_registry(),
                     cell_size,
+                    &view,
                 );
             }
             if term.has_virtual_placements() {
