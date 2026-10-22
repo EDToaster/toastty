@@ -33,7 +33,14 @@ enum ApcState {
     /// but in a UTF-8 stream it's just a byte (the tail of `М`,
     /// `\xd0\x9c`), and kitty only ends strings on `ESC \\` / BEL.
     /// vte ignores bytes >= 0x80 in a DCS anyway, so nothing is lost.
+    /// BEL ends the DCS like ST does (kitty; vte would keep it as
+    /// data), so it's handed to vte as `ESC \\` (WIRE-13).
     Dcs,
+    /// Inside a PM (`ESC ^`) or SOS (`ESC X`) string. vte would ignore
+    /// the body and end it only on ESC / CAN / SUB; kitty also ends it on
+    /// BEL (WIRE-13). So the scanner swallows the body itself, and vte
+    /// never sees the introducer.
+    SosPm,
 }
 
 /// Upper bound on one OSC string's payload, in bytes.
@@ -79,9 +86,18 @@ fn osc_terminator(bytes: &[u8]) -> Option<usize> {
 }
 
 /// First byte in a DCS body the scanner must act on: ESC (maybe ST),
-/// CAN / SUB (cancel), or 0x9C (dropped, see [`ApcState::Dcs`]).
+/// BEL (ends it), CAN / SUB (cancel), or 0x9C (dropped, see
+/// [`ApcState::Dcs`]).
 fn dcs_special(bytes: &[u8]) -> Option<usize> {
-    let a = memchr::memchr3(0x1B, 0x18, 0x9C, bytes);
+    let a = memchr::memchr3(0x1B, 0x07, 0x9C, bytes);
+    let b = memchr::memchr2(0x18, 0x1A, &bytes[..a.unwrap_or(bytes.len())]);
+    b.or(a)
+}
+
+/// First byte that ends a PM / SOS string: ESC, BEL, CAN or SUB (see
+/// [`ApcState::SosPm`]).
+fn sos_pm_terminator(bytes: &[u8]) -> Option<usize> {
+    let a = memchr::memchr3(0x1B, 0x07, 0x18, bytes);
     let b = memchr::memchr(0x1A, &bytes[..a.unwrap_or(bytes.len())]);
     b.or(a)
 }
@@ -135,28 +151,7 @@ impl Scanner {
                 ApcState::AfterEsc => {
                     let byte = bytes[0];
                     bytes = &bytes[1..];
-                    if byte == b'_' {
-                        perform.apc_start();
-                        self.apc = ApcState::Apc;
-                    } else if byte == b'P' && detect_tmux {
-                        // Give vte the ESC now (it ends any string or
-                        // sequence in progress, exactly as the direct
-                        // byte stream would) and hold the `P` until we
-                        // know whether this is `ESC P tmux ;`.
-                        self.vte
-                            .advance(&mut VteAdapter { inner: perform }, &[0x1B]);
-                        self.apc = ApcState::DcsIntro { matched: 0 };
-                    } else {
-                        // Replay ESC + this byte to vte, then track the
-                        // body of an OSC (length cap) or DCS (0x9C).
-                        self.vte
-                            .advance(&mut VteAdapter { inner: perform }, &[0x1B, byte]);
-                        self.apc = match byte {
-                            b']' => ApcState::Osc { len: 0 },
-                            b'P' => ApcState::Dcs,
-                            _ => ApcState::Ground,
-                        };
-                    }
+                    self.after_esc(perform, byte, detect_tmux);
                 }
                 ApcState::DcsIntro { matched } => {
                     if bytes[0] == TMUX_PREFIX[matched] {
@@ -185,6 +180,7 @@ impl Scanner {
                     self.apc = ApcState::Dcs;
                 }
                 ApcState::Dcs => bytes = self.advance_dcs(perform, bytes),
+                ApcState::SosPm => bytes = self.advance_sos_pm(perform, bytes),
                 ApcState::Apc => {
                     // Terminators: ESC (ST is `ESC \\`) or BEL, not 0x9C.
                     if let Some(pos) = memchr::memchr2(0x1B, 0x07, bytes) {
@@ -232,6 +228,64 @@ impl Scanner {
         None
     }
 
+    /// `ApcState::AfterEsc` step: the byte after an ESC picks what the
+    /// scanner tracks next.
+    fn after_esc<P: Perform + ?Sized>(&mut self, perform: &mut P, byte: u8, detect_tmux: bool) {
+        if byte == b'_' {
+            perform.apc_start();
+            self.apc = ApcState::Apc;
+        } else if byte == b'P' && detect_tmux {
+            // Give vte the ESC now (it ends any string or sequence in
+            // progress, exactly as the direct byte stream would) and
+            // hold the `P` until we know whether this is `ESC P tmux ;`.
+            self.vte
+                .advance(&mut VteAdapter { inner: perform }, &[0x1B]);
+            self.apc = ApcState::DcsIntro { matched: 0 };
+        } else if matches!(byte, b'^' | b'X') {
+            // PM / SOS. The ESC still ends whatever vte had in progress;
+            // CAN then returns vte to ground (the null performer
+            // swallows its execute), and the scanner eats the body.
+            self.vte
+                .advance(&mut VteAdapter { inner: perform }, &[0x1B]);
+            self.vte.advance(&mut NullPerform, &[0x18]);
+            self.apc = ApcState::SosPm;
+        } else {
+            // Replay ESC + this byte to vte, then track the body of an
+            // OSC (length cap) or DCS (0x9C, BEL).
+            self.vte
+                .advance(&mut VteAdapter { inner: perform }, &[0x1B, byte]);
+            self.apc = match byte {
+                b']' => ApcState::Osc { len: 0 },
+                b'P' => ApcState::Dcs,
+                _ => ApcState::Ground,
+            };
+        }
+    }
+
+    /// `ApcState::SosPm` step: drop the string body up to its
+    /// terminator. Returns the unconsumed input.
+    fn advance_sos_pm<'b, P: Perform + ?Sized>(
+        &mut self,
+        perform: &mut P,
+        bytes: &'b [u8],
+    ) -> &'b [u8] {
+        let Some(pos) = sos_pm_terminator(bytes) else {
+            return &[];
+        };
+        match bytes[pos] {
+            0x07 => self.apc = ApcState::Ground,
+            // ESC ends the string (vte semantics); `ESC \\` is the ST.
+            0x1B => self.apc = ApcState::AfterEsc,
+            // CAN / SUB: executed, as vte does when they end a string.
+            byte => {
+                self.vte
+                    .advance(&mut VteAdapter { inner: perform }, &[byte]);
+                self.apc = ApcState::Ground;
+            }
+        }
+        &bytes[pos + 1..]
+    }
+
     /// `ApcState::Dcs` step: forward DCS bytes to vte, dropping 0x9C
     /// (see [`ApcState::Dcs`]). Returns the unconsumed input.
     fn advance_dcs<'b, P: Perform + ?Sized>(
@@ -253,6 +307,12 @@ impl Scanner {
             // Possibly ST; the ESC peek replays it to vte, which ends
             // the DCS on any ESC.
             0x1B => self.apc = ApcState::AfterEsc,
+            // BEL ends the DCS exactly like ST.
+            0x07 => {
+                self.vte
+                    .advance(&mut VteAdapter { inner: perform }, b"\x1b\\");
+                self.apc = ApcState::Ground;
+            }
             // CAN / SUB: vte cancels the DCS.
             byte => {
                 self.vte
@@ -824,6 +884,83 @@ mod tests {
             vec![(vec![vec![1u16]], &b"a"[..]), (vec![vec![2u16]], &b"b"[..])]
         );
         assert_eq!(r.text, "z");
+    }
+
+    /// WIRE-13: kitty 0.49.2 ends every string type on BEL. OSC and APC
+    /// already did; DCS, PM and SOS now do too.
+    #[test]
+    fn dcs_ends_on_bel_like_st() {
+        let r = parse(b"\x1bP1$rab\x07x");
+        assert_eq!(r.dcs.len(), 1);
+        let (params, intermediates, action, body) = &r.dcs[0];
+        assert_eq!(params, &vec![vec![1u16]]);
+        assert_eq!(intermediates, b"$");
+        assert_eq!(*action, 'r');
+        assert_eq!(body, b"ab");
+        assert!(r.execs.is_empty(), "BEL ends the DCS, it isn't rung");
+        assert_eq!(r.text, "x");
+        // Split at every point.
+        let input = b"\x1bP1$rab\x07x";
+        for cut in 1..input.len() {
+            let mut p = Parser::new();
+            let mut r = Recorder::default();
+            p.advance(&mut r, &input[..cut]);
+            p.advance(&mut r, &input[cut..]);
+            assert_eq!(r.dcs.len(), 1, "cut {cut}");
+            assert_eq!(r.dcs[0].3, b"ab", "cut {cut}");
+            assert_eq!(r.text, "x", "cut {cut}");
+        }
+        // BEL before the final byte: no hook, nothing printed.
+        let r = parse(b"\x1bP1\x07x");
+        assert!(r.dcs.is_empty());
+        assert_eq!(r.text, "x");
+        // A DCS that started like a tmux passthrough.
+        let r = parse(b"\x1bPtm\x07x");
+        assert_eq!(r.text, "x");
+    }
+
+    #[test]
+    fn sixel_dcs_ends_on_bel() {
+        let r = parse(b"\x1bPq#0;2;100;0;0#0~~\x07ok");
+        assert_eq!(r.dcs.len(), 1);
+        assert_eq!(r.dcs[0].2, 'q');
+        assert_eq!(r.dcs[0].3, b"#0;2;100;0;0#0~~");
+        assert_eq!(r.text, "ok");
+    }
+
+    #[test]
+    fn pm_and_sos_end_on_bel_st_can_sub_and_esc() {
+        // `(tail, execs, csi count)`: what follows `hello`, then the
+        // expected executed controls and CSIs. The text after is always
+        // `x`, whole and split at every byte.
+        let cases: [(&[u8], &[u8], usize); 5] = [
+            (b"\x07x", b"", 0),     // BEL ends it, isn't rung
+            (b"\x1b\\x", b"", 0),   // ST
+            (b"\x18x", b"\x18", 0), // CAN: executed, as in vte
+            (b"\x1ax", b"\x1a", 0), // SUB
+            (b"\x1b[31mx", b"", 1), // ESC + other starts a new escape
+        ];
+        for intro in [&b"\x1b^"[..], b"\x1bX"] {
+            for (tail, execs, csi) in cases {
+                let mut input = intro.to_vec();
+                input.extend_from_slice(b"hello");
+                input.extend_from_slice(tail);
+                for cut in 0..input.len() {
+                    let mut p = Parser::new();
+                    let mut r = Recorder::default();
+                    p.advance(&mut r, &input[..cut]);
+                    p.advance(&mut r, &input[cut..]);
+                    let what = format!("{intro:x?} {tail:x?} cut {cut}");
+                    assert_eq!(r.text, "x", "{what}");
+                    assert_eq!(r.execs, execs, "{what}");
+                    assert_eq!(r.csi.len(), csi, "{what}");
+                }
+            }
+        }
+        // A PM cuts off a CSI in progress, as the ESC did before.
+        let r = parse(b"\x1b[1\x1b^zz\x07x");
+        assert!(r.csi.is_empty());
+        assert_eq!(r.text, "x");
     }
 
     #[test]
