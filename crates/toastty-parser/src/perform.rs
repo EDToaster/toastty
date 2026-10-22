@@ -26,7 +26,9 @@ pub trait Perform {
     }
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
 
-    /// The DCS in progress was cancelled by CAN or SUB. vte still calls
+    /// The DCS in progress was cancelled by CAN or SUB, or cut off by
+    /// an ESC that isn't the start of ST (`ESC P $ q m ESC [ c`: the
+    /// CSI is still run, the DCS is dropped). vte still calls
     /// [`Self::unhook`] for it (it unhooks the same way on every
     /// terminator), so a handler that acts on `unhook` (a query reply, a
     /// sixel) must drop what it buffered here. Called just before that
