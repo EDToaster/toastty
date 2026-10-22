@@ -308,6 +308,18 @@ to the next ESU (`CSI ? 2026 l`), so the frame goes out between updates
 even when the app sends ESU and the next BSU back to back. A batch that
 ends mid-update asks for a wake at the BSU watchdog deadline instead of a
 redraw that `render_term` would skip.
+After 33 ms of parsing with frames held back, the handler answers
+`ControlSignal::Defer` (resume from `about_to_wait`, no redraw), so a
+flood inside one long update doesn't hold input, resize and close for
+the whole 1 s watchdog.
+
+One invariant matters for both: the handler never stops before it has
+parsed a slice, and any stop answers `Yield`/`Defer`. A stop that left
+bytes untaken and answered `Continue` would freeze output for good, since
+the reader's wake stays armed until its buffer is taken (an early version
+did exactly that when the thread was descheduled at the top of a pass).
+The decisions are pure functions in `ingest` (`Ingest::step`, `outcome`)
+with unit tests.
 
 The CWD probe now runs only for slices that open an APC (`ESC _`, also
 across a slice boundary): RGP's `r;path=` registration, the only reader of

@@ -8,14 +8,12 @@
 //! the foreground app in paste-collect mode. `PtyWriter` must deliver every
 //! byte in order regardless of ring size.
 
-mod common;
-
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use common::{Batch, ChannelSink, recv_batch};
+use toastty_io::test_support::{Batch, ChannelSink, recv_batch};
 use toastty_io::{PtyReader, UserEvent, spawn_pty_reader_with_sink, spawn_pty_writer};
 use toastty_pty::{Pty, PtySpec};
 

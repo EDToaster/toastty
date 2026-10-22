@@ -6,13 +6,11 @@
 //! winit-side wiring is one trait impl and is exercised end-to-end by
 //! the binary's smoke run.
 
-mod common;
-
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use common::{Batch, ChannelSink, recv_batch};
+use toastty_io::test_support::{Batch, ChannelSink, recv_batch};
 use toastty_io::{PtyReader, UserEvent, spawn_pty_reader_with_sink};
 use toastty_pty::{Pty, PtySpec};
 

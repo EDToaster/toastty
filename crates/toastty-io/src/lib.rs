@@ -230,7 +230,8 @@ impl PtyReader {
 
     /// Whether unconsumed bytes are already in hand (not counting any
     /// the reader thread buffered since the last take).
-    pub fn has_unconsumed(&self) -> bool {
+    #[cfg(test)]
+    fn has_unconsumed(&self) -> bool {
         self.pos < self.buf.len()
     }
 
@@ -462,6 +463,69 @@ fn flush<S: EventSink>(bytes: &[u8], filled: &mut usize, shared: &Shared, sink: 
 
 fn is_eio(e: &io::Error) -> bool {
     e.raw_os_error() == Some(libc::EIO)
+}
+
+// ============================================================================
+// Test support
+// ============================================================================
+
+/// Glue for tests that drive a real reader without winit: a
+/// channel-backed [`EventSink`] and [`recv_batch`], which turns the wake +
+/// shared-buffer API back into "the next batch of bytes, or the close".
+/// Public for the integration tests here and in the binary crate.
+#[doc(hidden)]
+pub mod test_support {
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+
+    use super::{EventSink, PtyReader, SinkClosed, UserEvent};
+
+    /// Forwards each [`UserEvent`] into an mpsc channel.
+    #[derive(Debug)]
+    pub struct ChannelSink(pub Mutex<mpsc::Sender<UserEvent>>);
+
+    impl EventSink for ChannelSink {
+        fn send(&self, ev: UserEvent) -> Result<(), SinkClosed> {
+            let g = self.0.lock().map_err(|_| SinkClosed)?;
+            g.send(ev).map_err(|_| SinkClosed)
+        }
+    }
+
+    /// One step of what the reader delivered.
+    #[derive(Debug)]
+    pub enum Batch {
+        Bytes(Vec<u8>),
+        Closed,
+    }
+
+    /// Everything buffered right now, or the close once every byte is
+    /// out. Waits up to `timeout` for a wake when there is neither;
+    /// `None` on timeout.
+    pub fn recv_batch(
+        reader: &mut PtyReader,
+        rx: &mpsc::Receiver<UserEvent>,
+        timeout: Duration,
+    ) -> Option<Batch> {
+        loop {
+            let mut out = Vec::new();
+            loop {
+                let chunk = reader.peek(usize::MAX);
+                if chunk.is_empty() {
+                    break;
+                }
+                out.extend_from_slice(chunk);
+                let n = chunk.len();
+                reader.consume(n);
+            }
+            if !out.is_empty() {
+                return Some(Batch::Bytes(out));
+            }
+            if reader.is_finished() {
+                return Some(Batch::Closed);
+            }
+            rx.recv_timeout(timeout).ok()?;
+        }
+    }
 }
 
 // ============================================================================

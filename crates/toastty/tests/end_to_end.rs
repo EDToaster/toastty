@@ -8,7 +8,8 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use toastty_io::{EventSink, PtyReader, SinkClosed, UserEvent, spawn_pty_reader_with_sink};
+use toastty_io::spawn_pty_reader_with_sink;
+use toastty_io::test_support::{Batch, ChannelSink, recv_batch};
 use toastty_parser::Parser;
 use toastty_pty::{Pty, PtySpec, WinSize};
 use toastty_term::Term;
@@ -18,49 +19,6 @@ use toastty::keyboard::encode_key;
 use toastty::shell::resolve_shell;
 use toastty_config::ShellConfig;
 use toastty_window::{KeyState, LogicalKey, Modifiers, NamedKey};
-
-struct ChannelSink(Mutex<mpsc::Sender<UserEvent>>);
-impl EventSink for ChannelSink {
-    fn send(&self, ev: UserEvent) -> Result<(), SinkClosed> {
-        let g = self.0.lock().map_err(|_| SinkClosed)?;
-        g.send(ev).map_err(|_| SinkClosed)
-    }
-}
-
-/// One step of what the reader delivered.
-enum Batch {
-    Bytes(Vec<u8>),
-    Closed,
-}
-
-/// Everything buffered right now, or the close once every byte is out.
-/// Waits up to `timeout` for a wake when there is neither; `None` on
-/// timeout.
-fn recv_batch(
-    reader: &mut PtyReader,
-    rx: &mpsc::Receiver<UserEvent>,
-    timeout: Duration,
-) -> Option<Batch> {
-    loop {
-        let mut out = Vec::new();
-        loop {
-            let chunk = reader.peek(usize::MAX);
-            if chunk.is_empty() {
-                break;
-            }
-            out.extend_from_slice(chunk);
-            let n = chunk.len();
-            reader.consume(n);
-        }
-        if !out.is_empty() {
-            return Some(Batch::Bytes(out));
-        }
-        if reader.is_finished() {
-            return Some(Batch::Closed);
-        }
-        rx.recv_timeout(timeout).ok()?;
-    }
-}
 
 #[test]
 fn pty_echo_drives_term_through_parser() {

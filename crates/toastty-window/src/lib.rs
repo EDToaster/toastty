@@ -158,6 +158,11 @@ pub trait App {
     /// Called for every event. Returning [`ControlSignal::Exit`] stops
     /// the loop; [`ControlSignal::RedrawIn`] schedules a redraw deadline;
     /// [`ControlSignal::Continue`] waits for the next event.
+    /// [`ControlSignal::Yield`] (redraw now) and [`ControlSignal::Defer`]
+    /// (no redraw) are answers to [`Event::PtyReady`] that stopped with
+    /// PTY output still buffered: the loop handles its other pending
+    /// events, drops reader wakes, and delivers `Event::PtyReady` again
+    /// from `about_to_wait`.
     fn event(&mut self, event: Event) -> ControlSignal;
 }
 
@@ -598,14 +603,23 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<'_, A> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Resume PTY parsing after a `Yield`. winit runs this after the
-        // iteration's user events and redraws on X11, Wayland and macOS
-        // alike, so the frame the app yielded for is out by now. Calling
-        // the app directly (rather than posting a wake) keeps it to one
-        // parse slice per iteration without a channel round trip; the
-        // `Poll` flow `Yield` set means the loop doesn't sleep before the
-        // next frame. Otherwise we rely on the `ControlFlow` set in
-        // `apply_control`.
+        // Resume PTY parsing after a `Yield` / `Defer`. winit runs this
+        // after the iteration's user events and redraws on X11, Wayland
+        // and macOS alike, so the frame the app yielded for is out by
+        // now. Calling the app directly (rather than posting a wake)
+        // keeps it to one parse slice per iteration without a channel
+        // round trip; the `Poll` flow they set means the loop doesn't
+        // sleep before the next frame. Otherwise we rely on the
+        // `ControlFlow` set in `apply_control`.
+        //
+        // That ordering is load-bearing. If someone adds
+        // `Window::pre_present_notify()` (Wayland frame-callback
+        // throttling), winit holds `RedrawRequested` back until the
+        // compositor's frame callback, so the frame is NOT out by now:
+        // this resume would run before it, the app's
+        // `should_wait_for_frame` would `Yield` again, and under `Poll`
+        // the loop would spin until the callback (or the app's 100 ms
+        // cutoff). Revisit this before adding it.
         if std::mem::take(&mut self.resume_pty) {
             self.dispatch(Event::PtyReady, event_loop);
         }
