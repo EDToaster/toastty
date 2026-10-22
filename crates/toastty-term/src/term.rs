@@ -29,7 +29,7 @@ use toastty_graphics::rgp::path_resolver::resolve as resolve_rgp_path;
 use toastty_graphics::rgp::scene::{RgpAsset, RgpScene};
 use toastty_graphics::sixel::{SIXEL_MAX_COLORS, SixelDcs, SixelHandler};
 use toastty_graphics::{
-    ImageData, ImageGrid, ImageRegistry, ImageStore, Placement, VirtualPlacements,
+    ImageData, ImageGrid, ImageKey, ImageRegistry, ImageStore, Placement, VirtualPlacements,
 };
 
 /// m7: default per-screen image quota, 320 MiB (kitty's default storage
@@ -329,31 +329,20 @@ pub struct Term {
     /// DECSET 8452 — leave the cursor to the RIGHT of a sixel image
     /// (on its last row) instead of on the line below it. Off by default.
     sixel_cursor_right: bool,
-    /// The active screen's images: bytes, client ids, numbers, quota.
-    /// kitty keeps one store per screen; see
-    /// `docs/decisions/image-store.md`.
-    image_store: ImageStore,
-    /// The inactive screen's store, swapped with `image_store` (and
-    /// `stashed_image_grid` with `image_grid`) on every screen switch.
-    stashed_image_store: Option<ImageStore>,
+    /// The active screen's images: placements over the cell grid and
+    /// the stored bytes (client ids, numbers, quota). kitty keeps one
+    /// graphics manager per screen; see `docs/decisions/image-store.md`.
+    images: ScreenImages,
+    /// The inactive screen's images, swapped with `images` on every
+    /// screen switch (PLC-6). `None` while on the primary screen with
+    /// nothing stashed.
+    stashed_images: Option<ScreenImages>,
     /// Next image key to hand out ([`Term::alloc_image_key`]). Keys are
     /// unique across both screens' stores.
     next_image_key: u32,
     /// Key of the image the last `register_image` stored, for the
     /// placement an anonymous `a=T` (no id to name it by) makes next.
-    last_registered_key: Option<u32>,
-    /// Parallel layer of placements over the cell grid. Always refers
-    /// to the *active* screen's images.
-    image_grid: ImageGrid,
-    /// Images belonging to the *inactive* screen. The primary and alt
-    /// screens maintain independent image lists (per the kitty graphics
-    /// protocol), so when we switch screens we stash the departing
-    /// screen's grid here and install the other screen's as
-    /// `image_grid`. On the primary screen this holds the alt screen's
-    /// images left behind by a 47 / 1047 exit (`None` once 1049 or RIS
-    /// has discarded them); the alt images follow the alt *text*, which
-    /// 47 / 1047 keep and 1049 clears (SCR-12, see [`AltSwitch`]).
-    stashed_image_grid: Option<ImageGrid>,
+    last_registered_key: Option<ImageKey>,
     /// Test-only count of `region_scroll_up` calls, so tests can check
     /// scroll work without timing it.
     #[cfg(test)]
@@ -613,12 +602,10 @@ impl Term {
             // m7: default 320 MiB image cache cap (kitty spec recommends
             // 320 MB). Generous but bounded; the binary can override via
             // `Term::set_image_cap`.
-            image_store: ImageStore::new(DEFAULT_IMAGE_CAP),
-            stashed_image_store: None,
+            images: ScreenImages::new(DEFAULT_IMAGE_CAP),
+            stashed_images: None,
             next_image_key: 1,
             last_registered_key: None,
-            image_grid: ImageGrid::new(),
-            stashed_image_grid: None,
             #[cfg(test)]
             region_scrolls: 0,
             image_revision: 0,
@@ -685,28 +672,28 @@ impl Term {
     /// The active screen's image bytes, keyed by image key (what
     /// `Placement::key` and the renderer use).
     #[must_use]
-    pub fn image_registry(&self) -> &ImageRegistry {
-        self.image_store.registry()
+    pub fn image_registry(&self) -> &ImageRegistry<ImageKey> {
+        self.images.store.registry()
     }
 
     /// The active screen's image store (client ids, numbers, quota).
     #[must_use]
     pub fn image_store(&self) -> &ImageStore {
-        &self.image_store
+        &self.images.store
     }
 
     /// A fresh image key, unused by either screen's store. Keys are
     /// never reused while the old one is stored, so a re-transmission
     /// is always new content to the renderer.
-    fn alloc_image_key(&mut self) -> u32 {
+    fn alloc_image_key(&mut self) -> ImageKey {
         loop {
-            let key = self.next_image_key;
+            let key = ImageKey(self.next_image_key);
             self.next_image_key = self.next_image_key.wrapping_add(1).max(1);
-            let in_use = self.image_store.contains_key(key)
+            let in_use = self.images.store.contains_key(key)
                 || self
-                    .stashed_image_store
+                    .stashed_images
                     .as_ref()
-                    .is_some_and(|s| s.contains_key(key));
+                    .is_some_and(|s| s.store.contains_key(key));
             if !in_use {
                 return key;
             }
@@ -717,23 +704,14 @@ impl Term {
     /// screen switch. `fresh_active` installs an empty store and grid for
     /// the screen being entered instead of what was stashed for it.
     fn swap_screen_images(&mut self, fresh_active: bool) {
-        let cap = self.image_store.cap_bytes();
-        let (grid, store) = if fresh_active {
-            (None, None)
+        let cap = self.images.store.cap_bytes();
+        let incoming = if fresh_active {
+            None
         } else {
-            (
-                self.stashed_image_grid.take(),
-                self.stashed_image_store.take(),
-            )
+            self.stashed_images.take()
         };
-        self.stashed_image_grid = Some(std::mem::replace(
-            &mut self.image_grid,
-            grid.unwrap_or_default(),
-        ));
-        self.stashed_image_store = Some(std::mem::replace(
-            &mut self.image_store,
-            store.unwrap_or_else(|| ImageStore::new(cap)),
-        ));
+        let incoming = incoming.unwrap_or_else(|| ScreenImages::new(cap));
+        self.stashed_images = Some(std::mem::replace(&mut self.images, incoming));
         self.last_registered_key = None;
         self.image_revision = self.image_revision.wrapping_add(1);
     }
@@ -741,22 +719,24 @@ impl Term {
     /// Read-only view of placements over the cell grid.
     #[must_use]
     pub fn image_grid(&self) -> &ImageGrid {
-        &self.image_grid
+        &self.images.grid
     }
 
     /// Re-anchor the primary screen's placements (active, or stashed while
     /// the alt screen is up) after a primary reflow. Returns `true` if any
     /// were dropped.
     pub(crate) fn remap_primary_images(&mut self, remap: &crate::grid::LineRemap) -> bool {
-        let g = if self.alt_active {
-            match self.stashed_image_grid.as_mut() {
-                Some(g) => g,
+        let screen = if self.alt_active {
+            match self.stashed_images.as_mut() {
+                Some(s) => s,
                 None => return false,
             }
         } else {
-            &mut self.image_grid
+            &mut self.images
         };
-        remap_images(g, remap, &self.primary)
+        let dropped = remap_images(&mut screen.grid, remap, &self.primary);
+        screen.release(&dropped, false);
+        !dropped.is_empty()
     }
 
     /// Line id of the active screen's row 0: the origin image placements
@@ -789,14 +769,13 @@ impl Term {
     /// scrolled out of the history, or pushed entirely below the live
     /// bottom. Called after every full-screen scroll.
     fn evict_offscreen_images(&mut self) {
-        if self.image_grid.is_empty() {
+        if self.images.grid.is_empty() {
             return;
         }
         let g = self.active_grid();
         let (first, last) = (oldest_line_of(g), line_i64(g.bottom_id()));
-        if !self.image_grid.retain_lines(first, last).is_empty() {
-            self.image_revision = self.image_revision.wrapping_add(1);
-        }
+        let dropped = self.images.grid.retain_lines(first, last);
+        self.drop_placements(&dropped, false);
     }
 
     /// Scroll the image placements of the margin region `top..=bot` by
@@ -815,20 +794,19 @@ impl Term {
         delta: i32,
         only: impl Fn(&Placement) -> bool,
     ) {
-        if self.image_grid.is_empty() || delta == 0 {
+        if self.images.grid.is_empty() || delta == 0 {
             return;
         }
         let top_line = self.image_top_line();
         let dropped =
-            self.image_grid
+            self.images
+                .grid
                 .scroll_region_where(top_line, top..bot.saturating_add(1), delta, only);
-        self.image_grid.resolve_relative_positions();
+        self.images.grid.resolve_relative_positions();
         // Placements may have moved without being dropped; the renderer
         // rebuilds image instances every frame and the rows were marked,
         // so only a drop needs the revision bump.
-        if !dropped.is_empty() {
-            self.image_revision = self.image_revision.wrapping_add(1);
-        }
+        self.drop_placements(&dropped, false);
     }
 
     /// Full-screen scroll up by one on the active grid: the top row goes
@@ -909,21 +887,9 @@ impl Term {
         self.rich_dirty = true;
         self.cell_pixel_size = new;
         let cell = (u32::from(new.0), u32::from(new.1));
-        // Each screen's placements look their bytes up in that screen's
-        // own store.
-        let src_of = |store: &ImageStore, p: &Placement| {
-            store.get_key(p.key).map(|d| {
-                let r = p.src_rect.resolve(d.width, d.height);
-                (r.w, r.h)
-            })
-        };
-        let store = &self.image_store;
-        self.image_grid.reserve_all(|p| src_of(store, p), cell);
-        if let (Some(grid), Some(store)) = (
-            self.stashed_image_grid.as_mut(),
-            self.stashed_image_store.as_ref(),
-        ) {
-            grid.reserve_all(|p| src_of(store, p), cell);
+        self.images.reserve_all(cell);
+        if let Some(s) = self.stashed_images.as_mut() {
+            s.reserve_all(cell);
         }
     }
 
@@ -959,26 +925,22 @@ impl Term {
     /// Override the per-Term image-cache byte budget. May evict.
     /// Each screen has its own quota of `cap_bytes`, as in kitty.
     pub fn set_image_cap(&mut self, cap_bytes: u64) {
-        let evicted = self.image_store.set_cap(cap_bytes);
-        if let Some(store) = self.stashed_image_store.as_mut() {
-            for key in store.set_cap(cap_bytes) {
-                if let Some(grid) = self.stashed_image_grid.as_mut() {
-                    grid.remove_image_key(key);
-                }
+        let evicted = self.images.store.set_cap(cap_bytes);
+        if let Some(s) = self.stashed_images.as_mut() {
+            for key in s.store.set_cap(cap_bytes) {
+                let dropped = s.grid.remove_image_key(key);
+                s.release(&dropped, false);
             }
             // #28: the stashed screen's virtual placements of evicted
             // images go too.
             if let Some(vps) = self.stashed_virtual_placements.as_mut() {
-                vps.remove_where(|v| !store.contains(v.image_id));
+                vps.remove_where(|v| !s.store.contains(v.image_id));
             }
         }
         self.prune_virtual_placements();
-        if !evicted.is_empty() {
-            for key in &evicted {
-                self.image_grid.remove_image_key(*key);
-            }
-            self.image_revision = self.image_revision.wrapping_add(1);
-            self.mark_all_dirty();
+        for key in evicted {
+            let dropped = self.images.grid.remove_image_key(key);
+            self.drop_placements(&dropped, false);
         }
     }
 
@@ -2008,10 +1970,9 @@ impl Term {
                 sel.contains(line_id, col) || wide_partner_selected(sel, row, line_id, col)
             };
             let len = row.cells.len();
-            if let (Some(lo), Some(hi)) = (
-                (0..len).find(|&i| selected(i)),
-                (0..len).rev().find(|&i| selected(i)),
-            ) {
+            if let (Some(lo), Some(hi)) =
+                ((0..len).find(|&i| selected(i)), (0..len).rev().find(|&i| selected(i)))
+            {
                 let mut col = lo;
                 while col <= hi {
                     if Some(col) == pad_col {
@@ -2198,9 +2159,12 @@ impl Term {
         // Only placements whose text left the history go.
         let mut changed = self.remap_primary_images(&remap);
         if self.alt_active {
-            self.image_grid
+            self.images
+                .grid
                 .shift_lines(top_line_of(&self.alt) - alt_top);
-            changed |= evict_unretained(&mut self.image_grid, &self.alt);
+            let dropped = evict_unretained(&mut self.images.grid, &self.alt);
+            changed |= !dropped.is_empty();
+            self.images.release(&dropped, false);
         }
         if changed {
             self.image_revision = self.image_revision.wrapping_add(1);
@@ -2401,7 +2365,7 @@ impl Term {
             // image back. (If the grid renumbers rows to follow the text
             // instead, the top line moved and the anchors already track.)
             if self.image_top_line() == before {
-                self.image_grid.shift_rows_from(before, 0, 1);
+                self.images.grid.shift_rows_from(before, 0, 1);
             }
             self.evict_offscreen_images();
             return;
@@ -3373,13 +3337,19 @@ impl Term {
                 // 2J spares images entirely in scrollback (they belong
                 // to text it doesn't erase); 3J clears them all.
                 let dropped = if mode == 3 {
-                    self.image_grid.clear()
+                    self.images.grid.clear()
                 } else {
                     let top_line = self.image_top_line();
-                    self.image_grid
+                    self.images
+                        .grid
                         .remove_where(|p| p.screen_rows(top_line).end > 0)
                 };
-                if !dropped.is_empty() {
+                self.drop_placements(&dropped, false);
+                // PLC-8: kitty's clear then frees every image left with
+                // no placement, never-placed ones included, so after it
+                // `a=p` on such an id gets ENOENT and `I=` hands out the
+                // lowest id again (kitty-ref).
+                if self.images.free_unplaced() {
                     self.image_revision = self.image_revision.wrapping_add(1);
                 }
             }
@@ -4097,7 +4067,7 @@ impl Term {
             self.exit_alt_screen(AltSwitch::SaveCursorAndClear);
         }
         // The alt screen's text is rebuilt below; drop its images too.
-        self.stashed_image_grid = None;
+        self.stashed_images = None;
         // Fresh primary + alt grids: cleanest way to wipe both the
         // visible region and the entire scrollback ring.
         let primary_cap = self.rows as usize + self.scrollback as usize;
@@ -4131,8 +4101,11 @@ impl Term {
         self.hard_reset_vt();
         // Snap the viewport back to the live bottom.
         self.viewport = crate::viewport::Viewport::new();
-        // Clear image placements (kitty hard requirement for RIS).
-        self.image_grid.clear();
+        // Clear image placements (kitty hard requirement for RIS) and,
+        // as kitty does, every stored image: after RIS no id answers
+        // (`a=p,i=1` gets ENOENT; PLC-8).
+        self.images.clear();
+        self.last_registered_key = None;
         self.image_revision = self.image_revision.wrapping_add(1);
         // Drop any selection and re-shape everything.
         self.drop_selection();
@@ -4738,17 +4711,33 @@ impl Perform for Term {
 // ---- Kitty delete helpers (M10/M11/M12) ----
 
 impl Term {
+    /// Finish removing `dropped` from the active screen's grid: mark
+    /// their cells, bump the image revision and settle the store
+    /// ([`ScreenImages::release`]; `free_bytes` for an uppercase delete).
+    /// Every path that removes placements from the active grid calls
+    /// this.
+    fn drop_placements(&mut self, dropped: &[Placement], free_bytes: bool) {
+        if dropped.is_empty() {
+            return;
+        }
+        for p in dropped {
+            mark_placement_dirty(self, p);
+        }
+        self.images.release(dropped, free_bytes);
+        self.image_revision = self.image_revision.wrapping_add(1);
+    }
+
     /// Free the active screen's image answering to client `id` (and its
     /// number entries). Used by every by-id byte-freeing delete path.
     fn remove_image_bytes(&mut self, id: u32) {
-        self.image_store.remove_client(id);
+        self.images.store.remove_client(id);
         self.forget_virtual_placements(id);
     }
 
     /// The newest live image registered with number `number` (`I=`) on
     /// this screen; the store keeps the numbers now.
     fn newest_image_for_number(&self, number: u32) -> Option<u32> {
-        self.image_store.client_of_number(number)
+        self.images.store.client_of_number(number)
     }
 
     /// `a=d,d=f` / `d=F` — delete animation frames (DEL-2). Targets the
@@ -4788,39 +4777,18 @@ impl Term {
         if !uppercase {
             return Vec::new();
         }
-        let dropped = self.image_grid.remove_image(img);
+        let dropped = self.images.grid.remove_image(img);
         self.remove_image_bytes(img);
         dropped
-    }
-
-    /// Free image bytes for every image that just lost its last
-    /// placement: for each distinct image id among `dropped`, if the
-    /// grid no longer holds ANY placement for that id, remove its bytes
-    /// (and prune the number→id map). Shared by the uppercase
-    /// area/selector deletes (`A`, `P`, `C`, `Q`, `X`, `Y`, `Z`).
-    fn free_orphaned_image_bytes(&mut self, dropped: &[Placement]) {
-        let mut seen: Vec<u32> = Vec::new();
-        for p in dropped {
-            if seen.contains(&p.key) {
-                continue;
-            }
-            seen.push(p.key);
-            // By key, so anonymous images are freed too; only this
-            // screen's store, grid and virtual placements are consulted
-            // (PLC-6).
-            if !self.image_grid.iter().any(|q| q.key == p.key)
-                && !(p.image_id != 0 && self.virtual_placements.contains_image(p.image_id))
-            {
-                self.image_store.remove_key(p.key);
-            }
-        }
     }
 
     /// Register a decoded sixel image and place it at the cursor, then
     /// advance the cursor per the active sixel cursor mode (DECSET 8452).
     ///
-    /// Sixel carries no client-assigned image ids, so we register under
-    /// id 0 (the registry mints the lowest free id). The cell span is
+    /// Sixel carries no client-assigned image ids, so the image is
+    /// anonymous (client id 0): nothing can address it, the placement
+    /// finds its bytes by the key `register_image` just stored, and the
+    /// bytes go with the placement (PLC-8). The cell span is
     /// derived the way kitty derives an un-annotated transmit:
     /// `ceil(img_dim / cell_dim)`.
     fn place_sixel(&mut self, data: ImageData) {
@@ -4892,14 +4860,15 @@ impl KittySink for Term {
         // Only this screen's placements count: the other screen has its
         // own store and quota, so its images are never evicted from here
         // (PLC-6).
-        let pinned: std::collections::HashSet<u32> = self
-            .image_grid
+        let pinned: std::collections::HashSet<ImageKey> = self
+            .images
+            .grid
             .iter()
             .map(|p| p.key)
             .chain(
                 self.virtual_placements
                     .iter()
-                    .filter_map(|v| self.image_store.key_of(v.image_id)),
+                    .filter_map(|v| self.images.store.key_of(v.image_id)),
             )
             .collect();
         // Re-transmitting an id replaces the image, and the spec says its
@@ -4910,13 +4879,14 @@ impl KittySink for Term {
         }
         let key = self.alloc_image_key();
         match self
-            .image_store
+            .images
+            .store
             .insert(key, id_request, image_number, data, &pinned)
         {
             Ok(stored) => {
                 tracing::info!(
                     target: "kitty",
-                    key,
+                    key = key.0,
                     id = stored.client_id,
                     image_number,
                     replaced = ?stored.replaced,
@@ -4929,9 +4899,8 @@ impl KittySink for Term {
                 // all its placements; the new data shows only once placed.
                 // Evicted images lose their placements too.
                 for gone in stored.replaced.iter().chain(&stored.evicted) {
-                    for p in self.image_grid.remove_image_key(*gone) {
-                        mark_placement_dirty(self, &p);
-                    }
+                    let dropped = self.images.grid.remove_image_key(*gone);
+                    self.drop_placements(&dropped, false);
                 }
                 self.last_registered_key = Some(key);
                 self.image_revision = self.image_revision.wrapping_add(1);
@@ -4954,15 +4923,18 @@ impl KittySink for Term {
         // Resolve the stored bytes: by client id, or (anonymous `a=T`,
         // id 0) the image just registered.
         placement.key = if placement.image_id == 0 {
-            self.last_registered_key.unwrap_or(0)
+            self.last_registered_key.unwrap_or(ImageKey::NONE)
         } else {
-            self.image_store.key_of(placement.image_id).unwrap_or(0)
+            self.images
+                .store
+                .key_of(placement.image_id)
+                .unwrap_or(ImageKey::NONE)
         };
-        let image_known = self.image_store.contains_key(placement.key);
+        let image_known = self.images.store.contains_key(placement.key);
         // m5: mark the referenced image most-recently-used so the
         // registry's LRU reflects actual display, not insertion order.
         // No-op when the id isn't resident.
-        self.image_store.touch(placement.key);
+        self.images.store.touch(placement.key);
         tracing::info!(
             target: "kitty",
             image_id = placement.image_id,
@@ -5017,16 +4989,15 @@ impl KittySink for Term {
         if placement.image_id != 0 && placement.placement_id != 0 {
             let img = placement.image_id;
             let pid = placement.placement_id;
-            for old in self
-                .image_grid
-                .remove_where(|p| p.image_id == img && p.placement_id == pid)
-            {
-                mark_placement_dirty(self, &old);
-            }
+            let old = self
+                .images
+                .grid
+                .remove_where(|p| p.image_id == img && p.placement_id == pid);
+            self.drop_placements(&old, false);
         }
         // Mark dirty BEFORE consuming `placement` into the grid.
         mark_placement_dirty(self, &placement);
-        self.image_grid.add(placement);
+        self.images.grid.add(placement);
         self.image_revision = self.image_revision.wrapping_add(1);
     }
 
@@ -5036,7 +5007,11 @@ impl KittySink for Term {
     ) -> Result<(), toastty_graphics::image_grid::RelativeError> {
         // The stored bytes, by client id (A5). Parents stay addressed by
         // client id.
-        placement.key = self.image_store.key_of(placement.image_id).unwrap_or(0);
+        placement.key = self
+            .images
+            .store
+            .key_of(placement.image_id)
+            .unwrap_or(ImageKey::NONE);
         tracing::info!(
             target: "kitty",
             image_id = placement.image_id,
@@ -5050,22 +5025,22 @@ impl KittySink for Term {
         if placement.image_id != 0 && placement.placement_id != 0 {
             let img = placement.image_id;
             let pid = placement.placement_id;
-            for old in self
-                .image_grid
-                .remove_where(|p| p.image_id == img && p.placement_id == pid)
-            {
-                mark_placement_dirty(self, &old);
-            }
+            let old = self
+                .images
+                .grid
+                .remove_where(|p| p.image_id == img && p.placement_id == pid);
+            self.drop_placements(&old, false);
         }
         // `add_relative` validates the parent ref and rebases the child's
         // cell ranges onto the parent origin + (H, V). On error nothing is
         // inserted.
-        match self.image_grid.add_relative(placement) {
+        match self.images.grid.add_relative(placement) {
             Ok(handle) => {
                 // The placement was rebased inside `add_relative`; re-read
                 // it to mark the resolved cells dirty.
                 let resolved = self
-                    .image_grid
+                    .images
+                    .grid
                     .iter_with_handles()
                     .find(|(h, _)| *h == handle)
                     .map(|(_, p)| p.clone());
@@ -5081,10 +5056,10 @@ impl KittySink for Term {
 
     fn place_virtual(&mut self, placement: toastty_graphics::VirtualPlacement) {
         // kitty creates no placement for an unknown image.
-        let Some(key) = self.image_store.key_of(placement.image_id) else {
+        let Some(key) = self.images.store.key_of(placement.image_id) else {
             return;
         };
-        self.image_store.touch(key);
+        self.images.store.touch(key);
         self.virtual_placements.insert(placement);
         self.image_revision = self.image_revision.wrapping_add(1);
     }
@@ -5136,7 +5111,7 @@ impl KittySink for Term {
             // surviving placement (survivor sweep below).
             b'a' | b'A' => {
                 let rows = i64::from(self.rows);
-                dropped_placements.extend(self.image_grid.remove_where(|p| {
+                dropped_placements.extend(self.images.grid.remove_where(|p| {
                     let r = p.screen_rows(top_line);
                     r.start < rows && r.end > 0
                 }));
@@ -5150,20 +5125,21 @@ impl KittySink for Term {
                     let pid = header.placement_id;
                     if pid != 0 {
                         dropped_placements.extend(
-                            self.image_grid
+                            self.images
+                                .grid
                                 .remove_where(|p| p.image_id == img && p.placement_id == pid),
                         );
                         virtual_dropped |= self
                             .virtual_placements
                             .remove_where(|v| v.image_id == img && v.placement_id == pid);
                     } else {
-                        dropped_placements.extend(self.image_grid.remove_image(img));
+                        dropped_placements.extend(self.images.grid.remove_image(img));
                         virtual_dropped |= self.virtual_placements.remove_image(img);
                     }
                     // Uppercase frees the bytes, but only when no
                     // placement of this image survives. (B5)
                     if drop_bytes
-                        && !self.image_grid.iter().any(|p| p.image_id == img)
+                        && !self.images.grid.iter().any(|p| p.image_id == img)
                         && !self.virtual_placements.contains_image(img)
                     {
                         self.remove_image_bytes(img);
@@ -5178,9 +5154,9 @@ impl KittySink for Term {
             b'n' | b'N' => {
                 if header.image_number != 0 {
                     if let Some(img) = self.newest_image_for_number(header.image_number) {
-                        dropped_placements.extend(self.image_grid.remove_image(img));
+                        dropped_placements.extend(self.images.grid.remove_image(img));
                         virtual_dropped |= self.virtual_placements.remove_image(img);
-                        if drop_bytes && !self.image_grid.iter().any(|p| p.image_id == img) {
+                        if drop_bytes && !self.images.grid.iter().any(|p| p.image_id == img) {
                             self.remove_image_bytes(img);
                         }
                     }
@@ -5194,7 +5170,8 @@ impl KittySink for Term {
             // convert by subtracting 1. (B6)
             b'p' | b'P' => {
                 dropped_placements.extend(
-                    self.image_grid
+                    self.images
+                        .grid
                         .remove_where(|p| p.covers(top_line, sel_row, sel_col)),
                 );
                 // Uppercase `P` frees bytes for any image that lost its
@@ -5213,14 +5190,15 @@ impl KittySink for Term {
                     // Anonymous images (id 0) are never in an id range
                     // (PLC-4, as in kitty).
                     dropped_placements.extend(
-                        self.image_grid
+                        self.images
+                            .grid
                             .remove_where(|p| p.image_id != 0 && (lo..=hi).contains(&p.image_id)),
                     );
                     virtual_dropped |= self
                         .virtual_placements
                         .remove_where(|v| (lo..=hi).contains(&v.image_id));
                     if drop_bytes {
-                        for id in self.image_store.clients_in(lo, hi) {
+                        for id in self.images.store.clients_in(lo, hi) {
                             self.remove_image_bytes(id);
                         }
                     }
@@ -5232,7 +5210,8 @@ impl KittySink for Term {
                 let row = self.cursor.row;
                 let col = self.cursor.col.min(self.cols.saturating_sub(1));
                 dropped_placements.extend(
-                    self.image_grid
+                    self.images
+                        .grid
                         .remove_where(|p| p.covers(top_line, row, col)),
                 );
             }
@@ -5240,14 +5219,16 @@ impl KittySink for Term {
             // AND having z-index == `z=`.
             b'q' | b'Q' => {
                 dropped_placements.extend(
-                    self.image_grid
+                    self.images
+                        .grid
                         .remove_where(|p| p.covers(top_line, sel_row, sel_col) && p.z == sel_z),
                 );
             }
             // `x` / `X` — placements intersecting COLUMN sel_col.
             b'x' | b'X' => {
                 dropped_placements.extend(
-                    self.image_grid
+                    self.images
+                        .grid
                         .remove_where(|p| p.col_range().contains(&sel_col)),
                 );
             }
@@ -5255,13 +5236,14 @@ impl KittySink for Term {
             // "delete by row" selector (B7 moved `r/R` to id-range).
             b'y' | b'Y' => {
                 dropped_placements.extend(
-                    self.image_grid
+                    self.images
+                        .grid
                         .remove_where(|p| p.on_row(top_line, sel_row)),
                 );
             }
             // `z` / `Z` — placements with z-index == `z=`.
             b'z' | b'Z' => {
-                dropped_placements.extend(self.image_grid.remove_where(|p| p.z == sel_z));
+                dropped_placements.extend(self.images.grid.remove_where(|p| p.z == sel_z));
             }
             // `f` / `F` — delete animation frames (DEL-2); see
             // [`Term::delete_image_frames`].
@@ -5271,22 +5253,19 @@ impl KittySink for Term {
             }
             _ => {}
         }
-        // Uppercase area/selector deletes (`A`, `P`, `C`, `Q`, `X`, `Y`,
-        // `Z`) free image bytes for any image left with no surviving
-        // placement after the removals above (mirrors the B5 rule).
-        if needs_survivor_sweep {
-            self.free_orphaned_image_bytes(&dropped_placements);
-        }
         tracing::info!(
             target: "kitty",
             spec = %spec_char,
             dropped = dropped_placements.len(),
             "kitty: delete_image ok",
         );
-        for p in &dropped_placements {
-            mark_placement_dirty(self, p);
-        }
-        if !dropped_placements.is_empty() || drop_bytes || virtual_dropped {
+        // Uppercase area/selector deletes (`A`, `P`, `C`, `Q`, `X`, `Y`,
+        // `Z`) free image bytes for any image left with no surviving
+        // placement after the removals above (mirrors the B5 rule). Any
+        // delete frees an anonymous image's bytes with its last
+        // placement (PLC-8).
+        self.drop_placements(&dropped_placements, needs_survivor_sweep);
+        if drop_bytes || virtual_dropped {
             self.image_revision = self.image_revision.wrapping_add(1);
         }
     }
@@ -5299,13 +5278,16 @@ impl KittySink for Term {
         // Take registry budget minus the bytes already buffered in the
         // APC reassembly buffer.
         let used_buf = self.apc_buffer.len() as u64;
-        self.image_store.budget_remaining().saturating_sub(used_buf)
+        self.images
+            .store
+            .budget_remaining()
+            .saturating_sub(used_buf)
     }
 
     fn max_image_bytes(&self) -> u64 {
         // The registry evicts to make room, so its whole cap is what a
         // single image may use.
-        self.image_store.cap_bytes()
+        self.images.store.cap_bytes()
     }
 
     fn advance_cursor_after_placement(&mut self, rows: u16, cols: u16, start_col: u16) {
@@ -5358,7 +5340,7 @@ impl KittySink for Term {
     }
 
     fn image_exists(&self, id: u32) -> bool {
-        self.image_store.contains(id)
+        self.images.store.contains(id)
     }
 
     fn image_id_for_number(&self, number: u32) -> Option<u32> {
@@ -5366,11 +5348,11 @@ impl KittySink for Term {
     }
 
     fn next_image_id(&self) -> u32 {
-        self.image_store.lowest_free_client_id()
+        self.images.store.lowest_free_client_id()
     }
 
     fn image_dimensions(&self, id: u32) -> Option<(u32, u32)> {
-        self.image_store.get(id).map(|img| (img.width, img.height))
+        self.images.store.get(id).map(|img| (img.width, img.height))
     }
 
     fn cursor_col(&self) -> u16 {
@@ -5530,6 +5512,81 @@ impl RgpSink for Term {
 }
 
 /// Mark the on-screen cells under `p`'s shown part dirty.
+/// One screen's images, swapped as a unit on a screen switch: the
+/// placements and the stored bytes they show (#28 adds the virtual
+/// placements here). kitty keeps one graphics manager per screen.
+#[derive(Debug)]
+struct ScreenImages {
+    grid: ImageGrid,
+    store: ImageStore,
+}
+
+impl ScreenImages {
+    fn new(cap_bytes: u64) -> Self {
+        Self {
+            grid: ImageGrid::new(),
+            store: ImageStore::new(cap_bytes),
+        }
+    }
+
+    /// Settle the store after `dropped` left the grid. An image left
+    /// with no placement loses its bytes when it is anonymous (nothing
+    /// can place it again, as in kitty; PLC-8) or when `free_bytes` (an
+    /// uppercase delete) asks for it. Every placement removal ends here,
+    /// so what a removal implies for the rest of the screen (REL-2's
+    /// child cascade, #28's virtual placements) belongs here too.
+    fn release(&mut self, dropped: &[Placement], free_bytes: bool) {
+        if dropped.is_empty() {
+            return;
+        }
+        let placed: std::collections::HashSet<ImageKey> = self.grid.iter().map(|p| p.key).collect();
+        let mut seen: Vec<ImageKey> = Vec::new();
+        for p in dropped {
+            if seen.contains(&p.key) || placed.contains(&p.key) {
+                continue;
+            }
+            seen.push(p.key);
+            if free_bytes || self.store.client_of(p.key) == Some(0) {
+                self.store.remove_key(p.key);
+            }
+        }
+    }
+
+    /// Free every image with no placement, never-placed ones included
+    /// (kitty's `ESC[2J`/`ESC[3J`, PLC-8). Afterwards the lowest free
+    /// client id counts only images still on the screen or in its
+    /// history. Returns whether anything was freed.
+    fn free_unplaced(&mut self) -> bool {
+        let placed: std::collections::HashSet<ImageKey> = self.grid.iter().map(|p| p.key).collect();
+        let gone: Vec<ImageKey> = self.store.keys().filter(|k| !placed.contains(k)).collect();
+        for key in &gone {
+            self.store.remove_key(*key);
+        }
+        !gone.is_empty()
+    }
+
+    /// Recompute every placement's reserved cell box for a `cell`-pixel
+    /// cell (font zoom), from this screen's own bytes.
+    fn reserve_all(&mut self, cell: (u32, u32)) {
+        let store = &self.store;
+        self.grid.reserve_all(
+            |p| {
+                store.get_key(p.key).map(|d| {
+                    let r = p.src_rect.resolve(d.width, d.height);
+                    (r.w, r.h)
+                })
+            },
+            cell,
+        );
+    }
+
+    /// Drop every placement and image (RIS).
+    fn clear(&mut self) {
+        self.grid.clear();
+        self.store.clear();
+    }
+}
+
 fn mark_placement_dirty(t: &mut Term, p: &Placement) {
     let rows = t.screen_rows_clamped(p);
     let cols = p.col_range();
@@ -5564,7 +5621,11 @@ fn line_i64(id: u64) -> i64 {
 /// Re-anchor `images` (the primary screen's) through a reflow's
 /// [`LineRemap`] so each placement follows its text, then drop those whose
 /// text left `grid`'s history. Returns `true` if any were dropped.
-fn remap_images(images: &mut ImageGrid, remap: &crate::grid::LineRemap, grid: &Grid) -> bool {
+fn remap_images(
+    images: &mut ImageGrid,
+    remap: &crate::grid::LineRemap,
+    grid: &Grid,
+) -> Vec<Placement> {
     images.map_anchors(|l, c| remap.map_cell(l, c));
     evict_unretained(images, grid)
 }
@@ -5572,10 +5633,10 @@ fn remap_images(images: &mut ImageGrid, remap: &crate::grid::LineRemap, grid: &G
 /// Drop placements of `images` whose text is no longer retained in
 /// `grid` (scrolled out of its history). Placements below the live
 /// bottom are kept: a resize may move them there, and growing back
-/// brings them into view again. Returns `true` if any were dropped.
-fn evict_unretained(images: &mut ImageGrid, grid: &Grid) -> bool {
+/// brings them into view again. Returns the dropped placements.
+fn evict_unretained(images: &mut ImageGrid, grid: &Grid) -> Vec<Placement> {
     let first = oldest_line_of(grid);
-    !images.retain_lines(first, i64::MAX).is_empty()
+    images.retain_lines(first, i64::MAX)
 }
 
 /// True when the *other* half of the width-2 cluster at `col` is in
@@ -8922,7 +8983,7 @@ mod tests {
         payload.extend_from_slice(&b64_red_1x1());
         payload.extend_from_slice(b"\x1b\\");
         feed(&mut t, &payload);
-        assert!(t.image_registry().contains(7));
+        assert!(t.image_store().contains(7));
     }
 
     #[test]
@@ -8955,7 +9016,7 @@ mod tests {
             String::from_utf8_lossy(&replies),
             "\x1b_Gi=5;ENOMEM:PNG image is too large\x1b\\"
         );
-        assert!(!t.image_registry().contains(5));
+        assert!(!t.image_store().contains(5));
     }
 
     /// SEC-2 / SEC-4 round trip: `t=f` on a FIFO replies the uniform
@@ -9077,7 +9138,7 @@ mod tests {
         payload.extend_from_slice(b"\x1b\\\x1b_Ga=a,i=1,s=3,v=1\x1b\\\x1b_Ga=c,i=1,C=2\x1b\\");
         feed(&mut t, &payload);
         assert!(t.drain_pty_replies().is_empty());
-        assert!(t.image_registry().contains(1));
+        assert!(t.image_store().contains(1));
     }
 
     /// Review of #37: re-sending an image by `i=` keeps its number and its
@@ -10396,9 +10457,9 @@ mod major_delete_tests {
         assert_eq!(t.image_grid().len(), 3);
         feed(&mut t, b"\x1b_Ga=d,d=F,i=1\x1b\\");
         assert!(!has_placement_for(&t, 1), "both placements of image 1 gone");
-        assert!(!t.image_registry().contains(1), "F frees the data");
+        assert!(!t.image_store().contains(1), "F frees the data");
         assert!(has_placement_for(&t, 2), "other images untouched");
-        assert!(t.image_registry().contains(2));
+        assert!(t.image_store().contains(2));
     }
 
     #[test]
@@ -10407,7 +10468,7 @@ mod major_delete_tests {
         transmit_place_at(&mut t, 0, 0, 1, 0, 0);
         feed(&mut t, b"\x1b_Ga=d,d=f,i=1\x1b\\");
         assert!(has_placement_for(&t, 1));
-        assert!(t.image_registry().contains(1));
+        assert!(t.image_store().contains(1));
     }
 
     #[test]
@@ -10417,14 +10478,14 @@ mod major_delete_tests {
         place_again_at(&mut t, 0, 3, 3, 2);
         feed(&mut t, b"\x1b_Ga=d,d=F,i=3,p=2\x1b\\");
         assert!(!has_placement_for(&t, 3), "p= doesn't scope d=F");
-        assert!(!t.image_registry().contains(3));
+        assert!(!t.image_store().contains(3));
         // An image with no placements is freed too.
         let mut t = Term::new(8, 8, 0);
         transmit_place_at(&mut t, 0, 0, 4, 0, 0);
         feed(&mut t, b"\x1b_Ga=d,d=i,i=4\x1b\\");
-        assert!(t.image_registry().contains(4));
+        assert!(t.image_store().contains(4));
         feed(&mut t, b"\x1b_Ga=d,d=F,i=4\x1b\\");
-        assert!(!t.image_registry().contains(4));
+        assert!(!t.image_store().contains(4));
     }
 
     #[test]
@@ -10433,9 +10494,9 @@ mod major_delete_tests {
         transmit_place_numbered(&mut t, 0, 0, 7); // id 1 (older)
         transmit_place_numbered(&mut t, 2, 0, 7); // id 2 (newest)
         feed(&mut t, b"\x1b_Ga=d,d=F,I=7\x1b\\");
-        assert!(!t.image_registry().contains(2), "newest with I=7 freed");
+        assert!(!t.image_store().contains(2), "newest with I=7 freed");
         assert!(!has_placement_for(&t, 2));
-        assert!(t.image_registry().contains(1), "older one kept");
+        assert!(t.image_store().contains(1), "older one kept");
         assert!(has_placement_for(&t, 1));
     }
 
@@ -10451,13 +10512,13 @@ mod major_delete_tests {
             transmit_place_numbered(&mut t, 4, 0, 7); // id 3 (newest)
             let del = format!("\x1b_Ga=d,d={sel},I=7\x1b\\");
             feed(&mut t, del.as_bytes());
-            assert!(!t.image_registry().contains(3), "d={sel}: newest first");
-            assert!(t.image_registry().contains(2) && t.image_registry().contains(1));
+            assert!(!t.image_store().contains(3), "d={sel}: newest first");
+            assert!(t.image_store().contains(2) && t.image_store().contains(1));
             feed(&mut t, del.as_bytes());
-            assert!(!t.image_registry().contains(2), "d={sel}: then the next");
-            assert!(t.image_registry().contains(1));
+            assert!(!t.image_store().contains(2), "d={sel}: then the next");
+            assert!(t.image_store().contains(1));
             feed(&mut t, del.as_bytes());
-            assert!(!t.image_registry().contains(1), "d={sel}: then the oldest");
+            assert!(!t.image_store().contains(1), "d={sel}: then the oldest");
             assert!(t.image_grid().is_empty(), "d={sel}");
             // Nothing left with that number: a no-op.
             feed(&mut t, del.as_bytes());
@@ -10475,10 +10536,10 @@ mod major_delete_tests {
         transmit_place_at(&mut t, 4, 0, 1, 0, 0); // re-send A by i=1
         assert_eq!(t.newest_image_for_number(7), Some(2));
         feed(&mut t, b"\x1b_Ga=d,d=N,I=7\x1b\\");
-        assert!(!t.image_registry().contains(2), "B (newest) goes first");
-        assert!(t.image_registry().contains(1));
+        assert!(!t.image_store().contains(2), "B (newest) goes first");
+        assert!(t.image_store().contains(1));
         feed(&mut t, b"\x1b_Ga=d,d=N,I=7\x1b\\");
-        assert!(!t.image_registry().contains(1), "then A, which kept I=7");
+        assert!(!t.image_store().contains(1), "then A, which kept I=7");
         assert_eq!(t.newest_image_for_number(7), None);
     }
 
@@ -10489,7 +10550,7 @@ mod major_delete_tests {
         let mut t = Term::new(8, 8, 0);
         transmit_place_at(&mut t, 0, 0, 5, 0, 0);
         place_again_at(&mut t, 0, 3, 5, 2);
-        t.image_store.remove_client(5);
+        t.images.store.remove_client(5);
         assert!(has_placement_for(&t, 5));
         feed(&mut t, b"\x1b_Ga=d,d=F,i=5\x1b\\");
         assert!(!has_placement_for(&t, 5));
@@ -10503,7 +10564,7 @@ mod major_delete_tests {
         feed(&mut t, b"\x1b_Ga=d,d=F,i=99\x1b\\");
         feed(&mut t, b"\x1b_Ga=d,d=F,I=5\x1b\\");
         assert!(has_placement_for(&t, 1));
-        assert!(t.image_registry().contains(1));
+        assert!(t.image_store().contains(1));
     }
 
     // ---- M12: d=c/C, q/Q, x/X, y/Y, z/Z ----
@@ -11233,8 +11294,9 @@ mod minor_term_tests {
     #[test]
     fn place_image_touches_lru_so_touched_image_survives_eviction() {
         let mut t = Term::new(8, 8, 0);
-        // Tiny cap: each 1x1 RGBA image is 4 bytes. Cap of 8 holds two.
-        t.set_image_cap(8);
+        // Tiny cap: each 1x1 RGBA image costs 4 bytes plus the per-image
+        // overhead; the cap holds two.
+        t.set_image_cap(2 * (4 + toastty_graphics::IMAGE_OVERHEAD_BYTES)); // two 1x1 RGBA images
 
         // Insert images 1 and 2 (both placed). Order: [1, 2].
         place_image(&mut t, 1);
@@ -11255,7 +11317,7 @@ mod minor_term_tests {
         // is what `touch` reports. Remove placements so nothing is pinned,
         // then force an eviction and confirm the touched id survives.
         let mut t = Term::new(8, 8, 0);
-        t.set_image_cap(8);
+        t.set_image_cap(2 * (4 + toastty_graphics::IMAGE_OVERHEAD_BYTES)); // two 1x1 RGBA images
         place_image(&mut t, 1);
         place_image(&mut t, 2);
         // Touch 1 (re-place). Order becomes [2, 1].
@@ -12264,7 +12326,7 @@ mod image_store_tests {
         // Each screen has its own quota (kitty: one storage limit per
         // screen), so filling alt's never evicts main's images.
         let mut t = Term::new(10, 40, 0);
-        t.set_image_cap(8); // two 1x1 RGBA images per screen
+        t.set_image_cap(2 * (4 + toastty_graphics::IMAGE_OVERHEAD_BYTES)); // two 1x1 RGBA images
         send(&mut t, "a=T,i=1,c=1,r=1,C=1", RED);
         feed(&mut t, b"\x1b[?1049h");
         for id in 2..6 {
@@ -12297,5 +12359,95 @@ mod image_store_tests {
         send(&mut t, "a=T,i=7,c=1,r=1,C=1", GREEN);
         let alt_key = t.image_grid().iter().next().unwrap().key;
         assert_ne!(main_key, alt_key, "the renderer can't confuse them");
+    }
+
+    #[test]
+    fn plc8_ed2_frees_every_image_left_without_a_placement() {
+        // kitty-ref (a5k.sh ed2): after ESC[2J, `a=p` on a placed (60),
+        // a never-placed (61) and a re-placed (62) image all get ENOENT,
+        // and `I=6` is handed client id 1 again.
+        let mut t = Term::new(24, 80, 0);
+        feed(&mut t, b"\x1b[3;1H");
+        send(&mut t, "a=T,i=60,c=2,r=1", RED);
+        send(&mut t, "a=t,i=61", BLUE);
+        send(&mut t, "a=t,i=62", BLUE);
+        feed(&mut t, b"\x1b_Ga=d,d=a,q=2\x1b\\");
+        feed(&mut t, b"\x1b[12;1H\x1b_Ga=p,i=62,p=9,C=1,q=2\x1b\\");
+        assert_eq!(t.image_store().len(), 3, "lowercase d=a keeps bytes");
+        feed(&mut t, b"\x1b[2J\x1b[H");
+        assert!(t.image_store().is_empty());
+        send(&mut t, "a=t,I=6", BLUE);
+        assert_eq!(t.image_store().client_of_number(6), Some(1));
+    }
+
+    #[test]
+    fn plc8_ed2_keeps_images_placed_in_scrollback() {
+        // kitty-ref (a5k.sh ed2sb): a placement scrolled into the
+        // history survives ESC[2J and keeps its image (`a=p` OK); the
+        // never-placed image goes (ENOENT).
+        let mut t = Term::new(10, 40, 100);
+        send(&mut t, "a=T,i=70,c=2,r=1", RED);
+        send(&mut t, "a=t,i=71", BLUE);
+        feed(&mut t, &[b'\n'; 30]);
+        feed(&mut t, b"\x1b[2J\x1b[H");
+        assert_eq!(t.image_grid().len(), 1, "history placement kept");
+        assert!(t.image_store().contains(70));
+        assert!(!t.image_store().contains(71));
+    }
+
+    #[test]
+    fn plc8_ed3_frees_every_image() {
+        // kitty-ref (a5k.sh ed3): both ids get ENOENT after ESC[3J.
+        let mut t = Term::new(10, 40, 100);
+        send(&mut t, "a=T,i=60,c=2,r=1", RED);
+        send(&mut t, "a=t,i=61", BLUE);
+        feed(&mut t, b"\x1b[3J");
+        assert!(t.image_grid().is_empty());
+        assert!(t.image_store().is_empty());
+    }
+
+    #[test]
+    fn plc8_ris_frees_every_image() {
+        // kitty-ref (a5k.sh ris): `a=p,i=1` after ESC c gets ENOENT.
+        let mut t = Term::new(10, 40, 100);
+        send(&mut t, "a=T,i=1,c=2,r=1", RED);
+        send(&mut t, "a=t,i=2,I=4", BLUE);
+        feed(&mut t, b"\x1b[?1049h");
+        send(&mut t, "a=t,i=3", BLUE);
+        feed(&mut t, b"\x1bc");
+        assert!(!t.is_alt_active());
+        assert!(t.image_store().is_empty());
+        assert_eq!(t.image_store().client_of_number(4), None);
+        assert!(t.image_grid().is_empty());
+        // A fresh transmission still works.
+        send(&mut t, "a=T,i=1,c=2,r=1", GREEN);
+        assert_eq!(pixel(&t, 1), Some(GREEN));
+    }
+
+    #[test]
+    fn plc8_anonymous_image_goes_with_its_last_placement() {
+        // An image without an id can never be placed again, so (as in
+        // kitty) its bytes go when its last placement does: by a
+        // lowercase delete, by scrolling out of the history, or for a
+        // sixel.
+        let mut t = Term::new(10, 40, 100);
+        send(&mut t, "a=T,c=2,r=1", RED);
+        assert_eq!(t.image_store().len(), 1);
+        feed(&mut t, b"\x1b_Ga=d,d=a,q=2\x1b\\");
+        assert!(t.image_store().is_empty(), "d=a frees an anonymous image");
+
+        let mut t = Term::new(5, 40, 2);
+        send(&mut t, "a=T,c=2,r=1", RED);
+        send(&mut t, "a=T,i=9,c=2,r=1", BLUE);
+        feed(&mut t, &[b'\n'; 20]);
+        assert!(t.image_grid().is_empty(), "both scrolled out");
+        assert_eq!(t.image_store().len(), 1, "only the anonymous one freed");
+        assert!(t.image_store().contains(9));
+
+        let mut t = Term::new(10, 40, 100);
+        feed(&mut t, b"\x1bPq#0;2;100;0;0#0~\x1b\\");
+        assert_eq!(t.image_store().len(), 1);
+        feed(&mut t, b"\x1b_Ga=d,d=a,q=2\x1b\\");
+        assert!(t.image_store().is_empty(), "sixel bytes freed");
     }
 }

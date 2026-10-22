@@ -326,7 +326,7 @@ impl Term {
     /// Drop the virtual placements whose image left this screen's store
     /// (quota eviction).
     pub(super) fn prune_virtual_placements(&mut self) {
-        let store = &self.image_store;
+        let store = &self.images.store;
         if self.virtual_placements.remove_where(|v| !store.contains(v.image_id)) {
             self.image_revision = self.image_revision.wrapping_add(1);
         }

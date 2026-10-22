@@ -40,6 +40,8 @@
 
 use std::ops::Range;
 
+use crate::registry::ImageKey;
+
 /// A single image placement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placement {
@@ -48,9 +50,9 @@ pub struct Placement {
     pub image_id: u32,
     /// Key of the stored bytes in the screen's `ImageStore` (unique per
     /// transmission, across both screens). The renderer looks images up
-    /// by it. `Placement::new` defaults it to `image_id`; the host sets
-    /// the real key when it places the image.
-    pub key: u32,
+    /// by it. `Placement::new` leaves it [`ImageKey::NONE`] (draws
+    /// nothing); the host sets the real key when it places the image.
+    pub key: ImageKey,
     /// Stable per-image placement id. Kitty's `p=` field; zero means
     /// "unnamed".
     pub placement_id: u32,
@@ -116,7 +118,7 @@ impl Placement {
     pub fn new(image_id: u32, rows: u16, cols: u16) -> Self {
         Self {
             image_id,
-            key: image_id,
+            key: ImageKey::NONE,
             placement_id: 0,
             line: 0,
             col: 0,
@@ -506,7 +508,7 @@ impl ImageGrid {
     }
 
     /// Drop every placement showing the image stored under `key`.
-    pub fn remove_image_key(&mut self, key: u32) -> Vec<Placement> {
+    pub fn remove_image_key(&mut self, key: ImageKey) -> Vec<Placement> {
         self.remove_where(|p| p.key == key)
     }
 

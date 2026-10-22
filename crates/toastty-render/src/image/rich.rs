@@ -309,7 +309,7 @@ pub fn build_rich_instances(
             texture_index: tex as u32,
             z: -1,
             image_id: 0,
-            _pad: [0; 1],
+            key: 0,
         });
     }
 }

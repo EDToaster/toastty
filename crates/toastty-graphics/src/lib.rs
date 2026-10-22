@@ -20,7 +20,7 @@ pub use kitty::{
     },
     reply::{ErrorCode, encode_error, encode_ok},
 };
-pub use registry::{ImageData, ImageRegistry, InsertError, Inserted};
+pub use registry::{ImageData, ImageKey, ImageRegistry, InsertError, Inserted, RegistryKey};
 pub use rgp::{
     asset::{CpuAsset, CpuMaterial, CpuMesh},
     glb_loader::{GlbLoadError, load_glb},
@@ -34,4 +34,4 @@ pub use rgp::{
     reply::{frame_apc as frame_rgp_apc, support_reply as rgp_support_reply},
     scene::{RgpAsset, RgpPlacement, RgpScene},
 };
-pub use store::{ImageStore, Stored};
+pub use store::{IMAGE_OVERHEAD_BYTES, ImageStore, Stored};
