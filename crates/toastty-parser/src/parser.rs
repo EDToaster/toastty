@@ -216,10 +216,11 @@ struct Scanner {
     /// still is when the input ends, the state becomes
     /// [`ApcState::Seq`] so the next input is checked.
     open_seq: Option<bool>,
-    /// Inside a CSI (after `ESC [`) whose final byte hasn't arrived:
-    /// whether a parameter digit was seen so far. Reported through
-    /// [`Perform::csi_params_explicit`] right before vte dispatches it.
-    csi_digits: Option<bool>,
+    /// Inside a CSI (after `ESC [`) whose final byte hasn't arrived: the
+    /// parameters that held a digit so far (bit per parameter) and the
+    /// current parameter's index. Reported through
+    /// [`Perform::csi_param_digits`] right before vte dispatches it.
+    csi_digits: Option<(u32, u32)>,
 }
 
 impl Scanner {
@@ -306,17 +307,18 @@ impl Scanner {
 
     /// Track the parameter bytes of a CSI in ground text `chunk` (before
     /// vte sees it) and, when its final byte is in `chunk`, tell the
-    /// handler whether any digit was present.
+    /// handler which parameters held a digit.
     fn note_csi_params<P: Perform + ?Sized>(&mut self, perform: &mut P, chunk: &[u8]) {
-        let Some(mut digits) = self.csi_digits else {
+        let Some((mut mask, mut idx)) = self.csi_digits else {
             return;
         };
         for &b in chunk {
             match b {
-                b'0'..=b'9' => digits = true,
+                b'0'..=b'9' if idx < 32 => mask |= 1 << idx,
+                b';' => idx = idx.saturating_add(1),
                 0x40..=0x7E => {
                     self.csi_digits = None;
-                    perform.csi_params_explicit(digits);
+                    perform.csi_param_digits(mask);
                     return;
                 }
                 // CAN / SUB abort the CSI.
@@ -327,7 +329,7 @@ impl Scanner {
                 _ => {}
             }
         }
-        self.csi_digits = Some(digits);
+        self.csi_digits = Some((mask, idx));
     }
 
     /// Feed bytes through the scanner. With `detect_tmux`, stops right
@@ -377,7 +379,7 @@ impl Scanner {
                         let byte = bytes[0];
                         bytes = &bytes[1..];
                         // Any ESC ends a CSI in progress; `ESC [` starts one.
-                        self.csi_digits = (byte == b'[').then_some(false);
+                        self.csi_digits = (byte == b'[').then_some((0, 0));
                         let csi = match after_esc::TABLE[usize::from(byte)] {
                             after_esc::APC => {
                                 perform.apc_start();
@@ -1266,12 +1268,12 @@ mod tests {
     }
 
     #[test]
-    fn csi_params_explicit_tells_absent_from_zero() {
+    fn csi_param_digits_tells_empty_from_zero() {
         #[derive(Default)]
-        struct Rec(Vec<(bool, char)>, Option<bool>);
+        struct Rec(Vec<(u32, char)>, Option<u32>);
         impl Perform for Rec {
-            fn csi_params_explicit(&mut self, any_digit: bool) {
-                self.1 = Some(any_digit);
+            fn csi_param_digits(&mut self, mask: u32) {
+                self.1 = Some(mask);
             }
             fn csi_dispatch(&mut self, _: &Params, _: &[u8], _: bool, action: char) {
                 self.0
@@ -1279,15 +1281,20 @@ mod tests {
             }
         }
         let mut r = Rec::default();
-        Parser::new().advance(&mut r, b"\x1b[<u\x1b[<0u\x1b[u\x1b[5;0ux\x1b[?1h");
+        Parser::new().advance(
+            &mut r,
+            b"\x1b[<u\x1b[<0u\x1b[u\x1b[5;0ux\x1b[=5;u\x1b[<;u\x1b[?1h",
+        );
         assert_eq!(
             r.0,
             vec![
-                (false, 'u'),
-                (true, 'u'),
-                (false, 'u'),
-                (true, 'u'),
-                (true, 'h')
+                (0b0, 'u'),
+                (0b1, 'u'),
+                (0b0, 'u'),
+                (0b11, 'u'),
+                (0b1, 'u'),
+                (0b0, 'u'),
+                (0b1, 'h')
             ]
         );
         // Split inside the CSI.
@@ -1296,7 +1303,7 @@ mod tests {
         p.advance(&mut r, b"\x1b[<");
         p.advance(&mut r, b"0");
         p.advance(&mut r, b"u");
-        assert_eq!(r.0, vec![(true, 'u')]);
+        assert_eq!(r.0, vec![(0b1, 'u')]);
     }
 
     #[test]

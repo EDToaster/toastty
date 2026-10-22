@@ -1426,6 +1426,18 @@ Seen during app testing, not a graphics bug:
       because vte can't tell the two apart.
     - Flags are masked to 7 bits.
     - An explicit mode 0 in `CSI = f ; 0 u` is ignored.
+  - After the #43 review, re-checked live for flags 0, 1, 3, 5, 7, 8, 11
+    and 31:
+    - F3 is `CSI 13 ~` under the kitty flags, because `CSI R` collides
+      with a CPR. Legacy mode keeps xterm's `SS3 R` / `CSI 1;mR`.
+    - Report-alternates (4) adds the shifted key to every escape-coded
+      event, not only under 8: ctrl+shift+a under 5 is `CSI 97:65;6u`.
+    - Modified Enter, Tab and Backspace report their release.
+    - Under report-events alone, Ctrl / Alt repeats and modified Esc are
+      escape codes.
+    - `CSI = f ; u` (empty mode) sets the flags; `CSI < ; u` pops
+      nothing; `CSI < SP u` is ignored. The parser hook now reports which
+      parameters had digits (`Perform::csi_param_digits`).
   - Deliberate differences:
     - Under report-events (2) alone, kitty sends a bare ESC for the
       release of Esc, which reads as a second Escape press. toastty sends
