@@ -742,6 +742,22 @@ Done in #28. See
     red/blue, 20 identical), grabbed 0.25 s after each, all showed the
     right image. Each re-send now gets a fresh store key, so nothing keyed
     on the id can go stale.
+- [x] **P2 — PLC-8. Clears and lost placements don't free image data.**
+  - Repro: `a=T,i=60`, `a=t,i=61`, then `ESC[2J`, then `a=p,i=60` and
+    `a=p,i=61`; or `a=T,i=1`, `ESC c`, `a=p,i=1`.
+  - Expected (kitty-ref): `ESC[2J` frees every image left with no
+    placement, never-placed ones included, so both get ENOENT and the
+    next `I=` without `i=` is handed `i=1` again. Images placed in the
+    history survive. `ESC[3J` frees all of them. RIS frees the whole store
+    (ENOENT). An anonymous image's data goes with its last placement,
+    since nothing can place it again.
+  - Actual: toastty kept every image's bytes through all of these, so the
+    store grew, `a=p` still found them, and `I=` ids drifted upwards after
+    a clear.
+  - Fixed in #42. `ESC[2J`/`ESC[3J` free unplaced images, RIS clears the
+    store, and every placement removal frees an anonymous image (sixel
+    too) with its last placement. See
+    [`decisions/image-store.md`](decisions/image-store.md).
 
 ## 6. Deletion
 
