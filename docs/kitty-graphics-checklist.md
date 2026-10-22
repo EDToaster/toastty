@@ -1397,6 +1397,49 @@ Seen during app testing, not a graphics bug:
   - kitty 0.49.2 (checked live, launched with SIGINT / SIGQUIT ignored)
     resets SIGINT but leaves SIGQUIT ignored (`SigIgn: 0x4`). toastty
     resets everything.
+- [x] **P1 — KBD-1. Under kitty keyboard flags, Enter, Tab, Backspace and
+  Space are sent as `CSI … u`.** After a killed TUI, `less` ignores Space and
+  Enter, while kitty pages normally. Fixed in #43.
+  - Checked live against kitty 0.49.2, key by key (23 keys), for flags 0, 1,
+    2, 3, 4, 8, 9, 16, 24 and 31. Everything matches except the items
+    below.
+  - Enter, Tab and Backspace:
+    - Unmodified, they keep their legacy bytes unless report-all (8) is on,
+      and they never report a release without it (spec).
+    - Modified, they're `CSI code;mods u`, even under report-events (2)
+      alone.
+  - Text keys (Space, letters, ...) without Ctrl, Alt or Super send their
+    text unless report-all is on.
+  - Report-events (2) alone: Ctrl, Alt and Esc presses keep their legacy
+    bytes, and only releases are escape codes.
+  - A press never carries the `:1` event type.
+  - Report-alternates (4) alone, and report-text (16) without 8, behave
+    as legacy.
+  - Under 8: report-text (16) attaches the text (`CSI 97;;97u`; none with
+    Ctrl / Alt), and 4 adds the shifted key (`CSI 97:65;2;65u`).
+  - Legacy mode (no flags) now sends xterm's modified named keys:
+    `CSI 1;2A`, shift+Tab `CSI Z`, ctrl+Backspace `^H`, ctrl+Space NUL,
+    alt+Enter `ESC CR`.
+  - Stack edge cases:
+    - `CSI < 0 u` pops nothing; `CSI < u` pops one. The parser reports
+      whether a CSI had parameter digits (`Perform::csi_params_explicit`),
+      because vte can't tell the two apart.
+    - Flags are masked to 7 bits.
+    - An explicit mode 0 in `CSI = f ; 0 u` is ignored.
+  - Deliberate differences:
+    - Under report-events (2) alone, kitty sends a bare ESC for the
+      release of Esc, which reads as a second Escape press. toastty sends
+      `CSI 27;1:3u`.
+    - kitty's report-text (16) without 8 (undefined in the spec) half
+      disambiguates; toastty treats it as legacy.
+- [ ] **P2 — KBD-2. Keypad keys and modifier keys don't use kitty's own key
+  codes.** Found while checking KBD-1.
+  - kitty sends KP_Enter as `CSI 57414 u` under disambiguate, and keypad
+    digits as `CSI 57400 u` (and so on) under report-all.
+  - Under report-all, kitty also reports presses and releases of the
+    modifier keys themselves (`CSI 57441;2u` for Shift).
+  - toastty sends the main-keyboard codes and no modifier-key events,
+    because the encoder doesn't get the physical key.
 
 Performance notes (Xvfb, software present; not conclusive):
 
