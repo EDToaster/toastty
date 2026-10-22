@@ -4948,6 +4948,7 @@ version = "1.0.0"
 dependencies = [
  "memchr",
  "proptest",
+ "simdutf8",
  "thiserror 2.0.18",
  "toastty-pty",
  "vte",

@@ -132,13 +132,73 @@ impl Scanner {
         }
     }
 
-    /// Hand ground text to vte through the UTF-8 sanitizer. `cut_by_esc`
-    /// says an ESC follows directly (see [`Utf8Sanitizer::feed`]).
-    fn feed_ground<P: Perform + ?Sized>(&mut self, perform: &mut P, text: &[u8], cut_by_esc: bool) {
+    /// Hand ground text to vte, through the UTF-8 sanitizer where
+    /// needed. `text` starts at offset `at` of this `advance` call's
+    /// input, and `clean` is that input's [`Utf8Sanitizer::clean_span`]:
+    /// the part of `text` inside it is known-valid and goes straight to
+    /// vte; the parts before (finishing a held character) and after (a
+    /// trailing partial one, or an invalid chunk) are sanitized.
+    /// `cut_by_esc` says an ESC follows directly (see
+    /// [`Utf8Sanitizer::feed`]).
+    #[inline]
+    fn feed_ground<P: Perform + ?Sized>(
+        &mut self,
+        perform: &mut P,
+        text: &[u8],
+        at: usize,
+        clean: (usize, usize),
+        cut_by_esc: bool,
+    ) {
+        // Hot path, the same work as with no sanitizer at all: a run
+        // inside the clean span (all of an ASCII or valid chunk).
+        if clean.0 <= at && at + text.len() <= clean.1 && !self.utf8.holds_partial() {
+            if !text.is_empty() {
+                self.vte.advance(&mut VteAdapter { inner: perform }, text);
+            }
+            return;
+        }
+        self.feed_ground_slow(perform, text, at, clean, cut_by_esc);
+    }
+
+    /// The rest of [`Self::feed_ground`]: a run that needs the sanitizer
+    /// for some or all of its bytes.
+    #[inline(never)]
+    fn feed_ground_slow<P: Perform + ?Sized>(
+        &mut self,
+        perform: &mut P,
+        text: &[u8],
+        at: usize,
+        clean: (usize, usize),
+        cut_by_esc: bool,
+    ) {
         let vte = &mut self.vte;
-        self.utf8.feed(text, cut_by_esc, &mut |b| {
-            vte.advance(&mut VteAdapter { inner: perform }, b);
-        });
+        if text.is_empty() {
+            // An ESC right away still ends a held partial character.
+            if cut_by_esc && self.utf8.holds_partial() {
+                self.utf8.feed(text, true, &mut |s| {
+                    vte.advance(&mut VteAdapter { inner: perform }, s);
+                });
+            }
+            return;
+        }
+        let end = at + text.len();
+        let a = clean.0.clamp(at, end) - at;
+        let b = clean.1.clamp(at, end).max(at + a) - at;
+        let (head, mid, tail) = (&text[..a], &text[a..b], &text[b..]);
+        if !head.is_empty() {
+            self.utf8
+                .feed(head, cut_by_esc && a == text.len(), &mut |s| {
+                    vte.advance(&mut VteAdapter { inner: perform }, s);
+                });
+        }
+        if !mid.is_empty() {
+            vte.advance(&mut VteAdapter { inner: perform }, mid);
+        }
+        if !tail.is_empty() {
+            self.utf8.feed(tail, cut_by_esc, &mut |s| {
+                vte.advance(&mut VteAdapter { inner: perform }, s);
+            });
+        }
     }
 
     /// Feed bytes through the scanner. With `detect_tmux`, stops right
@@ -151,18 +211,23 @@ impl Scanner {
         mut bytes: &'b [u8],
         detect_tmux: bool,
     ) -> Option<&'b [u8]> {
+        // Check this input's UTF-8 once, not per run between escapes.
+        let total = bytes.len();
+        let clean = self.utf8.clean_span(bytes);
         while !bytes.is_empty() {
             match self.apc {
                 ApcState::Ground => {
                     // Scan for next ESC. Everything before is normal vte
                     // input, cleaned of invalid UTF-8 first.
                     if let Some(pos) = memchr::memchr(0x1B, bytes) {
-                        self.feed_ground(perform, &bytes[..pos], true);
+                        let at = total - bytes.len();
+                        self.feed_ground(perform, &bytes[..pos], at, clean, true);
                         // Don't feed the ESC to vte yet — peek the next byte.
                         self.apc = ApcState::AfterEsc;
                         bytes = &bytes[pos + 1..];
                     } else {
-                        self.feed_ground(perform, bytes, false);
+                        let at = total - bytes.len();
+                        self.feed_ground(perform, bytes, at, clean, false);
                         return None;
                     }
                 }
