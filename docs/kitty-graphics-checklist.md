@@ -1004,7 +1004,9 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
   - `kitten icat --detect-support` now reports `files` (kitty: `memory`).
     `a=q,t=s` keeps its ENOTSUP until shared memory lands (WIRE-2, separate
     PR); then detection should report `memory`.
-- [ ] **P1 — WIRE-2. Shared memory (`t=s`) is unsupported, and the shm object
+  - `a=q,t=s` fixed in #51 (WIRE-2): `--detect-support` reports `memory`
+    on Linux, as in kitty.
+- [x] **P1 — WIRE-2. Shared memory (`t=s`) is unsupported, and the shm object
   isn't unlinked.**
   - Actual: `kitten icat --transfer-mode=memory` shows nothing and exits 0,
     because icat sends `q=2`, and objects pile up in `/dev/shm`.
@@ -1013,6 +1015,27 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
   - Cause: `handler.rs:519-533`.
   - Implement it with `shm_open`/`mmap`/`shm_unlink` (rustix has these),
     after the SEC-1–SEC-3 fixes.
+  - Fixed in #51 for Linux. The object is the file `/dev/shm/<name>`,
+    read with the file mediums' rules (`O_NOFOLLOW | O_NONBLOCK` open
+    relative to a `/dev/shm` dirfd, `fstat` regular-file check, bounded
+    `read`s, no `mmap`), then unlinked through the same dirfd, also after
+    a failed read or decode. `a=q,t=s` reads, decodes and unlinks without
+    storing. Every failure is the uniform EBADF. `kitten icat
+    --transfer-mode=memory` displays and leaves `/dev/shm` clean. 12
+    measured cases match kitty 0.49.2 except that decode failures are
+    EBADF, not `EBADPNG` (SEC-4). Design and table:
+    `docs/decisions/kitty-file-medium.md`.
+  - **macOS / non-Linux: known limitation, pending a PM/user decision.**
+    macOS shm can only be read with `mmap`, which is `unsafe`, and
+    `toastty-graphics` is `#![forbid(unsafe_code)]`. Off Linux `t=s`
+    `shm_unlink`s the name (safe) and replies EBADF, so icat falls back
+    to another medium.
+  - **`mpv --vo=kitty --vo-kitty-use-shm=yes` doesn't work, in kitty
+    0.49.2 either.** mpv 0.41.0 sends the name without the leading `/`
+    (`mpv-kitty-0x…`); kitty logs "POSIX SHM names must start with /" per
+    frame and shows nothing, and toastty refuses it the same way (spec:
+    the name **must** start with `/`). mpv unlinks its own object, so
+    nothing leaks. Use mpv's default (direct) mode.
 - [x] **P0 — WIRE-3 (= APP-1). Animation commands without `q=` get ENOTSUP
   replies that get injected into the shell.**
   - Repro: `kitten icat anim.gif`, then type `echo hello` and press Enter.
@@ -1185,7 +1208,8 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
     giving EINVAL instead of ENOTSUP. Fixed in #37: `C` is a number, and
     `Header::frame()`, `Header::animation()` and `Header::composition()` give
     the animation meaning of the overloaded keys.
-- [ ] **P1 — Shared-memory transmission** (`t=s`). See WIRE-2.
+- [x] **P1 — Shared-memory transmission** (`t=s`). See WIRE-2.
+  - Fixed in #51 for Linux; macOS pending a decision (see WIRE-2).
 - [x] **P2 — Usage hints** (`N=1` transient).
   - The key is accepted and ignored, which the spec allows.
   - It could feed eviction priority.
@@ -1200,8 +1224,8 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
 | Client / feature | toastty | kitty |
 |---|---|---|
 | `kitten icat` PNG/JPEG, stream and file modes | works, stretched (SIZE-1) | works |
-| `kitten icat --transfer-mode=memory` | blank, shm leak (WIRE-2) | works |
-| `kitten icat --detect-support` | `stream` (WIRE-1) | `memory` |
+| `kitten icat --transfer-mode=memory` | works on Linux, `/dev/shm` clean (WIRE-2, #51) | works |
+| `kitten icat --detect-support` | `memory` on Linux (WIRE-1, WIRE-2) | `memory` |
 | `kitten icat --place` / `--align` | works, ~1 row too tall (SIZE-13) | works |
 | `kitten icat --scale-up` | wrong aspect ratio (SIZE-1, SIZE-13) | works |
 | `kitten icat` animated GIF | still frame + text injected into the shell (WIRE-3) | animates |
@@ -1213,6 +1237,7 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
 | tmux new-window / split over an image | stale image over other content (PH-1) | works |
 | yazi inside tmux | works | works |
 | `mpv --vo=kitty` incl. resize | works, ~26 fps, one core at 100 % | works |
+| `mpv --vo=kitty --vo-kitty-use-shm=yes` | blank: mpv 0.41 sends the name without `/`, refused per spec (WIRE-2) | blank, same refusal |
 | Rapid re-placement (3000 moves); 30k lines with 310 images | works | works |
 
 Seen during app testing, not a graphics bug:
