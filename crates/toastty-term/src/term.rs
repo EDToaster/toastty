@@ -8662,6 +8662,42 @@ mod tests {
     }
 
     #[test]
+    fn dcs_cut_off_by_esc_is_not_acted_on() {
+        // WIRE-16: a DCS ended by an ESC that isn't ST is dropped (kitty
+        // never answers it either). The escape the ESC starts still runs.
+        let mut t = Term::new(8, 8, 0);
+        feed(&mut t, b"\x1bP$qm\x1bx");
+        feed(&mut t, b"\x1bP+q544e\x1bx");
+        assert!(t.drain_pty_replies().is_empty(), "ESC x");
+        // ESC [ c: no DECRQSS reply, only the DA1 reply.
+        let mut da1 = Term::new(8, 8, 0);
+        feed(&mut da1, b"\x1b[c");
+        let da1 = da1.drain_pty_replies();
+        assert!(!da1.is_empty());
+        feed(&mut t, b"\x1bP$qm\x1b[c");
+        assert_eq!(t.drain_pty_replies(), da1, "ESC [ c");
+        // Split across reads, and tmux-wrapped.
+        let mut p = Parser::new();
+        p.advance(&mut t, b"\x1bP$qm\x1b");
+        p.advance(&mut t, b"x");
+        assert!(t.drain_pty_replies().is_empty(), "split");
+        feed(&mut t, b"\x1bPtmux;\x1b\x1bP$qm\x1b\x1bx\x1b\\");
+        assert!(t.drain_pty_replies().is_empty(), "tmux");
+        // A sixel cut off by ESC isn't placed.
+        let mut sixel = SIXEL_3X6[..SIXEL_3X6.len() - 2].to_vec();
+        sixel.extend_from_slice(b"\x1bx");
+        feed(&mut t, &sixel);
+        assert_eq!(t.image_grid().iter().count(), 0, "sixel");
+        // ST still works, split right after the ESC too.
+        let mut p = Parser::new();
+        p.advance(&mut t, b"\x1bP$qm\x1b");
+        p.advance(&mut t, b"\\");
+        assert!(t.drain_pty_replies().starts_with(b"\x1bP1$r"), "ST");
+        feed(&mut t, SIXEL_3X6);
+        assert_eq!(t.image_grid().iter().count(), 1, "sixel with ST");
+    }
+
+    #[test]
     fn sixel_advances_cursor_to_line_below() {
         let mut t = Term::new(8, 8, 0);
         feed(&mut t, SIXEL_3X6);

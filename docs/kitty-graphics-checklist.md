@@ -1109,6 +1109,26 @@ Anything that writes to the PTY can send these commands: `cat` of a file,
   - Fix: the parser's DCS state calls `Perform::dcs_cancel` before passing
     CAN / SUB to vte. `Term` then drops the pending query or sixel, so the
     `unhook` that follows does nothing. Fixed in #45.
+- [x] **P2 — WIRE-16. A DCS ended by an ESC that isn't ST is still acted
+  on.** Found in the #45 review.
+  - vte ends a DCS on any ESC and unhooks it as if it had ended on ST:
+    - `ESC P $ q m ESC CAN` and `ESC P $ q m ESC [ c` got a full DECRQSS
+      reply (the second one a DA1 reply too);
+    - `ESC P + q 544e ESC x` got an XTGETTCAP reply;
+    - a sixel cut off by an ESC was still placed.
+  - kitty 0.49.2 (checked live) treats the ESC as data, see WIRE-13. It
+    answers none of these until a real ST, and then answers for the whole
+    body (`ESC P 0 $ r` for DECRQSS, nothing for XTGETTCAP).
+  - Fix: a new scanner state holds the ESC after a DCS body. `\` makes it
+    ST; any other byte calls `Perform::dcs_cancel` (as CAN / SUB do,
+    WIRE-15), ends the DCS in vte and then handles the ESC as a fresh
+    escape. Works across reads and inside tmux passthrough. Side fix: an
+    `ESC _` (APC) right after a DCS body used to leave vte inside the DCS.
+    Fixed in #PRNUM.
+  - Deliberate difference: what follows the ESC still runs (the CSI, a new
+    DCS), as in xterm and vte; kitty swallows it as DCS data until ST. So
+    `ESC P $ q m ESC P $ q r ST` gets the second query's reply here and
+    `ESC P 0 $ r` in kitty.
 - [x] **P2 — WIRE-6. Malformed headers get an EINVAL reply; kitty stays
   silent.**
   - Cases: `s=abc`, `s=`, `a=X`, `t=x`, `o=y`, `x=-5`. (Re-measured for
