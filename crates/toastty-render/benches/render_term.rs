@@ -727,6 +727,24 @@ fn bench_min_times(c: &mut Criterion) {
     let (width, height) = viewport_pixels(ROWS, COLS);
     let mut h = Harness::new(width, height);
     h.cpu_only = true;
+    // Full repaint of faint (SGR 2) text.
+    let mut term = Term::new(ROWS, COLS, 0);
+    Parser::new().advance(&mut term, b"\x1b[2;33m");
+    let filled = make_term_filled(ROWS, COLS);
+    let text: String = (0..ROWS)
+        .flat_map(|r| filled.row(r).cells().iter().map(|c| c.ch))
+        .collect();
+    Parser::new().advance(&mut term, text.as_bytes());
+    h.render_term(&term);
+    let mut t = Vec::with_capacity(FRAMES);
+    for _ in 0..FRAMES {
+        term.mark_all_dirty();
+        let t0 = Instant::now();
+        h.render_term(&term);
+        t.push(t0.elapsed().as_secs_f64() * 1e6);
+        term.clear_damage();
+    }
+    report("repaint_dim_200x60", t);
     let mut term = make_term_unicode(ROWS, COLS);
     h.render_term(&term);
     let mut t = Vec::with_capacity(FRAMES);
