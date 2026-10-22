@@ -29,7 +29,7 @@ use base64::Engine as _;
 use super::b64;
 use super::decode::{DecodeError, RAW_DATA_SLACK, decode, raw_len};
 use super::header::{Action, Compression, DeleteSpec, Header, Quiet, Transmission};
-use super::medium::{self, FileError, FileRequest};
+use super::medium::{self, FileError, FileRequest, ShmRequest};
 use super::placeholder::VirtualPlacement;
 use super::reply::{ErrorCode, encode_error, encode_ok};
 use crate::image_grid::{Placement, RelativeError, SrcRect};
@@ -405,20 +405,21 @@ impl KittyHandler {
         }
     }
 
-    /// WIRE-1: `a=q` with `t=f` / `t=t`, as kitty 0.49.2 answers it.
+    /// WIRE-1 / WIRE-2: `a=q` with `t=f` / `t=t` / `t=s`, as kitty 0.49.2
+    /// answers it.
     ///
     /// The format and dimensions are checked first, before the file is
     /// touched (`EINVAL:Zero width/height not allowed`, which says nothing
     /// about the file). Then the file goes through the hardened
-    /// [`medium::read_image_file`] path, `t=t` deletion rule included, and
-    /// every failure from there on, decode errors too, is the uniform
+    /// [`medium::read_image_file`] path, `t=t` deletion rule included, or
+    /// for `t=s` [`medium::read_shm_object`], which unlinks the object
+    /// (`kitten icat --detect-support` finds `memory` this way). Every
+    /// failure from there on, decode errors too, is the uniform
     /// `EBADF:Failed to read image file` (SEC-4). Nothing is stored.
-    ///
-    /// `t=s` still replies ENOTSUP; shared memory comes in its own PR.
     #[allow(clippy::unused_self)]
     fn query_medium<S: KittySink>(&mut self, header: &Header, body: &[u8], sink: &mut S) {
         match header.transmission {
-            Transmission::File | Transmission::TempFile => {
+            Transmission::File | Transmission::TempFile | Transmission::Shared => {
                 if let Err(e) = check_medium_header(header) {
                     if !e.silent {
                         reply_error_if_verbose(header, sink, e.code, &e.detail);
@@ -426,16 +427,13 @@ impl KittyHandler {
                     return;
                 }
                 let quota = sink.max_image_bytes();
-                let result = read_medium_file(header, body, quota).and_then(|raw| {
+                let result = read_medium(header, body, quota).and_then(|raw| {
                     decode_payload(header, raw, quota).map_err(|e| FileError(e.detail))
                 });
                 match result {
                     Ok(_) => reply_ok_if_verbose(header, sink),
                     Err(e) => reply_file_error(header, sink, &e),
                 }
-            }
-            Transmission::Shared => {
-                reply_error_if_verbose(header, sink, ErrorCode::Enotsup, "transmission medium");
             }
             Transmission::Direct => unreachable!("direct queries handled by the caller"),
         }
@@ -602,15 +600,16 @@ impl KittyHandler {
     /// read its bytes (honoring `O=` offset and `S=` size) and feed them
     /// into the same decode tail as direct transmission. The path policy
     /// (regular files only, no `/proc`/`/sys`/`/dev`, non-blocking open,
-    /// bounded read, `t=t` deletion rules) lives in [`medium`]. Every
+    /// bounded read, `t=t` deletion rules) lives in [`medium`]. For `t=s`
+    /// the body is a base64 POSIX shm name (`/name`); the object is read
+    /// the same way and then unlinked ([`medium::read_shm_object`]). Every
     /// failure, up to and including decoding the bytes read, replies
-    /// `EBADF:Failed to read image file` (SEC-4). `t=s` is ENOTSUP — see
-    /// the match arm.
+    /// `EBADF:Failed to read image file` (SEC-4).
     #[allow(clippy::needless_pass_by_value)]
     fn handle_medium_transmit<S: KittySink>(&mut self, header: Header, body: &[u8], sink: &mut S) {
         match header.transmission {
             Transmission::Direct => unreachable!("direct handled by caller"),
-            Transmission::File | Transmission::TempFile => {
+            Transmission::File | Transmission::TempFile | Transmission::Shared => {
                 // kitty checks the format and dimensions before it touches
                 // the file, and replies about the command, not the file.
                 if let Err(e) = check_medium_header(&header) {
@@ -619,7 +618,7 @@ impl KittyHandler {
                     }
                     return;
                 }
-                let raw = match read_medium_file(&header, body, sink.max_image_bytes()) {
+                let raw = match read_medium(&header, body, sink.max_image_bytes()) {
                     Ok(bytes) => bytes,
                     Err(e) => {
                         reply_file_error(&header, sink, &e);
@@ -627,20 +626,6 @@ impl KittyHandler {
                     }
                 };
                 self.finalize_decoded(header, raw, PayloadSource::File, sink);
-            }
-            Transmission::Shared => {
-                // POSIX shared memory (`shm_open`/`mmap`/`shm_unlink`)
-                // needs a libc binding. `toastty-graphics` deliberately
-                // does NOT depend on `libc`, and we avoid pulling a heavy
-                // new dependency just for this medium. Reply ENOTSUP for
-                // now; `t=f`/`t=t` cover the common large-image transfer
-                // case (`kitten icat --transfer-mode=file`).
-                reply_error_if_verbose(
-                    &header,
-                    sink,
-                    ErrorCode::Enotsup,
-                    "shared-memory transmission medium",
-                );
             }
         }
     }
@@ -1052,12 +1037,13 @@ fn check_medium_header(header: &Header) -> Result<(), PayloadError> {
     Ok(())
 }
 
-/// Read the file a `t=f` / `t=t` command names. `body` is the base64
-/// path. See [`medium::read_image_file`] for the policy.
-fn read_medium_file(header: &Header, body: &[u8], quota: u64) -> Result<Vec<u8>, FileError> {
-    // Undecodable base64 becomes an empty path, which fails like any other.
-    let path_bytes = b64::decode_all(body);
-    let path = path_from_bytes(path_bytes);
+/// Read the file a `t=f` / `t=t` command names, or the shared-memory
+/// object a `t=s` command names. `body` is the base64 path or shm name.
+/// See [`medium::read_image_file`] and [`medium::read_shm_object`] for the
+/// policy.
+fn read_medium(header: &Header, body: &[u8], quota: u64) -> Result<Vec<u8>, FileError> {
+    // Undecodable base64 becomes an empty name, which fails like any other.
+    let name = b64::decode_all(body);
     // Uncompressed raw pixels need exactly `s*v*bpp` bytes: read that
     // much and no more. A longer file is fine (kitty ignores the tail), a
     // shorter one fails. Otherwise read `S=` bytes, or to EOF.
@@ -1068,9 +1054,18 @@ fn read_medium_file(header: &Header, body: &[u8], quota: u64) -> Result<Vec<u8>,
             .unwrap_or(0),
         (size, _) => u64::from(size),
     };
+    let offset = u64::from(header.offset);
+    if header.transmission == Transmission::Shared {
+        return medium::read_shm_object(&ShmRequest {
+            name: &name,
+            offset,
+            size,
+            max: quota,
+        });
+    }
     medium::read_image_file(&FileRequest {
-        path: &path,
-        offset: u64::from(header.offset),
+        path: &path_from_bytes(name),
+        offset,
         size,
         max: quota,
         delete_temp: matches!(header.transmission, Transmission::TempFile),
@@ -2633,16 +2628,18 @@ mod tests {
     }
 
     #[test]
-    fn shm_query_still_enotsup() {
-        // `a=q,t=s` keeps its ENOTSUP until shared memory lands (its own
-        // PR); `t=f` / `t=t` queries are WIRE-1, tested with the mediums.
+    fn shm_query_of_a_missing_object_is_ebadf() {
+        // WIRE-2: `a=q,t=s` is answered like a file query, on every
+        // platform; the full `t=s` cases are with the mediums.
         let mut h = KittyHandler::new();
         let mut sink = MockSink::with_budget(1 << 30);
-        h.process(b"Ga=q,t=s,f=32,s=1,v=1,i=1", b"L2tncEI=", &mut sink)
+        let name = base64::engine::general_purpose::STANDARD
+            .encode(format!("/toastty-no-such-shm-{}", std::process::id()));
+        h.process(b"Ga=q,t=s,f=32,s=1,v=1,i=1", name.as_bytes(), &mut sink)
             .unwrap();
         assert_eq!(
             sink.replies,
-            vec![b"\x1b_Gi=1;ENOTSUP:transmission medium\x1b\\".to_vec()]
+            vec![b"\x1b_Gi=1;EBADF:Failed to read image file\x1b\\".to_vec()]
         );
     }
 }
@@ -3284,17 +3281,228 @@ mod major_medium_tests {
         );
     }
 
+    // ---- t=s (WIRE-2) ----
+
+    /// A uniquely named POSIX shm object, made the way `shm_open` makes
+    /// one on Linux (a file in `/dev/shm`), removed on drop.
+    #[cfg(target_os = "linux")]
+    struct Shm(std::path::PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl Shm {
+        fn new(tag: &str, bytes: Option<&[u8]>) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let path = std::path::PathBuf::from(format!(
+                "/dev/shm/toastty-handler-shm-{tag}-{}-{n}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            if let Some(bytes) = bytes {
+                std::fs::write(&path, bytes).unwrap();
+            }
+            Self(path)
+        }
+
+        /// The base64 `/name` a client sends.
+        fn body(&self) -> Vec<u8> {
+            let name = self.0.file_name().unwrap().to_str().unwrap();
+            b64(format!("/{name}").as_bytes())
+        }
+
+        fn exists(&self) -> bool {
+            self.0.exists()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Shm {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    const RGBA_2X2: [u8; 16] = [
+        255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+    ];
+
+    #[cfg(target_os = "linux")]
     #[test]
-    fn t_s_replies_enotsup() {
-        // Shared memory is intentionally unimplemented (no libc dep in
-        // toastty-graphics). It must reply ENOTSUP, not silently succeed.
+    fn t_s_reads_registers_and_unlinks() {
+        let shm = Shm::new("t", Some(&RGBA_2X2));
         let mut h = KittyHandler::new();
         let mut sink = MockSink::default();
-        h.process(b"Ga=t,f=32,s=1,v=1,i=3,t=s", b"L215c2htb2Jq", &mut sink)
+        h.process(b"Ga=t,f=32,s=2,v=2,i=3,t=s", &shm.body(), &mut sink)
             .unwrap();
+        assert_eq!(replies_joined(&sink), "\x1b_Gi=3;OK\x1b\\");
+        assert_eq!(sink.registered.len(), 1);
+        assert_eq!(sink.registered[0].0, 3);
+        assert_eq!(sink.registered[0].1.width, 2);
+        assert_eq!(sink.registered[0].1.pixels, RGBA_2X2);
+        assert!(!shm.exists(), "the spec: read, then unlink");
+    }
+
+    /// `kitten icat --transfer-mode=memory` and `mpv --vo-kitty-use-shm`
+    /// send `a=T,t=s` with `S=`, `q=2`: displayed, no reply.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn t_s_transmit_and_place_with_size_and_offset() {
+        let mut bytes = vec![0xAA; 3];
+        bytes.extend_from_slice(&RGBA_2X2);
+        bytes.extend_from_slice(&[0xBB; 5]);
+        let shm = Shm::new("T", Some(&bytes));
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::default();
+        h.process(
+            b"Ga=T,f=32,s=2,v=2,i=4,t=s,O=3,S=16,q=2",
+            &shm.body(),
+            &mut sink,
+        )
+        .unwrap();
+        assert!(sink.replies.is_empty());
+        assert_eq!(sink.registered[0].1.pixels, RGBA_2X2);
+        assert_eq!(sink.placements.len(), 1);
+        assert!(!shm.exists());
+    }
+
+    /// Every failure is the uniform EBADF (SEC-4). A regular object is
+    /// unlinked even when the read or the decode fails.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn t_s_failures_reply_ebadf_and_still_unlink() {
+        let missing = Shm::new("missing", None);
+        let short = Shm::new("short", Some(&RGBA_2X2[..15]));
+        let junk = Shm::new("junk", Some(b"not a png at all"));
+        let past = Shm::new("past", Some(&RGBA_2X2));
+        let cases: [(&[u8], &Shm); 4] = [
+            (b"a=t,f=32,s=2,v=2,i=9,t=s", &missing),
+            (b"a=t,f=32,s=2,v=2,i=9,t=s", &short),
+            (b"a=t,f=100,i=9,t=s", &junk),
+            (b"a=t,f=100,i=9,t=s,O=99", &past),
+        ];
+        for (keys, shm) in cases {
+            let mut h = KittyHandler::new();
+            let mut sink = MockSink::default();
+            let ctl = [b"G", keys].concat();
+            h.process(&ctl, &shm.body(), &mut sink).unwrap();
+            assert_eq!(
+                replies_joined(&sink),
+                format!("\x1b_Gi=9;{FILE_ERR}\x1b\\"),
+                "{}",
+                String::from_utf8_lossy(keys)
+            );
+            assert!(sink.registered.is_empty());
+            assert!(!shm.exists(), "{}", String::from_utf8_lossy(keys));
+        }
+        // An invalid name (no leading `/`) gets the same reply.
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::default();
+        h.process(b"Ga=t,f=100,i=9,t=s", &b64(b"no-slash"), &mut sink)
+            .unwrap();
+        assert_eq!(replies_joined(&sink), format!("\x1b_Gi=9;{FILE_ERR}\x1b\\"));
+    }
+
+    /// `a=q,t=s` (how `kitten icat --detect-support` finds `memory`): the
+    /// object is read, decoded and unlinked, OK is sent, and nothing is
+    /// stored. Matches kitty 0.49.2, except that a decode failure is EBADF
+    /// rather than kitty's EBADPNG (SEC-4).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn t_s_query_reads_unlinks_and_stores_nothing() {
+        let ok = Shm::new("q-ok", Some(&RGBA_2X2));
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::default();
+        h.process(b"Ga=q,f=32,s=2,v=2,i=31,t=s", &ok.body(), &mut sink)
+            .unwrap();
+        assert_eq!(replies_joined(&sink), "\x1b_Gi=31;OK\x1b\\");
+        assert!(sink.registered.is_empty() && sink.placements.is_empty());
+        assert!(!ok.exists());
+
+        let junk = Shm::new("q-junk", Some(b"junk"));
+        let mut sink = MockSink::default();
+        h.process(b"Ga=q,f=100,i=32,t=s", &junk.body(), &mut sink)
+            .unwrap();
+        assert_eq!(
+            replies_joined(&sink),
+            format!("\x1b_Gi=32;{FILE_ERR}\x1b\\")
+        );
+        assert!(!junk.exists());
+
+        let missing = Shm::new("q-missing", None);
+        let mut sink = MockSink::default();
+        h.process(b"Ga=q,f=100,i=33,t=s", &missing.body(), &mut sink)
+            .unwrap();
+        assert_eq!(
+            replies_joined(&sink),
+            format!("\x1b_Gi=33;{FILE_ERR}\x1b\\")
+        );
+
+        // No `i=`: ignored entirely, as in kitty (WIRE-7). kitty leaves
+        // the object in place too.
+        let anon = Shm::new("q-anon", Some(&RGBA_2X2));
+        let mut sink = MockSink::default();
+        h.process(b"Ga=q,f=32,s=2,v=2,t=s", &anon.body(), &mut sink)
+            .unwrap();
+        assert!(sink.replies.is_empty());
+        assert!(anon.exists(), "kitty doesn't read an anonymous query");
+    }
+
+    /// A `t=s` transmit or query during a chunked upload drops the upload,
+    /// as a file transmit does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn t_s_aborts_a_loading_upload() {
+        let shm = Shm::new("abort", Some(&RGBA_2X2));
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::default();
+        h.process(
+            b"Ga=t,f=32,s=2,v=2,i=5,m=1",
+            &b64(&RGBA_2X2[..8]),
+            &mut sink,
+        )
+        .unwrap();
+        h.process(b"Ga=q,f=32,s=2,v=2,i=6,t=s", &shm.body(), &mut sink)
+            .unwrap();
+        assert_eq!(replies_joined(&sink), "\x1b_Gi=6;OK\x1b\\");
+        // The next chunk starts nothing: the upload is gone.
+        h.process(b"Gm=0", &b64(&RGBA_2X2[8..]), &mut sink).unwrap();
         assert!(sink.registered.is_empty());
-        let joined = replies_joined(&sink);
-        assert!(joined.contains("ENOTSUP"), "got {joined:?}");
+    }
+
+    /// Off Linux, `t=s` can't be read without `mmap` (see
+    /// `medium::read_shm_object`): it fails with the uniform EBADF, and
+    /// the object is still unlinked so clients don't leak it.
+    #[cfg(all(unix, not(target_os = "linux"), not(target_os = "android")))]
+    #[test]
+    fn t_s_off_linux_replies_ebadf_and_unlinks() {
+        use rustix::shm;
+        let name = format!("/toastty-handler-shm-{}", std::process::id());
+        let _ = shm::unlink(name.as_str());
+        let fd = shm::open(
+            name.as_str(),
+            shm::OFlags::CREATE | shm::OFlags::EXCL | shm::OFlags::RDWR,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        drop(fd);
+        let mut h = KittyHandler::new();
+        let mut sink = MockSink::default();
+        h.process(b"Ga=t,f=100,i=9,t=s", &b64(name.as_bytes()), &mut sink)
+            .unwrap();
+        let gone = shm::open(
+            name.as_str(),
+            shm::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        )
+        .is_err();
+        let _ = shm::unlink(name.as_str());
+        assert_eq!(replies_joined(&sink), format!("\x1b_Gi=9;{FILE_ERR}\x1b\\"));
+        assert!(
+            gone,
+            "t=s must unlink the object even when it can't read it"
+        );
     }
 
     // ---- SEC-1..SEC-5, SEC-7 through the handler ----

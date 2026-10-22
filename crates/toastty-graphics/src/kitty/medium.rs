@@ -1,4 +1,6 @@
 //! File transmission mediums (`t=f`, `t=t`): path policy and bounded reads.
+//! Shared memory (`t=s`, [`read_shm_object`]) reuses the same open and
+//! read rules for the object's file in `/dev/shm`.
 //!
 //! The path comes from whatever wrote to the PTY: `cat` of a file, a
 //! remote host over ssh, a sandboxed process. The spec's rules for it:
@@ -476,6 +478,163 @@ fn temp_roots() -> Vec<PathBuf> {
     canonical.sort();
     canonical.dedup();
     canonical
+}
+
+// ---- shared memory (`t=s`) ----
+
+/// Where Linux keeps POSIX shared-memory objects. glibc and musl implement
+/// `shm_open("/name")` as `open("/dev/shm/name")`, so an object is a plain
+/// file in this tmpfs.
+#[cfg(target_os = "linux")]
+const SHM_DIR: &str = "/dev/shm";
+
+/// Longest shm name we accept, not counting the leading `/`. On Linux the
+/// name is a file name in [`SHM_DIR`], so this is `NAME_MAX`.
+const MAX_SHM_NAME_LEN: usize = 255;
+
+/// What to read from a `t=s` shared-memory object.
+#[derive(Debug, Clone, Copy)]
+// Only Linux reads the object; elsewhere only `name` is used.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) struct ShmRequest<'a> {
+    /// The name exactly as the client sent it (`/name`).
+    pub(super) name: &'a [u8],
+    /// `O=`: byte offset to start reading at.
+    pub(super) offset: u64,
+    /// Bytes to read; `0` means "to the end of the object". An object
+    /// shorter than a non-zero `size` is read to its end, as for files.
+    pub(super) size: u64,
+    /// Hard cap on the bytes read, as for files.
+    pub(super) max: u64,
+}
+
+/// Check a POSIX shm name and return it without its leading `/`.
+///
+/// The spec: the name starts with `/` and has no other `/`. We also refuse
+/// an empty name, `.` and `..` (which would name `/dev/shm` itself or its
+/// parent), NUL bytes, and names over [`MAX_SHM_NAME_LEN`].
+fn shm_leaf(name: &[u8]) -> Result<&[u8], FileError> {
+    let Some(leaf) = name.strip_prefix(b"/") else {
+        return Err(FileError::new("shm name does not start with /"));
+    };
+    if leaf.is_empty() || leaf == b"." || leaf == b".." {
+        return Err(FileError::new("shm name is empty, . or .."));
+    }
+    if leaf.contains(&b'/') {
+        return Err(FileError::new("shm name has a / after the first byte"));
+    }
+    if leaf.contains(&0) {
+        return Err(FileError::new("shm name has a NUL byte"));
+    }
+    if leaf.len() > MAX_SHM_NAME_LEN {
+        return Err(FileError::new("shm name too long"));
+    }
+    Ok(leaf)
+}
+
+/// Read the bytes a `t=s` command asks for from a POSIX shared-memory
+/// object, then unlink the object, as the spec requires ("read the data
+/// from the memory object and then unlink and close it").
+///
+/// On Linux the object is a file in [`SHM_DIR`], read with the same rules
+/// as the file mediums: the leaf is opened relative to a directory fd with
+/// `O_NOFOLLOW | O_NONBLOCK | O_NOCTTY`, so a symlink is refused and a FIFO
+/// can't block us, and `fstat` on the opened fd must report a regular
+/// file. The read is plain bounded `read`s, never `mmap`, so a client that
+/// truncates the object while we read it gets a short read (an error), not
+/// a `SIGBUS` in the terminal.
+///
+/// The object is unlinked, relative to the same directory fd, whenever it
+/// opened as a regular file, even if the read (or a later decode) fails:
+/// like a `t=t` file it is the client's hand-off, and kitty consumes it
+/// either way. Anything else (a symlink, a directory, a FIFO) is left
+/// alone, as in kitty, whose `shm_open` refuses symlinks too.
+///
+/// Elsewhere, see [`read_shm_object_unsupported`].
+pub(super) fn read_shm_object(req: &ShmRequest<'_>) -> Result<Vec<u8>, FileError> {
+    #[cfg(target_os = "linux")]
+    {
+        read_shm_object_linux(req)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        read_shm_object_unsupported(req)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_shm_object_linux(req: &ShmRequest<'_>) -> Result<Vec<u8>, FileError> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+    use std::os::unix::ffi::OsStrExt;
+    let leaf = std::ffi::OsStr::from_bytes(shm_leaf(req.name)?);
+    let shown = Path::new(SHM_DIR).join(leaf);
+    // `/dev/shm` is a system mount point, trusted like `/` in
+    // `open_dir_chain`. `O_PATH`: we only look names up in it.
+    let dir = rustix::fs::open(
+        SHM_DIR,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| FileError(format!("{SHM_DIR}: open: {e}")))?;
+    let fd = rustix::fs::openat(
+        &dir,
+        leaf,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::NOCTTY,
+        Mode::empty(),
+    )
+    .map_err(|e| FileError(format!("{}: open: {e}", shown.display())))?;
+    let stat = rustix::fs::fstat(&fd)
+        .map_err(|e| FileError(format!("{}: fstat: {e}", shown.display())))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(FileError(format!(
+            "{}: not a regular file",
+            shown.display()
+        )));
+    }
+    let opened = OpenedFile {
+        file: std::fs::File::from(fd),
+        len: stat.st_size.max(0) as u64,
+        canonical: shown,
+    };
+    // The same bounded read as `t=f` (no temp-file deletion: the unlink
+    // below is t=s's own).
+    let range = FileRequest {
+        path: &opened.canonical,
+        offset: req.offset,
+        size: req.size,
+        max: req.max,
+        delete_temp: false,
+    };
+    let result = read_bounded(&opened, &range);
+    if let Err(e) = rustix::fs::unlinkat(&dir, leaf, AtFlags::empty()) {
+        tracing::debug!(path = %opened.canonical.display(), error = %e, "kitty: t=s unlink failed");
+    }
+    result
+}
+
+/// `t=s` where we can't read shared memory: macOS, the BSDs and other
+/// non-Linux targets.
+///
+/// A macOS shm object can only be read through `mmap`, which is `unsafe`,
+/// and this crate is `#![forbid(unsafe_code)]`. So the command fails with
+/// the usual uniform error. We still unlink a valid name
+/// (`rustix::shm::unlink` is safe), so a client that doesn't check the
+/// reply doesn't leak objects. Known limitation, recorded in
+/// `docs/decisions/kitty-file-medium.md`; whether to read it on macOS is
+/// pending a decision.
+#[cfg(not(target_os = "linux"))]
+fn read_shm_object_unsupported(req: &ShmRequest<'_>) -> Result<Vec<u8>, FileError> {
+    shm_leaf(req.name)?;
+    #[cfg(all(unix, not(target_os = "android")))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if let Err(e) = rustix::shm::unlink(std::ffi::OsStr::from_bytes(req.name)) {
+            tracing::debug!(error = %e, "kitty: t=s unlink failed");
+        }
+    }
+    Err(FileError::new(
+        "t=s: reading shared memory is only supported on Linux",
+    ))
 }
 
 /// Test-only hook, fired inside [`unlink_in_dir`] after the parent fd is
@@ -1054,5 +1213,239 @@ mod tests {
         for r in &roots {
             assert_eq!(&std::fs::canonicalize(r).unwrap(), r);
         }
+    }
+}
+
+/// `t=s` on Linux, against the real `/dev/shm`. Every test makes its own
+/// uniquely named entry and removes it, whatever it turned into, on drop.
+#[cfg(all(test, target_os = "linux"))]
+mod shm_tests {
+    use super::*;
+
+    /// A uniquely named entry in `/dev/shm`, removed on drop.
+    struct ShmEntry {
+        name: String,
+        path: PathBuf,
+    }
+
+    impl ShmEntry {
+        /// A name nothing uses yet; the entry isn't created.
+        fn reserve(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            Self::named(format!("toastty-shm-test-{tag}-{}-{n}", std::process::id()))
+        }
+
+        fn named(name: String) -> Self {
+            let path = Path::new(SHM_DIR).join(&name);
+            let entry = Self { name, path };
+            entry.remove();
+            entry
+        }
+
+        /// A regular object holding `bytes`, as `shm_open` + `write`
+        /// would make it.
+        fn object(tag: &str, bytes: &[u8]) -> Self {
+            let entry = Self::reserve(tag);
+            std::fs::write(&entry.path, bytes).unwrap();
+            entry
+        }
+
+        /// The name as a client sends it: `/name`.
+        fn wire(&self) -> Vec<u8> {
+            format!("/{}", self.name).into_bytes()
+        }
+
+        fn exists(&self) -> bool {
+            self.path.symlink_metadata().is_ok()
+        }
+
+        fn remove(&self) {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir(&self.path);
+        }
+    }
+
+    impl Drop for ShmEntry {
+        fn drop(&mut self) {
+            self.remove();
+        }
+    }
+
+    fn req(name: &[u8], offset: u64, size: u64) -> ShmRequest<'_> {
+        ShmRequest {
+            name,
+            offset,
+            size,
+            max: 1 << 20,
+        }
+    }
+
+    fn read(name: &[u8], offset: u64, size: u64) -> Result<Vec<u8>, FileError> {
+        read_shm_object(&req(name, offset, size))
+    }
+
+    #[test]
+    fn reads_the_whole_object_then_unlinks_it() {
+        let obj = ShmEntry::object("whole", &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(read(&obj.wire(), 0, 0).unwrap(), [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(!obj.exists(), "the object must be unlinked after the read");
+    }
+
+    #[test]
+    fn offset_and_size_select_a_range() {
+        let obj = ShmEntry::object("range", &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(read(&obj.wire(), 2, 4).unwrap(), [3, 4, 5, 6]);
+        assert!(!obj.exists());
+        let obj = ShmEntry::object("offset-only", &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(read(&obj.wire(), 6, 0).unwrap(), [7, 8]);
+        assert!(!obj.exists());
+    }
+
+    #[test]
+    fn missing_object_fails() {
+        let missing = ShmEntry::reserve("missing");
+        let err = read(&missing.wire(), 0, 0).unwrap_err();
+        assert!(err.0.contains("open"), "{err}");
+        assert!(!missing.exists());
+    }
+
+    /// Names the spec forbids fail before anything is opened, and leave
+    /// existing objects alone, even ones the bad name points at.
+    #[test]
+    fn invalid_names_fail_and_touch_nothing() {
+        let obj = ShmEntry::object("victim", &[1, 2, 3, 4]);
+        let bare = obj.name.clone().into_bytes();
+        let traversal = format!("/../shm/{}", obj.name).into_bytes();
+        let double = format!("//{}", obj.name).into_bytes();
+        let nul = format!("/{}\0x", obj.name).into_bytes();
+        let long = format!("/{}", "x".repeat(MAX_SHM_NAME_LEN + 1)).into_bytes();
+        let names: [&[u8]; 9] = [
+            b"", &bare, b"/", b"/.", b"/..", &traversal, &double, &nul, &long,
+        ];
+        for name in names {
+            assert!(
+                shm_leaf(name).is_err(),
+                "{:?} must be refused",
+                String::from_utf8_lossy(name)
+            );
+            assert!(read(name, 0, 0).is_err());
+        }
+        assert!(obj.exists(), "a refused name must not unlink anything");
+    }
+
+    #[test]
+    fn longest_valid_name_is_accepted() {
+        let base = ShmEntry::reserve("long").name.clone();
+        let mut name = format!("{base}-{}", "x".repeat(MAX_SHM_NAME_LEN));
+        name.truncate(MAX_SHM_NAME_LEN);
+        let long = ShmEntry::named(name);
+        std::fs::write(&long.path, [9, 9]).unwrap();
+        assert_eq!(long.wire().len(), MAX_SHM_NAME_LEN + 1);
+        assert_eq!(read(&long.wire(), 0, 0).unwrap(), [9, 9]);
+        assert!(!long.exists());
+    }
+
+    /// `O_NOFOLLOW`: a symlink in `/dev/shm` is refused, and neither the
+    /// link nor its target is removed (kitty's `shm_open` refuses it too).
+    #[test]
+    fn symlink_is_refused_and_kept() {
+        let target = ShmEntry::object("link-target", &[1, 2, 3, 4]);
+        let link = ShmEntry::reserve("link");
+        std::os::unix::fs::symlink(&target.path, &link.path).unwrap();
+        let err = read(&link.wire(), 0, 0).unwrap_err();
+        assert!(err.0.contains("open"), "{err}");
+        assert!(link.exists(), "a symlink must not be unlinked");
+        assert!(target.exists(), "a symlink's target must not be unlinked");
+    }
+
+    /// `O_NONBLOCK`: a FIFO can't park the terminal in `open()`, and isn't
+    /// unlinked.
+    #[test]
+    fn fifo_is_refused_without_blocking_and_kept() {
+        let fifo = ShmEntry::reserve("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo.path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let wire = fifo.wire();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read(&wire, 0, 0));
+        });
+        let err = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("t=s on a FIFO blocked")
+            .unwrap_err();
+        assert!(err.0.contains("not a regular file"), "{err}");
+        assert!(fifo.exists(), "a FIFO must not be unlinked");
+    }
+
+    #[test]
+    fn directory_is_refused_and_kept() {
+        let dir = ShmEntry::reserve("dir");
+        std::fs::create_dir(&dir.path).unwrap();
+        let err = read(&dir.wire(), 0, 0).unwrap_err();
+        assert!(err.0.contains("not a regular file"), "{err}");
+        assert!(dir.exists());
+    }
+
+    /// An object shorter than `S=` is read to its end, as files are (and
+    /// as kitty does); too little data is then the decoder's error.
+    #[test]
+    fn short_object_is_read_to_its_end() {
+        let short = ShmEntry::object("short", &[1, 2, 3, 4]);
+        assert_eq!(read(&short.wire(), 0, 5).unwrap(), [1, 2, 3, 4]);
+        assert!(!short.exists());
+        let tail = ShmEntry::object("tail", &[1, 2, 3, 4]);
+        assert_eq!(read(&tail.wire(), 2, 4).unwrap(), [3, 4]);
+        assert!(!tail.exists());
+    }
+
+    /// A regular object is the client's hand-off: it is unlinked even when
+    /// the read fails.
+    #[test]
+    fn failed_reads_still_unlink() {
+        // `O=` past the end.
+        let past = ShmEntry::object("past", &[1, 2, 3, 4]);
+        let err = read(&past.wire(), 99, 0).unwrap_err();
+        assert!(err.0.contains("nothing to read"), "{err}");
+        assert!(!past.exists());
+
+        // An empty object.
+        let empty = ShmEntry::object("empty", &[]);
+        assert!(read(&empty.wire(), 0, 0).is_err());
+        assert!(!empty.exists());
+    }
+
+    /// The image quota caps the read: an object (or `S=`) over it fails
+    /// before anything is allocated, and is still unlinked.
+    #[test]
+    fn read_over_the_quota_fails_and_unlinks() {
+        let big = ShmEntry::object("big", &[0; 64]);
+        let wire = big.wire();
+        let mut r = req(&wire, 0, 0);
+        r.max = 63;
+        let err = read_shm_object(&r).unwrap_err();
+        assert!(err.0.contains("exceeds"), "{err}");
+        assert!(!big.exists());
+
+        let sized = ShmEntry::object("big-s", &[0; 64]);
+        let wire = sized.wire();
+        let mut r = req(&wire, 0, 64);
+        r.max = 63;
+        assert!(read_shm_object(&r).unwrap_err().0.contains("exceeds"));
+        assert!(!sized.exists());
+
+        let exact = ShmEntry::object("exact", &[7; 64]);
+        let wire = exact.wire();
+        let mut r = req(&wire, 0, 0);
+        r.max = 64;
+        assert_eq!(read_shm_object(&r).unwrap().len(), 64);
+        assert!(!exact.exists());
     }
 }
