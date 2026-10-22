@@ -1,5 +1,9 @@
 # Toastty kitty graphics protocol — compliance audit
 
+> **Superseded.** This static audit is mostly fixed and was not exhaustive.
+> Open KGP work is tracked in [`kitty-graphics-checklist.md`](kitty-graphics-checklist.md),
+> a live stress test against reference kitty.
+
 Audit of the toastty implementation against the kitty terminal graphics protocol
 spec (<https://sw.kovidgoyal.net/kitty/graphics-protocol/>) and the reference
 kitty C implementation. Five parallel audits covered: wire format & transport,
