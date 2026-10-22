@@ -214,8 +214,13 @@ pub fn outcome(finished: bool, any_parsed: bool, stop: Option<Stop>, sync_paused
         _ if finished => Outcome::Closed,
         Some(Stop::Yield) => Outcome::Yield,
         Some(Stop::Defer) => Outcome::Defer,
-        None if !any_parsed => Outcome::Idle,
+        // Still inside a synchronized update: (re)arm the watchdog wake even
+        // when this pass parsed nothing. The pass before it may have taken
+        // the update's last bytes and stopped with a `Defer`, which arms no
+        // deadline; answering `Idle` here would then leave the frame stale
+        // until something unrelated redraws.
         None if sync_paused => Outcome::AwaitEsu,
+        None if !any_parsed => Outcome::Idle,
         None => Outcome::Redraw,
     }
 }
@@ -239,6 +244,14 @@ mod tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    #[test]
+    fn an_empty_pass_inside_a_synchronized_update_rearms_the_watchdog() {
+        // A `Defer` pass took the last bytes of an update; the resumed pass
+        // finds nothing but must still schedule the BSU watchdog.
+        assert_eq!(outcome(false, false, None, true), Outcome::AwaitEsu);
+        assert_eq!(outcome(false, false, None, false), Outcome::Idle);
     }
 
     #[test]

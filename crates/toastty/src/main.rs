@@ -1010,7 +1010,7 @@ impl Toastty {
             self.refresh_link_hover();
         }
         match outcome {
-            // Every byte read before the close is any_parsed by now.
+            // Every byte read before the close is parsed by now.
             ingest::Outcome::Closed => self.handle_pty_closed(),
             ingest::Outcome::Idle => ControlSignal::Continue,
             ingest::Outcome::Yield => {
