@@ -277,6 +277,14 @@ pub struct Cell {
     /// instances (otherwise we'd over-draw the second half of a CJK
     /// ideograph with a blank glyph).
     pub is_continuation: bool,
+    /// True iff this blank is the pad a width-2 cluster left behind when
+    /// it didn't fit in the last column and wrapped to the next row. It
+    /// displays as a blank, but it isn't text: reflow drops it when it
+    /// joins the soft-wrapped row back up, and copy skips it. A real
+    /// space at the wrap point is a plain [`Cell::BLANK`] and is kept.
+    /// Anything written over the cell (print, erase) replaces the whole
+    /// cell, so the marker never outlives the pad.
+    pub wrap_pad: bool,
     /// Intern-table id of the OSC 8 hyperlink this cell belongs to, if
     /// any. `None` when not part of a hyperlink. Resolves to a URL via
     /// `Term::hyperlink_url`. Stored as `NonZeroU16` so
@@ -298,8 +306,16 @@ impl Cell {
         ch: ' ',
         style: Style::RESET,
         is_continuation: false,
+        wrap_pad: false,
         hyperlink_id: None,
         extra: None,
+    };
+
+    /// The blank a wide char leaves in the last column when it wraps; see
+    /// [`Cell::wrap_pad`].
+    pub const WRAP_PAD: Self = Self {
+        wrap_pad: true,
+        ..Self::BLANK
     };
 }
 
@@ -466,8 +482,9 @@ mod tests {
     #[test]
     fn cell_size_documented() {
         // ch (4) + style (10: fg 4 + bg 4 + flags 2) + hyperlink_id (2)
-        // + extra (2) + is_continuation (1), padded to 4-byte alignment
-        // = 20. Before the SGR-attrs work `StyleFlags` was four bools
+        // + extra (2) + is_continuation (1) + wrap_pad (1) = 20, already
+        // a multiple of the 4-byte alignment (the wrap_pad byte used to be
+        // padding). Before the SGR-attrs work `StyleFlags` was four bools
         // (style = 12) and the cell was 24; packing the renditions into
         // a bit byte + an underline-style byte made room for dim,
         // blink, hidden, strike, overline and underline styles while
