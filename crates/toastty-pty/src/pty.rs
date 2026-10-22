@@ -152,6 +152,19 @@ impl Pty {
             None => false,
         }
     }
+
+    /// Short name of the foreground program (e.g. `"vim"`) when
+    /// [`Self::has_running_program`] is true, for the close-confirmation
+    /// prompt. `None` when only the shell is running or the name can't
+    /// be read.
+    #[must_use]
+    pub fn running_program_name(&self) -> Option<String> {
+        let fg = crate::foreground_cwd::foreground_pid(self.master.as_fd())?;
+        if fg == self.child.id() {
+            return None;
+        }
+        crate::foreground_cwd::process_name(fg)
+    }
 }
 
 impl Drop for Pty {
