@@ -208,12 +208,18 @@ pub struct Term {
     report_focus: bool,
     /// Current mouse reporting mode (DECSET 1000 / 1002 / 1003 / 1006).
     mouse_mode: MouseMode,
-    /// Kitty keyboard progressive-enhancement flag stack.
+    /// Kitty keyboard progressive-enhancement flag stacks, one per
+    /// screen: `[main, alt]`, indexed by `alt_active` (see
+    /// [`Term::kitty_stack`]). The spec requires independent stacks so
+    /// an alt-screen app's flags never leak to the shell, even if it dies
+    /// without popping them. Like kitty 0.49.2, a screen switch only
+    /// selects the other stack: the alt stack survives between visits
+    /// (all of 47 / 1047 / 1049), and only RIS clears both.
     ///
     /// The active flags are the top of the stack; empty stack == legacy
-    /// behaviour. Capped at 8 entries (more than enough — kitty docs say
-    /// "small stack").
-    kitty_keyboard_stack: Vec<u8>,
+    /// behaviour. Capped at 8 entries (kitty's limit too), evicting the
+    /// oldest.
+    kitty_keyboard_stacks: [Vec<u8>; 2],
     /// DECSET 2026 — synchronized output (BSU/ESU) state.
     sync_output: SyncOutput,
     /// DECSET 2027 — grapheme cluster processing opt-in.
@@ -583,7 +589,7 @@ impl Term {
             bracketed_paste: false,
             report_focus: false,
             mouse_mode: MouseMode::default(),
-            kitty_keyboard_stack: Vec::new(),
+            kitty_keyboard_stacks: [Vec::new(), Vec::new()],
             sync_output: SyncOutput::default(),
             grapheme_cluster_mode: false,
             inband_resize_mode: false,
@@ -1086,29 +1092,39 @@ impl Term {
     /// Zero == legacy behaviour.
     #[must_use]
     pub fn kitty_flags(&self) -> u8 {
-        self.kitty_keyboard_stack.last().copied().unwrap_or(0)
+        self.kitty_stack().last().copied().unwrap_or(0)
     }
 
-    /// Read-only view of the kitty flag stack; useful for tests.
+    /// Read-only view of the active screen's kitty flag stack; useful
+    /// for tests.
     #[must_use]
     pub fn kitty_stack(&self) -> &[u8] {
-        &self.kitty_keyboard_stack
+        &self.kitty_keyboard_stacks[usize::from(self.alt_active)]
     }
 
-    /// Push `flags` onto the kitty progressive-enhancement stack.
+    /// The active screen's kitty flag stack.
+    fn kitty_stack_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.kitty_keyboard_stacks[usize::from(self.alt_active)]
+    }
+
+    /// Push `flags` onto the active screen's kitty progressive-
+    /// enhancement stack.
     ///
     /// Caps the stack at 8 entries (rotates oldest out when full).
     pub fn kitty_push(&mut self, flags: u8) {
-        if self.kitty_keyboard_stack.len() >= 8 {
-            self.kitty_keyboard_stack.remove(0);
+        let stack = self.kitty_stack_mut();
+        if stack.len() >= 8 {
+            stack.remove(0);
         }
-        self.kitty_keyboard_stack.push(flags);
+        stack.push(flags);
     }
 
-    /// Pop `n` entries from the kitty flag stack. Saturates at zero.
+    /// Pop `n` entries from the active screen's kitty flag stack.
+    /// Saturates at zero.
     pub fn kitty_pop(&mut self, n: usize) {
-        let new_len = self.kitty_keyboard_stack.len().saturating_sub(n);
-        self.kitty_keyboard_stack.truncate(new_len);
+        let stack = self.kitty_stack_mut();
+        let new_len = stack.len().saturating_sub(n);
+        stack.truncate(new_len);
     }
 
     /// Mutate active kitty flags without push/pop. `mode` selects the
@@ -1120,15 +1136,13 @@ impl Term {
     /// If the stack is empty, this implicitly pushes `flags` (for mode 1
     /// or 2) or is a no-op (mode 3).
     pub fn kitty_set(&mut self, flags: u8, mode: u8) {
-        if self.kitty_keyboard_stack.is_empty() {
-            match mode {
-                1 | 2 => self.kitty_keyboard_stack.push(flags),
-                _ => {}
+        let stack = self.kitty_stack_mut();
+        let Some(top) = stack.last_mut() else {
+            if matches!(mode, 1 | 2) {
+                stack.push(flags);
             }
             return;
-        }
-        // Safe: just checked non-empty.
-        let top = self.kitty_keyboard_stack.last_mut().unwrap();
+        };
         match mode {
             1 => *top = flags,
             2 => *top |= flags,
@@ -3934,7 +3948,8 @@ impl Term {
         self.mouse_mode = MouseMode::default();
         self.grapheme_cluster_mode = false;
         self.inband_resize_mode = false;
-        self.kitty_keyboard_stack.clear();
+        // Both screens' stacks (kitty does the same).
+        self.kitty_keyboard_stacks = [Vec::new(), Vec::new()];
         self.modify_other_keys = 0;
         // REP char, tab stops, IRM / DECCKM / DECKPAM / DECOM / DECAWM /
         // DECSCNM / DECLRMM + margins, ...
@@ -6459,6 +6474,69 @@ mod tests {
         assert_eq!(t.kitty_stack().len(), 8);
         // Oldest values rotated out — top is the last value pushed.
         assert_eq!(t.kitty_flags(), 9);
+    }
+
+    /// Push, pop and set on one screen never touch the other screen's
+    /// stack (kitty keyboard spec; checked against kitty 0.49.2).
+    #[test]
+    fn kitty_flags_are_per_screen() {
+        for mode in ["1049", "47", "1047"] {
+            let mut t = Term::new(2, 4, 0);
+            feed(&mut t, b"\x1b[>1u");
+            feed(&mut t, format!("\x1b[?{mode}h").as_bytes());
+            assert_eq!(t.kitty_flags(), 0, "{mode}: alt starts empty");
+            feed(&mut t, b"\x1b[>3u\x1b[>5u");
+            assert_eq!(t.kitty_flags(), 5, "{mode}");
+            feed(&mut t, format!("\x1b[?{mode}l").as_bytes());
+            assert_eq!(t.kitty_flags(), 1, "{mode}: main restored");
+            assert_eq!(t.kitty_stack(), &[1], "{mode}");
+            // The alt stack survives between visits, as in kitty.
+            feed(&mut t, format!("\x1b[?{mode}h").as_bytes());
+            assert_eq!(t.kitty_stack(), &[3, 5], "{mode}: alt kept");
+            feed(&mut t, b"\x1b[<u\x1b[=9;1u");
+            assert_eq!(t.kitty_flags(), 9, "{mode}");
+            feed(&mut t, format!("\x1b[?{mode}l").as_bytes());
+            assert_eq!(t.kitty_stack(), &[1], "{mode}: set on alt left main alone");
+            feed(&mut t, b"\x1b[<u");
+            assert_eq!(t.kitty_flags(), 0, "{mode}");
+        }
+    }
+
+    #[test]
+    fn kitty_flags_of_a_killed_alt_app_do_not_leak() {
+        // The checklist repro: an alt-screen app pushes flags and dies;
+        // the shell then leaves the alt screen and must get legacy keys.
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[?1049h\x1b[>31u");
+        assert_eq!(t.kitty_flags(), 31);
+        feed(&mut t, b"\x1b[?1049l");
+        assert_eq!(t.kitty_flags(), 0);
+        feed(&mut t, b"\x1b[?u");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[?0u");
+    }
+
+    #[test]
+    fn kitty_stacks_cap_at_eight_each() {
+        let mut t = Term::new(2, 4, 0);
+        for n in 1..=10u8 {
+            t.kitty_push(n);
+        }
+        feed(&mut t, b"\x1b[?1049h");
+        t.kitty_push(42);
+        assert_eq!(t.kitty_stack(), &[42]);
+        feed(&mut t, b"\x1b[?1049l");
+        // Same eviction as kitty: pops go 9, 8, ..., 3, then 0.
+        assert_eq!(t.kitty_stack(), &[3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn ris_clears_both_kitty_stacks() {
+        let mut t = Term::new(2, 4, 0);
+        feed(&mut t, b"\x1b[>1u\x1b[?1049h\x1b[>2u\x1bc");
+        assert!(!t.is_alt_active());
+        assert!(t.kitty_stack().is_empty());
+        feed(&mut t, b"\x1b[?1049h");
+        assert!(t.kitty_stack().is_empty());
     }
 
     #[test]
