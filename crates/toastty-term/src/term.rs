@@ -8762,7 +8762,11 @@ mod tests {
         let mut t = Term::new(8, 20, 0);
         let px = String::from_utf8(b64_red_1x1()).unwrap();
         let mut payload = Vec::new();
-        for header in ["a=t,f=32,s=1,v=1,I=300,q=2", "a=t,f=32,s=1,v=1,I=300,q=2", "a=t,f=32,s=1,v=1,i=1,q=2"] {
+        for header in [
+            "a=t,f=32,s=1,v=1,I=300,q=2",
+            "a=t,f=32,s=1,v=1,I=300,q=2",
+            "a=t,f=32,s=1,v=1,i=1,q=2",
+        ] {
             payload.extend_from_slice(format!("\x1b_G{header};{px}\x1b\\").as_bytes());
         }
         payload.extend_from_slice(b"\x1b_Ga=d,d=N,I=300\x1b\\\x1b_Ga=p,I=300,C=1\x1b\\");
