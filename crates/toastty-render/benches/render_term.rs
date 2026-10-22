@@ -547,7 +547,11 @@ fn unicode_line(i: usize, cols: u16) -> String {
     // count as two columns.
     let mut w = line.len();
     for ch in base.chars().cycle() {
-        let cw = if ch.is_ascii() || ('\u{2190}'..='\u{2bff}').contains(&ch) { 1 } else { 2 };
+        let cw = if ch.is_ascii() || ('\u{2190}'..='\u{2bff}').contains(&ch) {
+            1
+        } else {
+            2
+        };
         if w + cw > usize::from(cols) {
             break;
         }
@@ -626,6 +630,107 @@ fn bench_scroll_unicode(c: &mut Criterion) {
     bench_scroll(c, "scroll_unicode_200x60", true);
 }
 
+/// Low-noise CPU numbers — runs when `TOASTTY_BENCH_MIN=1` is set,
+/// otherwise a no-op. Each scenario renders 400 frames CPU-only
+/// (shaping + instance building, no GPU) and prints the minimum and
+/// median frame time: the minimum is what the code costs, the median
+/// what it costs on a busy machine.
+fn bench_min_times(c: &mut Criterion) {
+    if std::env::var_os("TOASTTY_BENCH_MIN").is_none() {
+        return;
+    }
+    const FRAMES: usize = 400;
+    let report = |name: &str, mut t: Vec<f64>| {
+        t.sort_by(f64::total_cmp);
+        println!(
+            "min-time {name:<26} min {:>8.1} us  p50 {:>8.1} us",
+            t[0],
+            t[t.len() / 2]
+        );
+    };
+    let lorem: Vec<&str> = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do \
+                            eiusmod tempor incididunt ut labore et dolore magna aliqua"
+        .split(' ')
+        .collect();
+    for (rows, cols) in [(ROWS, COLS), (BIG_ROWS, BIG_COLS)] {
+        let (width, height) = viewport_pixels(rows, cols);
+        let mut h = Harness::new(width, height);
+        h.cpu_only = true;
+        // Full repaint of unchanged text.
+        let mut term = make_term_filled(rows, cols);
+        h.render_term(&term);
+        let mut t = Vec::with_capacity(FRAMES);
+        for _ in 0..FRAMES {
+            term.mark_all_dirty();
+            let t0 = Instant::now();
+            h.render_term(&term);
+            t.push(t0.elapsed().as_secs_f64() * 1e6);
+            term.clear_damage();
+        }
+        report(&format!("repaint_{cols}x{rows}"), t);
+        // Every row new text every frame (no memo hits), coloured words
+        // (256-colour, then truecolor).
+        for truecolor in [false, true] {
+            let mut parser = Parser::new();
+            let mut seed = 1u32;
+            let mut t = Vec::with_capacity(FRAMES);
+            for f in 0..FRAMES {
+                let mut screen = String::from("\x1b[H");
+                for r in 0..rows {
+                    screen.push_str(&format!("\x1b[{};1H", r + 1));
+                    let mut w = 0usize;
+                    while w + 12 < usize::from(cols) {
+                        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                        let word = lorem[(seed >> 16) as usize % lorem.len()];
+                        if truecolor {
+                            let (r, g, b) = (seed >> 8 & 255, seed >> 12 & 255, seed >> 4 & 255);
+                            screen.push_str(&format!("\x1b[38;2;{r};{g};{b}m{word} "));
+                        } else {
+                            screen.push_str(&format!("\x1b[38;5;{}m{word} ", (seed >> 8) % 256));
+                        }
+                        w += word.len() + 1;
+                    }
+                    screen.push_str(&format!("{f}\x1b[K"));
+                }
+                parser.advance(&mut term, screen.as_bytes());
+                let t0 = Instant::now();
+                h.render_term(&term);
+                t.push(t0.elapsed().as_secs_f64() * 1e6);
+                term.clear_damage();
+            }
+            let kind = if truecolor { "rgb" } else { "256" };
+            report(&format!("newtext_{kind}_{cols}x{rows}"), t);
+        }
+    }
+    let (width, height) = viewport_pixels(ROWS, COLS);
+    let mut h = Harness::new(width, height);
+    h.cpu_only = true;
+    let mut term = make_term_unicode(ROWS, COLS);
+    h.render_term(&term);
+    let mut t = Vec::with_capacity(FRAMES);
+    for _ in 0..FRAMES {
+        term.mark_all_dirty();
+        let t0 = Instant::now();
+        h.render_term(&term);
+        t.push(t0.elapsed().as_secs_f64() * 1e6);
+        term.clear_damage();
+    }
+    report("repaint_unicode_200x60", t);
+    let mut parser = Parser::new();
+    parser.advance(&mut term, b"\x1b[60;1H");
+    let mut t = Vec::with_capacity(FRAMES);
+    for i in 0..FRAMES {
+        parser.advance(&mut term, b"\r\n");
+        parser.advance(&mut term, unicode_line(i + 1000, COLS).as_bytes());
+        let t0 = Instant::now();
+        h.render_term(&term);
+        t.push(t0.elapsed().as_secs_f64() * 1e6);
+        term.clear_damage();
+    }
+    report("scroll_unicode_200x60", t);
+    c.bench_function("min_times_dummy", |b| b.iter(|| {}));
+}
+
 /// Phase breakdown — runs once when `TOASTTY_BENCH_BREAKDOWN=1` is set,
 /// otherwise registered as a no-op criterion bench. Prints per-section
 /// wall time for both the cached single-cell case and the worst-case
@@ -678,5 +783,6 @@ criterion_group!(
     bench_scroll_ascii,
     bench_scroll_unicode,
     bench_phase_breakdown,
+    bench_min_times,
 );
 criterion_main!(benches);
