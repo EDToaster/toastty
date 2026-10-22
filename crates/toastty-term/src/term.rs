@@ -5211,7 +5211,9 @@ impl KittySink for Term {
         // `cols` from `start_col` (the placement's starting column).
         //
         // When that row is past the bottom margin, kitty scrolls the
-        // region up by the overshoot and leaves the cursor on the margin.
+        // region up by the overshoot, then clamps the cursor to the
+        // *screen*, not the margin (kitty-ref: `ESC[3;8r ESC[7;20H`, a
+        // 3-row image, leaves the cursor on row 9).
         // This is the only place an image scrolls the screen, so `C=1`
         // (which skips this call) never scrolls (SCR-10). The image is
         // anchored to its line, so it rides up with the text instead of
@@ -5229,10 +5231,8 @@ impl KittySink for Term {
             for _ in 0..usize::from(target_row - bot).min(limit) {
                 self.region_scroll_up();
             }
-            self.cursor.row = bot;
-        } else {
-            self.cursor.row = target_row.min(self.rows.saturating_sub(1));
         }
+        self.cursor.row = target_row.min(self.rows.saturating_sub(1));
         self.cursor.col = start_col
             .saturating_add(cols)
             .min(self.cols.saturating_sub(1));
@@ -11374,7 +11374,8 @@ mod placement_model_tests {
         let mut t = Term::new(10, 20, 100);
         feed(&mut t, b"top\x1b[2;6r\x1b[5;1H"); // region rows 1..=5, cursor row 4
         place(&mut t, 1, 4, 3, "");
-        assert_eq!(t.cursor().row, 5);
+        // kitty clamps the cursor to the screen, not the margin.
+        assert_eq!(t.cursor().row, 6);
         assert_eq!(row_text(&t, 0), "top", "row above the region untouched");
         assert_eq!(t.history_lines(), 0);
         // Rows 4..7 straddle the bottom margin (5), so the image stays
@@ -11424,13 +11425,26 @@ mod placement_model_tests {
     }
 
     #[test]
+    fn overflowing_the_bottom_margin_clamps_the_cursor_to_the_screen() {
+        // #29 re-review, kitty-ref: ESC[3;8r ESC[7;20H, a=T c=4 r=3,
+        // then DSR answers row 9: the region scrolled by the overshoot
+        // (1) and the cursor sits on the image's last row, below the
+        // margin.
+        let mut t = Term::new(30, 80, 100);
+        feed(&mut t, b"\x1b[3;8r\x1b[7;20H");
+        place(&mut t, 1, 4, 3, "");
+        assert_eq!(t.cursor().row, 8);
+        assert_eq!(t.region_scrolls, 1);
+    }
+
+    #[test]
     fn huge_rows_in_a_region_scroll_at_most_the_region() {
         let mut t = Term::new(10, 20, 100);
         feed(&mut t, b"\x1b[3;8r\x1b[5;1H");
         t.region_scrolls = 0;
         place(&mut t, 1, 4, 65535, "");
         assert_eq!(t.region_scrolls, 6, "the region is 6 rows tall");
-        assert_eq!(t.cursor().row, 7, "cursor on the bottom margin");
+        assert_eq!(t.cursor().row, 9, "cursor clamped to the screen");
         // Full-screen margins: at most the screen height (SCR-14).
         let mut t = Term::new(10, 20, 100);
         t.region_scrolls = 0;
