@@ -46,20 +46,31 @@ demonstrated for the delete path). The open is now race-free:
 2. Cheap pre-check: refuse `/proc`, `/sys`, `/dev` (except
    `/dev/shm/<name>`) by path. The `fstatfs` below is the race-free guard.
 3. Descend the canonical path from `/` one component at a time with
-   `openat(O_DIRECTORY | O_NOFOLLOW)` (`open_dir_chain`). Since the
-   canonical path has no symlinks, a symlink or non-directory in any
-   component means it was swapped after the resolve, and we abort. The
-   final directory fd pins that inode, so later renames can't move the
-   leaf `openat`/`unlinkat` elsewhere.
+   `openat(O_DIRECTORY | O_NOFOLLOW)` (`open_dir_chain`), plus an `fstat`
+   that each step is a directory. Since the canonical path has no
+   symlinks, a symlink or non-directory in any component means it was
+   swapped after the resolve, and we abort. The final directory fd pins
+   that inode, so later renames can't move the leaf `openat`/`unlinkat`
+   elsewhere.
+   - On Linux and FreeBSD the directories are opened with `O_PATH`, which
+     needs only search (`x`) permission, so a search-only (`--x`)
+     directory on the path works as it does for a plain `open()`.
+   - **Limitation:** rustix has no `O_SEARCH` for macOS, so there the
+     walk opens directories `O_RDONLY` and a search-only directory on the
+     path fails the read (uniform EBADF). Reading through such a
+     directory is rare; the alternative would reintroduce the race.
 4. Open the leaf relative to that fd with
    `O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_NOCTTY | O_CLOEXEC`. `NONBLOCK`
    keeps a FIFO from parking the thread, `NOCTTY` keeps a tty from
    becoming our controlling terminal. `rustix` is now a unix-only
    dependency of `toastty-graphics` (workspace feature `fs`).
 5. Check the *opened fd*, not the path, so these are race-free: `fstat`
-   must report a regular file, and `fstatfs` must not report a
+   must report a regular file, and on Linux `fstatfs` must not report a
    pseudo-filesystem (proc, sysfs, debugfs, tracefs, securityfs, cgroup,
-   bpf). `/dev` isn't caught by `fstatfs` — devtmpfs shares its magic with
+   cgroup2, bpf, configfs, efivarfs, pstore, selinuxfs, smackfs,
+   binfmt_misc, fusectl, nsfs). The magic is compared on its low 32 bits,
+   because `f_type` is a signed word and magics with the top bit set
+   arrive sign-extended. `/dev` isn't caught by `fstatfs` — devtmpfs shares its magic with
    `/tmp` and `/dev/shm` — but a device there is already rejected as "not
    a regular file", and the path pre-check refuses a regular file directly
    under `/dev`.
