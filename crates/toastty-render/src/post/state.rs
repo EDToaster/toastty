@@ -5,13 +5,36 @@
 //! from those), so the timing rules are unit tested with synthetic
 //! instants.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use super::compile::ShaderInputs;
-use super::uniforms::{EMPTY_BELL, NEVER, PostUniforms, focus_mask, mouse_mask, time_mask};
+use super::uniforms::{
+    EMPTY_BELL, NEVER, PostUniforms, bell_mask, cursor_mask, focus_mask, mouse_mask, time_mask,
+};
 
 /// Interval between time-driven frames (~60 Hz).
 pub(crate) const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Interval between time-driven frames while the window is occluded: slow
+/// polling, so animation resumes on its own once it's visible again.
+pub(crate) const OCCLUDED_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Which events open a `TOASTTY_EVENT_DURATION` window for these inputs:
+/// `(bell, cursor change, focus gain)`. Each event counts only if the
+/// chain reads its uniforms; a chain that reads none of the three groups
+/// (a generic "animate after anything" shader) gets all three.
+pub(crate) fn window_events(inputs: &ShaderInputs) -> (bool, bool, bool) {
+    let bell = inputs.reads(bell_mask());
+    let cursor = inputs.reads(cursor_mask());
+    let focus = inputs.reads(focus_mask());
+    if bell || cursor || focus {
+        (bell, cursor, focus)
+    } else {
+        (true, true, true)
+    }
+}
 
 /// When post shaders get time-driven frames (`[shader] animation`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -97,11 +120,74 @@ impl Mouse {
     }
 }
 
-/// Seconds east of UTC for `iDate`, refreshed hourly.
-#[derive(Debug, Clone, Copy)]
-struct UtcOffset {
-    seconds: i64,
-    checked_at: Instant,
+/// The local zone's offset from UTC for `iDate`, looked up off the
+/// render thread: `date +%z` runs on a helper thread and publishes the
+/// result through atomics, refreshed at the next local hour boundary (DST
+/// changes happen on the hour). Until the first lookup lands, and when
+/// `date` is missing, the offset is 0 (UTC).
+///
+/// `date` rather than `localtime_r` because the crate forbids `unsafe`,
+/// and the `time` crate refuses to read the offset in a multi-threaded
+/// process.
+#[derive(Debug, Default, Clone)]
+struct LocalOffset(Arc<OffsetCell>);
+
+#[derive(Debug, Default)]
+struct OffsetCell {
+    seconds: AtomicI64,
+    /// Unix time of the next lookup (0: now).
+    refresh_at: AtomicU64,
+    in_flight: AtomicBool,
+}
+
+impl LocalOffset {
+    /// The offset in seconds east of UTC, starting a lookup when one is
+    /// due. Never blocks.
+    fn get(&self, unix_secs: u64) -> i64 {
+        let cell = &self.0;
+        if unix_secs >= cell.refresh_at.load(Ordering::Relaxed)
+            && !cell.in_flight.swap(true, Ordering::AcqRel)
+        {
+            let shared = Arc::clone(cell);
+            let spawned = std::thread::Builder::new()
+                .name("toastty-utc-offset".into())
+                .spawn(move || {
+                    let seconds = local_utc_offset().unwrap_or_else(|| {
+                        static LOGGED: AtomicBool = AtomicBool::new(false);
+                        if !LOGGED.swap(true, Ordering::Relaxed) {
+                            tracing::debug!("iDate: `date +%z` failed; using UTC");
+                        }
+                        0
+                    });
+                    shared.seconds.store(seconds, Ordering::Relaxed);
+                    let now = unix_now().as_secs();
+                    shared
+                        .refresh_at
+                        .store(next_local_hour(now, seconds), Ordering::Relaxed);
+                    shared.in_flight.store(false, Ordering::Release);
+                });
+            if spawned.is_err() {
+                cell.refresh_at
+                    .store(next_local_hour(unix_secs, 0), Ordering::Relaxed);
+                cell.in_flight.store(false, Ordering::Release);
+            }
+        }
+        cell.seconds.load(Ordering::Relaxed)
+    }
+}
+
+/// Unix time of the first local hour boundary after `unix_secs` in a zone
+/// `offset` seconds east of UTC.
+fn next_local_hour(unix_secs: u64, offset: i64) -> u64 {
+    let local = i64::try_from(unix_secs).unwrap_or(i64::MAX - 7200) + offset;
+    let next = (local.div_euclid(3600) + 1) * 3600 - offset;
+    u64::try_from(next).unwrap_or(0)
+}
+
+fn unix_now() -> Duration {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
 }
 
 /// The post-process state that outlives a chain (the clock keeps running
@@ -127,7 +213,10 @@ pub(crate) struct PostState {
     cursor: Option<CursorSnap>,
     previous_cursor: Option<CursorSnap>,
     cursor_changed_at: Option<Instant>,
-    utc_offset: Option<UtcOffset>,
+    local_offset: LocalOffset,
+    /// The last frame couldn't get a swapchain image because the window
+    /// is occluded: time-driven frames slow to [`OCCLUDED_INTERVAL`].
+    occluded: bool,
     uniforms: PostUniforms,
 }
 
@@ -149,7 +238,8 @@ impl Default for PostState {
             cursor: None,
             previous_cursor: None,
             cursor_changed_at: None,
-            utc_offset: None,
+            local_offset: LocalOffset::default(),
+            occluded: false,
             uniforms: PostUniforms::default(),
         }
     }
@@ -177,9 +267,12 @@ impl PostState {
         if focused {
             self.focus_gained_at = Some(now);
         }
-        // Focus also switches time-driven frames on and off under `auto`.
-        if inputs.reads(focus_mask()) || (mode == PostAnimation::Auto && inputs.reads(time_mask()))
-        {
+        // Under `auto`, focus also switches time-driven frames on and off
+        // (no duration), or opens a duration window (if focus counts).
+        let schedule = mode == PostAnimation::Auto
+            && inputs.reads(time_mask())
+            && (inputs.event_duration.is_none() || (focused && window_events(inputs).2));
+        if inputs.reads(focus_mask()) || schedule {
             self.event_pending = true;
         }
     }
@@ -245,12 +338,14 @@ impl PostState {
         self.event_pending = true;
     }
 
-    /// Latest event that starts an event-duration animation.
-    fn last_event(&self) -> Option<Instant> {
+    /// Latest event that starts an event-duration animation for a chain
+    /// with these inputs (see [`window_events`]).
+    fn last_event(&self, inputs: &ShaderInputs) -> Option<Instant> {
+        let (bell, cursor, focus) = window_events(inputs);
         [
-            self.bells[0].map(|b| b.at),
-            self.cursor_changed_at,
-            self.focus_gained_at,
+            self.bells[0].map(|b| b.at).filter(|_| bell),
+            self.cursor_changed_at.filter(|_| cursor),
+            self.focus_gained_at.filter(|_| focus),
         ]
         .into_iter()
         .flatten()
@@ -268,9 +363,14 @@ impl PostState {
         if self.event_pending {
             return Some(Duration::ZERO);
         }
+        let interval = if self.occluded {
+            OCCLUDED_INTERVAL
+        } else {
+            FRAME_INTERVAL
+        };
         let tick = || {
             self.last_frame.map_or(Duration::ZERO, |l| {
-                FRAME_INTERVAL.saturating_sub(now.saturating_duration_since(l))
+                interval.saturating_sub(now.saturating_duration_since(l))
             })
         };
         match mode {
@@ -280,7 +380,14 @@ impl PostState {
             PostAnimation::Auto => match inputs.event_duration {
                 None => self.focused.then(tick),
                 Some(d) => {
-                    let end = self.last_event()? + Duration::from_secs_f32(d);
+                    let start = self.last_event(inputs)?;
+                    let Some(end) = Duration::try_from_secs_f32(d)
+                        .ok()
+                        .and_then(|d| start.checked_add(d))
+                    else {
+                        // Past what `Instant` can hold: never ends.
+                        return Some(tick());
+                    };
                     if now < end {
                         Some(tick().min(end - now))
                     } else if self.last_frame.is_none_or(|l| l < end) {
@@ -341,7 +448,7 @@ impl PostState {
         let previous = self.previous_cursor.unwrap_or(f.cursor);
 
         let time = now.saturating_duration_since(start).as_secs_f32();
-        let date = if needs_date { self.date(now) } else { [0.0; 4] };
+        let date = if needs_date { self.date() } else { [0.0; 4] };
         let mut bells = [EMPTY_BELL; 4];
         for (slot, bell) in bells.iter_mut().zip(&self.bells) {
             if let Some(b) = bell {
@@ -406,33 +513,24 @@ impl PostState {
         self.frame = self.frame.wrapping_add(1);
         self.event_pending = false;
         self.mouse.pressed = false;
+        self.occluded = false;
     }
 
     /// A post frame at `now` was wanted but couldn't be drawn (no
-    /// swapchain image: occluded, outdated). Counts as shown for the
-    /// schedule, so an animating chain doesn't spin on a hidden window;
-    /// the next frame that draws shows the current state anyway.
-    pub(crate) fn frame_dropped(&mut self, now: Instant) {
+    /// swapchain image: occluded, outdated, timed out). Counts as shown for
+    /// the schedule, so an animating chain doesn't spin on a hidden window;
+    /// the next frame that draws shows the current state anyway. While
+    /// `occluded`, time-driven frames slow to [`OCCLUDED_INTERVAL`].
+    pub(crate) fn frame_dropped(&mut self, now: Instant, occluded: bool) {
         self.last_frame = Some(now);
         self.event_pending = false;
+        self.occluded = occluded;
     }
 
     /// `iDate`: `(year, month - 1, day, seconds since local midnight)`.
-    fn date(&mut self, now: Instant) -> [f32; 4] {
-        let stale = self
-            .utc_offset
-            .is_none_or(|o| now.saturating_duration_since(o.checked_at) > Duration::from_hours(1));
-        if stale {
-            self.utc_offset = Some(UtcOffset {
-                seconds: local_utc_offset().unwrap_or(0),
-                checked_at: now,
-            });
-        }
-        let offset = self.utc_offset.map_or(0, |o| o.seconds);
-        let since_epoch = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default();
-        date_uniform(since_epoch, offset)
+    fn date(&self) -> [f32; 4] {
+        let since_epoch = unix_now();
+        date_uniform(since_epoch, self.local_offset.get(since_epoch.as_secs()))
     }
 }
 
@@ -464,11 +562,8 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// The local zone's current offset from UTC in seconds, from `date +%z`.
-///
-/// The crate forbids `unsafe`, so `localtime_r` is out, and the `time`
-/// crate refuses to read the offset in a multi-threaded process. Only
-/// runs for shaders that read `iDate`, at most hourly.
+/// The local zone's current offset from UTC in seconds, from `date +%z`
+/// (blocks; runs on [`LocalOffset`]'s helper thread).
 fn local_utc_offset() -> Option<i64> {
     let out = std::process::Command::new("date")
         .arg("+%z")
@@ -748,6 +843,108 @@ mod tests {
             [2024.0, 1.0, 28.0, 48_615.0 - 14.0 * 3600.0 + 86_400.0]
         );
         assert_eq!(civil_from_days(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn huge_duration_does_not_overflow() {
+        let mut s = PostState::default();
+        let t0 = Instant::now();
+        let inputs = reads(&["iTime", "iBells"], Some(f32::MAX));
+        s.observe_bell(0, || [0.0; 4], t0, &inputs);
+        s.observe_bell(1, || [0.0; 4], t0, &inputs);
+        s.end_frame(t0);
+        assert!(
+            s.next_frame_in(t0 + ms(1), PostAnimation::Auto, &inputs)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn events_open_windows_only_for_what_the_chain_reads() {
+        let t0 = Instant::now();
+        // Reads the bells only: a cursor move or focus gain doesn't
+        // animate.
+        let bells = reads(&["iTime", "iBells"], Some(1.0));
+        let mut s = PostState::default();
+        s.begin_frame(t0, &frame_inputs(0.0), false);
+        s.end_frame(t0);
+        s.begin_frame(t0 + ms(10), &frame_inputs(10.0), false); // cursor moved
+        s.end_frame(t0 + ms(10));
+        s.set_focused(false, t0 + ms(20), &bells, PostAnimation::Auto);
+        s.set_focused(true, t0 + ms(30), &bells, PostAnimation::Auto);
+        assert_eq!(
+            s.next_frame_in(t0 + ms(100), PostAnimation::Auto, &bells),
+            None
+        );
+        s.observe_bell(0, || [0.0; 4], t0, &bells);
+        s.observe_bell(1, || [0.0; 4], t0 + ms(200), &bells);
+        s.end_frame(t0 + ms(200));
+        assert!(
+            s.next_frame_in(t0 + ms(210), PostAnimation::Auto, &bells)
+                .is_some()
+        );
+
+        // Reads the cursor only: a bell doesn't animate, a move does.
+        let cursor = reads(&["iTime", "iTimeCursorChange"], Some(1.0));
+        let mut s = PostState::default();
+        s.begin_frame(t0, &frame_inputs(0.0), false);
+        s.end_frame(t0);
+        s.observe_bell(0, || [0.0; 4], t0, &cursor);
+        s.observe_bell(1, || [0.0; 4], t0 + ms(10), &cursor);
+        assert_eq!(
+            s.next_frame_in(t0 + ms(20), PostAnimation::Auto, &cursor),
+            None
+        );
+        s.begin_frame(t0 + ms(30), &frame_inputs(10.0), false);
+        s.end_frame(t0 + ms(30));
+        assert!(
+            s.next_frame_in(t0 + ms(40), PostAnimation::Auto, &cursor)
+                .is_some()
+        );
+
+        // Reads none of the event groups: every event counts.
+        let any = reads(&["iTime"], Some(1.0));
+        let mut s = PostState::default();
+        s.observe_bell(0, || [0.0; 4], t0, &any);
+        s.observe_bell(1, || [0.0; 4], t0, &any);
+        s.end_frame(t0);
+        assert!(
+            s.next_frame_in(t0 + ms(10), PostAnimation::Auto, &any)
+                .is_some()
+        );
+        let mut s = PostState::default();
+        s.end_frame(t0);
+        s.set_focused(false, t0, &any, PostAnimation::Auto);
+        s.set_focused(true, t0 + ms(5), &any, PostAnimation::Auto);
+        assert!(s.frame_due(t0 + ms(5), PostAnimation::Auto, &any));
+    }
+
+    #[test]
+    fn occluded_window_polls_slowly() {
+        assert_eq!(OCCLUDED_INTERVAL, ms(250));
+        let mut s = PostState::default();
+        let t0 = Instant::now();
+        let inputs = reads(&["iTime"], None);
+        s.frame_dropped(t0, true);
+        assert_eq!(
+            s.next_frame_in(t0 + ms(50), PostAnimation::Always, &inputs),
+            Some(ms(200))
+        );
+        s.end_frame(t0 + ms(300));
+        assert_eq!(
+            s.next_frame_in(t0 + ms(304), PostAnimation::Always, &inputs),
+            Some(ms(12))
+        );
+    }
+
+    #[test]
+    fn next_local_hour_follows_the_zone() {
+        // 2024-02-29 13:30:15 UTC.
+        let t = 1_709_213_415;
+        assert_eq!(next_local_hour(t, 0), 1_709_215_200); // 14:00 UTC
+        // +05:30: local 19:00:15, next local hour 20:00 = 14:30 UTC.
+        assert_eq!(next_local_hour(t, 5 * 3600 + 1800), 1_709_217_000);
+        assert_eq!(next_local_hour(1_709_215_200, 0), 1_709_215_200 + 3600);
     }
 
     #[test]
