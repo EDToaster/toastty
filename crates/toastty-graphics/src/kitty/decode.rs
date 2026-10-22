@@ -1,48 +1,94 @@
 //! Decoder from on-wire bytes to fully-resident RGBA8 [`ImageData`].
 //!
 //! Supports three formats from the Kitty graphics protocol:
-//! - `f=24` raw RGB (3 bytes per pixel). Validated against
-//!   `width * height * 3`.
-//! - `f=32` raw RGBA (4 bytes per pixel). Validated against
-//!   `width * height * 4`.
+//! - `f=24` raw RGB (3 bytes per pixel).
+//! - `f=32` raw RGBA (4 bytes per pixel).
 //! - `f=100` PNG. Decoded via the `image` crate (zero-config — we don't
 //!   need to autodetect, the wire format dictates the codec).
 //!
-//! Errors map to Kitty's standard reply codes:
-//! - `Einval` — dimension/length mismatch, missing dims for raw formats.
-//! - `Ebadf` — PNG could not be decoded.
-//! - `Enomem` — the PNG's IHDR declares an image larger than the caller's
-//!   quota. Checked before any pixel data is decoded (SEC-7).
-//! - `Efbig` — the caller's responsibility (we just decode here).
+//! Raw data is checked against `width * height * bpp` the way kitty
+//! 0.49.2 checks it: fewer bytes is `ENODATA`, up to [`RAW_DATA_SLACK`]
+//! extra bytes are ignored, more is `EFBIG`.
+//!
+//! Each [`DecodeError`] carries kitty's reply code and message
+//! ([`DecodeError::code`], `Display`), checked live against kitty:
+//! - `EINVAL:Unknown image format: N`, `EINVAL:Zero width/height not
+//!   allowed`.
+//! - `ENODATA:Insufficient image data: GOT < EXPECTED`.
+//! - `EFBIG:Too much data`.
+//! - `EBADPNG:Not a PNG file`, `EBADPNG:PNG data is truncated: …`, or
+//!   `EBADPNG:<decoder message>` for other PNG errors.
+//! - `ENOMEM:PNG image is too large`: the PNG's IHDR declares an image
+//!   larger than the caller's quota. Checked before any pixel data is
+//!   decoded (SEC-7).
 
 use thiserror::Error;
 
 use crate::registry::ImageData;
 
 use super::header::Format;
+use super::reply::ErrorCode;
 
-/// Decode errors. The caller maps these onto Kitty error replies.
+/// Extra bytes past `width * height * bpp` that kitty accepts (and
+/// ignores) in a raw upload. Measured on kitty 0.49.2: 1x1 RGBA takes up
+/// to 14 bytes, 10x10 up to 410.
+pub const RAW_DATA_SLACK: usize = 10;
+
+/// kitty's message for a PNG that ends early.
+const PNG_TRUNCATED: &str = "PNG data is truncated: not enough bytes to satisfy read request";
+
+/// Decode errors. The caller maps these onto Kitty error replies with
+/// [`DecodeError::code`]; `Display` is kitty's message.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DecodeError {
-    /// Raw RGB/RGBA bytes don't match the declared `(width, height)`.
-    #[error("expected {expected} bytes for raw {fmt} {width}x{height}; got {got}")]
-    LengthMismatch {
-        fmt: &'static str,
-        width: u32,
-        height: u32,
-        expected: usize,
-        got: usize,
-    },
-    /// Width or height is zero where required.
-    #[error("missing required dimensions (width={width}, height={height})")]
-    MissingDims { width: u32, height: u32 },
-    /// PNG decode failed.
-    #[error("PNG decode failed: {0}")]
+    /// `f=` is not 24, 32 or 100.
+    #[error("Unknown image format: {0}")]
+    UnknownFormat(u32),
+    /// Width or height is zero for a raw format.
+    #[error("Zero width/height not allowed")]
+    MissingDims,
+    /// Fewer raw bytes than `width * height * bpp`.
+    #[error("Insufficient image data: {got} < {expected}")]
+    InsufficientData { got: usize, expected: usize },
+    /// More than [`RAW_DATA_SLACK`] bytes past `width * height * bpp`.
+    #[error("Too much data")]
+    TooMuchData,
+    /// PNG decode failed; the message is kitty's where known.
+    #[error("{0}")]
     BadPng(String),
     /// The PNG header declares more than `max_bytes` of RGBA8 pixels.
     /// The message matches kitty's `ENOMEM:PNG image is too large`.
     #[error("PNG image is too large")]
     PngTooLarge { width: u32, height: u32 },
+}
+
+impl DecodeError {
+    /// The reply code kitty uses for this error.
+    #[must_use]
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            DecodeError::UnknownFormat(_) | DecodeError::MissingDims => ErrorCode::Einval,
+            DecodeError::InsufficientData { .. } => ErrorCode::Enodata,
+            DecodeError::TooMuchData => ErrorCode::Efbig,
+            DecodeError::BadPng(_) => ErrorCode::Ebadpng,
+            DecodeError::PngTooLarge { .. } => ErrorCode::Enomem,
+        }
+    }
+}
+
+/// `width * height * bpp` for a raw format, after kitty's format and
+/// dimension checks. `Ok(None)` for PNG (it carries its own size).
+pub fn raw_len(format: Format, w: u32, h: u32) -> Result<Option<u64>, DecodeError> {
+    let bpp = match format {
+        Format::Rgb24 => 3,
+        Format::Rgba32 => 4,
+        Format::Png => return Ok(None),
+        Format::Unknown(n) => return Err(DecodeError::UnknownFormat(n)),
+    };
+    if w == 0 || h == 0 {
+        return Err(DecodeError::MissingDims);
+    }
+    Ok(Some(u64::from(w) * u64::from(h) * bpp))
 }
 
 /// Decode `body` according to `format`. `decl_w` / `decl_h` are the
@@ -61,78 +107,62 @@ pub fn decode(
     decl_h: u32,
     max_bytes: u64,
 ) -> Result<ImageData, DecodeError> {
-    match format {
-        Format::Rgba32 => decode_raw(body, decl_w, decl_h, 4, "RGBA"),
-        Format::Rgb24 => {
-            let rgb = decode_raw_passthrough(body, decl_w, decl_h, 3, "RGB")?;
-            // Expand to RGBA8.
-            let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
-            for chunk in rgb.chunks_exact(3) {
-                rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 0xFF]);
-            }
-            Ok(ImageData {
-                width: decl_w,
-                height: decl_h,
-                pixels: rgba,
-            })
-        }
-        Format::Png => decode_png(body, max_bytes),
+    let Some(expected) = raw_len(format, decl_w, decl_h)? else {
+        return decode_png(body, max_bytes);
+    };
+    let expected = usize::try_from(expected).unwrap_or(usize::MAX);
+    if body.len() < expected {
+        return Err(DecodeError::InsufficientData {
+            got: body.len(),
+            expected,
+        });
     }
-}
-
-fn decode_raw(
-    body: &[u8],
-    w: u32,
-    h: u32,
-    bpp: usize,
-    label: &'static str,
-) -> Result<ImageData, DecodeError> {
-    let raw = decode_raw_passthrough(body, w, h, bpp, label)?;
+    if body.len() - expected > RAW_DATA_SLACK {
+        return Err(DecodeError::TooMuchData);
+    }
+    let raw = &body[..expected];
+    let pixels = if matches!(format, Format::Rgb24) {
+        // Expand to RGBA8.
+        let mut rgba = Vec::with_capacity(raw.len() / 3 * 4);
+        for chunk in raw.chunks_exact(3) {
+            rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 0xFF]);
+        }
+        rgba
+    } else {
+        raw.to_vec()
+    };
     Ok(ImageData {
-        width: w,
-        height: h,
-        pixels: raw.to_vec(),
+        width: decl_w,
+        height: decl_h,
+        pixels,
     })
 }
 
-fn decode_raw_passthrough<'a>(
-    body: &'a [u8],
-    w: u32,
-    h: u32,
-    bpp: usize,
-    label: &'static str,
-) -> Result<&'a [u8], DecodeError> {
-    if w == 0 || h == 0 {
-        return Err(DecodeError::MissingDims {
-            width: w,
-            height: h,
-        });
-    }
-    let expected = (w as usize)
-        .checked_mul(h as usize)
-        .and_then(|p| p.checked_mul(bpp))
-        .ok_or(DecodeError::LengthMismatch {
-            fmt: label,
-            width: w,
-            height: h,
-            expected: usize::MAX,
-            got: body.len(),
-        })?;
-    if body.len() != expected {
-        return Err(DecodeError::LengthMismatch {
-            fmt: label,
-            width: w,
-            height: h,
-            expected,
-            got: body.len(),
-        });
-    }
-    Ok(body)
+/// Map an `image` error onto kitty's PNG messages.
+fn png_error(e: &image::ImageError) -> DecodeError {
+    let msg = e.to_string();
+    let truncated = matches!(e, image::ImageError::IoError(io) if io.kind() == std::io::ErrorKind::UnexpectedEof)
+        || msg.contains("end of file")
+        || msg.contains("unexpected EOF");
+    DecodeError::BadPng(if truncated {
+        PNG_TRUNCATED.to_string()
+    } else {
+        msg
+    })
 }
 
 fn decode_png(body: &[u8], max_bytes: u64) -> Result<ImageData, DecodeError> {
     use image::ImageDecoder;
     use std::io::Cursor;
+    const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+    // kitty: fewer than 8 bytes is "truncated", a wrong signature is
+    // "Not a PNG file".
+    if body.len() < SIGNATURE.len() {
+        return Err(DecodeError::BadPng(PNG_TRUNCATED.to_string()));
+    }
+    if body[..SIGNATURE.len()] != SIGNATURE {
+        return Err(DecodeError::BadPng("Not a PNG file".to_string()));
+    }
     // Build a decoder (reads only the header), and check the *native*
     // decoded size before touching pixel data. `total_bytes()` accounts
     // for bit depth and channel count, so a 16-bit image isn't
@@ -140,20 +170,17 @@ fn decode_png(body: &[u8], max_bytes: u64) -> Result<ImageData, DecodeError> {
     // A lying IHDR that claims a huge size is caught here too. `max_alloc`
     // makes the image crate's own allocation limit agree with the quota,
     // so an image right at the cap is rejected as ENOMEM rather than a
-    // `BadPng` decode error.
+    // decode error.
     let mut reader = image::ImageReader::with_format(Cursor::new(body), image::ImageFormat::Png);
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(max_bytes);
     reader.limits(limits);
-    let decoder = reader
-        .into_decoder()
-        .map_err(|e| DecodeError::BadPng(e.to_string()))?;
+    let decoder = reader.into_decoder().map_err(|e| png_error(&e))?;
     let (width, height) = decoder.dimensions();
     if decoder.total_bytes() > max_bytes {
         return Err(DecodeError::PngTooLarge { width, height });
     }
-    let img = image::DynamicImage::from_decoder(decoder)
-        .map_err(|e| DecodeError::BadPng(e.to_string()))?;
+    let img = image::DynamicImage::from_decoder(decoder).map_err(|e| png_error(&e))?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     Ok(ImageData {
@@ -232,20 +259,66 @@ mod tests {
         assert_eq!(&img.pixels[8..12], &[0, 0, 255, 255]);
     }
 
+    /// WIRE-7, against kitty 0.49.2: short raw data is
+    /// `ENODATA:Insufficient image data: 7 < 16`.
     #[test]
-    fn decode_rgba32_length_mismatch_is_einval() {
+    fn decode_rgba32_short_is_enodata() {
         let buf = vec![0u8; 7]; // Should be 16.
         let err = decode(Format::Rgba32, &buf, 2, 2, u64::MAX).unwrap_err();
-        assert!(matches!(err, DecodeError::LengthMismatch { .. }));
+        assert_eq!(
+            err,
+            DecodeError::InsufficientData {
+                got: 7,
+                expected: 16
+            }
+        );
+        assert_eq!(err.code(), ErrorCode::Enodata);
+        assert_eq!(err.to_string(), "Insufficient image data: 7 < 16");
+    }
+
+    /// kitty ignores up to 10 trailing bytes and rejects more with
+    /// `EFBIG:Too much data`.
+    #[test]
+    fn decode_raw_slack_matches_kitty() {
+        for (w, h, n, ok) in [
+            (1, 1, 14, true),
+            (1, 1, 15, false),
+            (2, 2, 26, true),
+            (2, 2, 27, false),
+            (10, 10, 410, true),
+            (10, 10, 411, false),
+        ] {
+            let res = decode(Format::Rgba32, &vec![7u8; n], w, h, u64::MAX);
+            if ok {
+                assert_eq!(res.unwrap().pixels.len(), (w * h * 4) as usize);
+            } else {
+                assert_eq!(res.unwrap_err(), DecodeError::TooMuchData);
+            }
+        }
+        assert!(decode(Format::Rgb24, &[0u8; 13], 1, 1, u64::MAX).is_ok());
+        let err = decode(Format::Rgb24, &[0u8; 14], 1, 1, u64::MAX).unwrap_err();
+        assert_eq!(
+            (err.code(), err.to_string().as_str()),
+            (ErrorCode::Efbig, "Too much data")
+        );
     }
 
     #[test]
     fn decode_rgba32_missing_dims_is_einval() {
         let buf = vec![0u8; 16];
-        let err = decode(Format::Rgba32, &buf, 0, 2, u64::MAX).unwrap_err();
-        assert!(matches!(err, DecodeError::MissingDims { .. }));
-        let err = decode(Format::Rgba32, &buf, 2, 0, u64::MAX).unwrap_err();
-        assert!(matches!(err, DecodeError::MissingDims { .. }));
+        for (w, h) in [(0, 2), (2, 0)] {
+            let err = decode(Format::Rgba32, &buf, w, h, u64::MAX).unwrap_err();
+            assert_eq!(err, DecodeError::MissingDims);
+            assert_eq!(err.code(), ErrorCode::Einval);
+            assert_eq!(err.to_string(), "Zero width/height not allowed");
+        }
+    }
+
+    #[test]
+    fn decode_unknown_format_is_einval() {
+        let err = decode(Format::Unknown(8), &[0u8; 4], 1, 1, u64::MAX).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Einval);
+        assert_eq!(err.to_string(), "Unknown image format: 8");
     }
 
     #[test]
@@ -257,21 +330,33 @@ mod tests {
         assert_eq!(img.pixels.len(), 2 * 2 * 4);
     }
 
+    /// kitty's PNG messages: a wrong signature, a short or cut-off file.
     #[test]
-    fn decode_png_garbage_is_ebadf() {
-        let buf = vec![0xFFu8; 32]; // not a PNG.
-        let err = decode(Format::Png, &buf, 0, 0, u64::MAX).unwrap_err();
-        assert!(matches!(err, DecodeError::BadPng(_)));
+    fn decode_png_errors_use_kitty_messages() {
+        let cases: [(Vec<u8>, &str); 4] = [
+            (vec![0xFFu8; 32], "Not a PNG file"),
+            (b"junk".to_vec(), PNG_TRUNCATED),
+            (png_2x2()[..40].to_vec(), PNG_TRUNCATED),
+            (png_2x2()[..20].to_vec(), PNG_TRUNCATED),
+        ];
+        for (buf, msg) in cases {
+            let err = decode(Format::Png, &buf, 0, 0, u64::MAX).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::Ebadpng);
+            assert_eq!(err.to_string(), msg, "{} bytes", buf.len());
+        }
+        // Trailing junk after IEND is fine, as in kitty.
+        let mut buf = png_2x2();
+        buf.extend_from_slice(&[0u8; 100]);
+        assert!(decode(Format::Png, &buf, 0, 0, u64::MAX).is_ok());
     }
 
     #[test]
-    fn decode_rgb24_length_mismatch() {
+    fn decode_rgb24_short_is_enodata() {
         // 2x2 RGB = 12 bytes; pass 11.
         let buf = vec![0u8; 11];
         let err = decode(Format::Rgb24, &buf, 2, 2, u64::MAX).unwrap_err();
-        assert!(matches!(err, DecodeError::LengthMismatch { .. }));
+        assert_eq!(err.to_string(), "Insufficient image data: 11 < 12");
     }
-
     #[test]
     fn decode_png_over_quota_is_rejected_from_the_header() {
         let err = decode(
