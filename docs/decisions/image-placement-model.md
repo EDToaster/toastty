@@ -97,14 +97,19 @@ measured on kitty 0.49.2 with PIL bounding boxes (9×20 px cells):
 | Given | Drawn size | Reserved cells |
 |---|---|---|
 | neither `c=` nor `r=` | the source rect's native pixels (205×105 → 205×105; 3×50 → 3×50) | `ceil((w + X) / cell_w)` × `ceil((h + Y) / cell_h)` |
-| only `c=` | width `c·cell_w − X`, height from the source aspect, rounded (400×200 `c=10` → 90×45; 333×100 `c=10` → 90×27) | `c` × `ceil((h + Y) / cell_h)` |
-| only `r=` | height `r·cell_h − Y`, width from the aspect (400×200 `r=3` → 120×60) | `ceil((w + X) / cell_w)` × `r` |
+| only `c=` | width `c·cell_w − X`, height from the source aspect, rounded (400×200 `c=10` → 90×45; 333×100 `c=10` → 90×27) | `c` × `ceil((c·cell_w + X) · h / w / cell_h)`: the given span plus its own offset, at the aspect; `Y` doesn't count (`c=10,Y=19` → 10×3; `c=4,X=8` → 4×2) |
+| only `r=` | height `r·cell_h − Y`, width from the aspect (400×200 `r=3` → 120×60) | `ceil((r·cell_h + Y) · w / h / cell_w)` × `r`; `X` doesn't count (`r=3,X=9` → 14×3; `r=3,Y=19` → 18×3) |
 | both | the box less the offsets, stretched (200×100 `c=4,r=8` → 36×160) | `c` × `r` |
 
 - The spec says to letterbox when both are given. kitty stretches, and so
   does toastty (SIZE-3).
-- `X=`/`Y=` are clamped to `cell − 1` (`X=25,Y=40` → +8,+19). They also
-  widen the reservation: `X=8,Y=19` on 200×100 reserves 24×6 cells.
+- `X=`/`Y=` are clamped to `cell − 1` (`X=25,Y=40` → +8,+19). For a
+  natural-size image both widen the reservation (`X=8,Y=19` on 200×100
+  reserves 24×6 cells). With one side given, only that side's offset
+  counts, through the derived side (table above). The reservation is
+  never rounded before the ceiling: `c=10` on 1000×449 takes 3 rows for
+  40.41 px. All of this was measured with DSR after `a=T` on kitty-ref
+  and is locked by `Placement::reserved_cells` tests (review of #39).
 - The source rect (`x`/`y`/`w`/`h`) is kept as given. `SrcRect::resolve`
   applies the spec's defaults and intersects it with the image:
   - unset `w`/`h` run to the edge (`x=150` alone → 50×100);
@@ -118,6 +123,12 @@ measured on kitty 0.49.2 with PIL bounding boxes (9×20 px cells):
   `c=`/`r=` images at their cell span. kitty-ref after two zoom steps:
   205×105 stays 205×105, and `c=10` on 400×200 becomes 120×60 at 12 px
   cells. This falls out of computing the size at render time (SIZE-11).
+  The **reservation** is recomputed too, as kitty does
+  (`Term::set_cell_pixel_size` → `ImageGrid::reserve_all`, both the
+  active and the stashed grid). On kitty-ref, after zooming in a `d=p`
+  outside the drawn image but inside the old reservation misses it, and
+  after zooming out one inside the drawn image but outside the old
+  reservation hits it. The cursor isn't moved.
 - **Pixel exactness:** the quad's origin is snapped to whole window
   pixels, including a centered grid's half-pixel lead
   (`ImageView::origin`). A native-size image then maps texels 1:1 under
