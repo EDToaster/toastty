@@ -921,13 +921,14 @@ mod tests {
 
     #[test]
     fn occluded_window_polls_slowly() {
+        assert_eq!(OCCLUDED_INTERVAL, ms(250));
         let mut s = PostState::default();
         let t0 = Instant::now();
         let inputs = reads(&["iTime"], None);
         s.frame_dropped(t0, true);
         assert_eq!(
             s.next_frame_in(t0 + ms(50), PostAnimation::Always, &inputs),
-            Some(OCCLUDED_INTERVAL - ms(50))
+            Some(ms(200))
         );
         s.end_frame(t0 + ms(300));
         assert_eq!(

@@ -28,6 +28,8 @@ pub mod color;
 pub mod dialog;
 pub mod image;
 pub mod post;
+#[cfg(test)]
+mod render_tests;
 pub mod rgp;
 pub mod surface_format;
 #[cfg(test)]
@@ -469,7 +471,9 @@ impl GpuContext {
 pub struct Renderer {
     device: Device,
     queue: Queue,
-    surface: Surface<'static>,
+    /// Where frames go (the window's swapchain; an offscreen texture in
+    /// this crate's tests).
+    target: Target,
     config: SurfaceConfiguration,
     clear_color: [f32; 4],
     /// Text pipeline lives lazily — `with_font` initializes it; `render`
@@ -919,6 +923,61 @@ fn create_scratch_depth(
     (texture, view)
 }
 
+/// Where the renderer's frames go.
+#[derive(Debug)]
+enum Target {
+    /// The window's swapchain.
+    Surface(Surface<'static>),
+    /// A texture standing in for the swapchain (this crate's tests).
+    #[cfg(test)]
+    Offscreen(wgpu::Texture),
+}
+
+/// One frame being drawn: a swapchain image, or the offscreen target.
+enum Frame {
+    Surface(wgpu::SurfaceTexture),
+    #[cfg(test)]
+    Offscreen(wgpu::Texture),
+}
+
+impl Frame {
+    fn texture(&self) -> &wgpu::Texture {
+        match self {
+            Self::Surface(f) => &f.texture,
+            #[cfg(test)]
+            Self::Offscreen(t) => t,
+        }
+    }
+
+    fn present(self) {
+        match self {
+            Self::Surface(f) => f.present(),
+            #[cfg(test)]
+            Self::Offscreen(_) => {}
+        }
+    }
+}
+
+/// The test target for `config`: what the swapchain would hand out
+/// (format, view formats), readable back.
+#[cfg(test)]
+fn offscreen_target(device: &Device, config: &SurfaceConfiguration) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("toastty-render offscreen target"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: config.format,
+        usage: config.usage | TextureUsages::COPY_SRC,
+        view_formats: &config.view_formats,
+    })
+}
+
 /// sRGB-encode a linear-light colour's RGB (post-shader colour uniforms).
 fn srgb3(c: [f32; 4]) -> [f32; 3] {
     [
@@ -1329,15 +1388,33 @@ impl Renderer {
             .flags
             .contains(wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS);
 
+        Ok(Self::from_parts(
+            device,
+            queue,
+            Target::Surface(surface),
+            config,
+            surface_view_formats,
+        ))
+    }
+
+    /// The renderer around a configured `target`: everything else starts
+    /// in its initial state.
+    fn from_parts(
+        device: Device,
+        queue: Queue,
+        target: Target,
+        config: SurfaceConfiguration,
+        surface_view_formats: bool,
+    ) -> Self {
         let (scratch_texture, scratch_view) =
-            create_scratch(&device, config.width, config.height, format, false);
+            create_scratch(&device, config.width, config.height, config.format, false);
         let (scratch_depth_texture, scratch_depth_view) =
             create_scratch_depth(&device, config.width, config.height);
 
-        Ok(Self {
+        Self {
             device,
             queue,
-            surface,
+            target,
             config,
             clear_color: [0.07, 0.07, 0.09, 1.0],
             text: None,
@@ -1408,7 +1485,62 @@ impl Renderer {
             surface_view_formats,
             post_palette: Box::new([[0.0; 3]; 256]),
             post_palette_key: None,
-        })
+        }
+    }
+
+    /// A renderer drawing into an offscreen texture shaped like the
+    /// swapchain (`Bgra8UnormSrgb`), on the shared test device, so tests
+    /// can drive [`Self::render_term`]. `surface_view_formats: false`
+    /// exercises the post chain's copy fallback. `None` without a GPU.
+    #[cfg(test)]
+    pub(crate) fn headless(width: u32, height: u32, surface_view_formats: bool) -> Option<Self> {
+        let (device, queue) = crate::test_gpu::try_device_and_queue()?;
+        let config = SurfaceConfiguration {
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_DST,
+            format: TextureFormat::Bgra8UnormSrgb,
+            width: width.max(1),
+            height: height.max(1),
+            present_mode: PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: CompositeAlphaMode::Opaque,
+            view_formats: vec![],
+        };
+        let target = Target::Offscreen(offscreen_target(&device, &config));
+        Some(Self::from_parts(
+            device,
+            queue,
+            target,
+            config,
+            surface_view_formats,
+        ))
+    }
+
+    /// The offscreen target's current contents (BGRA rows; tests only).
+    #[cfg(test)]
+    pub(crate) fn read_offscreen(&self) -> Vec<u8> {
+        let Target::Offscreen(t) = &self.target else {
+            panic!("not a headless renderer");
+        };
+        crate::test_gpu::read_texture(&self.device, &self.queue, t)
+    }
+
+    /// The window surface, unless this is a headless test renderer.
+    fn surface(&self) -> Option<&Surface<'static>> {
+        match &self.target {
+            Target::Surface(s) => Some(s),
+            #[cfg(test)]
+            Target::Offscreen(_) => None,
+        }
+    }
+
+    /// Apply `config` to the target (configure the surface, or recreate
+    /// the offscreen texture).
+    fn configure_target(&mut self) {
+        match &mut self.target {
+            Target::Surface(s) => s.configure(&self.device, &self.config),
+            #[cfg(test)]
+            Target::Offscreen(t) => *t = offscreen_target(&self.device, &self.config),
+        }
     }
 
     /// Read-only view of the cached linear-light extended palette
@@ -2444,7 +2576,7 @@ impl Renderer {
         } else {
             Vec::new()
         };
-        self.surface.configure(&self.device, &self.config);
+        self.configure_target();
         let (tex, view) = create_scratch(
             &self.device,
             self.config.width,
@@ -2507,7 +2639,7 @@ impl Renderer {
     pub fn resize(&mut self, width: u32, height: u32) {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
-        self.surface.configure(&self.device, &self.config);
+        self.configure_target();
         // Scratch must match the swapchain dims; recreate. Its contents
         // become undefined → force a full clear on the next frame.
         let (tex, view) = create_scratch(
@@ -3455,7 +3587,7 @@ impl Renderer {
         let frame_view = if render_direct {
             Some(
                 frame
-                    .texture
+                    .texture()
                     .create_view(&wgpu::TextureViewDescriptor::default()),
             )
         } else {
@@ -3653,10 +3785,10 @@ impl Renderer {
 
         if post_on {
             // Post passes (scratch → swapchain), then the UI on top.
-            self.encode_post(&mut encoder, &frame.texture, term, cursor_visible, now);
+            self.encode_post(&mut encoder, frame.texture(), term, cursor_visible, now);
             self.encode_ui_pass(
                 &mut encoder,
-                &frame.texture,
+                frame.texture(),
                 term,
                 chip_alpha,
                 ui_start..dialog_glyphs_start,
@@ -3676,7 +3808,7 @@ impl Renderer {
                     aspect: wgpu::TextureAspect::All,
                 },
                 wgpu::TexelCopyTextureInfo {
-                    texture: &frame.texture,
+                    texture: frame.texture(),
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
@@ -3748,9 +3880,9 @@ impl Renderer {
             });
         let cursor_visible =
             self.blink.visible && term.cursor_visible() && !term.is_view_scrolled_back();
-        self.encode_post(&mut encoder, &frame.texture, term, cursor_visible, now);
+        self.encode_post(&mut encoder, frame.texture(), term, cursor_visible, now);
         let chip_alpha = self.chip_fade.value(now);
-        self.encode_ui_pass(&mut encoder, &frame.texture, term, chip_alpha, 0..0, None);
+        self.encode_ui_pass(&mut encoder, frame.texture(), term, chip_alpha, 0..0, None);
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
         self.post_state.end_frame(now);
@@ -3891,15 +4023,22 @@ impl Renderer {
     /// touched, and the post passes rewrite the whole swapchain image
     /// anyway. The post schedule counts the frame as dropped instead
     /// (slowing time-driven frames while occluded).
-    fn acquire_frame(&mut self, now: Instant) -> Result<Option<wgpu::SurfaceTexture>, RenderError> {
-        let occluded = match self.surface.get_current_texture() {
+    fn acquire_frame(&mut self, now: Instant) -> Result<Option<Frame>, RenderError> {
+        #[cfg(test)]
+        if let Target::Offscreen(t) = &self.target {
+            return Ok(Some(Frame::Offscreen(t.clone())));
+        }
+        let Some(surface) = self.surface() else {
+            return Ok(None);
+        };
+        let occluded = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => return Ok(Some(t)),
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => return Ok(Some(Frame::Surface(t))),
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Validation => {
                 return Err(RenderError::SurfaceLost);
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.config);
+                self.configure_target();
                 false
             }
             wgpu::CurrentSurfaceTexture::Timeout => false,
@@ -3921,12 +4060,15 @@ impl Renderer {
 
     /// Render one frame. M4a: just a clear-color pass.
     pub fn render(&mut self) -> Result<(), RenderError> {
-        let frame = match self.surface.get_current_texture() {
+        let Some(surface) = self.surface() else {
+            return Ok(());
+        };
+        let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated => {
                 // Surface size mismatch — reconfigure and try next frame.
-                self.surface.configure(&self.device, &self.config);
+                surface.configure(&self.device, &self.config);
                 return Ok(());
             }
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Validation => {
