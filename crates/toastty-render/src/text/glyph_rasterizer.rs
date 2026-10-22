@@ -390,16 +390,17 @@ impl GlyphRasterizer {
         font_size: f32,
         line_height_ratio: f32,
         font_name: Option<&str>,
-        bundled_font: Option<&[u8]>,
+        bundled_font: Option<&'static [u8]>,
     ) -> Self {
         let mut font_system = FontSystem::new();
 
         if let Some(data) = bundled_font {
+            // Borrow the static bytes rather than copying them into a
+            // `Vec`: fontdb only needs `AsRef<[u8]>`, and the copy was a
+            // 170 KB heap allocation held for the life of the process.
             font_system
                 .db_mut()
-                .load_font_source(cosmic_text::fontdb::Source::Binary(std::sync::Arc::new(
-                    data.to_vec(),
-                )));
+                .load_font_source(cosmic_text::fontdb::Source::Binary(std::sync::Arc::new(data)));
         }
 
         // Line height = `font_size * line_height_ratio`, snapped to a
@@ -433,7 +434,7 @@ impl GlyphRasterizer {
         );
 
         // Pre-allocate the per-line buffer.
-        let mut buffer = Buffer::new(&mut font_system, metrics);
+        let mut buffer = Buffer::new_empty(metrics);
         buffer.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
         // Tell cosmic-text we want monospace-style positioning; the
         // cluster-width snap fixes its per-glyph rounding (decision §3).
@@ -441,7 +442,7 @@ impl GlyphRasterizer {
 
         // Tiny buffer reused for single-char standalone shapes. Same
         // monospace-width hint so isolated glyphs land at x=0.
-        let mut isolation_buffer = Buffer::new(&mut font_system, metrics);
+        let mut isolation_buffer = Buffer::new_empty(metrics);
         isolation_buffer.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
         isolation_buffer.set_monospace_width(Some(cell_size.0));
 
@@ -528,7 +529,7 @@ impl GlyphRasterizer {
             self.primary_weight,
         );
         for buf in [&mut self.buffer, &mut self.isolation_buffer] {
-            *buf = Buffer::new(&mut self.font_system, metrics);
+            *buf = Buffer::new_empty(metrics);
             buf.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
             buf.set_monospace_width(Some(cell_w));
         }
@@ -1475,7 +1476,7 @@ fn measure_decorations(
     cell_h: f32,
     baseline_y: f32,
 ) -> DecorationMetrics {
-    let mut probe = Buffer::new(font_system, metrics);
+    let mut probe = Buffer::new_empty(metrics);
     probe.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
     let attrs = Attrs::new()
         .family(Family::Name(family.unwrap_or("monospace")))
@@ -1548,7 +1549,16 @@ fn measure_cell(
     family: Option<&str>,
     weight: Weight,
 ) -> (f32, f32, f32) {
-    let mut probe = Buffer::new(font_system, metrics);
+    // `Buffer::new_empty`, not `Buffer::new`, here and for every other
+    // buffer in this file: `Buffer::new` shapes an empty line with the
+    // default `Attrs` (sans-serif, weight 400), and the first shape of a
+    // given `Attrs` makes cosmic-text rank every installed face against
+    // it (`get_font_matches`, ~10 ms with 1000 system faces, opening each
+    // variable font to read its weight axis). We never shape with the
+    // default `Attrs`, so that ranking was pure startup cost. Every buffer
+    // gets `set_text` before it is shaped, so the missing empty line is
+    // never observed.
+    let mut probe = Buffer::new_empty(metrics);
     probe.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
     let fam = family.unwrap_or("monospace");
     let attrs = Attrs::new().family(Family::Name(fam)).weight(weight);
