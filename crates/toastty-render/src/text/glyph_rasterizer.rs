@@ -12,6 +12,7 @@ use cosmic_text::{
     SwashContent, Weight, fontdb,
 };
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use toastty_protocols::unicode_core::cluster_cell_width;
 use unicode_width::UnicodeWidthChar;
 use wgpu::{Device, Extent3d, Queue, Texture, TextureFormat};
@@ -27,6 +28,29 @@ use crate::text::presentation;
 /// the old `HashMap<(col, char), GlyphSlot>` had — callers re-check the
 /// char so a stale cache entry (e.g. wrong-char lookup) misses cleanly.
 type ColumnSlot = Option<(char, GlyphSlot)>;
+
+/// Chars below this code point get a dense entry in
+/// [`GlyphRasterizer::fast_chars`]: Latin, Greek, Cyrillic, general
+/// punctuation, arrows, box drawing, block elements and Braille (which
+/// btop-style graphs are made of). Everything above falls back to the
+/// hash lookups.
+const FAST_CHARS_LEN: usize = 0x3000;
+
+/// What the shaping fast path does with one char. A dense mirror of
+/// `char_cache` / `char_cache_misses` / `uncacheable_chars` (plus the
+/// width-1 test) so the per-char cost is one indexed load instead of up
+/// to three `SipHash` lookups. Recomputed by
+/// [`GlyphRasterizer::sync_fast_char`] whenever one of those sets
+/// changes, so the sets stay the source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastChar {
+    /// Leave the fast path (not width 1, uncacheable, or not cached yet).
+    Bail,
+    /// No glyph: blank, NUL, or a recorded cache miss.
+    Skip,
+    /// Cached; index into [`GlyphRasterizer::fast_slots`].
+    Cached(u32),
+}
 
 /// Mask atlas dims (R8) and color atlas dims (BGRA8) — generously sized
 /// per the M4b "panic when full" policy.
@@ -321,6 +345,12 @@ pub struct GlyphRasterizer {
     /// `font.family` config didn't take effect. Surfaced via
     /// [`GlyphRasterizer::requested_family_available`].
     requested_family_available: bool,
+    /// Dense fast-path state for chars below [`FAST_CHARS_LEN`]; see
+    /// [`FastChar`].
+    fast_chars: Box<[FastChar]>,
+    /// Slots the [`FastChar::Cached`] entries point at. Append-only
+    /// between [`Self::rebuild_fast_chars`] calls.
+    fast_slots: Vec<GlyphSlot>,
 }
 
 impl GlyphRasterizer {
@@ -440,6 +470,8 @@ impl GlyphRasterizer {
             presentation_override: HashMap::new(),
             vs16_color_override: HashMap::new(),
             requested_family_available,
+            fast_chars: initial_fast_chars(),
+            fast_slots: Vec::new(),
         }
     }
 
@@ -482,6 +514,76 @@ impl GlyphRasterizer {
         self.atlas = Atlas::new(ATLAS_W, ATLAS_H);
         self.placements.clear();
         self.char_cache.clear();
+        self.rebuild_fast_chars();
+    }
+
+    /// Recompute `fast_chars[ch]` from the char sets, with the same
+    /// precedence the fast path used to apply to them one by one:
+    /// blank → width ≠ 1 → uncacheable → miss → cached → unknown.
+    fn sync_fast_char(&mut self, ch: char) {
+        let Some(i) = fast_char_index(ch) else {
+            return;
+        };
+        self.fast_chars[i] = if ch == ' ' || ch == '\0' {
+            FastChar::Skip
+        } else if ch.width() != Some(1) || self.uncacheable_chars.contains(&ch) {
+            FastChar::Bail
+        } else if self.char_cache_misses.contains(&ch) {
+            FastChar::Skip
+        } else if let Some(slot) = self.char_cache.get(&ch) {
+            #[allow(clippy::cast_possible_truncation)] // < one entry per cache insert
+            let idx = self.fast_slots.len() as u32;
+            self.fast_slots.push(*slot);
+            FastChar::Cached(idx)
+        } else {
+            FastChar::Bail
+        };
+    }
+
+    /// Rebuild the whole [`Self::fast_chars`] table (after `char_cache`
+    /// was cleared).
+    fn rebuild_fast_chars(&mut self) {
+        self.fast_chars = initial_fast_chars();
+        self.fast_slots.clear();
+        let chars: Vec<char> = self
+            .char_cache
+            .keys()
+            .chain(self.char_cache_misses.iter())
+            .chain(self.uncacheable_chars.iter())
+            .copied()
+            .collect();
+        for ch in chars {
+            self.sync_fast_char(ch);
+        }
+    }
+
+    /// Cache `slot` as the standalone glyph of `ch`, unless one is
+    /// cached already.
+    fn cache_standalone(&mut self, ch: char, slot: GlyphSlot) {
+        if let Entry::Vacant(e) = self.char_cache.entry(ch) {
+            e.insert(slot);
+            self.sync_fast_char(ch);
+        }
+    }
+
+    /// Record `ch` as having no glyph. Returns true if it was new.
+    fn mark_cache_miss(&mut self, ch: char) -> bool {
+        let new = self.char_cache_misses.insert(ch);
+        if new {
+            self.sync_fast_char(ch);
+        }
+        new
+    }
+
+    /// Record `ch` as contextually shaped (see `uncacheable_chars`) and
+    /// evict its `char_cache` entry. Returns true if it was new.
+    fn mark_uncacheable(&mut self, ch: char) -> bool {
+        let new = self.uncacheable_chars.insert(ch);
+        if new {
+            self.char_cache.remove(&ch);
+            self.sync_fast_char(ch);
+        }
+        new
     }
 
     /// Glyph id this char would produce shaped alone, with no
@@ -794,54 +896,77 @@ impl GlyphRasterizer {
     /// uncacheable, or any non-single-column character). When it
     /// returns `Some`, no cosmic-text work was done.
     fn try_shape_line_fast(&self, text: &str) -> Option<LineGlyphs> {
-        let mut out = LineGlyphs::default();
         let cell_w = self.cell_size.0;
         if cell_w <= 0.0 {
             return None;
         }
+        // Trailing blanks never produce a slot and never bail, so only
+        // the trimmed prefix decides the result; this also sizes
+        // `by_column` to the populated range up front instead of growing
+        // it slot by slot.
+        let text = text.trim_end_matches([' ', '\0']);
+        let mut by_column: Vec<ColumnSlot> = Vec::with_capacity(text.len());
         // Each character in a monospace terminal grid occupies one
         // cell. We assign columns by index in the iteration order; the
         // term's row text is fed cell-by-cell, so the i'th char is
         // column i. This breaks for wide / zero-width characters
         // (CJK ideographs, combining marks, controls): a wide char
         // would span two columns, and a combining mark would consume a
-        // column index without advancing the cell. Bail to the slow
-        // path on any char whose `unicode_width` is not exactly 1.
+        // column index without advancing the cell. Such chars bail to
+        // the slow path (`FastChar::Bail`, or the `width` test in
+        // `fast_lookup_hashed`).
         for (col, ch) in text.chars().enumerate() {
             if col > u16::MAX as usize {
                 return None;
             }
-            if ch == ' ' || ch == '\0' {
-                continue;
-            }
-            // Width-1 invariant — see `char_cache` doc comment.
-            if ch.width() != Some(1) {
-                return None;
-            }
-            // Char has been observed shaping to a contextual glyph
-            // (ligature / GSUB substitution). We can't serve it from
-            // `char_cache` — the cached single-char form might be the
-            // wrong half of a ligature, or the line we're rendering
-            // *now* might want a contextual form. Bail so the slow
-            // path does the right shaping each frame.
-            if self.uncacheable_chars.contains(&ch) {
-                return None;
-            }
-            // Already-known miss: skip the cell, but keep going on
-            // the fast path. This stops e.g. control characters from
-            // forcing every line through cosmic-text forever.
-            if self.char_cache_misses.contains(&ch) {
-                continue;
-            }
-            match self.char_cache.get(&ch) {
-                Some(slot) => {
-                    #[allow(clippy::cast_possible_truncation)]
-                    out.insert(col as u16, ch, *slot);
-                }
-                None => return None,
-            }
+            let slot = match fast_char_index(ch) {
+                Some(i) => match self.fast_chars[i] {
+                    FastChar::Bail => return None,
+                    FastChar::Skip => None,
+                    FastChar::Cached(idx) => Some(self.fast_slots[idx as usize]),
+                },
+                None => self.fast_lookup_hashed(ch)?,
+            };
+            by_column.push(slot.map(|s| (ch, s)));
         }
-        Some(out)
+        // `text` ends in a non-blank char, so the last column is either a
+        // slot or a skipped miss; drop trailing misses to match
+        // `LineGlyphs::insert`'s "grown only as far as the highest column
+        // shaped".
+        while by_column.last().is_some_and(Option::is_none) {
+            by_column.pop();
+        }
+        Some(LineGlyphs {
+            by_column,
+            secondary: Vec::new(),
+        })
+    }
+
+    /// Fast-path verdict for a char outside the dense `fast_chars`
+    /// table: `None` = bail to the slow path, `Some(None)` = no glyph,
+    /// `Some(Some(slot))` = cached.
+    #[allow(clippy::option_option)] // three outcomes, read in one `?`
+    fn fast_lookup_hashed(&self, ch: char) -> Option<Option<GlyphSlot>> {
+        // Width-1 invariant — see `char_cache` doc comment.
+        if ch.width() != Some(1) {
+            return None;
+        }
+        // Char has been observed shaping to a contextual glyph
+        // (ligature / GSUB substitution). We can't serve it from
+        // `char_cache` — the cached single-char form might be the
+        // wrong half of a ligature, or the line we're rendering
+        // *now* might want a contextual form. Bail so the slow
+        // path does the right shaping each frame.
+        if self.uncacheable_chars.contains(&ch) {
+            return None;
+        }
+        // Already-known miss: skip the cell, but keep going on
+        // the fast path. This stops e.g. control characters from
+        // forcing every line through cosmic-text forever.
+        if self.char_cache_misses.contains(&ch) {
+            return Some(None);
+        }
+        self.char_cache.get(&ch).map(|slot| Some(*slot))
     }
 
     /// Slow path: cosmic-text shaping. Populates `char_cache` /
@@ -998,12 +1123,11 @@ impl GlyphRasterizer {
                 if p.cluster_chars.len() == 1 && p.ch.width() == Some(1) {
                     let standalone = self.standalone_glyph_id_of(p.ch);
                     if standalone == Some(p.glyph.glyph_id) {
-                        self.char_cache.entry(p.ch).or_insert(slot);
-                    } else if self.uncacheable_chars.insert(p.ch) {
-                        // Already-cached entries from earlier
-                        // standalone-only renders would now be wrong
-                        // (the font wants to substitute), so evict.
-                        self.char_cache.remove(&p.ch);
+                        self.cache_standalone(p.ch, slot);
+                    } else if self.mark_uncacheable(p.ch) {
+                        // Earlier standalone-only cache entries would now
+                        // be wrong (the font wants to substitute), so
+                        // `mark_uncacheable` evicted them.
                         tracing::debug!(
                             target: "toastty_render::glyph",
                             "marking {:?} (U+{:04X}) as contextually-shaped; \
@@ -1021,8 +1145,7 @@ impl GlyphRasterizer {
                     // the ligature visual. Force the slow path on any
                     // line containing these chars from now on.
                     for ch in &p.cluster_chars {
-                        if self.uncacheable_chars.insert(*ch) {
-                            self.char_cache.remove(ch);
+                        if self.mark_uncacheable(*ch) {
                             tracing::debug!(
                                 target: "toastty_render::glyph",
                                 "marking {:?} (U+{:04X}) as multi-char-cluster member; \
@@ -1046,7 +1169,7 @@ impl GlyphRasterizer {
             if ch == ' ' || ch == '\0' {
                 continue;
             }
-            if !produced_chars.contains(&ch) && self.char_cache_misses.insert(ch) {
+            if !produced_chars.contains(&ch) && self.mark_cache_miss(ch) {
                 tracing::debug!(
                     target: "toastty_render::glyph",
                     "marking {ch:?} (U+{:04X}) as cache miss; future renders will skip it",
@@ -1178,6 +1301,22 @@ impl GlyphRasterizer {
             AtlasLayer::Color => &self.color_texture,
         }
     }
+}
+
+/// `fast_chars` index of `ch`, if it has one.
+#[inline]
+fn fast_char_index(ch: char) -> Option<usize> {
+    let i = ch as usize;
+    (i < FAST_CHARS_LEN).then_some(i)
+}
+
+/// `fast_chars` with nothing cached: blanks skip, everything else bails
+/// to the slow path until it is cached.
+fn initial_fast_chars() -> Box<[FastChar]> {
+    let mut t = vec![FastChar::Bail; FAST_CHARS_LEN].into_boxed_slice();
+    t[' ' as usize] = FastChar::Skip;
+    t[0] = FastChar::Skip;
+    t
 }
 
 fn stable_key(k: CacheKey) -> u64 {
@@ -1858,8 +1997,7 @@ mod tests {
         // Simulate the slow path having observed `=` shaping to a
         // contextual variant (the half-ligature case). Future fast-
         // path attempts on any line containing `=` must bail.
-        rasterizer.uncacheable_chars.insert('=');
-        rasterizer.char_cache.remove(&'=');
+        rasterizer.mark_uncacheable('=');
 
         assert!(
             rasterizer.try_shape_line_fast("ab=").is_none(),
@@ -2322,5 +2460,93 @@ mod tests {
         // Cached: a second shape takes the same decision without a scan.
         assert!(rasterizer.vs16_color_override.contains_key(&heart));
         let _ = rasterizer.shape_line(&queue, "\u{2764}\u{FE0F}", true);
+    }
+
+    /// The fast path as it was before the dense `fast_chars` table: one
+    /// hash lookup per set, slots inserted column by column. Kept as the
+    /// oracle for `fast_table_matches_hashed_reference`.
+    fn reference_fast(r: &GlyphRasterizer, text: &str) -> Option<LineGlyphs> {
+        let mut out = LineGlyphs::default();
+        for (col, ch) in text.chars().enumerate() {
+            if ch == ' ' || ch == '\0' {
+                continue;
+            }
+            if ch.width() != Some(1) || r.uncacheable_chars.contains(&ch) {
+                return None;
+            }
+            if r.char_cache_misses.contains(&ch) {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            out.insert(col as u16, ch, *r.char_cache.get(&ch)?);
+        }
+        Some(out)
+    }
+
+    /// The dense table gives exactly the old hashed fast path's answer
+    /// (bail vs. not, and the same slots in the same columns), and stays
+    /// in sync with the char sets as shaping adds entries, misses and
+    /// uncacheable chars.
+    #[test]
+    fn fast_table_matches_hashed_reference() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        let warm = [
+            "The quick brown fox jumps over the lazy dog 0123456789",
+            "│ ├── src/main.rs ┼ ═ ░▒▓ ⣿⡇ → ← … «» ¿¡ ñ é ü Ω λ Ж",
+            "tab\there \u{200B}zero width \u{7}bell",
+            "a != b => c -> d",
+            "你好 wide 😀 emoji",
+        ];
+        for line in warm {
+            let _ = rasterizer.shape_line(&queue, line, false);
+        }
+        // Force one ASCII char uncacheable to cover that state.
+        rasterizer.mark_uncacheable('q');
+        let probes = [
+            "",
+            "   ",
+            "hello world   ",
+            "hello\0world\0\0",
+            "The lazy dog",
+            "The quick dog",
+            "│ ├── ┼ ═ ░▒▓ ⣿⡇ → …",
+            "zero\u{200B}width",
+            "bell\u{7}x",
+            "你好",
+            "Ω λ Ж ñ é ü   trailing   ",
+            "never seen: ʬ ʭ",
+            "trailing miss\u{200B}",
+        ];
+        for probe in probes {
+            let got = rasterizer.try_shape_line_fast(probe);
+            let want = reference_fast(&rasterizer, probe);
+            assert_eq!(
+                got.as_ref().map(|g| (&g.by_column, &g.secondary)),
+                want.as_ref().map(|g| (&g.by_column, &g.secondary)),
+                "fast path disagrees with the hashed reference on {probe:?}",
+            );
+        }
+        // Table invariant: every dense entry equals what the sets say.
+        for i in 0..FAST_CHARS_LEN {
+            let Some(ch) = char::from_u32(u32::try_from(i).unwrap()) else {
+                continue;
+            };
+            let want = reference_fast(&rasterizer, &ch.to_string()).map(|g| g.by_column);
+            let got = rasterizer
+                .try_shape_line_fast(&ch.to_string())
+                .map(|g| g.by_column);
+            assert_eq!(got, want, "fast_chars out of sync for {ch:?}");
+        }
+    }
+
+    /// `set_font_size` rebuilds the dense table: nothing stays cached at
+    /// the old size, so the next line goes through the slow path.
+    #[test]
+    fn set_font_size_resets_fast_table() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        let _ = rasterizer.shape_line(&queue, "abc", false);
+        assert!(rasterizer.try_shape_line_fast("abc").is_some());
+        rasterizer.set_font_size(20.0, DEFAULT_LINE_HEIGHT_RATIO);
+        assert!(rasterizer.try_shape_line_fast("abc").is_none());
     }
 }
