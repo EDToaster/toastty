@@ -108,3 +108,68 @@ of the placement-named fields:
 - **`t=s`** still replies ENOTSUP; that is B4's job.
 - **Other PNG errors** carry the `image` crate's message after `EBADPNG:`
   rather than libpng's.
+
+## Chunked transport (B3: WIRE-4, WIRE-9, WIRE-10, WIRE-11, DEL-3)
+
+These rules were measured live on kitty 0.49.2.
+
+- **One loading slot.** `KittyHandler::loading` is an `Option<Upload>`. A
+  first chunk with `m=1` starts it. kitty checks the format and the
+  dimensions *then*:
+  - `EINVAL:Zero width/height not allowed` and `EINVAL:Unknown image
+    format: N` are replied at once, and nothing loads.
+  - Dimensions over 10000 are dropped silently. kitty answers those under
+    a stale id, which is nearly always none.
+- **Every direct transmit during a load is a continuation**, whatever its
+  `i=` or other keys. Only `q=` is taken from it. A stray `a=t,i=57` from
+  another program is therefore appended to the load and answered under
+  the loading image's id, as kitty does. The 60 s idle expiry is the
+  safety net (a divergence: kitty has none). It runs at the start of each
+  graphics command and after each batch of PTY input
+  (`Term::drain_pty_replies`), so an abandoned upload doesn't stay
+  resident.
+- **Per-chunk base64** (`kitty/b64.rs`). Each chunk is decoded on arrival
+  and may carry its own `=` padding. toastty is more lenient than kitty in
+  three ways:
+  - whitespace is skipped;
+  - an unpadded partial quantum carries over into the next chunk;
+  - decoding continues after a `=` inside a chunk.
+
+  As in kitty, decoding a chunk stops at its first junk byte and keeps
+  the bytes before it (`/wAA*w==` gives 3 bytes).
+- **Bounded before decoding.** Before a chunk is decoded, its decoded
+  size is bounded from its base64 length (`b64::decoded_len_bound`, three
+  bytes per four characters, plus any carried partial quantum), and a
+  chunk that can't fit the cap is refused with `EFBIG:Too much data`
+  without allocating. One APC can carry up to 256 MiB of base64.
+- **The cap counts decoded bytes.** It is kitty's buffer size:
+  - `s*v*bpp` + 10, or + about 1 KiB for `o=z`, capped at the quota plus
+    that slack;
+  - the image quota for PNG.
+
+  Past it, kitty replies `EFBIG:Too much data` and drops the upload. `S=`
+  is ignored for `t=d`.
+- **Aborts.** Any delete aborts the load ("the partial upload must be
+  aborted"), whatever it deletes, and so does a file-medium transmit.
+  Remaining chunks get no reply. A bare continuation has no dimensions,
+  so it fails the first-chunk check, anonymously.
+- **Queries.** A query without `i=` (anonymous or `I=`-only) is dropped
+  before any loading logic: it doesn't append to, finish, abort or EILSEQ
+  an upload in progress.
+  - A chunked `a=q` (with `i=`) is checked up front, then consumes the
+    next chunk and ends with no reply. Nothing is stored.
+  - A chunked `a=q` during a transmit replies `EILSEQ:More payload loading
+    refers to non-existent image` for the upload and drops it. A second
+    chunked `a=q` while a chunked query is loading gets the same EILSEQ,
+    under its own id.
+  - A non-chunked `a=q` during a transmit is that transmit's final chunk:
+    the image is stored under its own id, and the reply goes out under the
+    query's id.
+- **Puts during a load.** `a=p` on the loading image replies
+  `ENOENT:Put command refers to image with id: N that could not load its
+  data`, and the load carries on. `a=a` on the loading image is silent.
+
+Deliberate divergences:
+- the three base64 leniencies above;
+- `a=f` during a load, which needs animation (stack E);
+- the stale-id reply for dimensions over 10000.
