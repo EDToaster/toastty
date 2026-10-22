@@ -2767,7 +2767,12 @@ impl Term {
             // treat the single-param form as SD; anything with more params
             // falls through to the catch-all.
             'T' if priv_marker.is_none() && params.len() <= 1 => {
-                let n = first_param(params, 1).max(1);
+                // Scrolling the region by its height or more blanks it
+                // either way, so clamp: `CSI 65535 T` would otherwise
+                // run 65535 full-region shifts.
+                let bot = self.scroll_bot.min(self.rows.saturating_sub(1));
+                let height = bot.saturating_sub(self.scroll_top) + 1;
+                let n = first_param(params, 1).clamp(1, height);
                 for _ in 0..n {
                     self.region_scroll_down();
                 }
@@ -5468,6 +5473,29 @@ mod tests {
         assert_eq!(scrollback_text(&t, 1), "6");
         assert_eq!(row_text(&t, 2), "7");
         assert_eq!(row_text(&t, 3), "X");
+    }
+
+    #[test]
+    fn sd_count_is_clamped_to_region_height() {
+        // A huge SD count acts like SD by the region height: the region
+        // is blanked, rows outside it and the scrollback are untouched.
+        let mut t = Term::new(6, 8, 100);
+        feed(&mut t, &seq_bytes(10));
+        // Region rows 2..=5 (1-based), i.e. "6".."9" on screen.
+        feed(&mut t, b"\x1b[2;5r\x1b[65535T");
+        assert_eq!(row_text(&t, 0), "5");
+        for r in 1..5 {
+            assert_eq!(row_text(&t, r), "", "row {r}");
+        }
+        assert_eq!(row_text(&t, 5), "10");
+        assert_eq!(t.history_lines(), 4);
+        // Full screen: same, history kept.
+        feed(&mut t, b"\x1b[r\x1b[1;1Htop\x1b[65535T");
+        for r in 0..6 {
+            assert_eq!(row_text(&t, r), "", "row {r}");
+        }
+        assert_eq!(t.history_lines(), 4);
+        assert_eq!(scrollback_text(&t, 0), "4");
     }
 
     #[test]

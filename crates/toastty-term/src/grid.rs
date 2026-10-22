@@ -108,9 +108,11 @@ pub type RelayoutFn<'a> = dyn FnMut(RichBlockId, &[Row]) -> Option<Vec<Row>> + '
 ///
 /// Invariant for off-screen slots: each one is either (a) within the most
 /// recent `history_lines` slots immediately preceding `head` (mod `cap`)
-/// and holds a valid scrollback row, or (b) blank. `scroll_up` /
-/// `scroll_down` are the only places that touch off-screen slots, and
-/// they uphold this invariant.
+/// and holds a valid scrollback row, or (b) blank. `scroll_up` (which
+/// rotates a row into scrollback and pre-blanks the slot it brings on
+/// screen) and `resize` (which rebuilds the ring) are the only places
+/// that touch off-screen slots, and they uphold this invariant.
+/// `scroll_down` only permutes the visible slots.
 #[derive(Debug)]
 pub struct Grid {
     rows: Box<[Row]>,
@@ -811,29 +813,31 @@ mod tests {
     }
 
     #[test]
-    fn grid_scroll_down_with_scrollback_blanks_off_screen_slot() {
-        // cap > visible_rows: verify the slot scrolled off the visible
-        // bottom is blanked so it stays clean as it rotates around the
-        // ring (the invariant scroll_up also relies on).
-        let mut g = Grid::new(2, 3, 4);
-        g.row_mut(1).put(
-            0,
-            Cell {
-                ch: 'z',
-                style: Style::RESET,
-                is_continuation: false,
-                hyperlink_id: None,
-                extra: None,
-            },
-            3,
-        );
-        g.scroll_down();
-        // After scrolling down twice more, the slot that held 'z' rotates
-        // back into the visible region; it must still be blank.
+    fn grid_scroll_down_leaves_off_screen_slots_alone() {
+        // cap > visible_rows: scroll_down permutes only the visible
+        // slots. The bottom row falls off (it isn't parked in an
+        // off-screen slot), and the history / spare slots are untouched,
+        // so a later scroll_up still brings on a blank row and retains
+        // the existing history.
+        let mut g = Grid::new(2, 3, 5);
+        put_at(&mut g, 0, 'h');
+        g.scroll_up();
+        put_at(&mut g, 0, 'a');
+        put_at(&mut g, 1, 'z');
+        // History: 'h'. Visible: 'a', 'z'. Two spare blank slots.
         g.scroll_down();
         g.scroll_down();
-        for r in 0..2 {
-            assert_eq!(g.row(r).cells[0], Cell::BLANK);
+        assert_eq!(g.row(0).cells[0], Cell::BLANK);
+        assert_eq!(g.row(1).cells[0], Cell::BLANK);
+        assert_eq!(g.history_lines(), 1);
+        assert_eq!(g.scrollback_row(0).unwrap().cells[0].ch, 'h');
+        // 'z' must not resurface anywhere as the ring rotates on.
+        for _ in 0..3 {
+            g.scroll_up();
+            assert_eq!(g.row(1).cells[0], Cell::BLANK);
+        }
+        for n in 0..g.history_lines() {
+            assert_ne!(g.scrollback_row(n).unwrap().cells[0].ch, 'z');
         }
     }
 
