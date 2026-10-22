@@ -29,6 +29,12 @@ toastty-parser.workspace = true
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
 
+# `t=s` off Linux: we can't read the object without `mmap` (unsafe), but
+# we still `shm_unlink` it. Linux reads and unlinks it through `/dev/shm`
+# with plain `fs` calls.
+[target.'cfg(all(unix, not(target_os = "linux"), not(target_os = "android")))'.dependencies]
+rustix = { workspace = true, features = ["shm"] }
+
 [dev-dependencies]
 proptest.workspace = true
 
