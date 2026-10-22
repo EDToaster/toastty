@@ -787,10 +787,12 @@ impl Toastty {
     /// Recompute the cell grid from the current pixel size and apply it
     /// to both [`Term`] and [`Pty`].
     ///
-    /// The grid is inset by the configured window padding: the cell grid
-    /// and the PTY winsize pixel fields report the **content** dims (the
-    /// surface minus padding), not the full surface. The renderer keeps
-    /// the full surface size via `resize()`.
+    /// The grid is inset by the configured window padding. The PTY
+    /// winsize pixel fields report whole cells only (`cols × cell_w` by
+    /// `rows × cell_h`, see [`Term::text_area_pixel_size`]), without the
+    /// padding or the sub-cell strip left over at the right / bottom,
+    /// like kitty (SIZE-13). The renderer keeps the full surface size
+    /// via `resize()`; Term gets it for `CSI 14 ; 2 t`.
     fn resync_grid(&mut self) {
         let Some(renderer) = self.renderer.as_ref() else {
             return;
@@ -819,10 +821,11 @@ impl Toastty {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let (cpw, cph) = (cell_w as u16, cell_h as u16);
         self.term.set_cell_pixel_size(cpw, cph);
+        self.term
+            .set_window_pixel_size(self.physical_size.0, self.physical_size.1);
         self.push_rich_env();
         if let Some(pty) = self.pty.as_mut() {
-            let pixel_width = u16::try_from(content_w).unwrap_or(u16::MAX);
-            let pixel_height = u16::try_from(content_h).unwrap_or(u16::MAX);
+            let (pixel_width, pixel_height) = winsize_pixels(&self.term);
             if let Err(e) = pty.resize(WinSize {
                 rows,
                 cols,
@@ -877,22 +880,12 @@ impl Toastty {
     /// everything else on the PTY (no SIGWINCH race). The encoder returns
     /// `None` when 2048 is off, so the default case doesn't touch the PTY.
     ///
-    /// The pixel fields report the CONTENT dims (surface minus padding),
-    /// matching `resync_grid`, not the full surface. Shared by window
-    /// resize, font zoom and font-changing config reloads.
+    /// The pixel fields are the PTY winsize ones (whole cells, see
+    /// [`winsize_pixels`]), so the report and `TIOCGWINSZ` always agree.
+    /// Shared by window resize, font zoom and font-changing config
+    /// reloads. (Enabling the mode reports straight away from Term.)
     fn report_inband_resize(&mut self) {
-        let (rows, cols) = self.term.size();
-        let pad = &self.config.window.padding;
-        let (_ox, _oy, content_w, content_h) = content_rect_from_padding(
-            self.physical_size,
-            (pad.top, pad.right, pad.bottom, pad.left),
-            self.scale_factor,
-        );
-        let pixel_w = u16::try_from(content_w).unwrap_or(u16::MAX);
-        let pixel_h = u16::try_from(content_h).unwrap_or(u16::MAX);
-        if let Some(bytes) =
-            encode_resize_report(rows, cols, pixel_h, pixel_w, self.term.inband_resize_mode())
-        {
+        if let Some(bytes) = inband_resize_report(&self.term) {
             self.write_pty(&bytes);
         }
     }
@@ -1083,16 +1076,9 @@ impl Toastty {
         // launched from `/`).
         let working_dir = self.cli_working_dir.take().unwrap_or_else(initial_cwd);
         info!(?program, ?args, ?working_dir, rows, cols, "spawning shell");
-        // PTY winsize pixel fields report the CONTENT dims (surface minus
-        // padding), matching `resync_grid`.
-        let pad = &self.config.window.padding;
-        let (_ox, _oy, content_w, content_h) = content_rect_from_padding(
-            self.physical_size,
-            (pad.top, pad.right, pad.bottom, pad.left),
-            self.scale_factor,
-        );
-        let pixel_width = u16::try_from(content_w).unwrap_or(u16::MAX);
-        let pixel_height = u16::try_from(content_h).unwrap_or(u16::MAX);
+        // PTY winsize pixel fields: whole cells only, matching
+        // `resync_grid` (which already sized Term above).
+        let (pixel_width, pixel_height) = winsize_pixels(&self.term);
         // TERM: until `terminfo/toastty.terminfo` is installed via
         // `tic -x`, advertise `xterm-256color`. That's a near-superset
         // of what we currently implement (256-color + truecolor + alt
@@ -2546,7 +2532,8 @@ impl App for Toastty {
                 // clear only on an actual change.
                 self.push_padding_to_renderer();
                 self.resync_grid();
-                // DECSET 2048 in-band resize report (content dims).
+                // DECSET 2048 in-band resize report (whole-cell pixels,
+                // same as TIOCGWINSZ).
                 self.report_inband_resize();
                 ControlSignal::RedrawIn(Duration::ZERO)
             }
@@ -2824,7 +2811,27 @@ impl App for Toastty {
     }
 }
 
-/// True when `(button, modifiers)` is the "open hyperlink under cursor"
+/// PTY `TIOCGWINSZ` pixel fields (`ws_xpixel`, `ws_ypixel`) for the
+/// current grid: [`Term::text_area_pixel_size`], saturated to `u16`. Whole
+/// cells only, so `ws_ypixel / ws_row` is exactly the cell height that
+/// `CSI 16 t` reports (SIZE-13).
+fn winsize_pixels(term: &Term) -> (u16, u16) {
+    let (w, h) = term.text_area_pixel_size();
+    (
+        u16::try_from(w).unwrap_or(u16::MAX),
+        u16::try_from(h).unwrap_or(u16::MAX),
+    )
+}
+
+/// DECSET 2048 in-band resize report for the current grid, or `None`
+/// when the app hasn't opted in. The pixel fields are the same
+/// whole-cell numbers as `TIOCGWINSZ` ([`winsize_pixels`]), like kitty.
+fn inband_resize_report(term: &Term) -> Option<Vec<u8>> {
+    let (rows, cols) = term.size();
+    let (pixel_w, pixel_h) = winsize_pixels(term);
+    encode_resize_report(rows, cols, pixel_h, pixel_w, term.inband_resize_mode())
+}
+
 /// Convert a linear-light channel value (0.0..1.0) back to an 8-bit
 /// sRGB byte. Inverse of `srgb_to_linear` in toastty-render. Used to
 /// feed Term's OSC 10/11/12 query handlers a byte triplet apps can
@@ -2840,6 +2847,7 @@ fn linear_to_srgb_u8(x: f32) -> u8 {
     (srgb * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
+/// True when `(button, modifiers)` is the "open hyperlink under cursor"
 /// binding. On macOS it's `Cmd-Left`; on every other platform it's
 /// `Ctrl-Left` (matching iTerm2 / Alacritty conventions).
 fn is_open_link_binding(button: MouseButton, modifiers: Modifiers) -> bool {
@@ -2938,6 +2946,48 @@ fn is_paste_binding(logical: &LogicalKey, modifiers: Modifiers) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn winsize_pixels_are_whole_cells() {
+        // SIZE-13: a 1000x600 content area with 10x19 cells is 100x31
+        // cells; the 11 px strip at the bottom is not reported.
+        let (cols, rows) = grid_dims_from_pixels(1000, 600, 10.0, 19.0);
+        let mut t = Term::new(rows, cols, 0);
+        t.set_cell_pixel_size(10, 19);
+        t.set_window_pixel_size(1000, 600);
+        assert_eq!(winsize_pixels(&t), (1000, 589));
+        // Font zoom changes the cell size; the grid and pixels follow.
+        let (cols, rows) = grid_dims_from_pixels(1000, 600, 12.0, 23.0);
+        t.resize(rows, cols);
+        t.set_cell_pixel_size(12, 23);
+        assert_eq!((rows, cols), (26, 83));
+        assert_eq!(winsize_pixels(&t), (996, 598));
+    }
+
+    #[test]
+    fn inband_resize_report_matches_winsize() {
+        // #25 review: after a resize to 803x411 (10x19 cells, 80x21)
+        // the 2048 report carries TIOCGWINSZ's 800x399, not the window.
+        let (cols, rows) = grid_dims_from_pixels(803, 411, 10.0, 19.0);
+        let mut t = Term::new(rows, cols, 0);
+        t.set_cell_pixel_size(10, 19);
+        t.set_window_pixel_size(803, 411);
+        assert_eq!(inband_resize_report(&t), None, "off by default");
+        Parser::new().advance(&mut t, b"\x1b[?2048h");
+        let _ = t.drain_pty_replies();
+        assert_eq!(winsize_pixels(&t), (800, 399));
+        assert_eq!(
+            inband_resize_report(&t).as_deref(),
+            Some(&b"\x1b[48;21;80;399;800t"[..])
+        );
+    }
+
+    #[test]
+    fn winsize_pixels_saturate_at_u16() {
+        let mut t = Term::new(10, 10, 0);
+        t.set_cell_pixel_size(7000, 7000);
+        assert_eq!(winsize_pixels(&t), (u16::MAX, u16::MAX));
+    }
 
     fn ch(s: &str) -> LogicalKey {
         LogicalKey::Character(s.to_string())

@@ -333,6 +333,11 @@ pub struct Term {
     /// use it to compute kitty-graphics image placement sizes.
     /// Defaults to a plausible (8, 16) until the binary updates it.
     cell_pixel_size: (u16, u16),
+    /// Full window size in pixels (padding and the leftover sub-cell
+    /// strip included). Set by the binary on resize; reported by
+    /// `CSI 14 ; 2 t`. `None` until set, in which case that query falls
+    /// back to the text-area size.
+    window_pixel_size: Option<(u32, u32)>,
     /// Default background color in sRGB bytes. Set by the binary from
     /// the renderer's theme. Read by the OSC 11 `?` query handler.
     /// Apps use it to decide dark vs light rendering modes.
@@ -612,6 +617,7 @@ impl Term {
             // Reasonable defaults until the binary plumbs the real
             // values from the renderer.
             cell_pixel_size: (8, 16),
+            window_pixel_size: None,
             default_bg_rgb: [0x12, 0x12, 0x17],
             cursor_visible: true,
             viewport: crate::viewport::Viewport::new(),
@@ -736,6 +742,28 @@ impl Term {
             self.rich_dirty = true;
         }
         self.cell_pixel_size = new;
+    }
+
+    /// Plumb the full window size in pixels (the surface, padding
+    /// included) so `CSI 14 ; 2 t` can report it, as kitty does.
+    pub fn set_window_pixel_size(&mut self, width: u32, height: u32) {
+        self.window_pixel_size = Some((width.max(1), height.max(1)));
+    }
+
+    /// Text-area size in pixels: `cols × cell_w` by `rows × cell_h`.
+    /// This is what `CSI 14 t` reports and what the binary must put in
+    /// the PTY's `TIOCGWINSZ` pixel fields, so the two always agree. It
+    /// excludes window padding and the strip left over when the content
+    /// area isn't a whole number of cells (kitty does the same), so
+    /// clients that size images from `ws_ypixel / rows` get exactly one
+    /// cell per row.
+    #[must_use]
+    pub fn text_area_pixel_size(&self) -> (u32, u32) {
+        let (cw, ch) = self.cell_pixel_size;
+        (
+            u32::from(self.cols) * u32::from(cw),
+            u32::from(self.rows) * u32::from(ch),
+        )
     }
 
     /// Plumb the renderer's theme background color (sRGB bytes) into
@@ -2751,8 +2779,7 @@ impl Term {
                 let reply = match pi {
                     1 => format!("\x1b[?1;0;{SIXEL_MAX_COLORS}S"),
                     2 => {
-                        let w = u32::from(self.cols) * u32::from(self.cell_pixel_size.0);
-                        let h = u32::from(self.rows) * u32::from(self.cell_pixel_size.1);
+                        let (w, h) = self.text_area_pixel_size();
                         format!("\x1b[?2;0;{w};{h}S")
                     }
                     _ => format!("\x1b[?{pi};2S"),
@@ -2923,6 +2950,8 @@ impl Term {
             }
             // XTWINOPS — window-manipulation reports.
             //   CSI 14 t → report text-area pixel size: CSI 4 ; H ; W t.
+            //   CSI 14 ; 2 t → report the full window's pixel size, same
+            //                  reply form (xterm; kitty answers it too).
             //   CSI 16 t → report cell pixel size:       CSI 6 ; H ; W t.
             //   CSI 18 t → report text-area cell size:   CSI 8 ; H ; W t.
             // Apps (yazi, kitty +kitten icat, neovim with image.nvim,
@@ -2935,8 +2964,12 @@ impl Term {
                 let (cw, ch) = self.cell_pixel_size;
                 match ps {
                     14 => {
-                        let h = u32::from(ch) * u32::from(self.rows);
-                        let w = u32::from(cw) * u32::from(self.cols);
+                        let (w, h) = if nth_param(params, 1, 0) == 2 {
+                            self.window_pixel_size
+                                .unwrap_or_else(|| self.text_area_pixel_size())
+                        } else {
+                            self.text_area_pixel_size()
+                        };
                         let reply = format!("\x1b[4;{h};{w}t");
                         self.pty_replies.extend_from_slice(reply.as_bytes());
                     }
@@ -3739,9 +3772,21 @@ impl Term {
                 2027 => {
                     self.grapheme_cluster_mode = enable;
                 }
-                // 2048 — in-band resize notifications.
+                // 2048 — in-band resize notifications. Like kitty, every
+                // set (even when already on) reports the current size
+                // straight away, so the app learns the geometry without
+                // waiting for a resize. Same numbers as the binary's
+                // resize reports and `TIOCGWINSZ`: whole-cell pixels.
                 2048 => {
                     self.inband_resize_mode = enable;
+                    let (w, h) = self.text_area_pixel_size();
+                    let w = u16::try_from(w).unwrap_or(u16::MAX);
+                    let h = u16::try_from(h).unwrap_or(u16::MAX);
+                    if let Some(reply) = toastty_protocols::resize_inband::encode_resize_report(
+                        self.rows, self.cols, h, w, enable,
+                    ) {
+                        self.pty_replies.extend_from_slice(&reply);
+                    }
                 }
                 // 80 — DECSDM (sixel display mode). SET disables sixel
                 // scrolling (image stays anchored); RESET enables it
@@ -7963,6 +8008,64 @@ mod tests {
         t.set_cell_pixel_size(9, 18);
         feed(&mut t, b"\x1b[16t");
         assert_eq!(&t.drain_pty_replies()[..], b"\x1b[6;18;9t");
+    }
+
+    #[test]
+    fn xtwinops_14_replies_with_whole_cells_only() {
+        // SIZE-13: CSI 14 t is cols × cell_w by rows × cell_h — never
+        // the window, whose size includes padding and a sub-cell strip.
+        let mut t = Term::new(31, 100, 0);
+        t.set_cell_pixel_size(10, 19);
+        t.set_window_pixel_size(1000, 600);
+        feed(&mut t, b"\x1b[14t");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[4;589;1000t");
+        assert_eq!(t.text_area_pixel_size(), (1000, 589));
+        // `14;1t` (and any Ps2 other than 2) is still the text area.
+        feed(&mut t, b"\x1b[14;1t");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[4;589;1000t");
+    }
+
+    #[test]
+    fn xtwinops_14_2_replies_with_window_pixel_size() {
+        // CSI 14 ; 2 t reports the whole window, like kitty.
+        let mut t = Term::new(31, 100, 0);
+        t.set_cell_pixel_size(10, 19);
+        t.set_window_pixel_size(1000, 600);
+        feed(&mut t, b"\x1b[14;2t");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[4;600;1000t");
+        // A resize updates both answers.
+        t.resize(20, 50);
+        t.set_window_pixel_size(510, 400);
+        feed(&mut t, b"\x1b[14t\x1b[14;2t");
+        assert_eq!(
+            &t.drain_pty_replies()[..],
+            b"\x1b[4;380;500t\x1b[4;400;510t"
+        );
+    }
+
+    #[test]
+    fn xtwinops_14_2_falls_back_to_text_area_before_window_is_known() {
+        let mut t = Term::new(24, 80, 0);
+        t.set_cell_pixel_size(9, 18);
+        feed(&mut t, b"\x1b[14;2t");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[4;432;720t");
+    }
+
+    #[test]
+    fn decset_2048_reports_size_on_every_enable() {
+        // kitty 0.49.2: `CSI ? 2048 h` answers with an in-band resize
+        // report right away, also when the mode is already on; reset
+        // sends nothing.
+        let mut t = Term::new(21, 80, 0);
+        t.set_cell_pixel_size(10, 19);
+        t.set_window_pixel_size(803, 411);
+        feed(&mut t, b"\x1b[?2048h");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[48;21;80;399;800t");
+        feed(&mut t, b"\x1b[?2048h");
+        assert_eq!(&t.drain_pty_replies()[..], b"\x1b[48;21;80;399;800t");
+        feed(&mut t, b"\x1b[?2048l");
+        assert!(t.drain_pty_replies().is_empty());
+        assert!(!t.inband_resize_mode());
     }
 
     #[test]
