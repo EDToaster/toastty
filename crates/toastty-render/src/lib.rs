@@ -2865,7 +2865,7 @@ impl Renderer {
         self.image_instances_below_bg.clear();
         self.image_instances_below.clear();
         self.image_instances_above.clear();
-        if !term.image_grid().is_empty() {
+        if !term.image_grid().is_empty() || term.has_virtual_placements() {
             let mut tmp: Vec<ImageInstance> = Vec::new();
             build_image_instances(
                 &mut tmp,
@@ -2873,6 +2873,29 @@ impl Renderer {
                 term.image_registry(),
                 &self.image_tex_cache,
                 cell_size,
+            );
+            // Unicode-placeholder images, resolved from the rows drawn
+            // this frame. Re-sorts `tmp` by (z, id) for the split.
+            let view_pixel = term.view_offset_pixel();
+            crate::image::placeholder::build_placeholder_instances(
+                &mut tmp,
+                term,
+                &self.image_tex_cache,
+                cell_size,
+                crate::image::placeholder::RowLayout {
+                    rows_rendered: crate::text::instance::rows_to_render(
+                        rows,
+                        view_pixel,
+                        cell_size.1,
+                        content_dims.1,
+                    ),
+                    y_translate: if view_pixel > 0.0 {
+                        view_pixel - cell_size.1
+                    } else {
+                        0.0
+                    },
+                },
+                (!(self.needs_full_clear || damage_all)).then(|| term.damage()),
             );
             let (below_bg, below, above) = split_layers(&tmp);
             self.image_instances_below_bg.extend_from_slice(below_bg);
