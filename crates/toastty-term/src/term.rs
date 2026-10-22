@@ -3486,9 +3486,8 @@ impl Term {
         // SCR-6: image placements stay put. kitty 0.49.2 moves only the
         // text on IL (checked on kitty-ref) and the spec lists only index
         // and history scrolling as moving images. Unicode-placeholder
-        // images are text, so their tiles move with their cells.
-        // TODO(#28): drop this once placeholders render from the cells.
-        self.scroll_region_images_where(cur_row, bot, i32::from(n), |p| p.from_placeholder);
+        // images are text and render from the cells (#28), so they move
+        // with them.
     }
 
     /// DL — Delete Line. `CSI Ps M` removes `n` lines at the cursor
@@ -3554,9 +3553,7 @@ impl Term {
         }
         // SCR-6: image placements stay put, as on IL. kitty 0.49.2 keeps
         // an image whole even when DL deletes the rows under it.
-        // Placeholder tiles move with their cells.
-        // TODO(#28): drop this once placeholders render from the cells.
-        self.scroll_region_images_where(cur_row, bot, -i32::from(n), |p| p.from_placeholder);
+        // Placeholder images render from the cells (#28) and move with them.
     }
 
     /// VPA — Vertical Position Absolute. `CSI Ps d` moves the cursor
@@ -11778,44 +11775,44 @@ mod placement_resize_tests {
         assert_eq!(rows(&t), 2..4, "a drag doesn't walk it up the line");
     }
 
-    // TODO(#28): drop these two once placeholders render from the cells.
-    fn placeholder_tile_rows(t: &Term) -> std::ops::Range<i64> {
-        let p = t
-            .image_grid()
-            .iter()
-            .find(|p| p.from_placeholder)
-            .expect("placeholder tile");
-        t.prows(p)
+    /// Row of the (single) placeholder run on screen.
+    fn placeholder_run_row(t: &Term) -> u16 {
+        (0..t.rows)
+            .find(|&r| {
+                let mut runs = Vec::new();
+                t.placeholder_runs(t.active_grid().row(r), &mut runs);
+                !runs.is_empty()
+            })
+            .expect("placeholder run")
     }
 
     fn print_placeholder_on_row_5(t: &mut Term) {
-        feed(t, b"\x1b_Ga=t,f=32,s=1,v=1,i=42,q=2;/wAA/w==\x1b\\");
+        feed(t, b"\x1b_Ga=T,f=32,s=1,v=1,i=42,U=1,q=2;/wAA/w==\x1b\\");
         // U+10EEEE with row/col diacritic 0 (U+0305), fg = image id 42.
         feed(
             t,
             "\x1b[6;1H\x1b[38;5;42m\u{10EEEE}\u{305}\u{305}\x1b[0m".as_bytes(),
         );
-        feed(t, b"x"); // end the placeholder run
-        assert_eq!(placeholder_tile_rows(t), 5..6);
+        assert_eq!(placeholder_run_row(t), 5);
     }
 
     #[test]
-    fn il_moves_placeholder_tiles_with_their_cells() {
+    fn il_moves_placeholder_images_with_their_cells() {
+        // Was the per-cell tile version (removed by #28): placeholder
+        // images render from the cells, so IL moves them like text.
         let mut t = Term::new(10, 20, 0);
         print_placeholder_on_row_5(&mut t);
         place_id(&mut t, 1, 2, 2); // an ordinary image at row 5 too
         feed(&mut t, b"\x1b[3;1H\x1b[2L");
-        assert_eq!(placeholder_tile_rows(&t), 7..8, "follows its cell");
-        assert_eq!(t.row(7).cells[0].ch, '\u{10EEEE}');
+        assert_eq!(placeholder_run_row(&t), 7, "follows its cell");
         assert_eq!(rows_of(&t, 1), 5..7, "ordinary image stays (SCR-6)");
     }
 
     #[test]
-    fn dl_moves_placeholder_tiles_with_their_cells() {
+    fn dl_moves_placeholder_images_with_their_cells() {
         let mut t = Term::new(10, 20, 0);
         print_placeholder_on_row_5(&mut t);
         feed(&mut t, b"\x1b[3;1H\x1b[2M");
-        assert_eq!(placeholder_tile_rows(&t), 3..4);
-        assert_eq!(t.row(3).cells[0].ch, '\u{10EEEE}');
+        assert_eq!(placeholder_run_row(&t), 3);
     }
 }
