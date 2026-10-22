@@ -73,15 +73,15 @@ for `U=1` on `a=T` and `a=p`.
   capitals) leave them alone (PH-7). An image with a virtual placement
   counts as placed: it is pinned against quota eviction, and the
   capital positional deletes don't free its bytes.
-- **Scope.** There is one table per screen, stashed with the image grid
-  on alt-screen switches. In kitty, main's virtual placements don't show
-  on alt and alt's are gone after exit. The image *registry* is still
-  shared between screens (a separate item). So whenever an image's bytes
+- **Scope.** There is one table per screen. It lives in the screen's
+  `ScreenImages` next to its grid and its own image store (#42), and
+  swaps with them on alt-screen switches, as kitty keeps one graphics
+  manager per screen: main's virtual placements don't show on alt, and
+  the other screen's `i=5` is a different image. When an image's bytes
   are replaced or freed (re-transmit, eviction, a byte-freeing delete),
-  its virtual placements are dropped from *both* tables. Otherwise a
-  stashed placement's old `c`/`r` would apply to whatever image later
-  reuses the id. Invariant: every virtual placement names a registered
-  image.
+  its virtual placements go from that screen's table only. Invariant:
+  every virtual placement names an image in its own screen's store.
+  (Before #42 the registry was shared, so both tables were cleaned.)
 - **Copy.** A placeholder cell copies as `U+10EEEE` followed by the
   diacritics it was printed with, as kitty does, so pasting reproduces
   the image cell.

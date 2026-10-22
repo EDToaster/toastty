@@ -561,37 +561,56 @@ fn copy_keeps_the_diacritics_like_kitty() {
 }
 
 #[test]
-fn retransmit_on_alt_drops_mains_stale_placement() {
-    // #28 review: re-transmission / eviction only cleaned the active
-    // screen's table, so a stashed placement's old c/r applied to an
-    // image that later reused the id.
+fn retransmit_on_alt_keeps_mains_virtual_placement() {
+    // #28 review cleaned both screens' tables because the registry was
+    // shared. With per-screen stores (#42) the alt screen's i=5 is a
+    // different image, so main's virtual placement (and its image) stay,
+    // as with kitty's one graphics manager per screen.
     let mut t = Term::new(6, 10, 0);
     transmit(&mut t, "a=T,i=5,U=1,c=3,r=2", 4, 2);
     feed(&mut t, b"\x1b[?1049h");
     transmit(&mut t, "a=t,i=5", 8, 8);
     feed(&mut t, b"\x1b[?1049l");
-    assert!(!t.virtual_placements().contains_image(5));
+    assert!(t.virtual_placements().contains_image(5));
+    assert_eq!(t.image_store().get(5).map(|i| i.width), Some(4));
 }
 
 #[test]
-fn eviction_or_free_on_alt_drops_mains_stale_placement() {
+fn eviction_drops_virtual_placements_on_both_screens() {
     let mut t = Term::new(6, 10, 0);
     transmit(&mut t, "a=T,i=5,U=1,c=3,r=2", 4, 2);
     transmit(&mut t, "a=T,i=6,U=1,c=3,r=2", 4, 2);
     feed(&mut t, b"\x1b[?1049h");
-    // Evict everything while alt is up, then reuse id 5 there.
+    // set_image_cap sets both screens' quota, so main's images are
+    // evicted from main's own store too, virtual placements with them.
     t.set_image_cap(1);
     assert!(!t.image_store().contains(5));
     feed(&mut t, b"\x1b[?1049l");
-    assert!(!t.virtual_placements().contains_image(5), "evicted on alt");
+    assert!(!t.virtual_placements().contains_image(5), "evicted");
     // Reusing the id on main doesn't bring the old c/r back.
     t.set_image_cap(64 * 1024 * 1024);
     transmit(&mut t, "a=t,i=5", 8, 8);
     assert!(t.virtual_placements().find(5, 0).is_none());
-    // A byte-freeing delete on alt also cleans main's table.
+    // A byte-freeing delete on alt only touches alt's store.
     transmit(&mut t, "a=T,i=7,U=1,c=3,r=2", 4, 2);
     feed(&mut t, b"\x1b[?1049h\x1b_Ga=d,d=I,i=7,q=2\x1b\\\x1b[?1049l");
-    assert!(!t.virtual_placements().contains_image(7));
+    assert!(t.virtual_placements().contains_image(7));
+}
+
+#[test]
+fn clears_and_ris_keep_images_shown_only_through_placeholders() {
+    // #42's PLC-8 frees images left without a placement on ED 2 / ED 3
+    // and RIS; a virtual placement counts as one (#28, PH-7), so the
+    // image a placeholder shows survives, as in kitty 0.49.2.
+    let mut t = Term::new(6, 10, 0);
+    transmit(&mut t, "a=T,i=42,U=1,c=4,r=2", 4, 2);
+    transmit(&mut t, "a=t,i=43", 4, 2);
+    feed(&mut t, b"\x1b[2J");
+    assert!(t.image_store().contains(42));
+    assert!(!t.image_store().contains(43), "unplaced image freed");
+    feed(&mut t, b"\x1bc");
+    assert!(t.virtual_placements().contains_image(42));
+    assert!(t.image_store().contains(42));
 }
 
 #[test]
