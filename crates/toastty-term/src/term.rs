@@ -308,10 +308,10 @@ pub struct Term {
     /// oldest first. The kitty spec lets a client refer to "the newest
     /// image with this number" (`d=n`/`d=N`, `d=f`/`d=F`); keeping every
     /// id means that once the newest is freed, the next-newest is still
-    /// reachable, as in kitty. Updated on every registration (an id
-    /// re-registered moves to the end, or out if it lost its number);
-    /// pruned when an id leaves the registry (delete / eviction). Read it
-    /// through [`Term::newest_image_for_number`].
+    /// reachable, as in kitty. Appended on each numbered registration (an
+    /// image re-sent by `i=` keeps its number and place); pruned when an
+    /// id leaves the registry (delete / eviction). Read it through
+    /// [`Term::newest_image_for_number`].
     image_number_to_id: std::collections::HashMap<u32, Vec<u32>>,
     /// Monotonic counter bumped whenever the registry or grid mutates.
     /// The renderer compares against its cached value to decide when
@@ -4689,14 +4689,14 @@ impl KittySink for Term {
                     self.forget_image_number(*evicted);
                 }
                 // Record this id as the newest for its image number (M11:
-                // `d=n`/`d=N` resolution). A re-registered id first leaves
-                // whatever number it had.
-                self.forget_image_number(inserted.id);
+                // `d=n`/`d=N` resolution). Re-sending an existing image by
+                // `i=` keeps its number and its age, as in kitty (`i=` and
+                // `I=` can't be combined, so it can't gain a new one).
                 if image_number != 0 {
-                    self.image_number_to_id
-                        .entry(image_number)
-                        .or_default()
-                        .push(inserted.id);
+                    let ids = self.image_number_to_id.entry(image_number).or_default();
+                    if !ids.contains(&inserted.id) {
+                        ids.push(inserted.id);
+                    }
                 }
                 self.image_revision = self.image_revision.wrapping_add(1);
                 Some(inserted.id)
@@ -9886,19 +9886,34 @@ mod major_delete_tests {
     }
 
     #[test]
-    fn number_map_follows_reregistration() {
-        // Re-transmitting an id moves it to the newest slot of its new
-        // number and out of its old one.
+    fn reregistering_by_id_keeps_number_and_age() {
+        // #35 review, matching kitty: re-sending image A (I=7) by `i=A`
+        // keeps its number and its original age, so `d=N,I=7` removes
+        // the newer B first and then A.
         let mut t = Term::new(8, 8, 0);
-        transmit_place_numbered(&mut t, 0, 0, 7); // id 1
-        transmit_place_numbered(&mut t, 2, 0, 7); // id 2
+        transmit_place_numbered(&mut t, 0, 0, 7); // id 1 (A)
+        transmit_place_numbered(&mut t, 2, 0, 7); // id 2 (B)
+        transmit_place_at(&mut t, 4, 0, 1, 0, 0); // re-send A by i=1
         assert_eq!(t.newest_image_for_number(7), Some(2));
-        // Re-register id 1 with no number (i= only): it leaves I=7.
-        transmit_place_at(&mut t, 4, 0, 1, 0, 0);
         feed(&mut t, b"\x1b_Ga=d,d=N,I=7\x1b\\");
-        assert!(!t.image_registry().contains(2));
-        assert!(t.image_registry().contains(1), "id 1 no longer has I=7");
+        assert!(!t.image_registry().contains(2), "B (newest) goes first");
+        assert!(t.image_registry().contains(1));
+        feed(&mut t, b"\x1b_Ga=d,d=N,I=7\x1b\\");
+        assert!(!t.image_registry().contains(1), "then A, which kept I=7");
         assert_eq!(t.newest_image_for_number(7), None);
+    }
+
+    #[test]
+    fn del2_uppercase_f_removes_placements_whose_data_is_gone() {
+        // `d=F,i=N` doesn't need the image data to exist: leftover
+        // placements of an id whose bytes are already gone are removed.
+        let mut t = Term::new(8, 8, 0);
+        transmit_place_at(&mut t, 0, 0, 5, 0, 0);
+        place_again_at(&mut t, 0, 3, 5, 2);
+        t.image_registry.remove(5);
+        assert!(has_placement_for(&t, 5));
+        feed(&mut t, b"\x1b_Ga=d,d=F,i=5\x1b\\");
+        assert!(!has_placement_for(&t, 5));
     }
 
     #[test]
