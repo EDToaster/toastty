@@ -7,7 +7,6 @@
 
 use crate::cell::{Cell, Style};
 use crate::rich::{RichBlockId, RichRow};
-use smallvec::SmallVec;
 
 /// A single row in the grid. `soft_wrap` indicates the row continues onto
 /// the next one (load-bearing for reflow — decision #6).
@@ -17,9 +16,23 @@ use smallvec::SmallVec;
 /// erasing the row or writing a cell into it ([`Row::clear`],
 /// [`Row::erase`], [`Row::put`]) clears it, so an app drawing over a
 /// block wins.
+///
+/// The cells are private so the row can keep `used`: every cell at or
+/// past `used` is exactly [`Cell::BLANK`]. That lets [`Row::clear`] (run
+/// on every linefeed at the bottom of the screen, on a row recycled from
+/// the far end of the 10k-row scrollback ring and so cold in cache)
+/// blank only the prefix that was ever written instead of all `cols`
+/// cells: for `seq` / log-style output that's one cache line instead of
+/// forty (2026-10-22 perf note in `docs/decisions/scrollback.md`).
+/// Writers through [`Row::cells_mut`] conservatively set `used` to the
+/// full length; the hot paths ([`Row::put`], `Row::write_ascii`,
+/// [`Row::erase`]) track it exactly.
 #[derive(Debug, Clone, Default)]
 pub struct Row {
-    pub cells: SmallVec<[Cell; 16]>,
+    cells: Vec<Cell>,
+    /// Upper bound on the written prefix: `cells[used..]` are all
+    /// `Cell::BLANK`. Always `<= cells.len()`.
+    used: u16,
     pub soft_wrap: bool,
     pub rich: Option<RichRow>,
 }
@@ -29,22 +42,71 @@ impl Row {
     /// "scroll up" path when the bottom row falls off into history.
     #[must_use]
     pub fn blank(cols: u16) -> Self {
-        let mut cells = SmallVec::with_capacity(cols as usize);
-        for _ in 0..cols {
-            cells.push(Cell::BLANK);
-        }
         Self {
-            cells,
+            cells: vec![Cell::BLANK; cols as usize],
+            used: 0,
             soft_wrap: false,
             rich: None,
         }
     }
 
-    /// Reset every cell to blank but keep allocated capacity.
-    pub fn clear(&mut self) {
-        for c in &mut self.cells {
-            *c = Cell::BLANK;
+    /// A row holding `cells` (any length; reflow and rich-block layout
+    /// build rows this way).
+    #[must_use]
+    pub fn from_cells(cells: Vec<Cell>, soft_wrap: bool) -> Self {
+        let used = cells
+            .iter()
+            .rposition(|c| *c != Cell::BLANK)
+            .map_or(0, |i| i + 1);
+        Self {
+            used: u16::try_from(used).unwrap_or(u16::MAX),
+            cells,
+            soft_wrap,
+            rich: None,
         }
+    }
+
+    /// The row's cells, one per column.
+    #[inline]
+    #[must_use]
+    pub fn cells(&self) -> &[Cell] {
+        &self.cells
+    }
+
+    /// Mutable access to every cell. Counts the whole row as written
+    /// (see the type docs), so prefer [`Row::put`] / [`Row::erase`] on
+    /// hot paths.
+    #[inline]
+    pub fn cells_mut(&mut self) -> &mut [Cell] {
+        self.used = u16::try_from(self.cells.len()).unwrap_or(u16::MAX);
+        &mut self.cells
+    }
+
+    /// Number of cells (normally the grid's column count).
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// True for a row with no cells (an off-screen ring slot that was
+    /// never used, see [`Grid`]).
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
+    /// Reset every cell to blank but keep allocated capacity. Only the
+    /// written prefix is touched (see the type docs).
+    pub fn clear(&mut self) {
+        let used = usize::from(self.used).min(self.cells.len());
+        debug_assert!(
+            self.cells[used..].iter().all(|c| *c == Cell::BLANK),
+            "Row::used understates the written prefix"
+        );
+        self.cells[..used].fill(Cell::BLANK);
+        self.used = 0;
         self.soft_wrap = false;
         self.rich = None;
     }
@@ -57,30 +119,56 @@ impl Row {
             self.cells.resize(cols, Cell::BLANK);
         } else {
             self.cells.truncate(cols);
+            self.used = self.used.min(u16::try_from(cols).unwrap_or(u16::MAX));
         }
     }
 
     /// Write a cell at `col`, growing the row with blanks if necessary.
     /// Out-of-range writes against a clamped column are a logic bug in
     /// the caller — we silently grow, but never beyond `max_cols`.
+    #[inline]
     pub fn put(&mut self, col: u16, cell: Cell, max_cols: u16) {
         self.rich = None;
-        let col = col as usize;
-        if col >= self.cells.len() {
-            let target = (col + 1).min(max_cols as usize);
+        let c = col as usize;
+        if c >= self.cells.len() {
+            let target = (c + 1).min(max_cols as usize);
             self.cells.resize(target, Cell::BLANK);
         }
-        if let Some(slot) = self.cells.get_mut(col) {
+        if let Some(slot) = self.cells.get_mut(c) {
             *slot = cell;
+            self.used = self.used.max(col + 1);
         }
+    }
+
+    /// Write one cell per byte of `run` (printable ASCII) at
+    /// `col..col + run.len()`, each `template` with that character: the
+    /// same as one [`Row::put`] per byte. The caller keeps the run inside
+    /// `max_cols`.
+    #[inline]
+    pub(crate) fn write_ascii(&mut self, col: u16, run: &[u8], template: Cell, max_cols: u16) {
+        self.rich = None;
+        let start = col as usize;
+        let end = (start + run.len()).min(max_cols as usize);
+        if end > self.cells.len() {
+            self.cells.resize(end, Cell::BLANK);
+        }
+        for (slot, &b) in self.cells[start..end].iter_mut().zip(run) {
+            *slot = Cell {
+                ch: char::from(b),
+                ..template
+            };
+        }
+        #[allow(clippy::cast_possible_truncation)] // end <= max_cols
+        let end = end as u16;
+        self.used = self.used.max(end);
     }
 
     /// Erase cells in `[start, end)` (open at end) — used by EL handlers.
     pub fn erase(&mut self, start: u16, end: u16, style: Style) {
         self.rich = None;
-        let start = start as usize;
-        let end = (end as usize).min(self.cells.len());
-        if start >= end {
+        let s = start as usize;
+        let e = (end as usize).min(self.cells.len());
+        if s >= e {
             return;
         }
         let blank = Cell {
@@ -91,9 +179,41 @@ impl Row {
             hyperlink_id: None,
             extra: None,
         };
-        for c in &mut self.cells[start..end] {
-            *c = blank;
+        self.cells[s..e].fill(blank);
+        #[allow(clippy::cast_possible_truncation)] // e <= cells.len()
+        let e16 = e as u16;
+        if blank != Cell::BLANK {
+            self.used = self.used.max(e16);
+        } else if e16 >= self.used {
+            // Erasing (with the default background) through the end of
+            // the written prefix shortens it: `EL 0` / `ED` keep later
+            // clears cheap.
+            self.used = self.used.min(start);
         }
+    }
+
+    /// Fill every cell with `cell` (BCE erase of a whole row).
+    pub fn fill(&mut self, cell: Cell) {
+        self.cells.fill(cell);
+        self.used = if cell == Cell::BLANK {
+            0
+        } else {
+            u16::try_from(self.cells.len()).unwrap_or(u16::MAX)
+        };
+    }
+
+    /// Release the cell storage, leaving an empty row (an unused ring
+    /// slot, see [`Grid`]).
+    pub(crate) fn release(&mut self) {
+        *self = Self::default();
+    }
+
+    /// True when every cell is [`Cell::BLANK`] — the written prefix is
+    /// checked, the rest is blank by construction.
+    #[must_use]
+    pub fn is_blank(&self) -> bool {
+        let used = usize::from(self.used).min(self.cells.len());
+        self.cells[..used].iter().all(|c| *c == Cell::BLANK)
     }
 }
 
@@ -114,6 +234,12 @@ pub type RelayoutFn<'a> = dyn FnMut(RichBlockId, &[Row]) -> Option<Vec<Row>> + '
 /// screen), `clear_history` and `resize` (which rebuild the ring) are the
 /// only places that touch off-screen slots, and they uphold this
 /// invariant. `scroll_down` only permutes the visible slots.
+///
+/// A blank off-screen slot may also be *empty* (no cells, no
+/// allocation): the ring starts that way and fills on demand as output
+/// scrolls into history, so an idle terminal doesn't pay for 10k rows of
+/// blank cells (~26 MB at 128 columns). Visible rows always hold `cols`
+/// cells; every path that brings a slot on screen sizes it.
 #[derive(Debug)]
 pub struct Grid {
     rows: Box<[Row]>,
@@ -224,10 +350,11 @@ impl Grid {
         debug_assert!(cap >= visible_rows as usize, "cap < visible_rows");
         debug_assert!(visible_rows > 0 && cols > 0, "zero-sized grid");
         let cap = cap.max(visible_rows as usize).max(1);
+        // Only the visible rows get cells; the scrollback slots stay
+        // empty until something scrolls into them.
         let mut v: Vec<Row> = Vec::with_capacity(cap);
-        for _ in 0..cap {
-            v.push(Row::blank(cols));
-        }
+        v.resize_with(visible_rows as usize, || Row::blank(cols));
+        v.resize_with(cap, Row::default);
         Self {
             rows: v.into_boxed_slice(),
             head: 0,
@@ -304,8 +431,21 @@ impl Grid {
         }
     }
 
+    /// Ring slot of logical row `idx`. `head < cap` and callers nearly
+    /// always pass a visible row, so a conditional subtract replaces the
+    /// `%` (a 64-bit divide on every cell write and row read); far
+    /// out-of-range indices still wrap as before.
+    #[inline]
     fn slot(&self, idx: u16) -> usize {
-        (self.head + idx as usize) % self.rows.len()
+        let s = self.head + idx as usize;
+        let cap = self.rows.len();
+        if s < cap {
+            s
+        } else if s - cap < cap {
+            s - cap
+        } else {
+            s % cap
+        }
     }
 
     /// Every ring slot — visible, scrollback and blank — in storage
@@ -316,11 +456,13 @@ impl Grid {
     }
 
     /// Borrow visible row `idx` (0-based, top of viewport = 0).
+    #[inline]
     pub fn row(&self, idx: u16) -> &Row {
         &self.rows[self.slot(idx)]
     }
 
     /// Mutably borrow visible row `idx`.
+    #[inline]
     pub fn row_mut(&mut self, idx: u16) -> &mut Row {
         let s = self.slot(idx);
         &mut self.rows[s]
@@ -365,10 +507,14 @@ impl Grid {
         // becomes scrollback row 0 after the head bump — that's the
         // retention path.
         let cap = self.rows.len();
-        let new_bottom_slot = (self.head + self.visible_rows as usize) % cap;
+        let new_bottom_slot = self.slot(self.visible_rows);
         self.rows[new_bottom_slot].clear();
         self.rows[new_bottom_slot].resize_cols(self.cols);
-        self.head = (self.head + 1) % cap;
+        self.head = if self.head + 1 == cap {
+            0
+        } else {
+            self.head + 1
+        };
         // Grow history, capped at the ring's scrollback budget.
         let max_history = (cap as u32).saturating_sub(u32::from(self.visible_rows));
         if self.history_lines < max_history {
@@ -413,8 +559,8 @@ impl Grid {
         let cap = self.rows.len();
         for n in 0..self.history_lines as usize {
             let slot = (self.head + cap - 1 - n) % cap;
-            self.rows[slot].clear();
-            self.rows[slot].resize_cols(self.cols);
+            // Hand the memory back: the slot refills on demand.
+            self.rows[slot].release();
         }
         self.history_lines = 0;
     }
@@ -426,10 +572,10 @@ impl Grid {
         for i in 0..self.visible_rows {
             let row = self.row_mut(i);
             // Ensure width matches current geometry, then blank every cell.
-            if row.cells.len() != cols as usize {
+            if row.cells().len() != cols as usize {
                 row.resize_cols(cols);
             }
-            row.cells.fill(Cell {
+            row.fill(Cell {
                 ch: ' ',
                 style,
                 is_continuation: false,
@@ -454,8 +600,12 @@ impl Grid {
         let cap = cap.max(visible_rows as usize).max(1);
         let old_visible_rows = self.visible_rows;
         if cap == self.rows.len() {
+            // Empty (never-used) slots stay empty; the visible rows are
+            // sized below, since a taller screen can take in some.
             for r in &mut self.rows {
-                r.resize_cols(cols);
+                if !r.is_empty() {
+                    r.resize_cols(cols);
+                }
             }
         } else {
             let mut v: Vec<Row> = Vec::with_capacity(cap);
@@ -466,9 +616,8 @@ impl Grid {
                 r.resize_cols(cols);
                 v.push(r);
             }
-            for _ in preserve..cap {
-                v.push(Row::blank(cols));
-            }
+            v.resize_with(visible_rows as usize, || Row::blank(cols));
+            v.resize_with(cap, Row::default);
             self.rows = v.into_boxed_slice();
             self.head = 0;
             // Cap changed → fresh ring; existing scrollback is dropped.
@@ -476,6 +625,9 @@ impl Grid {
         }
         self.cols = cols;
         self.visible_rows = visible_rows;
+        for i in 0..visible_rows {
+            self.row_mut(i).resize_cols(cols);
+        }
         // Re-clamp history to the new scrollback budget. If the visible
         // region grew within the same cap, some scrollback slots may now
         // overlap the visible region.
@@ -590,7 +742,7 @@ impl Grid {
         // still yields a line for the cursor.
         let last_nonblank = retained
             .iter()
-            .rposition(|r| r.rich.is_some() || r.cells.iter().any(|c| *c != Cell::BLANK))
+            .rposition(|r| r.rich.is_some() || r.cells().iter().any(|c| *c != Cell::BLANK))
             .unwrap_or(0);
         let end = cursor_idx
             .max(last_nonblank)
@@ -607,7 +759,9 @@ impl Grid {
         let vis = visible_rows as usize;
         let budget = cap.saturating_sub(vis);
         let n = flat.len();
-        let mut ring: Vec<Row> = (0..cap).map(|_| Row::blank(cols)).collect();
+        let mut ring: Vec<Row> = Vec::with_capacity(cap);
+        ring.resize_with(vis, || Row::blank(cols));
+        ring.resize_with(cap, Row::default);
         let mut flat = flat;
 
         let (cursor_row, new_history) = if n <= vis {
@@ -775,15 +929,15 @@ mod tests {
     #[test]
     fn new_row_is_all_blanks() {
         let r = Row::blank(4);
-        assert_eq!(r.cells.len(), 4);
-        assert!(r.cells.iter().all(|c| *c == Cell::BLANK));
+        assert_eq!(r.cells().len(), 4);
+        assert!(r.cells().iter().all(|c| *c == Cell::BLANK));
         assert!(!r.soft_wrap);
     }
 
     #[test]
     fn row_clear_resets_cells_and_soft_wrap() {
         let mut r = Row::blank(3);
-        r.cells[0] = Cell {
+        r.cells_mut()[0] = Cell {
             ch: 'x',
             style: red_style(),
             is_continuation: false,
@@ -793,21 +947,82 @@ mod tests {
         };
         r.soft_wrap = true;
         r.clear();
-        assert!(r.cells.iter().all(|c| *c == Cell::BLANK));
+        assert!(r.cells().iter().all(|c| *c == Cell::BLANK));
         assert!(!r.soft_wrap);
+    }
+
+    /// A ring slot is a `Vec` header plus a few flags (it was ~350 B
+    /// with the inline `SmallVec<[Cell; 16]>`); 10k+ of them per grid.
+    #[test]
+    fn row_slot_stays_small() {
+        let s = std::mem::size_of::<Row>();
+        assert!(s <= 56, "Row grew to {s} bytes");
+    }
+
+    /// `Row::used` must stay an upper bound on the non-blank prefix
+    /// whichever path writes the row, or `clear` would leave stale cells.
+    #[test]
+    fn row_used_tracks_every_write_path() {
+        let x = Cell {
+            ch: 'x',
+            ..Cell::BLANK
+        };
+        let red = Cell {
+            style: red_style(),
+            ..Cell::BLANK
+        };
+        let mut r = Row::blank(10);
+        assert_eq!(r.used, 0);
+        r.put(3, x, 10);
+        assert_eq!(r.used, 4);
+        r.put(1, x, 10);
+        assert_eq!(r.used, 4, "an earlier column doesn't shrink it");
+        // Default-style erase through the end shortens the prefix...
+        r.erase(2, 10, Style::RESET);
+        assert_eq!(r.used, 2);
+        // ...one that stops short of it doesn't...
+        r.put(6, x, 10);
+        r.erase(0, 3, Style::RESET);
+        assert_eq!(r.used, 7);
+        // ...and a coloured (BCE) erase extends it.
+        r.erase(7, 9, red_style());
+        assert_eq!(r.used, 9);
+        r.clear();
+        assert!(r.is_blank() && r.used == 0);
+        // Raw mutable access counts the whole row as written.
+        r.cells_mut()[9] = x;
+        assert_eq!(r.used, 10);
+        r.clear();
+        assert!(r.cells().iter().all(|c| *c == Cell::BLANK));
+        // Whole-row fills: BCE colour keeps everything, blank resets.
+        r.fill(red);
+        assert_eq!(r.used, 10);
+        r.fill(Cell::BLANK);
+        assert_eq!(r.used, 0);
+        // Shrinking clamps it; growing adds blanks past it.
+        r.put(8, x, 10);
+        r.resize_cols(5);
+        assert_eq!(r.used, 5);
+        r.resize_cols(10);
+        assert_eq!(r.used, 5);
+        r.clear();
+        assert!(r.is_blank());
+        // `from_cells` counts up to the last non-blank cell.
+        let r = Row::from_cells(vec![Cell::BLANK, x, Cell::BLANK, Cell::BLANK], true);
+        assert_eq!((r.used, r.len(), r.soft_wrap), (2, 4, true));
     }
 
     #[test]
     fn row_resize_grows_and_shrinks() {
         let mut r = Row::blank(2);
         r.resize_cols(5);
-        assert_eq!(r.cells.len(), 5);
+        assert_eq!(r.cells().len(), 5);
         r.resize_cols(1);
-        assert_eq!(r.cells.len(), 1);
+        assert_eq!(r.cells().len(), 1);
         // grow back — newly added cells must be blank.
         r.resize_cols(3);
-        assert_eq!(r.cells[1], Cell::BLANK);
-        assert_eq!(r.cells[2], Cell::BLANK);
+        assert_eq!(r.cells()[1], Cell::BLANK);
+        assert_eq!(r.cells()[2], Cell::BLANK);
     }
 
     #[test]
@@ -825,10 +1040,10 @@ mod tests {
             },
             8,
         );
-        assert_eq!(r.cells.len(), 5);
-        assert_eq!(r.cells[4].ch, 'z');
+        assert_eq!(r.cells().len(), 5);
+        assert_eq!(r.cells()[4].ch, 'z');
         // intermediate cells should be blanks
-        assert_eq!(r.cells[2], Cell::BLANK);
+        assert_eq!(r.cells()[2], Cell::BLANK);
     }
 
     #[test]
@@ -848,14 +1063,14 @@ mod tests {
             },
             3,
         );
-        assert_eq!(r.cells.len(), 3);
-        assert!(r.cells.iter().all(|c| *c == Cell::BLANK));
+        assert_eq!(r.cells().len(), 3);
+        assert!(r.cells().iter().all(|c| *c == Cell::BLANK));
     }
 
     #[test]
     fn row_erase_handles_range_and_clamping() {
         let mut r = Row::blank(5);
-        for (i, c) in r.cells.iter_mut().enumerate() {
+        for (i, c) in r.cells_mut().iter_mut().enumerate() {
             *c = Cell {
                 ch: char::from(b'a' + i as u8),
                 style: Style::RESET,
@@ -866,9 +1081,9 @@ mod tests {
             };
         }
         r.erase(1, 3, red_style());
-        assert_eq!(r.cells[0].ch, 'a');
+        assert_eq!(r.cells()[0].ch, 'a');
         assert_eq!(
-            r.cells[1],
+            r.cells()[1],
             Cell {
                 ch: ' ',
                 style: red_style(),
@@ -879,7 +1094,7 @@ mod tests {
             }
         );
         assert_eq!(
-            r.cells[2],
+            r.cells()[2],
             Cell {
                 ch: ' ',
                 style: red_style(),
@@ -889,13 +1104,50 @@ mod tests {
                 extra: None,
             }
         );
-        assert_eq!(r.cells[3].ch, 'd');
+        assert_eq!(r.cells()[3].ch, 'd');
         // Out-of-range end gets clamped.
         r.erase(4, 100, Style::RESET);
-        assert_eq!(r.cells[4], Cell::BLANK);
+        assert_eq!(r.cells()[4], Cell::BLANK);
         // start >= end is a no-op (no panic).
         r.erase(3, 3, red_style());
-        assert_eq!(r.cells[3].ch, 'd');
+        assert_eq!(r.cells()[3].ch, 'd');
+    }
+
+    /// The scrollback part of the ring is allocated on demand: empty
+    /// slots until output scrolls into them, and again after ED 3.
+    /// Whatever brings a slot on screen gives it `cols` cells.
+    #[test]
+    fn grid_allocates_scrollback_slots_lazily() {
+        let mut g = Grid::new(2, 3, 6);
+        let sized = |g: &Grid| g.ring_rows().filter(|r| !r.is_empty()).count();
+        assert_eq!(sized(&g), 2, "only the visible rows have cells");
+        for _ in 0..3 {
+            put_at(&mut g, 0, 'a');
+            g.scroll_up();
+        }
+        assert_eq!(sized(&g), 5);
+        assert_eq!(g.history_lines(), 3);
+        for n in 0..3 {
+            assert_eq!(g.scrollback_row(n).unwrap().len(), 3);
+        }
+        for r in 0..2 {
+            assert_eq!(g.row(r).len(), 3);
+        }
+        g.clear_history();
+        assert_eq!(sized(&g), 2, "ED 3 frees the history rows");
+        // A taller screen in the same ring takes in empty slots: they
+        // come on screen sized and blank.
+        g.resize(5, 4, 6);
+        for r in 0..5 {
+            assert_eq!(g.row(r).len(), 4);
+            assert!(g.row(r).cells()[1..].iter().all(|c| *c == Cell::BLANK));
+        }
+        // So does a ring rebuilt at a new capacity, and a reflow.
+        g.resize(3, 4, 9);
+        assert_eq!(sized(&g), 3);
+        let _ = g.resize_reflow(4, 5, 12, (0, 0));
+        assert_eq!(sized(&g), 4);
+        assert!((0..4).all(|r| g.row(r).len() == 5));
     }
 
     #[test]
@@ -906,7 +1158,7 @@ mod tests {
         assert_eq!(g.cap(), 5);
         for r in 0..3 {
             let row = g.row(r);
-            assert_eq!(row.cells.len(), 4);
+            assert_eq!(row.cells().len(), 4);
         }
     }
 
@@ -944,9 +1196,9 @@ mod tests {
         );
         g.scroll_up();
         // Now row 0 should hold what was row 1.
-        assert_eq!(g.row(0).cells[0].ch, 'b');
+        assert_eq!(g.row(0).cells()[0].ch, 'b');
         // Row 1 is fresh blank.
-        assert_eq!(g.row(1).cells[0], Cell::BLANK);
+        assert_eq!(g.row(1).cells()[0], Cell::BLANK);
     }
 
     #[test]
@@ -978,10 +1230,10 @@ mod tests {
         );
         g.scroll_down();
         // Row 0 is fresh blank (the inserted line at the top).
-        assert_eq!(g.row(0).cells[0], Cell::BLANK);
+        assert_eq!(g.row(0).cells()[0], Cell::BLANK);
         // Row 1 holds what was row 0 ('a' moved down by one); 'b' fell
         // off the bottom.
-        assert_eq!(g.row(1).cells[0].ch, 'a');
+        assert_eq!(g.row(1).cells()[0].ch, 'a');
     }
 
     #[test]
@@ -999,17 +1251,17 @@ mod tests {
         // History: 'h'. Visible: 'a', 'z'. Two spare blank slots.
         g.scroll_down();
         g.scroll_down();
-        assert_eq!(g.row(0).cells[0], Cell::BLANK);
-        assert_eq!(g.row(1).cells[0], Cell::BLANK);
+        assert_eq!(g.row(0).cells()[0], Cell::BLANK);
+        assert_eq!(g.row(1).cells()[0], Cell::BLANK);
         assert_eq!(g.history_lines(), 1);
-        assert_eq!(g.scrollback_row(0).unwrap().cells[0].ch, 'h');
+        assert_eq!(g.scrollback_row(0).unwrap().cells()[0].ch, 'h');
         // 'z' must not resurface anywhere as the ring rotates on.
         for _ in 0..3 {
             g.scroll_up();
-            assert_eq!(g.row(1).cells[0], Cell::BLANK);
+            assert_eq!(g.row(1).cells()[0], Cell::BLANK);
         }
         for n in 0..g.history_lines() {
-            assert_ne!(g.scrollback_row(n).unwrap().cells[0].ch, 'z');
+            assert_ne!(g.scrollback_row(n).unwrap().cells()[0].ch, 'z');
         }
     }
 
@@ -1033,7 +1285,7 @@ mod tests {
         for r in 0..2 {
             let row = g.row(r);
             assert!(
-                row.cells
+                row.cells()
                     .iter()
                     .all(|c| c.ch == ' ' && c.style == red_style())
             );
@@ -1058,8 +1310,8 @@ mod tests {
         );
         g.resize(3, 6, 3);
         assert_eq!(g.cols(), 6);
-        assert_eq!(g.row(0).cells.len(), 6);
-        assert_eq!(g.row(0).cells[2].ch, 'a');
+        assert_eq!(g.row(0).cells().len(), 6);
+        assert_eq!(g.row(0).cells()[2].ch, 'a');
     }
 
     #[test]
@@ -1092,9 +1344,9 @@ mod tests {
         g.resize(3, 3, 6);
         assert_eq!(g.cap(), 6);
         assert_eq!(g.visible_rows(), 3);
-        assert_eq!(g.row(0).cells[0].ch, 'a');
-        assert_eq!(g.row(1).cells[0].ch, 'b');
-        assert_eq!(g.row(2).cells[0], Cell::BLANK);
+        assert_eq!(g.row(0).cells()[0].ch, 'a');
+        assert_eq!(g.row(1).cells()[0].ch, 'b');
+        assert_eq!(g.row(2).cells()[0], Cell::BLANK);
     }
 
     #[test]
@@ -1103,9 +1355,9 @@ mod tests {
         // clear_visible should still align the row to current cols.
         let mut g = Grid::new(1, 3, 1);
         // Manually shrink the underlying row to simulate a partial state.
-        g.row_mut(0).cells.truncate(1);
+        g.row_mut(0).resize_cols(1);
         g.clear_visible(Style::RESET);
-        assert_eq!(g.row(0).cells.len(), 3);
+        assert_eq!(g.row(0).cells().len(), 3);
     }
 
     /// Test helper: write `ch` into column 0 of `row`.
@@ -1133,11 +1385,11 @@ mod tests {
         put_at(&mut g, 1, 'b');
         g.scroll_up();
         // Visible: 'b' at top, blank at bottom.
-        assert_eq!(g.row(0).cells[0].ch, 'b');
-        assert_eq!(g.row(1).cells[0], Cell::BLANK);
+        assert_eq!(g.row(0).cells()[0].ch, 'b');
+        assert_eq!(g.row(1).cells()[0], Cell::BLANK);
         // History: 'a' is now scrollback row 0 (most recent).
         assert_eq!(g.history_lines(), 1);
-        assert_eq!(g.scrollback_row(0).unwrap().cells[0].ch, 'a');
+        assert_eq!(g.scrollback_row(0).unwrap().cells()[0].ch, 'a');
         assert!(g.scrollback_row(1).is_none());
     }
 
@@ -1156,8 +1408,8 @@ mod tests {
         assert_eq!(g.history_lines(), 2);
         // Most recent scrollback rows are 'e' (row 0) then 'd' (row 1);
         // 'a', 'b', 'c' were evicted.
-        assert_eq!(g.scrollback_row(0).unwrap().cells[0].ch, 'e');
-        assert_eq!(g.scrollback_row(1).unwrap().cells[0].ch, 'd');
+        assert_eq!(g.scrollback_row(0).unwrap().cells()[0].ch, 'e');
+        assert_eq!(g.scrollback_row(1).unwrap().cells()[0].ch, 'd');
         assert!(g.scrollback_row(2).is_none());
     }
 
@@ -1172,8 +1424,8 @@ mod tests {
         g.scroll_up();
         // History is full; '1' was evicted. Most recent is '3', then '2'.
         assert_eq!(g.history_lines(), 2);
-        assert_eq!(g.scrollback_row(0).unwrap().cells[0].ch, '3');
-        assert_eq!(g.scrollback_row(1).unwrap().cells[0].ch, '2');
+        assert_eq!(g.scrollback_row(0).unwrap().cells()[0].ch, '3');
+        assert_eq!(g.scrollback_row(1).unwrap().cells()[0].ch, '2');
     }
 
     #[test]
@@ -1200,9 +1452,9 @@ mod tests {
         assert_eq!(g.history_lines(), 1);
         g.scroll_down();
         assert_eq!(g.history_lines(), 1);
-        assert_eq!(g.scrollback_row(0).unwrap().cells[0].ch, 'a');
-        assert_eq!(g.row(0).cells[0], Cell::BLANK);
-        assert_eq!(g.row(1).cells[0].ch, 'b');
+        assert_eq!(g.scrollback_row(0).unwrap().cells()[0].ch, 'a');
+        assert_eq!(g.row(0).cells()[0], Cell::BLANK);
+        assert_eq!(g.row(1).cells()[0].ch, 'b');
     }
 
     #[test]
@@ -1218,19 +1470,19 @@ mod tests {
         // History (most recent first): 'd', 'c'. Visible: 'e', 'f', 'g'.
         assert_eq!(g.history_lines(), 2);
         g.scroll_down();
-        assert_eq!(g.row(0).cells[0], Cell::BLANK);
-        assert_eq!(g.row(1).cells[0].ch, 'e');
-        assert_eq!(g.row(2).cells[0].ch, 'f');
+        assert_eq!(g.row(0).cells()[0], Cell::BLANK);
+        assert_eq!(g.row(1).cells()[0].ch, 'e');
+        assert_eq!(g.row(2).cells()[0].ch, 'f');
         assert_eq!(g.history_lines(), 2);
-        assert_eq!(g.scrollback_row(0).unwrap().cells[0].ch, 'd');
-        assert_eq!(g.scrollback_row(1).unwrap().cells[0].ch, 'c');
+        assert_eq!(g.scrollback_row(0).unwrap().cells()[0].ch, 'd');
+        assert_eq!(g.scrollback_row(1).unwrap().cells()[0].ch, 'c');
         // Scrolling up again pushes the blank top into history and
         // brings a fresh bottom row; nothing stale resurfaces.
         g.scroll_up();
-        assert_eq!(g.scrollback_row(0).unwrap().cells[0], Cell::BLANK);
-        assert_eq!(g.row(0).cells[0].ch, 'e');
-        assert_eq!(g.row(1).cells[0].ch, 'f');
-        assert_eq!(g.row(2).cells[0], Cell::BLANK);
+        assert_eq!(g.scrollback_row(0).unwrap().cells()[0], Cell::BLANK);
+        assert_eq!(g.row(0).cells()[0].ch, 'e');
+        assert_eq!(g.row(1).cells()[0].ch, 'f');
+        assert_eq!(g.row(2).cells()[0], Cell::BLANK);
     }
 
     #[test]
@@ -1255,14 +1507,14 @@ mod tests {
         assert!(g.scrollback_row(0).is_none());
         assert_eq!(g.bottom_id(), bottom);
         assert_eq!(g.oldest_retained_id(), bottom - 1);
-        assert_eq!(g.row(0).cells[0].ch, 'd');
-        assert_eq!(g.row(1).cells[0].ch, 'e');
+        assert_eq!(g.row(0).cells()[0].ch, 'd');
+        assert_eq!(g.row(1).cells()[0].ch, 'e');
         // New history accumulates again, and no old row resurfaces as
         // the ring wraps.
         for _ in 0..10 {
             g.scroll_up();
             for n in 0..g.history_lines() {
-                let ch = g.scrollback_row(n).unwrap().cells[0].ch;
+                let ch = g.scrollback_row(n).unwrap().cells()[0].ch;
                 assert!(ch == ' ' || ch == 'd' || ch == 'e', "stale {ch:?}");
             }
         }
@@ -1421,10 +1673,10 @@ mod tests {
         assert_eq!(g.visible_rows(), 4);
         // 3 rows revealed into the viewport; 3 remain in scrollback.
         assert_eq!(g.history_lines(), 3);
-        assert_eq!(g.row(0).cells[0].ch, 'd');
-        assert_eq!(g.row(2).cells[0].ch, 'f');
+        assert_eq!(g.row(0).cells()[0].ch, 'd');
+        assert_eq!(g.row(2).cells()[0].ch, 'f');
         // Oldest scrollback ('a') still retained, not evicted.
-        assert_eq!(g.scrollback_row(2).unwrap().cells[0].ch, 'a');
+        assert_eq!(g.scrollback_row(2).unwrap().cells()[0].ch, 'a');
         assert!(crow < 4, "cursor row must stay in the new viewport");
     }
 
@@ -1474,7 +1726,7 @@ mod tests {
         let (_, remap) = g.resize_reflow_mapped(4, 2, 4 + 10, (1, 1), &mut |_, _| None);
         assert_eq!(remap.map(old_top), top(&g));
         assert_eq!(remap.map(b_line), top(&g) + 2, "'b' is now on row 2");
-        assert_eq!(g.row(2).cells[0].ch, 'b');
+        assert_eq!(g.row(2).cells()[0].ch, 'b');
         // Past the reflowed span: same distance from its last row.
         assert_eq!(remap.map(b_line + 3), top(&g) + 5);
     }

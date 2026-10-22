@@ -90,26 +90,22 @@ pub enum WindowError {
 /// Custom user-event payload — sent via [`WindowHandle::wake`] from
 /// background threads (e.g. the mio PTY thread).
 ///
-/// `PtyBytes` and `PtyClosed` correspond 1:1 to
-/// [`toastty_io::UserEvent`]; the `From` impl below makes the
-/// `spawn_pty_reader<EventLoopProxy<UserEvent>>` call site work
-/// without any per-call conversion.
+/// `PtyReady` corresponds 1:1 to [`toastty_io::UserEvent`]; the `From`
+/// impl below makes the `spawn_pty_reader<EventLoopProxy<UserEvent>>`
+/// call site work without any per-call conversion.
 #[derive(Debug)]
 pub enum UserEvent {
     /// Wake the event loop. Surfaces as [`Event::User`].
     Wake,
-    /// PTY bytes ready, from `toastty-io::spawn_pty_reader`. Surfaces as
-    /// [`Event::PtyBytes`].
-    PtyBytes(Vec<u8>),
-    /// PTY closed (child exited / EIO). Surfaces as [`Event::PtyClosed`].
-    PtyClosed,
+    /// The PTY reader has bytes (or the close) for the main thread, from
+    /// `toastty-io::spawn_pty_reader`. Surfaces as [`Event::PtyReady`].
+    PtyReady,
 }
 
 impl From<toastty_io::UserEvent> for UserEvent {
     fn from(ev: toastty_io::UserEvent) -> Self {
         match ev {
-            toastty_io::UserEvent::PtyBytes(b) => UserEvent::PtyBytes(b),
-            toastty_io::UserEvent::PtyClosed => UserEvent::PtyClosed,
+            toastty_io::UserEvent::PtyReady => UserEvent::PtyReady,
         }
     }
 }
@@ -162,6 +158,11 @@ pub trait App {
     /// Called for every event. Returning [`ControlSignal::Exit`] stops
     /// the loop; [`ControlSignal::RedrawIn`] schedules a redraw deadline;
     /// [`ControlSignal::Continue`] waits for the next event.
+    /// [`ControlSignal::Yield`] (redraw now) and [`ControlSignal::Defer`]
+    /// (no redraw) are answers to [`Event::PtyReady`] that stopped with
+    /// PTY output still buffered: the loop handles its other pending
+    /// events, drops reader wakes, and delivers `Event::PtyReady` again
+    /// from `about_to_wait`.
     fn event(&mut self, event: Event) -> ControlSignal;
 }
 
@@ -266,6 +267,7 @@ pub fn run<A: App>(options: WindowOptions, mut app: A) -> Result<(), WindowError
         app: &mut app,
         last_status: ControlSignal::Continue,
         redraw_at: None,
+        resume_pty: false,
     };
 
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -320,6 +322,9 @@ fn schedule(sig: ControlSignal, is_redraw: bool, redraw_at: Option<Instant>, now
                 redraw_at,
             }
         }
+        // Yield redraws now exactly like RedrawIn(0), Defer polls
+        // without a redraw; the resumed PtyReady is the Runner's business
+        // (see `Runner::resume_pty`).
         // Duration::ZERO means "wake immediately" — under
         // ControlFlow::WaitUntil(now), winit's EventLoopWaker re-arms
         // the CFRunLoopTimer every iteration because Instant::now()
@@ -328,6 +333,16 @@ fn schedule(sig: ControlSignal, is_redraw: bool, redraw_at: Option<Instant>, now
         // CFRunLoopTimerSetNextFireDate. ControlFlow::Poll dedups
         // against a fixed past instant inside EventLoopWaker::start, so
         // the arm happens once and subsequent iterations short-circuit.
+        ControlSignal::Yield => Plan {
+            flow: Flow::Poll,
+            redraw_now: true,
+            redraw_at,
+        },
+        ControlSignal::Defer => Plan {
+            flow: Flow::Poll,
+            redraw_now: false,
+            redraw_at,
+        },
         ControlSignal::RedrawIn(d) if d.is_zero() => Plan {
             flow: Flow::Poll,
             redraw_now: true,
@@ -360,6 +375,12 @@ struct Runner<'a, A: App> {
     /// When the next scheduled redraw is due (from a
     /// `ControlSignal::RedrawIn`), if any.
     redraw_at: Option<Instant>,
+    /// The app answered `ControlSignal::Yield` (or `Defer`): it stopped
+    /// parsing PTY output so a frame could be drawn (or input handled).
+    /// Until `about_to_wait` (which every platform runs after the
+    /// iteration's `RedrawRequested`) delivers the resuming
+    /// `Event::PtyReady`, reader wakes are dropped.
+    resume_pty: bool,
 }
 
 impl<A: App> Runner<'_, A> {
@@ -367,6 +388,9 @@ impl<A: App> Runner<'_, A> {
         let is_redraw = matches!(ev, Event::Redraw);
         let sig = self.app.event(ev);
         self.last_status = sig;
+        if matches!(sig, ControlSignal::Yield | ControlSignal::Defer) {
+            self.resume_pty = true;
+        }
         self.apply_control(sig, is_redraw, event_loop);
     }
 
@@ -559,8 +583,9 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<'_, A> {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, ev: UserEvent) {
         let mapped = match ev {
             UserEvent::Wake => Event::User,
-            UserEvent::PtyBytes(b) => Event::PtyBytes(b),
-            UserEvent::PtyClosed => Event::PtyClosed,
+            // Covered by the resume in `about_to_wait`, after the frame.
+            UserEvent::PtyReady if self.resume_pty => return,
+            UserEvent::PtyReady => Event::PtyReady,
         };
         self.dispatch(mapped, event_loop);
     }
@@ -577,8 +602,27 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<'_, A> {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // No-op. We rely on `ControlFlow` set in `apply_control`.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Resume PTY parsing after a `Yield` / `Defer`. winit runs this
+        // after the iteration's user events and redraws on X11, Wayland
+        // and macOS alike, so the frame the app yielded for is out by
+        // now. Calling the app directly (rather than posting a wake)
+        // keeps it to one parse slice per iteration without a channel
+        // round trip; the `Poll` flow they set means the loop doesn't
+        // sleep before the next frame. Otherwise we rely on the
+        // `ControlFlow` set in `apply_control`.
+        //
+        // That ordering is load-bearing. If someone adds
+        // `Window::pre_present_notify()` (Wayland frame-callback
+        // throttling), winit holds `RedrawRequested` back until the
+        // compositor's frame callback, so the frame is NOT out by now:
+        // this resume would run before it, the app's
+        // `should_wait_for_frame` would `Yield` again, and under `Poll`
+        // the loop would spin until the callback (or the app's 100 ms
+        // cutoff). Revisit this before adding it.
+        if std::mem::take(&mut self.resume_pty) {
+            self.dispatch(Event::PtyReady, event_loop);
+        }
     }
 }
 
@@ -1046,6 +1090,34 @@ mod tests {
         assert_eq!(
             schedule(ControlSignal::Exit, false, pending, now).flow,
             Flow::Exit
+        );
+    }
+
+    #[test]
+    fn yield_redraws_at_once_and_keeps_the_deadline() {
+        let now = Instant::now();
+        let pending = Some(now + ms(300));
+        assert_eq!(
+            schedule(ControlSignal::Yield, false, pending, now),
+            schedule(ControlSignal::RedrawIn(ms(0)), false, pending, now),
+        );
+        let plan = schedule(ControlSignal::Yield, false, pending, now);
+        assert_eq!(plan.flow, Flow::Poll);
+        assert!(plan.redraw_now);
+        assert_eq!(plan.redraw_at, pending);
+    }
+
+    #[test]
+    fn defer_polls_without_redrawing() {
+        let now = Instant::now();
+        let pending = Some(now + ms(300));
+        assert_eq!(
+            schedule(ControlSignal::Defer, false, pending, now),
+            Plan {
+                flow: Flow::Poll,
+                redraw_now: false,
+                redraw_at: pending,
+            }
         );
     }
 

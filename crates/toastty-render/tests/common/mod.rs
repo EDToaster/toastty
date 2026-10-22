@@ -14,8 +14,9 @@ use image::RgbaImage;
 use image_compare::Algorithm;
 use pollster::block_on;
 use toastty_render::text::glyph_rasterizer::GlyphRasterizer;
-use toastty_render::text::instance::Theme;
+use toastty_render::text::instance::{EdgeBleed, ExtendCondition, Theme};
 use toastty_render::text::pipeline::{self, GlobalsUbo, TextPipeline};
+use toastty_render::text::row_shaper::RowShaper;
 use toastty_render::{instance_descriptor, instance_flags_for_tests};
 use toastty_term::Term;
 use wgpu::{
@@ -59,13 +60,49 @@ fn shared_device() -> (wgpu::Device, wgpu::Queue) {
 }
 
 /// Render `term` into a `width × height` RGBA8 image, headless.
-#[allow(clippy::too_many_lines)] // test harness — clarity > brevity
 pub(crate) fn render_term_offscreen(term: &Term, width: u32, height: u32) -> RgbaImage {
-    let (device, queue) = shared_device();
+    render_term_offscreen_with(term, width, height, &Offscreen::default())
+}
 
-    // Offscreen render target. RGBA8 (not sRGB) so saved PNG bytes are
-    // directly comparable across runs without sRGB-decode drift.
-    let format = TextureFormat::Rgba8Unorm;
+/// Knobs for [`render_term_offscreen_with`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Offscreen {
+    /// Render target format. RGBA8 (not sRGB) by default so saved PNG
+    /// bytes are directly comparable across runs without sRGB-decode
+    /// drift; the app's swapchain is usually `Bgra8UnormSrgb`.
+    pub format: TextureFormat,
+    /// `CellRenderOpts::skip_default_bg`.
+    pub skip_default_bg: bool,
+    /// Window padding `[top, right, bottom, left]` in px; the grid is
+    /// inset by it, as in the renderer.
+    pub pad: [u32; 4],
+    /// Edge bleed (`extend_background = always` on both axes).
+    pub bleed: bool,
+}
+
+impl Default for Offscreen {
+    fn default() -> Self {
+        Self {
+            format: TextureFormat::Rgba8Unorm,
+            skip_default_bg: true,
+            pad: [0; 4],
+            bleed: false,
+        }
+    }
+}
+
+/// [`render_term_offscreen`] with explicit [`Offscreen`] options. Rows
+/// are shaped by the renderer's own `RowShaper` (viewport rows, so a
+/// scrolled-back term draws its glyphs).
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)] // test harness — clarity > brevity
+pub(crate) fn render_term_offscreen_with(
+    term: &Term,
+    width: u32,
+    height: u32,
+    o: &Offscreen,
+) -> RgbaImage {
+    let (device, queue) = shared_device();
+    let format = o.format;
     let target = device.create_texture(&TextureDescriptor {
         label: Some("snapshot target"),
         size: Extent3d {
@@ -117,44 +154,59 @@ pub(crate) fn render_term_offscreen(term: &Term, width: u32, height: u32) -> Rgb
     let color_view = pipeline::default_view(rasterizer.color_texture());
     let bind_group = text_pipeline.make_bind_group(&device, &mask_view, &color_view);
 
-    // Shape every visible row.
+    // Content area inside the padding, and the rows drawn into it (the
+    // renderer's own math), shaped like the renderer does.
     let cell_size = rasterizer.cell_size();
     let atlas_dims = rasterizer.atlas_dims();
-    let (rows, _cols) = term.size();
-    let mut row_glyphs = Vec::with_capacity(rows as usize);
-    for r in 0..rows {
-        let row = term.row(r);
-        let line_text: String = row
-            .cells
-            .iter()
-            .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
-            .collect();
-        row_glyphs.push(rasterizer.shape_line(&queue, &line_text, term.grapheme_cluster_mode()));
-    }
+    let (rows, cols) = term.size();
+    let [pad_t, pad_r, pad_b, pad_l] = o.pad.map(|p| p as f32);
+    let content_w = width as f32 - pad_l - pad_r;
+    let content_h = height as f32 - pad_t - pad_b;
+    let rows_rendered = toastty_render::text::instance::rows_to_render(
+        rows,
+        term.view_offset_pixel(),
+        cell_size.1,
+        content_h,
+    );
+    let mut shaper = RowShaper::new();
+    shaper.shape_rows(&mut rasterizer, &queue, term, rows_rendered, &[]);
+    // Bleed distance per edge: padding plus the floor-divide leftover on
+    // the trailing edges (top-left grid alignment).
+    let bleed = EdgeBleed {
+        pad: [
+            pad_t,
+            pad_r + (content_w - f32::from(cols) * cell_size.0),
+            pad_b + (content_h - f32::from(rows) * cell_size.1),
+            pad_l,
+        ],
+        active: o.bleed,
+        horizontal: ExtendCondition::Always,
+        vertical: ExtendCondition::Always,
+        col_fills: &[],
+    };
 
     // Build instances.
     let theme = Theme::default_dark();
-    let row_glyphs_ref = &row_glyphs;
+    let skip_default_bg = o.skip_default_bg;
     // Font-derived decoration geometry, as the live renderer uses.
     let opts = toastty_render::text::instance::CellRenderOpts {
         blink_on: true,
         decor: Some(rasterizer.decoration_metrics()),
+        // The pass below clears to `theme.bg`, as the renderer's
+        // full-redraw frames do.
+        skip_default_bg,
     };
     let mut instances = Vec::new();
-    let (rows, _) = term.size();
     toastty_render::text::instance::build_instances_into_opts(
         &mut instances,
         term,
         cell_size,
         &theme,
         None,
-        |row, col, ch, _style| {
-            let lg = row_glyphs_ref.get(row as usize)?;
-            lg.get(col, ch)
-        },
+        |row, col, ch, _style| shaper.glyph(row, col, ch),
         |_, _| false,
-        toastty_render::text::instance::EdgeBleed::default(),
-        f32::from(rows) * cell_size.1,
+        bleed,
+        content_h,
         &opts,
     );
 
@@ -215,7 +267,7 @@ pub(crate) fn render_term_offscreen(term: &Term, width: u32, height: u32) -> Rgb
             ],
             cursor_rect: toastty_render::text::instance::cursor_pixel_rect(term, cell_size),
             cursor_color: theme.cursor,
-            content_origin: [0.0; 4],
+            content_origin: [pad_l, pad_t, 0.0, 0.0],
         };
 
         text_pipeline.upload(&device, &queue, globals, &instances);
@@ -254,12 +306,21 @@ pub(crate) fn render_term_offscreen(term: &Term, width: u32, height: u32) -> Rgb
     }
     let data = slice.get_mapped_range();
 
-    // Repack into a tight RGBA8 buffer (skip row padding).
+    // Repack into a tight RGBA8 buffer (skip row padding; swizzle BGRA).
+    let bgra = matches!(
+        format,
+        TextureFormat::Bgra8Unorm | TextureFormat::Bgra8UnormSrgb
+    );
     let mut out = Vec::with_capacity((row_bytes * height) as usize);
     for y in 0..height {
         let row_start = (y * padded_row_bytes) as usize;
         let row_end = row_start + row_bytes as usize;
         out.extend_from_slice(&data[row_start..row_end]);
+    }
+    if bgra {
+        for px in out.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
     }
     drop(data);
     readback.unmap();

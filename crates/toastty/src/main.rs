@@ -6,9 +6,9 @@
 //!
 //! The render thread (winit main thread on macOS) owns the parser,
 //! `Term`, and `Renderer`. A background mio thread reads bytes from
-//! the PTY master and posts them via `EventLoopProxy::send_event` as
-//! `Event::PtyBytes(...)`; the binary feeds those to the parser and
-//! requests a redraw.
+//! the PTY master into a bounded buffer and wakes the loop with
+//! `Event::PtyReady`; the binary drains that buffer into the parser
+//! (paced by `toastty::ingest` during floods) and requests a redraw.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -42,6 +42,7 @@ use toastty::font_zoom::{FontZoom, ZoomAction, zoom_action};
 use toastty::geometry::{
     content_rect_from_padding, effective_font_size_px, grid_dims_from_pixels, scaled_pads,
 };
+use toastty::ingest::{self, Ingest};
 use toastty::keyboard::{self, encode_key_with_modes};
 use toastty::mouse::{
     MouseEventKind, classify_button_event, drag_autoscroll_dir, encode_mouse, pixel_to_cell,
@@ -49,6 +50,7 @@ use toastty::mouse::{
 };
 use toastty::paste::wrap_for_paste;
 use toastty::perf_stats::PerfStats;
+use toastty::preload::Preload;
 use toastty::pty_log::{Direction, PtyLogger};
 use toastty::shell::resolve_command;
 use toastty::theme_bridge::{
@@ -232,6 +234,9 @@ fn main() -> Result<()> {
     if let Some(ref e) = load_err {
         warn!("config load failed, using defaults: {e}");
     }
+    // GPU + font setup need no window: start them now so they overlap
+    // winit opening the display and the window (see `toastty::preload`).
+    let preload = Preload::spawn(&config.font.family);
 
     let initial_size = (config.window.width.max(1), config.window.height.max(1));
     let transparent = config.theme.bg.as_array()[3] < 1.0;
@@ -251,6 +256,7 @@ fn main() -> Result<()> {
         cli_working_dir,
         initial_size,
         load_err,
+        preload,
     );
     run(opts, app).context("window run")?;
     Ok(())
@@ -268,12 +274,21 @@ struct Toastty {
     cli_working_dir: Option<std::path::PathBuf>,
     window: Option<ToasttyWindow>,
     renderer: Option<Renderer>,
+    /// GPU context + fonts being built on worker threads since `main`;
+    /// consumed by `init_impl`.
+    preload: Preload,
+    /// The first frame has been drawn and the startup heap churn released
+    /// (`toastty::heap::release_free_memory`).
+    startup_heap_released: bool,
     parser: Parser,
     term: Term,
     pty: Option<Pty>,
-    /// `JoinHandle` for the mio reader; held so we don't drop it. The
-    /// thread exits on its own when the PTY closes or the proxy goes away.
-    reader: Option<std::thread::JoinHandle<()>>,
+    /// The main thread's end of the mio reader: the PTY output read so
+    /// far, drained on `Event::PtyReady`. The thread exits on its own when
+    /// the PTY closes or the proxy goes away.
+    reader: Option<toastty_io::PtyReader>,
+    /// Paces `reader` draining against frames during floods.
+    ingest: Ingest,
     /// Background writer that drains queued bytes to the PTY master in
     /// order. Routing writes through here (instead of a direct
     /// `Pty::write`) guarantees the whole payload lands even when the
@@ -299,7 +314,7 @@ struct Toastty {
     /// other reload keeps it. See [`toastty::font_zoom`].
     font_zoom: FontZoom,
     /// Last title we pushed to `winit::Window::set_title`. Tracked so
-    /// we don't churn the compositor on every `PtyBytes` batch — only
+    /// we don't churn the compositor on every `PtyReady` batch — only
     /// change the title when it actually differs.
     last_title: Option<String>,
     /// Most recent mouse pixel position; tracked so motion events that
@@ -480,6 +495,7 @@ impl Toastty {
         cli_working_dir: Option<std::path::PathBuf>,
         initial_size: (u32, u32),
         load_err: Option<ConfigError>,
+        preload: Preload,
     ) -> Self {
         let scrollback = config.scrollback.lines.try_into().unwrap_or(u16::MAX);
         // Start at a tiny grid; init() resizes once we know cell dimensions.
@@ -500,10 +516,13 @@ impl Toastty {
             cli_working_dir,
             window: None,
             renderer: None,
+            preload,
+            startup_heap_released: false,
             parser: Parser::new(),
             term,
             pty: None,
             reader: None,
+            ingest: Ingest::default(),
             pty_writer: None,
             physical_size: initial_size,
             // Real value is read from the window in `init_impl`; 1.0 is a
@@ -964,19 +983,119 @@ impl Toastty {
         }
     }
 
-    /// Feed a batch of PTY bytes through the parser. Returns whether a
-    /// fresh BSU (mode 2026 begin-synchronized-update) just went high
-    /// during this batch — the caller uses that signal to schedule the
-    /// watchdog redraw via `ControlSignal::RedrawIn(BSU_TIMEOUT)`.
-    fn handle_pty_bytes(&mut self, bytes: &[u8]) -> bool {
+    /// Drain the PTY reader into the parser (`Event::PtyReady`).
+    ///
+    /// Parses in slices of at most [`ingest::SLICE`]. When output keeps
+    /// coming for longer than a frame interval, stops once a frame is due
+    /// and answers `Yield`, so the loop draws and then calls back here
+    /// (see `toastty::ingest`). Bytes the reader buffers meanwhile wait
+    /// in its bounded buffer, and past that in the kernel's, which blocks
+    /// the child: memory stays flat however fast it writes.
+    fn handle_pty_ready(&mut self) -> ControlSignal {
+        let parse_start = Instant::now();
+        if self.ingest.should_wait_for_frame(parse_start) {
+            // Nothing taken from the reader, so its wake stays armed and
+            // it won't post again; the runner's `about_to_wait` resume
+            // that `Yield` schedules is what brings us back.
+            return ControlSignal::Yield;
+        }
+        // No reader (spawn failed): there is nothing to wake us anyway.
+        let Some(mut reader) = self.reader.take() else {
+            return ControlSignal::Continue;
+        };
+        let mut any_parsed = false;
+        let mut stopped = None;
+        loop {
+            let step = self.ingest.step(
+                Instant::now(),
+                parse_start,
+                any_parsed,
+                self.term.pause_rendering(),
+            );
+            if let ingest::Step::Stop(why) = step {
+                stopped = Some(why);
+                break;
+            }
+            let avail = reader.peek(ingest::SLICE);
+            if avail.is_empty() {
+                break;
+            }
+            // A frame is due but a synchronized update holds it: parse
+            // only to the end of that update, then check again.
+            let n = if step == ingest::Step::ParseToEsu {
+                ingest::slice_to_esu(avail)
+            } else {
+                avail.len()
+            };
+            // After `peek`, so a buffer swap doesn't count as parsing.
+            let at = Instant::now();
+            self.handle_pty_bytes(&avail[..n]);
+            self.stats.pty_batch(at, n, at.elapsed());
+            reader.consume(n);
+            any_parsed = true;
+        }
+        let finished = reader.is_finished();
+        self.reader = Some(reader);
+        let outcome = ingest::outcome(finished, any_parsed, stopped, self.term.pause_rendering());
+        if any_parsed && outcome != ingest::Outcome::Closed && self.term.link_hover().is_some() {
+            // New output may have rewritten or moved the hovered link;
+            // re-resolve it (clears when it's gone).
+            self.refresh_link_hover();
+        }
+        match outcome {
+            // Every byte read before the close is parsed by now.
+            ingest::Outcome::Closed => self.handle_pty_closed(),
+            ingest::Outcome::Idle => ControlSignal::Continue,
+            ingest::Outcome::Yield => {
+                self.ingest.frame_requested(parse_start);
+                ControlSignal::Yield
+            }
+            ingest::Outcome::Defer => ControlSignal::Defer,
+            ingest::Outcome::AwaitEsu => {
+                // `handle_pty_bytes` fires the watchdog when more bytes
+                // arrive after it; this covers BSU-then-silence.
+                let left = self.term.sync_output_started_at().map_or(BSU_TIMEOUT, |t| {
+                    (t + BSU_TIMEOUT).saturating_duration_since(Instant::now())
+                });
+                ControlSignal::RedrawIn(left)
+            }
+            ingest::Outcome::Redraw => {
+                // RedrawIn — not Continue — to force the event loop to
+                // wake. On macOS, plain `request_redraw()` doesn't wake
+                // from Wait reliably; RedrawIn(ZERO) sets ControlFlow::Poll
+                // and a later deadline WaitUntil, which both do. The delay
+                // is zero unless a frame was drawn under one frame
+                // interval ago (see `Ingest::redraw_delay`).
+                self.ingest.frame_requested(parse_start);
+                ControlSignal::RedrawIn(self.ingest.redraw_delay(Instant::now()))
+            }
+        }
+    }
+
+    /// The PTY closed and its last bytes are parsed: reap and exit.
+    fn handle_pty_closed(&mut self) -> ControlSignal {
+        debug!("pty closed; exiting");
+        self.stats.write();
+        toastty::perf_stats::finish_profiler();
+        if let Some(pty) = self.pty.as_mut() {
+            let _ = pty.wait();
+        }
+        ControlSignal::Exit
+    }
+
+    /// Feed one slice of PTY bytes through the parser, then service what
+    /// it queued (title, clipboard, replies, BSU watchdog).
+    fn handle_pty_bytes(&mut self, bytes: &[u8]) {
         self.pty_log.log(Direction::FromApp, bytes);
-        let was_paused = self.term.pause_rendering();
-        // Refresh the foreground-process CWD before parsing this
-        // batch — if an RGP `r;path=...` arrives in these bytes,
+        // Refresh the foreground-process CWD before parsing a slice that
+        // opens an APC — if it is an RGP `r;path=...`,
         // `Term::register_asset_by_path` needs to know the current
         // shell-side CWD to resolve relative paths. macOS uses
-        // `proc_pidinfo`; Linux uses `/proc/<pid>/cwd`.
-        if let Some(pty) = self.pty.as_ref()
+        // `proc_pidinfo`; Linux uses `/proc/<pid>/cwd`. Nothing else
+        // reads it, and the probe (an ioctl plus a readlink) was ~8% of
+        // flood CPU when it ran on every read.
+        if self.ingest.opens_apc(bytes)
+            && let Some(pty) = self.pty.as_ref()
             && let Some(cwd) = toastty_pty::pty_foreground_cwd(pty.master_fd())
         {
             let cwd_str = cwd.to_string_lossy();
@@ -1025,15 +1144,47 @@ impl Toastty {
                 w.request_redraw();
             }
         }
-
-        // A fresh BSU started in this batch — caller will schedule a
-        // wake-up at BSU_TIMEOUT so the watchdog above eventually
-        // fires even if the app sends no more bytes.
-        !was_paused && self.term.pause_rendering()
     }
 }
 
 impl Toastty {
+    /// Create the renderer and load its font, from the GPU context and
+    /// fonts preloaded since `main` when they're ready (see
+    /// `toastty::preload`), else inline. `None` (logged) when no GPU
+    /// renderer can be created.
+    fn build_renderer(&mut self, window: &ToasttyWindow, size: (u32, u32)) -> Option<Renderer> {
+        // Transparency is logged once at startup in `run`; here we only
+        // need the flag for surface configuration.
+        let transparent = self.config.theme.bg.as_array()[3] < 1.0;
+        let mut renderer = match block_on(Renderer::with_gpu(
+            self.preload.take_gpu(),
+            window.clone(),
+            size,
+            self.config.window.vsync,
+            transparent,
+        )) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("renderer init failed: {e}");
+                // Nothing will take the preloaded fonts now; join the
+                // workers and free the font database instead of holding
+                // it for the rest of the (renderer-less) session.
+                self.preload = Preload::default();
+                return None;
+            }
+        };
+        // Compile the shaders while the font thread may still be busy.
+        renderer.prepare_pipelines();
+        let font_px = self.scaled_font_px();
+        let line_height = self.config.font.line_height;
+        if let Some(fonts) = self.preload.take_fonts(&self.config.font.family) {
+            renderer.with_loaded_fonts(fonts, font_px, line_height);
+        } else {
+            renderer.with_font_ex(Some(self.config.font.family.as_str()), font_px, line_height);
+        }
+        Some(renderer)
+    }
+
     fn init_impl(&mut self, window: ToasttyWindow, handle: &WindowHandle) {
         let size = window.physical_size();
         self.physical_size = size;
@@ -1043,26 +1194,9 @@ impl Toastty {
         // `Resize`). Fractional Wayland scales are included.
         self.scale_factor = window.scale_factor();
 
-        // Build the renderer. Transparency is logged once at startup in
-        // `run`; here we only need the flag for surface configuration.
-        let transparent = self.config.theme.bg.as_array()[3] < 1.0;
-        let mut renderer = match block_on(Renderer::new(
-            window.clone(),
-            size,
-            self.config.window.vsync,
-            transparent,
-        )) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("renderer init failed: {e}");
-                return;
-            }
+        let Some(mut renderer) = self.build_renderer(&window, size) else {
+            return;
         };
-        renderer.with_font_ex(
-            Some(self.config.font.family.as_str()),
-            self.scaled_font_px(),
-            self.config.font.line_height,
-        );
         if !renderer.font_family_available() {
             warn!(
                 "configured font {:?} not found on this system; falling back to the bundled / system default",
@@ -1183,7 +1317,7 @@ impl Toastty {
 
         // Spawn the mio reader thread. It posts user-events via the
         // winit `EventLoopProxy`, which arrive in `App::event` as
-        // `Event::PtyBytes` / `Event::PtyClosed`.
+        // `Event::PtyReady`.
         let proxy = handle.event_loop_proxy();
         let reader = match toastty_io::spawn_pty_reader(pty.master_fd(), proxy) {
             Ok(j) => j,
@@ -1391,7 +1525,7 @@ impl Toastty {
         // guaranteed: the loop's RedrawIn handler issues the
         // `request_redraw` + `ControlFlow::Poll` wake, which a bare
         // `request_redraw()` from `Wait` doesn't do reliably on macOS
-        // (same reasoning as the `Event::PtyBytes` path).
+        // (same reasoning as the `Event::PtyReady` path).
         ControlSignal::RedrawIn(Duration::ZERO)
     }
 
@@ -2953,11 +3087,20 @@ impl Toastty {
                 self.term.sync_rich_blocks();
                 self.refresh_rich_chip();
                 let mut next_blink: Option<Duration> = None;
+                self.ingest.redraw_handled();
                 if let Some(r) = self.renderer.as_mut() {
                     let frame_start = Instant::now();
                     match r.render_term(&mut self.term) {
                         Ok(RenderOutcome::Rendered) => {
-                            self.stats.frame(frame_start, Instant::now());
+                            let frame_end = Instant::now();
+                            self.stats.frame(frame_start, frame_end);
+                            self.ingest.frame_drawn(frame_start, frame_end);
+                            if !self.startup_heap_released {
+                                // Startup is over once the first frame is
+                                // up; drop its freed heap (see `heap`).
+                                self.startup_heap_released = true;
+                                toastty::heap::release_free_memory();
+                            }
                             // Consume the per-cell damage signal so the
                             // next render only re-emits cells that
                             // changed. Clear the BSU timeout-flush
@@ -3143,43 +3286,7 @@ impl Toastty {
                     signal
                 }
             }
-            Event::PtyBytes(bytes) => {
-                let at = Instant::now();
-                let fresh_bsu = self.handle_pty_bytes(&bytes);
-                self.stats.pty_batch(at, bytes.len(), at.elapsed());
-                // New output may have rewritten or moved the hovered
-                // link; re-resolve it (clears when it's gone).
-                if self.term.link_hover().is_some() {
-                    self.refresh_link_hover();
-                }
-                // If a BSU just went high we still want to wake the
-                // event loop, but at the watchdog deadline rather than
-                // immediately — `render_term` would just skip while the
-                // pause is active. The watchdog inside
-                // `handle_pty_bytes` already fires if the previous BSU
-                // had already expired; this branch covers the
-                // "BSU-then-silence" case where no further bytes
-                // arrive to drive the watchdog.
-                //
-                // RedrawIn(ZERO) — not Continue — to force the event
-                // loop to wake immediately. On macOS, plain
-                // `request_redraw()` doesn't wake from Wait reliably;
-                // RedrawIn sets ControlFlow::WaitUntil(now) which does.
-                if fresh_bsu {
-                    ControlSignal::RedrawIn(BSU_TIMEOUT)
-                } else {
-                    ControlSignal::RedrawIn(Duration::ZERO)
-                }
-            }
-            Event::PtyClosed => {
-                debug!("pty closed; exiting");
-                self.stats.write();
-                toastty::perf_stats::finish_profiler();
-                if let Some(pty) = self.pty.as_mut() {
-                    let _ = pty.wait();
-                }
-                ControlSignal::Exit
-            }
+            Event::PtyReady => self.handle_pty_ready(),
             Event::User => {
                 // The config watcher wakes the loop via Wake on file
                 // changes. Drain its pending flag (atomic swap) and
@@ -3405,7 +3512,14 @@ mod tests {
     }
 
     fn headless_app() -> Toastty {
-        Toastty::new(Config::defaults(), None, None, (800, 600), None)
+        Toastty::new(
+            Config::defaults(),
+            None,
+            None,
+            (800, 600),
+            None,
+            Preload::default(),
+        )
     }
 
     fn mouse(button: MouseButton, state: KeyState, position: (f64, f64)) -> Event {
@@ -3578,6 +3692,12 @@ mod tests {
         // against, so this checks the guard's effect on a hand cursor
         // that was showing: under the prompt, Ctrl and new output only
         // ever clear it. (Checked against a real link on Xvfb.)
+        struct Wake(std::sync::mpsc::Sender<()>);
+        impl toastty_io::EventSink for Wake {
+            fn send(&self, _: toastty_io::UserEvent) -> Result<(), toastty_io::SinkClosed> {
+                self.0.send(()).map_err(|_| toastty_io::SinkClosed)
+            }
+        }
         let mut app = headless_app();
         let ctrl = if cfg!(target_os = "macos") {
             Modifiers::SUPER
@@ -3590,7 +3710,18 @@ mod tests {
         app.event(Event::ModifiersChanged(ctrl));
         assert!(!app.link_pointer && app.term.link_hover().is_none());
         app.link_pointer = true;
-        app.event(Event::PtyBytes(b"x".to_vec()));
+        // New output arrives the real way: through a reader on a pipe,
+        // drained on `PtyReady`.
+        let (rx, mut tx) = std::io::pipe().unwrap();
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let reader =
+            toastty_io::spawn_pty_reader_with_sink(std::os::fd::AsFd::as_fd(&rx), Wake(wake_tx))
+                .unwrap();
+        std::io::Write::write_all(&mut tx, b"x").unwrap();
+        wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        app.reader = Some(reader);
+        app.event(Event::PtyReady);
+        assert_eq!(app.term.cursor().col, 1, "the output was parsed");
         assert!(app.term.link_hover().is_none());
     }
 

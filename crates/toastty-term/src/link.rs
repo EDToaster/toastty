@@ -92,7 +92,7 @@ impl Term {
     /// row is evicted or `at` is past the row's end.
     fn primary_pos(&self, at: Pos) -> Option<Pos> {
         let row = self.row_by_line_id(at.line_id)?;
-        let cell = row.cells.get(usize::from(at.col))?;
+        let cell = row.cells().get(usize::from(at.col))?;
         if cell.is_continuation && at.col > 0 {
             return Some(Pos::new(at.line_id, at.col - 1));
         }
@@ -105,13 +105,13 @@ impl Term {
     #[must_use]
     pub fn hyperlink_at(&self, at: Pos) -> Option<LinkHit> {
         let at = self.primary_pos(at)?;
-        let id = self.row_by_line_id(at.line_id)?.cells[usize::from(at.col)].hyperlink_id?;
+        let id = self.row_by_line_id(at.line_id)?.cells()[usize::from(at.col)].hyperlink_id?;
         let url = self.hyperlink_url(id)?.to_string();
         let (_, cols) = self.size();
         let last_col = cols.saturating_sub(1);
         let same = |p: Pos| -> bool {
             self.row_by_line_id(p.line_id)
-                .and_then(|r| r.cells.get(usize::from(p.col)))
+                .and_then(|r| r.cells().get(usize::from(p.col)))
                 .is_some_and(|c| c.hyperlink_id == Some(id) || c.is_continuation)
         };
         let prev = |p: Pos| -> Option<Pos> {
@@ -175,7 +175,7 @@ impl Term {
         let mut map: Vec<(usize, Pos)> = Vec::new();
         for line_id in lo..=hi {
             let row = self.row_by_line_id(line_id)?;
-            for (i, cell) in row.cells.iter().enumerate() {
+            for (i, cell) in row.cells().iter().enumerate() {
                 if cell.is_continuation || cell.wrap_pad {
                     continue;
                 }

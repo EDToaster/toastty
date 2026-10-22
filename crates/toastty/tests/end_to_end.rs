@@ -1,14 +1,15 @@
 //! End-to-end (sans-renderer) integration: PTY → mio reader → parser → Term.
 //!
 //! Builds the same data pipeline `main.rs` does without the wgpu/winit
-//! halves. Exercises the `Vec<u8>` payload path between
+//! halves. Exercises the shared-buffer path between
 //! `toastty-io::spawn_pty_reader_with_sink` and the binary's parser.
 
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use toastty_io::{EventSink, SinkClosed, UserEvent, spawn_pty_reader_with_sink};
+use toastty_io::spawn_pty_reader_with_sink;
+use toastty_io::test_support::{Batch, ChannelSink, recv_batch};
 use toastty_parser::Parser;
 use toastty_pty::{Pty, PtySpec, WinSize};
 use toastty_term::Term;
@@ -18,14 +19,6 @@ use toastty::keyboard::encode_key;
 use toastty::shell::resolve_shell;
 use toastty_config::ShellConfig;
 use toastty_window::{KeyState, LogicalKey, Modifiers, NamedKey};
-
-struct ChannelSink(Mutex<mpsc::Sender<UserEvent>>);
-impl EventSink for ChannelSink {
-    fn send(&self, ev: UserEvent) -> Result<(), SinkClosed> {
-        let g = self.0.lock().map_err(|_| SinkClosed)?;
-        g.send(ev).map_err(|_| SinkClosed)
-    }
-}
 
 #[test]
 fn pty_echo_drives_term_through_parser() {
@@ -42,7 +35,7 @@ fn pty_echo_drives_term_through_parser() {
 
     let (tx, rx) = mpsc::channel();
     let sink = ChannelSink(Mutex::new(tx));
-    let _reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("reader");
+    let mut reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("reader");
 
     let mut parser = Parser::new();
     let mut term = Term::new(24, 80, 0);
@@ -50,10 +43,10 @@ fn pty_echo_drives_term_through_parser() {
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut closed = false;
     while !closed && Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(UserEvent::PtyBytes(b)) => parser.advance(&mut term, &b),
-            Ok(UserEvent::PtyClosed) => closed = true,
-            Err(_) => {}
+        match recv_batch(&mut reader, &rx, Duration::from_millis(200)) {
+            Some(Batch::Bytes(b)) => parser.advance(&mut term, &b),
+            Some(Batch::Closed) => closed = true,
+            None => {}
         }
     }
     assert!(closed, "expected PtyClosed event");
@@ -64,7 +57,7 @@ fn pty_echo_drives_term_through_parser() {
     for r in 0..rows {
         let row = term.row(r);
         let s: String = row
-            .cells
+            .cells()
             .iter()
             .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
             .collect();
@@ -91,7 +84,7 @@ fn keyboard_encoder_round_trips_through_cat() {
 
     let (tx, rx) = mpsc::channel();
     let sink = ChannelSink(Mutex::new(tx));
-    let _reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("reader");
+    let mut reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("reader");
 
     // Encode "hi\r" the way the binary would.
     let bytes_h = encode_key(
@@ -130,8 +123,8 @@ fn keyboard_encoder_round_trips_through_cat() {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut total = Vec::new();
     while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(UserEvent::PtyBytes(b)) => {
+        match recv_batch(&mut reader, &rx, Duration::from_millis(200)) {
+            Some(Batch::Bytes(b)) => {
                 total.extend_from_slice(&b);
                 parser.advance(&mut term, &b);
                 let s = String::from_utf8_lossy(&total);
@@ -139,8 +132,8 @@ fn keyboard_encoder_round_trips_through_cat() {
                     break;
                 }
             }
-            Ok(UserEvent::PtyClosed) => break,
-            Err(_) => {}
+            Some(Batch::Closed) => break,
+            None => {}
         }
     }
     let s = String::from_utf8_lossy(&total);
@@ -162,7 +155,7 @@ fn resize_propagates_through_pty_and_term() {
 
     let (tx, rx) = mpsc::channel();
     let sink = ChannelSink(Mutex::new(tx));
-    let _reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("reader");
+    let mut reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("reader");
 
     // Resize using the same helper main.rs uses.
     let (cols, rows) = grid_dims_from_pixels(1280, 800, 10.0, 20.0);
@@ -184,13 +177,13 @@ fn resize_propagates_through_pty_and_term() {
     let mut closed = false;
     let mut all = Vec::new();
     while !closed && Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(UserEvent::PtyBytes(b)) => {
+        match recv_batch(&mut reader, &rx, Duration::from_millis(200)) {
+            Some(Batch::Bytes(b)) => {
                 all.extend_from_slice(&b);
                 parser.advance(&mut term, &b);
             }
-            Ok(UserEvent::PtyClosed) => closed = true,
-            Err(_) => {}
+            Some(Batch::Closed) => closed = true,
+            None => {}
         }
     }
     let s = String::from_utf8_lossy(&all);
@@ -218,18 +211,18 @@ fn pty_drives_bracketed_paste_mode_through_term() {
 
     let (tx, rx) = mpsc::channel();
     let sink = ChannelSink(Mutex::new(tx));
-    let _reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("reader");
+    let mut reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("reader");
 
     let mut parser = Parser::new();
     let mut term = Term::new(24, 80, 0);
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(UserEvent::PtyBytes(b)) => {
+        match recv_batch(&mut reader, &rx, Duration::from_millis(200)) {
+            Some(Batch::Bytes(b)) => {
                 parser.advance(&mut term, &b);
             }
-            Ok(UserEvent::PtyClosed) => break,
-            Err(_) => {}
+            Some(Batch::Closed) => break,
+            None => {}
         }
         if term.bracketed_paste() {
             break;
@@ -257,18 +250,18 @@ fn pty_drives_focus_reporting_mode_through_term() {
 
     let (tx, rx) = mpsc::channel();
     let sink = ChannelSink(Mutex::new(tx));
-    let _reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("reader");
+    let mut reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("reader");
 
     let mut parser = Parser::new();
     let mut term = Term::new(24, 80, 0);
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(UserEvent::PtyBytes(b)) => {
+        match recv_batch(&mut reader, &rx, Duration::from_millis(200)) {
+            Some(Batch::Bytes(b)) => {
                 parser.advance(&mut term, &b);
             }
-            Ok(UserEvent::PtyClosed) => break,
-            Err(_) => {}
+            Some(Batch::Closed) => break,
+            None => {}
         }
         if term.report_focus() {
             break;
@@ -302,7 +295,7 @@ fn shift_letter_under_kitty_disambiguate_writes_plain_uppercase_to_pty() {
 
     let (tx, rx) = mpsc::channel();
     let sink = ChannelSink(Mutex::new(tx));
-    let _reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("reader");
+    let mut reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("reader");
 
     // Flag bit 1 == disambiguate-only, the same value zellij pushes.
     let kitty_flags = 1u8;
@@ -347,8 +340,8 @@ fn shift_letter_under_kitty_disambiguate_writes_plain_uppercase_to_pty() {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut total = Vec::new();
     while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(UserEvent::PtyBytes(b)) => {
+        match recv_batch(&mut reader, &rx, Duration::from_millis(200)) {
+            Some(Batch::Bytes(b)) => {
                 total.extend_from_slice(&b);
                 parser.advance(&mut term, &b);
                 let s = String::from_utf8_lossy(&total);
@@ -356,8 +349,8 @@ fn shift_letter_under_kitty_disambiguate_writes_plain_uppercase_to_pty() {
                     break;
                 }
             }
-            Ok(UserEvent::PtyClosed) => break,
-            Err(_) => {}
+            Some(Batch::Closed) => break,
+            None => {}
         }
     }
     let s = String::from_utf8_lossy(&total);

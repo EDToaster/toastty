@@ -17,7 +17,6 @@
 
 use crate::cell::Cell;
 use crate::grid::Row;
-use smallvec::SmallVec;
 
 /// Display width of the cluster starting at `cells[i]`: 2 when the next
 /// cell is the continuation half of a width-2 cluster, else 1.
@@ -90,11 +89,11 @@ fn build_logical_lines(
             let row = &rows[i];
             let is_last = !row.soft_wrap;
             let trim = if is_last {
-                trailing_blank_run(&row.cells)
+                trailing_blank_run(row.cells())
             } else {
-                trailing_wrap_pad(&row.cells)
+                trailing_wrap_pad(row.cells())
             };
-            let keep = row.cells.len() - trim;
+            let keep = row.cells().len() - trim;
             row_starts.push((lines.len(), content.len()));
 
             if i == cursor_idx {
@@ -107,7 +106,7 @@ fn build_logical_lines(
                 cursor_offset = content.len() + (cursor_col as usize).min(keep);
             }
 
-            content.extend_from_slice(&row.cells[..keep]);
+            content.extend_from_slice(&row.cells()[..keep]);
 
             // `soft_wrap` on the final retained row (its continuation was
             // truncated away as blank padding) terminates the line here.
@@ -156,11 +155,7 @@ fn wrap_line(
             Cell::BLANK
         };
         cur.resize(cols_usize, fill);
-        rows.push(Row {
-            cells: SmallVec::from_vec(std::mem::take(cur)),
-            soft_wrap,
-            rich: None,
-        });
+        rows.push(Row::from_cells(std::mem::take(cur), soft_wrap));
     };
 
     let mut i = 0usize;
@@ -371,11 +366,7 @@ mod tests {
     }
 
     fn row(cells: Vec<Cell>, soft_wrap: bool) -> Row {
-        Row {
-            cells: SmallVec::from_vec(cells),
-            soft_wrap,
-            rich: None,
-        }
+        Row::from_cells(cells, soft_wrap)
     }
 
     fn text(cells: &[Cell]) -> String {
@@ -406,15 +397,15 @@ mod tests {
         let mut rejoined: Vec<Cell> = Vec::new();
         for (idx, r) in narrow.iter().enumerate() {
             let trim = if idx + 1 < narrow.len() {
-                trailing_wrap_pad(&r.cells)
+                trailing_wrap_pad(r.cells())
             } else {
-                trailing_blank_run(&r.cells)
+                trailing_blank_run(r.cells())
             };
-            rejoined.extend_from_slice(&r.cells[..r.cells.len() - trim]);
+            rejoined.extend_from_slice(&r.cells()[..r.cells().len() - trim]);
         }
         let (wide_again, _) = wrap_line(&rejoined, 11, None, &mut Vec::new());
         assert_eq!(wide_again.len(), 1);
-        assert_eq!(text(&wide_again[0].cells).trim_end(), "hello world");
+        assert_eq!(text(wide_again[0].cells()).trim_end(), "hello world");
     }
 
     #[test]
@@ -427,9 +418,9 @@ mod tests {
         let (rows, _) = wrap_line(&content, 4, None, &mut Vec::new());
         assert_eq!(rows.len(), 2);
         assert!(rows[0].soft_wrap);
-        assert_eq!(rows[0].cells[3], Cell::WRAP_PAD, "last col is the pad");
-        assert_eq!(rows[1].cells[0].ch, '世');
-        assert!(rows[1].cells[1].is_continuation);
+        assert_eq!(rows[0].cells()[3], Cell::WRAP_PAD, "last col is the pad");
+        assert_eq!(rows[1].cells()[0].ch, '世');
+        assert!(rows[1].cells()[1].is_continuation);
     }
 
     #[test]
@@ -496,11 +487,11 @@ mod tests {
         let content: Vec<Cell> = "foo bar".chars().map(cell).collect();
         let rows = vec![row(content, false)];
         let (narrow, _) = reflow_rows(&rows, 4, 0, 0);
-        assert_eq!(text(&narrow[0].cells), "foo ");
+        assert_eq!(text(&narrow[0].cells()), "foo ");
         assert!(narrow[0].soft_wrap);
         let (widened, _) = reflow_rows(&narrow, 20, 0, 0);
         assert_eq!(widened.len(), 1);
-        assert_eq!(text(&widened[0].cells).trim_end(), "foo bar");
+        assert_eq!(text(&widened[0].cells()).trim_end(), "foo bar");
     }
 
     #[test]
@@ -519,7 +510,7 @@ mod tests {
             cur = reflow_rows(&cur, cols, 0, 0).0;
         }
         assert_eq!(cur.len(), 1);
-        assert_eq!(text(&cur[0].cells).trim_end(), "a世界世界世界");
+        assert_eq!(text(&cur[0].cells()).trim_end(), "a世界世界世界");
     }
 
     #[test]
@@ -539,7 +530,7 @@ mod tests {
         let rows = vec![row(vec![Cell::BLANK, Cell::BLANK], false)];
         let (out, cursor) = reflow_rows(&rows, 4, 0, 0);
         assert_eq!(out.len(), 1);
-        assert!(out[0].cells.iter().all(|c| *c == Cell::BLANK));
+        assert!(out[0].cells().iter().all(|c| *c == Cell::BLANK));
         assert_eq!(cursor, (0, 0));
     }
 
@@ -552,7 +543,7 @@ mod tests {
         assert!(narrow.len() >= 3);
         let (widened, _) = reflow_rows(&narrow, 11, 0, 0);
         assert_eq!(widened.len(), 1);
-        assert_eq!(text(&widened[0].cells).trim_end(), "hello world");
+        assert_eq!(text(widened[0].cells()).trim_end(), "hello world");
     }
 
     #[test]

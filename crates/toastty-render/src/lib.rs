@@ -40,7 +40,7 @@ use thiserror::Error;
 use toastty_protocols::unicode_core::cluster_cell_width;
 use toastty_term::Term;
 use wgpu::{
-    BackendOptions, Backends, CompositeAlphaMode, Device, DeviceDescriptor, Instance,
+    Adapter, BackendOptions, Backends, CompositeAlphaMode, Device, DeviceDescriptor, Instance,
     InstanceDescriptor, InstanceFlags, MemoryBudgetThresholds, PowerPreference, PresentMode, Queue,
     RequestAdapterOptions, Surface, SurfaceConfiguration, TextureFormat, TextureUsages,
 };
@@ -55,9 +55,10 @@ use crate::image::instance::{
 };
 use crate::image::pipeline::ImagePipeline;
 use crate::rgp::{GpuAssetCache, Rgp3dPipeline};
-use crate::text::glyph_rasterizer::{DEFAULT_LINE_HEIGHT_RATIO, GlyphRasterizer, LineGlyphs};
+use crate::text::glyph_rasterizer::{DEFAULT_LINE_HEIGHT_RATIO, GlyphRasterizer};
 use crate::text::instance::{CellInstance, CellRenderOpts, Theme};
 use crate::text::pipeline::{GlobalsUbo, TextPipeline};
+use crate::text::row_shaper::RowShaper;
 
 /// True when a placement that actually draws sits in the kitty
 /// `z < INT32_MIN/2` band, which draws under non-default cell
@@ -87,35 +88,16 @@ fn below_bg_forces_full_redraw(active: bool, drawn_last: &mut bool) -> bool {
 }
 
 /// Post-process the full-build cell instances: drop the trailing cursor
-/// instance when the cursor is hidden, and, while a below-cell-bg image
-/// is on screen, the default-bg quads it must show through.
-fn finish_full_build(
-    instances: &mut Vec<CellInstance>,
-    cursor_visible: bool,
-    below_bg_active: bool,
-    default_bg: [f32; 4],
-) {
+/// instance when the cursor is hidden.
+///
+/// While a `z < INT32_MIN/2` image is on screen the builder runs with
+/// [`CellRenderOpts::skip_default_bg`], so that image (drawn before the
+/// bg pass) shows through default-bg cells while non-default backgrounds
+/// (SGR colors, reverse video, selection) still cover it (SIZE-9).
+fn finish_full_build(instances: &mut Vec<CellInstance>, cursor_visible: bool) {
     if !cursor_visible {
         instances.pop();
     }
-    if below_bg_active {
-        drop_default_bg_quads(instances, default_bg);
-    }
-}
-
-/// Drop the cell-background quads painted in the default background
-/// color, so `z < INT32_MIN/2` images drawn before the bg pass show
-/// through default-bg cells while non-default backgrounds (SGR colors,
-/// reverse video, selection) still cover them.
-///
-/// Only valid on a full-clear frame: the clear already paints the
-/// default background (premultiplied, so a transparent theme bg stays
-/// transparent), which makes these quads redundant everywhere else.
-/// Cursor, decoration and cover quads carry extra flags and are kept.
-// Exact compare is intended: default-bg quads carry `theme.bg` verbatim.
-#[allow(clippy::float_cmp)]
-fn drop_default_bg_quads(instances: &mut Vec<CellInstance>, default_bg: [f32; 4]) {
-    instances.retain(|i| i.flags != crate::text::instance::FLAG_NO_GLYPH || i.bg != default_bg);
 }
 
 /// Append instances for `term` into `out`. The closure pulls glyph
@@ -129,7 +111,7 @@ fn build_term_instances_into(
     cell_size: (f32, f32),
     theme: &Theme,
     ext_palette: &[[f32; 4]; 256],
-    row_glyphs: &[Option<LineGlyphs>],
+    row_glyphs: &RowShaper,
     bleed: EdgeBleed<'_>,
     content_h: f32,
     opts: &CellRenderOpts,
@@ -140,10 +122,7 @@ fn build_term_instances_into(
         cell_size,
         theme,
         Some(ext_palette),
-        |row, col, ch, _style| {
-            let lg = row_glyphs.get(row as usize)?.as_ref()?;
-            lg.get(col, ch)
-        },
+        |row, col, ch, _style| row_glyphs.glyph(row, col, ch),
         |line_id, col| term.is_cell_selected(line_id, col),
         bleed,
         content_h,
@@ -162,7 +141,7 @@ fn build_term_dirty_instances_into(
     theme: &Theme,
     ext_palette: &[[f32; 4]; 256],
     cursor_visible: bool,
-    row_glyphs: &[Option<LineGlyphs>],
+    row_glyphs: &RowShaper,
     bleed: EdgeBleed<'_>,
     opts: &CellRenderOpts,
 ) {
@@ -174,10 +153,7 @@ fn build_term_dirty_instances_into(
         theme,
         Some(ext_palette),
         cursor_visible,
-        |row, col, ch, _style| {
-            let lg = row_glyphs.get(row as usize)?.as_ref()?;
-            lg.get(col, ch)
-        },
+        |row, col, ch, _style| row_glyphs.glyph(row, col, ch),
         |line_id, col| term.is_cell_selected(line_id, col),
         bleed,
         opts,
@@ -233,7 +209,7 @@ fn mark_blinking_cells_dirty(term: &mut Term, row_blink: &[bool]) {
         cols.clear();
         cols.extend(
             term.view_row(r)
-                .cells
+                .cells()
                 .iter()
                 .enumerate()
                 .filter(|(_, c)| c.style.flags.blink())
@@ -261,6 +237,19 @@ fn normalize_preedit(text: Option<&str>) -> Option<String> {
 /// Even when the host has system monospace fonts, embedding one makes
 /// snapshot tests deterministic across machines.
 const BUNDLED_FONT: &[u8] = include_bytes!("../fonts/FiraMono-Medium.ttf");
+
+pub use crate::text::glyph_rasterizer::LoadedFonts;
+
+/// Load the font database [`Renderer::with_font_ex`] would build for
+/// `font_name` (system fonts plus the bundled fallback; `None` means the
+/// bundled Fira Mono).
+///
+/// Needs no window or device, so the binary calls it on a worker thread
+/// during startup and hands the result to [`Renderer::with_loaded_fonts`].
+#[must_use]
+pub fn load_fonts(font_name: Option<&str>) -> LoadedFonts {
+    LoadedFonts::load(Some(font_name.unwrap_or("Fira Mono")), Some(BUNDLED_FONT))
+}
 
 /// Default font pixel size for the demo and snapshot tests.
 pub const DEFAULT_FONT_SIZE_PX: f32 = 16.0;
@@ -338,6 +327,137 @@ pub fn instance_descriptor(flags: InstanceFlags) -> InstanceDescriptor {
     }
 }
 
+/// Instance flags `Renderer` uses: validation in this crate's tests, off
+/// otherwise.
+fn renderer_instance_flags() -> InstanceFlags {
+    if cfg!(test) {
+        instance_flags_for_tests()
+    } else {
+        instance_flags_for_release()
+    }
+}
+
+fn log_adapter(adapter: &Adapter) {
+    let info = adapter.get_info();
+    tracing::info!(
+        target: "render_trace",
+        "wgpu adapter: name={:?} backend={:?} device_type={:?} vendor=0x{:04x} device=0x{:04x}",
+        info.name, info.backend, info.device_type, info.vendor, info.device,
+    );
+}
+
+/// Request the renderer's device from `adapter`. The limits depend only on
+/// the adapter, not on any surface.
+async fn request_device(adapter: &Adapter) -> Result<(Device, Queue), RenderError> {
+    Ok(adapter
+        .request_device(&DeviceDescriptor {
+            label: Some("toastty-render device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            memory_hints: wgpu::MemoryHints::Performance,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            trace: wgpu::Trace::Off,
+        })
+        .await?)
+}
+
+/// Pick an adapter that can present to `surface` and open its device.
+async fn open_for_surface(
+    instance: &Instance,
+    surface: &Surface<'_>,
+) -> Result<(Adapter, Device, Queue), RenderError> {
+    let adapter = instance
+        .request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::LowPower, // power-friendly
+            force_fallback_adapter: false,
+            compatible_surface: Some(surface),
+        })
+        .await
+        .map_err(|_| RenderError::NoAdapter)?;
+    log_adapter(&adapter);
+    let (device, queue) = request_device(&adapter).await?;
+    Ok((adapter, device, queue))
+}
+
+/// Create `window`'s surface and the device to render it with: `gpu`'s
+/// adapter and device when it can present to the surface, otherwise an
+/// adapter picked for the surface (see [`Renderer::with_gpu`]).
+async fn surface_and_device<W>(
+    gpu: Option<GpuContext>,
+    window: W,
+) -> Result<(Surface<'static>, Adapter, Device, Queue), RenderError>
+where
+    W: HasDisplayHandle + HasWindowHandle + Send + Sync + 'static,
+{
+    // create_surface takes `impl Into<SurfaceTarget>`. A `&'static W`
+    // that impls `HasDisplayHandle + HasWindowHandle + Send + Sync` is
+    // accepted via the blanket `From<T> for SurfaceTarget` impl.
+    let Some(gpu) = gpu else {
+        let instance = Instance::new(instance_descriptor(renderer_instance_flags()));
+        let surface = instance.create_surface(window)?;
+        let (adapter, device, queue) = open_for_surface(&instance, &surface).await?;
+        return Ok((surface, adapter, device, queue));
+    };
+    let surface = gpu.instance.create_surface(window)?;
+    if gpu.adapter.is_surface_supported(&surface) {
+        log_adapter(&gpu.adapter);
+        return Ok((surface, gpu.adapter, gpu.device, gpu.queue));
+    }
+    tracing::info!("pre-selected GPU adapter can't present to the window; selecting another");
+    let GpuContext {
+        instance,
+        adapter,
+        device,
+        queue,
+    } = gpu;
+    // Release the unusable device before opening another.
+    drop((adapter, device, queue));
+    let (adapter, device, queue) = open_for_surface(&instance, &surface).await?;
+    Ok((surface, adapter, device, queue))
+}
+
+/// The window-independent part of renderer setup: the wgpu instance, an
+/// adapter and its device.
+///
+/// Creating these is ~20 ms of startup (loading and initialising the
+/// Vulkan driver, mostly) and none of it needs the window, so the binary
+/// builds one on a worker thread while winit opens the display and the
+/// window, then passes it to [`Renderer::with_gpu`]. The adapter is chosen
+/// without a surface; `with_gpu` checks that it can present to the
+/// window's surface and re-selects one exactly as [`Renderer::new`] does
+/// when it can't (e.g. a multi-GPU machine whose low-power GPU doesn't
+/// drive the display).
+#[derive(Debug)]
+pub struct GpuContext {
+    instance: Instance,
+    adapter: Adapter,
+    device: Device,
+    queue: Queue,
+}
+
+impl GpuContext {
+    /// Create the instance, pick the adapter [`Renderer::new`] would prefer
+    /// (low power, no surface filter yet) and open its device.
+    pub async fn new() -> Result<Self, RenderError> {
+        let instance = Instance::new(instance_descriptor(renderer_instance_flags()));
+        let adapter = instance
+            .request_adapter(&RequestAdapterOptions {
+                power_preference: PowerPreference::LowPower,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .await
+            .map_err(|_| RenderError::NoAdapter)?;
+        let (device, queue) = request_device(&adapter).await?;
+        Ok(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+        })
+    }
+}
+
 /// The renderer.
 ///
 /// Owns the wgpu device, queue, surface, and current surface config. M4a
@@ -352,6 +472,10 @@ pub struct Renderer {
     /// Text pipeline lives lazily — `with_font` initializes it; `render`
     /// (M4a path) tolerates its absence; `render_term` requires it.
     text: Option<TextState>,
+    /// Text pipeline built by [`Renderer::prepare_pipelines`] before any
+    /// font was loaded; the next [`Renderer::with_loaded_fonts`] takes it
+    /// instead of building its own.
+    spare_text_pipeline: Option<TextPipeline>,
     /// Theme used by `render_term` when emitting instances: `base_theme`,
     /// or its fg/bg swap while the terminal is in reverse video
     /// (DECSCNM).
@@ -908,28 +1032,11 @@ struct TextState {
     rasterizer: GlyphRasterizer,
     pipeline: TextPipeline,
     bind_group: wgpu::BindGroup,
-    /// Row-shape cache. `line_cache[r]` holds the shaped glyphs for row
-    /// `r` of the active grid; `None` slots are re-shaped on the next
-    /// frame. Sized to match the term's current visible-row count;
-    /// resized in `render_term` on geometry change.
-    ///
-    /// This is the minimum-viable subset of decision #7 / M9 needed to
-    /// kill the per-keystroke render cost — shape only dirty rows, reuse
-    /// cached glyphs for the rest.
-    line_cache: Vec<Option<LineGlyphs>>,
-    /// `row_blink[r]` is true when rendered row `r` holds a visible
-    /// SGR-blink cell. Parallel to `line_cache` and refreshed for the
-    /// same (dirty) rows, so finding blinking text costs nothing on
-    /// clean frames. Drives [`TextBlink`].
-    row_blink: Vec<bool>,
+    /// Row-shape cache + the per-frame shaping loop.
+    rows: RowShaper,
     /// Reusable instance buffer. Cleared (not freed) at the start of
     /// every `render_term` so the allocation survives across frames.
     instances_scratch: Vec<CellInstance>,
-    /// Reusable per-row text buffer. `render_term` clears + repopulates
-    /// this for each dirty row instead of allocating a fresh `String`,
-    /// which previously showed up in profile traces as per-row alloc
-    /// churn (one allocation per dirty row, every frame).
-    line_text_scratch: String,
 }
 
 impl std::fmt::Debug for TextState {
@@ -1048,45 +1155,26 @@ impl Renderer {
     where
         W: HasDisplayHandle + HasWindowHandle + Send + Sync + 'static,
     {
-        let flags = if cfg!(test) {
-            instance_flags_for_tests()
-        } else {
-            instance_flags_for_release()
-        };
+        Self::with_gpu(None, window, size, vsync, transparent).await
+    }
 
-        let instance = Instance::new(instance_descriptor(flags));
-
-        // create_surface takes `impl Into<SurfaceTarget>`. A `&'static W`
-        // that impls `HasDisplayHandle + HasWindowHandle + Send + Sync` is
-        // accepted via the blanket `From<T> for SurfaceTarget` impl.
-        let surface = instance.create_surface(window)?;
-
-        let adapter = instance
-            .request_adapter(&RequestAdapterOptions {
-                power_preference: PowerPreference::LowPower, // power-friendly
-                force_fallback_adapter: false,
-                compatible_surface: Some(&surface),
-            })
-            .await
-            .map_err(|_| RenderError::NoAdapter)?;
-        let info = adapter.get_info();
-        tracing::info!(
-            target: "render_trace",
-            "wgpu adapter: name={:?} backend={:?} device_type={:?} vendor=0x{:04x} device=0x{:04x}",
-            info.name, info.backend, info.device_type, info.vendor, info.device,
-        );
-
-        let (device, queue) = adapter
-            .request_device(&DeviceDescriptor {
-                label: Some("toastty-render device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults()
-                    .using_resolution(adapter.limits()),
-                memory_hints: wgpu::MemoryHints::Performance,
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                trace: wgpu::Trace::Off,
-            })
-            .await?;
+    /// [`Self::new`], reusing a [`GpuContext`] created ahead of the window
+    /// when `gpu` is `Some`.
+    ///
+    /// The context's adapter is kept only if it can present to `window`'s
+    /// surface. Otherwise an adapter is chosen for the surface the way
+    /// [`Self::new`] does, so the result never differs from `new`'s.
+    pub async fn with_gpu<W>(
+        gpu: Option<GpuContext>,
+        window: W,
+        size: (u32, u32),
+        vsync: bool,
+        transparent: bool,
+    ) -> Result<Self, RenderError>
+    where
+        W: HasDisplayHandle + HasWindowHandle + Send + Sync + 'static,
+    {
+        let (surface, adapter, device, queue) = surface_and_device(gpu, window).await?;
 
         let caps = surface.get_capabilities(&adapter);
         let format = surface_format::pick(&caps.formats).ok_or(RenderError::NoSurfaceFormat)?;
@@ -1132,6 +1220,7 @@ impl Renderer {
             config,
             clear_color: [0.07, 0.07, 0.09, 1.0],
             text: None,
+            spare_text_pipeline: None,
             theme: Theme::default_dark(),
             base_theme: Theme::default_dark(),
             reverse_video: false,
@@ -1242,17 +1331,20 @@ impl Renderer {
     /// [`DEFAULT_LINE_HEIGHT`]. Callers loading a `toastty_config::FontConfig`
     /// should pass `font.line_height` here.
     pub fn with_font_ex(&mut self, font_name: Option<&str>, font_size_px: f32, line_height: f32) {
-        // Resolve the font family. We always bundle FiraMono so the
-        // caller can pass `None` and still get text.
-        let family = font_name.unwrap_or("Fira Mono");
-        let rasterizer = GlyphRasterizer::new(
-            &self.device,
-            font_size_px,
-            line_height,
-            Some(family),
-            Some(BUNDLED_FONT),
-        );
-        let pipeline = TextPipeline::new(&self.device, self.config.format);
+        // We always bundle FiraMono so the caller can pass `None` and
+        // still get text (see `load_fonts`).
+        self.with_loaded_fonts(load_fonts(font_name), font_size_px, line_height);
+    }
+
+    /// [`Self::with_font_ex`] with a font database loaded ahead of time by
+    /// [`load_fonts`] (the family is the one `fonts` was loaded for).
+    pub fn with_loaded_fonts(&mut self, fonts: LoadedFonts, font_size_px: f32, line_height: f32) {
+        let rasterizer =
+            GlyphRasterizer::with_fonts(&self.device, fonts, font_size_px, line_height);
+        let pipeline = self
+            .spare_text_pipeline
+            .take()
+            .unwrap_or_else(|| TextPipeline::new(&self.device, self.config.format));
 
         let mask_view = text::pipeline::default_view(rasterizer.mask_texture());
         let color_view = text::pipeline::default_view(rasterizer.color_texture());
@@ -1262,14 +1354,32 @@ impl Renderer {
             rasterizer,
             pipeline,
             bind_group,
-            line_cache: Vec::new(),
-            row_blink: Vec::new(),
+            rows: RowShaper::new(),
             instances_scratch: Vec::new(),
-            line_text_scratch: String::new(),
         });
-        // Lazy-init the image pipeline alongside the text pipeline so
-        // both are ready before the first `render_term`. The image
-        // pipeline shares the swapchain format.
+        // Ready before the first `render_term`.
+        self.prepare_aux_pipelines();
+        // Font swap invalidates the cell grid — force the next frame
+        // to clear.
+        self.needs_full_clear = true;
+    }
+
+    /// Build the GPU pipelines (text, images, chips, RGP) now. They depend
+    /// only on the device and the surface format, not on the font, so a
+    /// caller still waiting for [`LoadedFonts`] from another thread can
+    /// compile them in the meantime (~5 ms of shader compilation at
+    /// startup). Optional: [`Self::with_loaded_fonts`] builds whatever is
+    /// missing.
+    pub fn prepare_pipelines(&mut self) {
+        if self.text.is_none() && self.spare_text_pipeline.is_none() {
+            self.spare_text_pipeline = Some(TextPipeline::new(&self.device, self.config.format));
+        }
+        self.prepare_aux_pipelines();
+    }
+
+    /// Create the image, chip, UI and RGP pipelines if they don't exist yet.
+    /// They share the swapchain format.
+    fn prepare_aux_pipelines(&mut self) {
         if self.image_pipeline.is_none() {
             self.image_pipeline = Some(ImagePipeline::new(&self.device, self.config.format));
         }
@@ -1282,13 +1392,9 @@ impl Renderer {
         if self.ui_pipeline.is_none() {
             self.ui_pipeline = Some(UiPipeline::new(&self.device, self.config.format));
         }
-        // Same for the RGP pipeline.
         if self.rgp_pipeline.is_none() {
             self.rgp_pipeline = Some(Rgp3dPipeline::new(&self.device, self.config.format));
         }
-        // Font swap invalidates the cell grid — force the next frame
-        // to clear.
-        self.needs_full_clear = true;
     }
 
     /// Change only the font size, keeping the family, font database and
@@ -1308,7 +1414,7 @@ impl Renderer {
         };
         text.rasterizer.set_font_size(font_size_px, line_height);
         // Cached rows hold atlas slots from the old packer: re-shape all.
-        text.line_cache.clear();
+        text.rows.invalidate();
         self.needs_full_clear = true;
     }
 
@@ -2180,7 +2286,12 @@ impl Renderer {
         if rich_active != self.rich_drawn_last {
             self.needs_full_clear = true;
         }
-        let mut rich_suppress = vec![false; usize::from(term.size().0) + 2];
+        // Rows whose text is suppressed for a rich slice. Left empty
+        // (no allocation) on the common frame without rich blocks.
+        let mut rich_suppress = Vec::new();
+        if rich_active {
+            rich_suppress.resize(usize::from(term.size().0) + 2, false);
+        }
         for d in &rich_draws {
             if let Some(slot) = rich_suppress.get_mut(usize::from(d.0)) {
                 *slot = true;
@@ -2319,7 +2430,7 @@ impl Renderer {
         if text_blink_due {
             self.text_blink.tick(now);
             if let Some(text) = self.text.as_ref() {
-                mark_blinking_cells_dirty(term, &text.row_blink);
+                mark_blinking_cells_dirty(term, text.rows.row_blink());
             }
         }
         // If the term has blink disabled, the cursor must always be
@@ -2352,19 +2463,6 @@ impl Renderer {
             cell_size = text.rasterizer.cell_size();
             atlas_dims = text.rasterizer.atlas_dims();
 
-            // Resize the row-shape cache. We allocate two extra slots
-            // beyond `rows`: one for the partial *top* row during sub-pixel
-            // scrolling, one for the partial *bottom* row when the content
-            // area isn't a whole number of cells tall. Sizing for the worst
-            // case avoids reallocation churn as the scroll offset crosses
-            // cell boundaries. Growth is dirty (new entries are `None`);
-            // shrinking just drops old slots.
-            let cache_len = rows as usize + 2;
-            if text.line_cache.len() != cache_len {
-                text.line_cache.resize(cache_len, None);
-            }
-            text.row_blink.resize(cache_len, false);
-
             // Number of rows to render this frame: content rows, plus the
             // partial top row (sub-row pixel offset) and the trailing
             // partial bottom row (floor-divided grid leftover). See
@@ -2376,81 +2474,25 @@ impl Renderer {
                 content_dims.1,
             );
 
-            // Re-shape only dirty rows; reuse cached `LineGlyphs` for
-            // the rest. The atlas itself never shrinks, so a clean row's
-            // glyph slots stay valid across frames.
-            let damage = term.damage();
-            let mut shaped = 0u32;
             let t_shape = if trace {
                 Some(std::time::Instant::now())
             } else {
                 None
             };
-            for r in 0..rows_rendered {
-                let is_dirty = damage.all
-                    || damage.rows.get(r as usize).is_some_and(|rd| !rd.is_empty())
-                    || text.line_cache[r as usize].is_none();
-                if !is_dirty {
-                    continue;
-                }
-                let row = term.view_row(r);
-                text.row_blink[r as usize] = crate::text::instance::row_has_blink(row);
-                // Reuse the cross-row scratch String instead of
-                // allocating a fresh one per dirty row.
-                //
-                // Continuation cells are excluded: they're the second
-                // half of a width-2 cluster whose primary cell already
-                // contributes its full multi-cell glyph to the shaper.
-                // Feeding the continuation in as a space would insert
-                // an extra glyph cosmic-text would shape, shifting every
-                // downstream cluster's snapped column by one.
-                text.line_text_scratch.clear();
-                // A row showing a rich-block slice draws the image
-                // instead of its text glyphs (the cells keep the text
-                // for selection / copy / the evicted fallback).
-                let suppress = rich_suppress.get(r as usize).copied().unwrap_or(false);
-                for c in &row.cells {
-                    if c.is_continuation {
-                        continue;
-                    }
-                    if suppress {
-                        text.line_text_scratch.push(' ');
-                        continue;
-                    }
-                    // Replace Kitty Unicode placeholder cells
-                    // (U+10EEEE) with a space before shaping. The
-                    // codepoint shapes to `.notdef` and its
-                    // cluster width can throw off the snap of
-                    // neighboring chars — we don't want it in the
-                    // glyph cache and the image pipeline draws
-                    // the real pixels anyway.
-                    let ch = if c.ch == '\0' || c.ch == toastty_term::PLACEHOLDER {
-                        ' '
-                    } else {
-                        c.ch
-                    };
-                    text.line_text_scratch.push(ch);
-                    // The rest of a multi-codepoint grapheme (combining
-                    // marks, ZWJ tail, VS16) so it shapes as one cluster;
-                    // its extra glyphs come back as secondary glyphs of
-                    // this cell (see `instance::secondary_glyph_key`).
-                    if c.extra.is_some() && ch != ' ' {
-                        text.line_text_scratch.push_str(term.grapheme_tail(c));
-                    }
-                }
-                let lg = text.rasterizer.shape_line(
-                    &self.queue,
-                    &text.line_text_scratch,
-                    term.grapheme_cluster_mode(),
-                );
-                text.line_cache[r as usize] = Some(lg);
-                shaped += 1;
-            }
+            let shaped = text.rows.shape_rows(
+                &mut text.rasterizer,
+                &self.queue,
+                term,
+                rows_rendered,
+                &rich_suppress,
+            );
             if let Some(t) = t_shape {
                 let ms = t.elapsed().as_secs_f64() * 1000.0;
                 tracing::info!(target: "render_trace", "shape rows={shaped} took={ms:.3}ms");
             }
-            any_blink = text.row_blink[..rows_rendered as usize].iter().any(|b| *b);
+            any_blink = text.rows.row_blink()[..rows_rendered as usize]
+                .iter()
+                .any(|b| *b);
             // make_bind_group used to be rebuilt every frame "in case
             // the atlas textures grew". They don't grow inside the
             // render path — `queue.write_texture` makes uploads visible
@@ -2515,7 +2557,7 @@ impl Renderer {
                 #[allow(clippy::needless_range_loop)]
                 for c in 0..cols as usize {
                     let filled = row
-                        .cells
+                        .cells()
                         .get(c)
                         .is_some_and(crate::text::instance::cell_fills_bg);
                     if !filled {
@@ -2595,6 +2637,9 @@ impl Renderer {
         let cell_opts = crate::text::instance::CellRenderOpts {
             blink_on: self.text_blink.blink_on(),
             decor: Some(text.rasterizer.decoration_metrics()),
+            // Only consulted by the full builder, which only runs on
+            // `LoadOp::Clear(theme.bg)` frames.
+            skip_default_bg: crate::text::instance::may_skip_default_bg(&bleed, below_bg_active),
         };
         let t_bi = if trace {
             Some(std::time::Instant::now())
@@ -2611,12 +2656,12 @@ impl Renderer {
                 cell_size,
                 &theme,
                 ext_palette,
-                &text.line_cache,
+                &text.rows,
                 bleed,
                 content_dims.1,
                 &cell_opts,
             );
-            finish_full_build(&mut instances, cursor_visible, below_bg_active, theme.bg);
+            finish_full_build(&mut instances, cursor_visible);
         } else {
             build_term_dirty_instances_into(
                 &mut instances,
@@ -2625,7 +2670,7 @@ impl Renderer {
                 &theme,
                 ext_palette,
                 cursor_visible,
-                &text.line_cache,
+                &text.rows,
                 bleed,
                 &cell_opts,
             );
@@ -4044,93 +4089,25 @@ mod below_cell_bg_tests {
         assert!(!below_bg_forces_full_redraw(false, &mut drawn_last));
     }
 
-    /// `finish_full_build` (what `render_term` calls on the full path):
-    /// default-bg quads go only with the flag on; the hidden cursor is
-    /// popped either way.
+    /// The hidden cursor (the full build's last instance) is popped.
     #[test]
-    fn finish_full_build_drops_default_bg_only_when_below_bg_active() {
-        use crate::text::instance::{FLAG_CURSOR, FLAG_NO_GLYPH, Theme, build_instances};
+    fn finish_full_build_pops_hidden_cursor() {
+        use crate::text::instance::{FLAG_CURSOR, Theme, build_instances};
         let theme = Theme::default_dark();
         let mut term = Term::new(1, 6, 0);
         let mut parser = toastty_parser::Parser::new();
         parser.advance(&mut term, b"ab\x1b[41mcd\x1b[0m");
         let built = build_instances(&term, (10.0, 20.0), &theme, None, |_, _, _, _| None);
-        let bg_quads = |v: &[CellInstance]| v.iter().filter(|i| i.flags == FLAG_NO_GLYPH).count();
         let has_cursor = |v: &[CellInstance]| v.iter().any(|i| i.flags & FLAG_CURSOR != 0);
-        assert_eq!(bg_quads(&built), 4);
 
         let mut v = built.clone();
-        finish_full_build(&mut v, true, false, theme.bg);
-        assert_eq!((bg_quads(&v), has_cursor(&v)), (4, true));
+        finish_full_build(&mut v, true);
+        assert_eq!(v, built);
+        assert!(has_cursor(&v));
 
         let mut v = built.clone();
-        finish_full_build(&mut v, true, true, theme.bg);
-        assert_eq!((bg_quads(&v), has_cursor(&v)), (2, true), "only red stays");
-
-        let mut v = built.clone();
-        finish_full_build(&mut v, false, false, theme.bg);
-        assert_eq!((bg_quads(&v), has_cursor(&v)), (4, false));
-
-        let mut v = built;
-        finish_full_build(&mut v, false, true, theme.bg);
-        assert_eq!((bg_quads(&v), has_cursor(&v)), (2, false));
-    }
-
-    /// SIZE-9: default-bg cell quads are dropped (the image shows
-    /// through), while SGR backgrounds, reverse video, selection and the
-    /// cursor keep their quads (they cover the image).
-    #[test]
-    fn drop_default_bg_quads_keeps_non_default_backgrounds() {
-        use crate::text::instance::{
-            EdgeBleed, FLAG_CURSOR, FLAG_NO_GLYPH, Theme, build_instances_into,
-        };
-        let theme = Theme::default_dark();
-        let mut term = Term::new(1, 10, 0);
-        let mut parser = toastty_parser::Parser::new();
-        // cols 0-1 default text, 2-3 red bg, 4-5 reverse, 6 blank, 7-8
-        // selected blanks, cursor parked at col 9.
-        parser.advance(&mut term, b"ab\x1b[41mcd\x1b[0m\x1b[7mef\x1b[0m\x1b[1;10H");
-        let mut v = Vec::new();
-        build_instances_into(
-            &mut v,
-            &term,
-            (10.0, 20.0),
-            &theme,
-            None,
-            |_, _, _, _| None,
-            |_, c| c == 7 || c == 8,
-            EdgeBleed::default(),
-            20.0,
-        );
-        let bg_cols = |v: &[CellInstance]| -> Vec<u32> {
-            v.iter()
-                .filter(|i| i.flags == FLAG_NO_GLYPH)
-                .map(|i| (i.pos[0] / 10.0) as u32)
-                .collect()
-        };
-        assert_eq!(bg_cols(&v), vec![0, 1, 2, 3, 4, 5, 7, 8]);
-
-        drop_default_bg_quads(&mut v, theme.bg);
-        assert_eq!(bg_cols(&v), vec![2, 3, 4, 5, 7, 8]);
-        assert!(
-            v.iter().any(|i| i.flags & FLAG_CURSOR != 0),
-            "cursor quad is kept"
-        );
-    }
-
-    /// A transparent theme bg is still matched exactly, so its default
-    /// cells are dropped too (the clear paints the same premultiplied
-    /// color), while an opaque explicit color is kept.
-    #[test]
-    fn drop_default_bg_quads_matches_transparent_default() {
-        use crate::text::instance::CellInstance;
-        let default_bg = [0.1, 0.1, 0.1, 0.5];
-        let mut v = vec![
-            CellInstance::background([0.0, 0.0], [10.0, 20.0], default_bg),
-            CellInstance::background([10.0, 0.0], [10.0, 20.0], [0.1, 0.1, 0.1, 1.0]),
-        ];
-        drop_default_bg_quads(&mut v, default_bg);
-        assert_eq!(v.len(), 1);
-        assert!((v[0].pos[0] - 10.0).abs() < 1e-6);
+        finish_full_build(&mut v, false);
+        assert_eq!(v.len(), built.len() - 1);
+        assert!(!has_cursor(&v));
     }
 }

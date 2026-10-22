@@ -143,3 +143,29 @@ bitflags             = "=2.11.1"
 2. **Spacer cells and selection.** When a wide char gets bumped, our spacer is `' '` width=1. For text selection / copy, the spacer should produce zero output and the wide char should produce one grapheme. Add a `Cell::is_spacer()` flag and have copy-out skip spacers. *Done as `Cell::wrap_pad`: `Term::print_char` and reflow write `Cell::WRAP_PAD` there, reflow drops only that cell when it rejoins a soft-wrapped row (a real space at the wrap point stays), and copy and URL detection skip it.*
 3. **Span table for SGR runs.** All three prototypes store style per-cell. A space-optimized version stores `Span { start, end, style }` separately. This is a *cell-shape* refactor — orthogonal to the container choice. Defer until profiling shows it matters.
 4. **Reflow is not the hot path.** Median 66 ms for the ring is fine; users resize maybe once per session. The hot path is **append**, where the ring is 250 ns p50 — comfortably under one frame budget at any refresh rate.
+
+## 2026-10-22: row representation revised (performance pass)
+
+The ring buffer, its stable line ids, reflow and eviction are unchanged.
+What changed is the row inside it and when the ring's rows get memory:
+
+- **`Row.cells` is a `Vec<Cell>`, not `SmallVec<[Cell; 16]>`.** Real rows
+  hold one cell per column (80-300), so they always spilled and the
+  16-cell inline buffer (~330 B per slot, 20-byte cells) was dead weight
+  in every one of the 10k+ ring slots. A `Row` is now 56 B.
+- **Scrollback slots are allocated on demand.** Only the visible rows
+  get cells at start-up; an off-screen slot stays empty (no allocation)
+  until output first scrolls into it, and ED 3 hands history memory
+  back. At 128 columns that is ~26 MB less RSS for a terminal that
+  hasn't scrolled. Visible rows still always hold exactly `cols` cells,
+  so readers see no difference.
+- **`Row` tracks its written prefix (`used`).** Every cell at or past
+  `used` is `Cell::BLANK`, so `Row::clear` (one per bottom-of-screen
+  linefeed, on a row recycled from the far, cache-cold end of the ring)
+  blanks only the prefix instead of the whole row: for short lines
+  (`seq`, logs) one cache line instead of forty. The cells are private
+  (`Row::cells` / `cells_mut`) so the invariant can't be broken from
+  outside; `cells_mut` conservatively counts the whole row as written.
+
+The cell layout itself (20 bytes) is untouched; shrinking `Cell` is still
+the lever for scrollback memory once it fills, as noted above.

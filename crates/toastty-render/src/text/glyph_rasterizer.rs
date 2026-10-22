@@ -12,6 +12,8 @@ use cosmic_text::{
     SwashContent, Weight, fontdb,
 };
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::sync::Arc;
 use toastty_protocols::unicode_core::cluster_cell_width;
 use unicode_width::UnicodeWidthChar;
 use wgpu::{Device, Extent3d, Queue, Texture, TextureFormat};
@@ -27,6 +29,37 @@ use crate::text::presentation;
 /// the old `HashMap<(col, char), GlyphSlot>` had — callers re-check the
 /// char so a stale cache entry (e.g. wrong-char lookup) misses cleanly.
 type ColumnSlot = Option<(char, GlyphSlot)>;
+
+/// Chars below this code point get a dense entry in
+/// [`GlyphRasterizer::fast_chars`]: Latin, Greek, Cyrillic, general
+/// punctuation, arrows, box drawing, block elements and Braille (which
+/// btop-style graphs are made of). Everything above falls back to the
+/// hash lookups.
+const FAST_CHARS_LEN: usize = 0x3000;
+
+/// What the shaping fast path does with one char. A dense mirror of
+/// `char_cache` / `char_cache_misses` / `uncacheable_chars` (plus the
+/// width-1 test) so the per-char cost is one indexed load instead of up
+/// to three `SipHash` lookups. Recomputed by
+/// [`GlyphRasterizer::sync_fast_char`] whenever one of those sets
+/// changes, so the sets stay the source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastChar {
+    /// Leave the fast path (not width 1, uncacheable, or not cached yet).
+    Bail,
+    /// No glyph: blank, NUL, or a recorded cache miss.
+    Skip,
+    /// Cached; index into [`GlyphRasterizer::fast_slots`].
+    Cached(u32),
+}
+
+/// Memoised shape of one row text; see [`GlyphRasterizer::shape_line_memo`].
+#[derive(Debug)]
+struct MemoEntry {
+    glyphs: Arc<LineGlyphs>,
+    /// [`GlyphRasterizer::memo_frame`] of the last lookup that hit it.
+    last_used: u64,
+}
 
 /// Mask atlas dims (R8) and color atlas dims (BGRA8) — generously sized
 /// per the M4b "panic when full" policy.
@@ -321,6 +354,104 @@ pub struct GlyphRasterizer {
     /// `font.family` config didn't take effect. Surfaced via
     /// [`GlyphRasterizer::requested_family_available`].
     requested_family_available: bool,
+    /// Dense fast-path state for chars below [`FAST_CHARS_LEN`]; see
+    /// [`FastChar`].
+    fast_chars: Box<[FastChar]>,
+    /// Slots the [`FastChar::Cached`] entries point at. Append-only
+    /// between [`Self::rebuild_fast_chars`] calls.
+    fast_slots: Vec<GlyphSlot>,
+    /// Shaped rows keyed by their exact text, one map per mode-2027
+    /// state. Lets a row whose text was shaped recently (it scrolled,
+    /// or was repainted in new colours) skip shaping and the
+    /// `LineGlyphs` allocation. Cleared whenever an earlier shape could
+    /// go stale: a char turning uncacheable, an atlas eviction, a size
+    /// change. Trimmed by [`Self::trim_line_memo`].
+    line_memo: [HashMap<Box<str>, MemoEntry>; 2],
+    /// Frame counter for [`MemoEntry::last_used`], advanced by
+    /// [`Self::trim_line_memo`].
+    memo_frame: u64,
+    /// Set when [`Self::ensure_atlas_slot`] returned `None` (no atlas
+    /// room, no image); [`Self::shape_line_memo`] then skips memoising.
+    slot_failed: bool,
+}
+
+/// The GPU-independent, size-independent half of a [`GlyphRasterizer`]:
+/// the font database (every installed face plus the bundled fallback),
+/// the requested family, and the weight that family resolves to.
+///
+/// Loading it is most of the rasterizer's startup cost:
+/// [`FontSystem::new`] scans and parses every installed font, and the
+/// first shape with the primary family's `Attrs` makes cosmic-text rank
+/// every face against them. Neither needs a window, a device or the font
+/// size (which depends on the monitor's scale factor), so the binary
+/// builds one on a worker thread while the window and GPU come up and
+/// hands it to `Renderer::with_loaded_fonts`. It is `Send` for that.
+#[derive(Debug)]
+pub struct LoadedFonts {
+    font_system: FontSystem,
+    font_name: Option<String>,
+    primary_weight: Weight,
+    requested_family_available: bool,
+}
+
+impl LoadedFonts {
+    /// Scan the system fonts, add `bundled_font` (a guaranteed-present
+    /// monospace face), and resolve `font_name` (falls back to monospace
+    /// if absent or unloaded).
+    pub fn load(font_name: Option<&str>, bundled_font: Option<&'static [u8]>) -> Self {
+        let mut font_system = FontSystem::new();
+
+        if let Some(data) = bundled_font {
+            // Borrow the static bytes rather than copying them into a
+            // `Vec`: fontdb only needs `AsRef<[u8]>`, and the copy was a
+            // 170 KB heap allocation held for the life of the process.
+            font_system
+                .db_mut()
+                .load_font_source(cosmic_text::fontdb::Source::Binary(std::sync::Arc::new(
+                    data,
+                )));
+        }
+
+        let primary_weight = resolve_family_weight(&font_system, font_name);
+
+        // Check whether the requested family is actually present in
+        // the font database. `db().faces()` walks every loaded face;
+        // we report whether any face's `families` list contains a
+        // case-insensitive match. The bundled fallback TTF advertises
+        // its own family name (e.g. "Fira Mono"), so requesting that
+        // family will resolve even on a host with no system fonts of
+        // the same name. Used by the binary to log a warning when the
+        // user's `font.family` config doesn't match anything.
+        let requested_family_available = font_name.is_none_or(|requested| {
+            font_system.db().faces().any(|face| {
+                face.families
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(requested))
+            })
+        });
+
+        // Rank the faces for the primary family's `Attrs` now, while we
+        // may be off the main thread. These are exactly the `Attrs` the
+        // cell probe (`measure_cell`) and every primary-family line shape
+        // with (`family_attrs` for the primary family), so the ranking is
+        // cached by the time the rasterizer first shapes. It is ~10 ms
+        // with ~1000 system faces.
+        let family = font_name.unwrap_or("monospace");
+        font_system.get_font_matches(&family_attrs(family, family, primary_weight));
+
+        Self {
+            font_system,
+            font_name: font_name.map(str::to_owned),
+            primary_weight,
+            requested_family_available,
+        }
+    }
+
+    /// The family name passed to [`Self::load`].
+    #[must_use]
+    pub fn font_name(&self) -> Option<&str> {
+        self.font_name.as_deref()
+    }
 }
 
 impl GlyphRasterizer {
@@ -333,22 +464,40 @@ impl GlyphRasterizer {
     ///
     /// Pass [`DEFAULT_LINE_HEIGHT_RATIO`] for the value the M4b snapshots
     /// were captured at.
+    ///
+    /// Equivalent to [`Self::with_fonts`] on
+    /// `LoadedFonts::load(font_name, bundled_font)`.
     pub fn new(
         device: &Device,
         font_size: f32,
         line_height_ratio: f32,
         font_name: Option<&str>,
-        bundled_font: Option<&[u8]>,
+        bundled_font: Option<&'static [u8]>,
     ) -> Self {
-        let mut font_system = FontSystem::new();
+        Self::with_fonts(
+            device,
+            LoadedFonts::load(font_name, bundled_font),
+            font_size,
+            line_height_ratio,
+        )
+    }
 
-        if let Some(data) = bundled_font {
-            font_system
-                .db_mut()
-                .load_font_source(cosmic_text::fontdb::Source::Binary(std::sync::Arc::new(
-                    data.to_vec(),
-                )));
-        }
+    /// Build a rasterizer from an already-loaded font database (see
+    /// [`LoadedFonts`]), at `font_size` pixels and the line-height ratio
+    /// (× `font_size`).
+    pub fn with_fonts(
+        device: &Device,
+        fonts: LoadedFonts,
+        font_size: f32,
+        line_height_ratio: f32,
+    ) -> Self {
+        let LoadedFonts {
+            mut font_system,
+            font_name,
+            primary_weight,
+            requested_family_available,
+        } = fonts;
+        let font_name = font_name.as_deref();
 
         // Line height = `font_size * line_height_ratio`, snapped to a
         // whole device pixel. Per-row origins are `row * cell_h`, so a
@@ -367,7 +516,6 @@ impl GlyphRasterizer {
         // same pixel-grid-alignment reason as the height above. The same
         // probe yields the constant baseline used for every glyph's
         // vertical placement (see [`Self::baseline_y`]).
-        let primary_weight = resolve_family_weight(&font_system, font_name);
         let (cell_w, cell_h, baseline_y) =
             measure_cell(&mut font_system, metrics, font_name, primary_weight);
         let cell_size = (cell_w, cell_h);
@@ -381,7 +529,7 @@ impl GlyphRasterizer {
         );
 
         // Pre-allocate the per-line buffer.
-        let mut buffer = Buffer::new(&mut font_system, metrics);
+        let mut buffer = Buffer::new_empty(metrics);
         buffer.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
         // Tell cosmic-text we want monospace-style positioning; the
         // cluster-width snap fixes its per-glyph rounding (decision §3).
@@ -389,7 +537,7 @@ impl GlyphRasterizer {
 
         // Tiny buffer reused for single-char standalone shapes. Same
         // monospace-width hint so isolated glyphs land at x=0.
-        let mut isolation_buffer = Buffer::new(&mut font_system, metrics);
+        let mut isolation_buffer = Buffer::new_empty(metrics);
         isolation_buffer.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
         isolation_buffer.set_monospace_width(Some(cell_size.0));
 
@@ -401,22 +549,6 @@ impl GlyphRasterizer {
             create_atlas_texture(device, TextureFormat::Bgra8Unorm, "toastty-color-atlas");
 
         let family_name = font_name.unwrap_or("monospace").to_string();
-
-        // Check whether the requested family is actually present in
-        // the font database. `db().faces()` walks every loaded face;
-        // we report whether any face's `families` list contains a
-        // case-insensitive match. The bundled fallback TTF advertises
-        // its own family name (e.g. "Fira Mono"), so requesting that
-        // family will resolve even on a host with no system fonts of
-        // the same name. Used by the binary to log a warning when the
-        // user's `font.family` config doesn't match anything.
-        let requested_family_available = font_name.is_none_or(|requested| {
-            font_system.db().faces().any(|face| {
-                face.families
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case(requested))
-            })
-        });
 
         Self {
             font_system,
@@ -440,6 +572,11 @@ impl GlyphRasterizer {
             presentation_override: HashMap::new(),
             vs16_color_override: HashMap::new(),
             requested_family_available,
+            fast_chars: initial_fast_chars(),
+            fast_slots: Vec::new(),
+            line_memo: [HashMap::new(), HashMap::new()],
+            memo_frame: 0,
+            slot_failed: false,
         }
     }
 
@@ -471,7 +608,7 @@ impl GlyphRasterizer {
             self.primary_weight,
         );
         for buf in [&mut self.buffer, &mut self.isolation_buffer] {
-            *buf = Buffer::new(&mut self.font_system, metrics);
+            *buf = Buffer::new_empty(metrics);
             buf.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
             buf.set_monospace_width(Some(cell_w));
         }
@@ -482,6 +619,90 @@ impl GlyphRasterizer {
         self.atlas = Atlas::new(ATLAS_W, ATLAS_H);
         self.placements.clear();
         self.char_cache.clear();
+        self.rebuild_fast_chars();
+        self.clear_line_memo();
+    }
+
+    /// Recompute `fast_chars[ch]` from the char sets, with the same
+    /// precedence the fast path used to apply to them one by one:
+    /// blank → width ≠ 1 → uncacheable → miss → cached → unknown.
+    fn sync_fast_char(&mut self, ch: char) {
+        let Some(i) = fast_char_index(ch) else {
+            return;
+        };
+        self.fast_chars[i] = if ch == ' ' || ch == '\0' {
+            FastChar::Skip
+        } else if ch.width() != Some(1) || self.uncacheable_chars.contains(&ch) {
+            FastChar::Bail
+        } else if self.char_cache_misses.contains(&ch) {
+            FastChar::Skip
+        } else if let Some(slot) = self.char_cache.get(&ch) {
+            #[allow(clippy::cast_possible_truncation)] // < one entry per cache insert
+            let idx = self.fast_slots.len() as u32;
+            self.fast_slots.push(*slot);
+            FastChar::Cached(idx)
+        } else {
+            FastChar::Bail
+        };
+    }
+
+    /// Rebuild the whole [`Self::fast_chars`] table (after `char_cache`
+    /// was cleared).
+    fn rebuild_fast_chars(&mut self) {
+        self.fast_chars = initial_fast_chars();
+        self.fast_slots.clear();
+        let chars: Vec<char> = self
+            .char_cache
+            .keys()
+            .chain(self.char_cache_misses.iter())
+            .chain(self.uncacheable_chars.iter())
+            .copied()
+            .collect();
+        for ch in chars {
+            self.sync_fast_char(ch);
+        }
+    }
+
+    /// Cache `slot` as the standalone glyph of `ch`, unless one is
+    /// cached already.
+    fn cache_standalone(&mut self, ch: char, slot: GlyphSlot) {
+        if let Entry::Vacant(e) = self.char_cache.entry(ch) {
+            e.insert(slot);
+            self.sync_fast_char(ch);
+        }
+    }
+
+    /// Record `ch` as having no glyph. Returns true if it was new.
+    fn mark_cache_miss(&mut self, ch: char) -> bool {
+        let new = self.char_cache_misses.insert(ch);
+        if new {
+            self.sync_fast_char(ch);
+            // Same rule as `mark_uncacheable`: a char-cache change drops
+            // the memoised rows rather than reasoning about which could
+            // have shaped differently.
+            self.clear_line_memo();
+        }
+        new
+    }
+
+    /// Record `ch` as contextually shaped (see `uncacheable_chars`) and
+    /// evict its `char_cache` entry. Returns true if it was new. Rows
+    /// shaped earlier may have served the old standalone glyph for it,
+    /// so the line memo is dropped too.
+    fn mark_uncacheable(&mut self, ch: char) -> bool {
+        let new = self.uncacheable_chars.insert(ch);
+        if new {
+            self.char_cache.remove(&ch);
+            self.sync_fast_char(ch);
+            self.clear_line_memo();
+        }
+        new
+    }
+
+    fn clear_line_memo(&mut self) {
+        for m in &mut self.line_memo {
+            m.clear();
+        }
     }
 
     /// Glyph id this char would produce shaped alone, with no
@@ -794,54 +1015,139 @@ impl GlyphRasterizer {
     /// uncacheable, or any non-single-column character). When it
     /// returns `Some`, no cosmic-text work was done.
     fn try_shape_line_fast(&self, text: &str) -> Option<LineGlyphs> {
-        let mut out = LineGlyphs::default();
         let cell_w = self.cell_size.0;
         if cell_w <= 0.0 {
             return None;
         }
+        // Trailing blanks never produce a slot and never bail, so only
+        // the trimmed prefix decides the result; this also sizes
+        // `by_column` to the populated range up front instead of growing
+        // it slot by slot.
+        let text = text.trim_end_matches([' ', '\0']);
+        let mut by_column: Vec<ColumnSlot> = Vec::with_capacity(text.len());
         // Each character in a monospace terminal grid occupies one
         // cell. We assign columns by index in the iteration order; the
         // term's row text is fed cell-by-cell, so the i'th char is
         // column i. This breaks for wide / zero-width characters
         // (CJK ideographs, combining marks, controls): a wide char
         // would span two columns, and a combining mark would consume a
-        // column index without advancing the cell. Bail to the slow
-        // path on any char whose `unicode_width` is not exactly 1.
+        // column index without advancing the cell. Such chars bail to
+        // the slow path (`FastChar::Bail`, or the `width` test in
+        // `fast_lookup_hashed`).
         for (col, ch) in text.chars().enumerate() {
             if col > u16::MAX as usize {
                 return None;
             }
-            if ch == ' ' || ch == '\0' {
-                continue;
-            }
-            // Width-1 invariant — see `char_cache` doc comment.
-            if ch.width() != Some(1) {
-                return None;
-            }
-            // Char has been observed shaping to a contextual glyph
-            // (ligature / GSUB substitution). We can't serve it from
-            // `char_cache` — the cached single-char form might be the
-            // wrong half of a ligature, or the line we're rendering
-            // *now* might want a contextual form. Bail so the slow
-            // path does the right shaping each frame.
-            if self.uncacheable_chars.contains(&ch) {
-                return None;
-            }
-            // Already-known miss: skip the cell, but keep going on
-            // the fast path. This stops e.g. control characters from
-            // forcing every line through cosmic-text forever.
-            if self.char_cache_misses.contains(&ch) {
-                continue;
-            }
-            match self.char_cache.get(&ch) {
-                Some(slot) => {
-                    #[allow(clippy::cast_possible_truncation)]
-                    out.insert(col as u16, ch, *slot);
-                }
-                None => return None,
-            }
+            let slot = match fast_char_index(ch) {
+                Some(i) => match self.fast_chars[i] {
+                    FastChar::Bail => return None,
+                    FastChar::Skip => None,
+                    FastChar::Cached(idx) => Some(self.fast_slots[idx as usize]),
+                },
+                None => self.fast_lookup_hashed(ch)?,
+            };
+            by_column.push(slot.map(|s| (ch, s)));
         }
-        Some(out)
+        // `text` ends in a non-blank char, so the last column is either a
+        // slot or a skipped miss; drop trailing misses to match
+        // `LineGlyphs::insert`'s "grown only as far as the highest column
+        // shaped".
+        while by_column.last().is_some_and(Option::is_none) {
+            by_column.pop();
+        }
+        Some(LineGlyphs {
+            by_column,
+            secondary: Vec::new(),
+        })
+    }
+
+    /// Fast-path verdict for a char outside the dense `fast_chars`
+    /// table: `None` = bail to the slow path, `Some(None)` = no glyph,
+    /// `Some(Some(slot))` = cached.
+    #[allow(clippy::option_option)] // three outcomes, read in one `?`
+    fn fast_lookup_hashed(&self, ch: char) -> Option<Option<GlyphSlot>> {
+        // Width-1 invariant — see `char_cache` doc comment.
+        if ch.width() != Some(1) {
+            return None;
+        }
+        // Char has been observed shaping to a contextual glyph
+        // (ligature / GSUB substitution). We can't serve it from
+        // `char_cache` — the cached single-char form might be the
+        // wrong half of a ligature, or the line we're rendering
+        // *now* might want a contextual form. Bail so the slow
+        // path does the right shaping each frame.
+        if self.uncacheable_chars.contains(&ch) {
+            return None;
+        }
+        // Already-known miss: skip the cell, but keep going on
+        // the fast path. This stops e.g. control characters from
+        // forcing every line through cosmic-text forever.
+        if self.char_cache_misses.contains(&ch) {
+            return Some(None);
+        }
+        self.char_cache.get(&ch).map(|slot| Some(*slot))
+    }
+
+    /// [`Self::shape_line`] through the row-text memo: a row whose exact
+    /// text (and mode-2027 state) was shaped recently gets the same
+    /// shared `LineGlyphs` back without shaping. Scrolling and
+    /// full-screen repaints in new colours re-dirty rows whose text
+    /// hasn't changed; for rows that need cosmic-text (CJK, emoji,
+    /// ligatures) this skips ~100 µs of layout per row.
+    ///
+    /// Call [`Self::trim_line_memo`] once per frame to bound it.
+    pub fn shape_line_memo(
+        &mut self,
+        queue: &Queue,
+        text: &str,
+        mode_2027_active: bool,
+    ) -> Arc<LineGlyphs> {
+        let frame = self.memo_frame;
+        let m = usize::from(mode_2027_active);
+        if let Some(e) = self.line_memo[m].get_mut(text) {
+            e.last_used = frame;
+            return Arc::clone(&e.glyphs);
+        }
+        self.slot_failed = false;
+        let glyphs = Arc::new(self.shape_line(queue, text, mode_2027_active));
+        // A glyph that got no atlas slot (atlas full even after evicting)
+        // left its cell blank: don't memoise that, so the row is shaped
+        // again next time it is dirty, as without the memo.
+        if self.slot_failed {
+            return glyphs;
+        }
+        // Shaping may have cleared the memo (a char turned uncacheable,
+        // an atlas shelf was evicted); this fresh shape is still valid.
+        self.line_memo[m].insert(
+            text.into(),
+            MemoEntry {
+                glyphs: Arc::clone(&glyphs),
+                last_used: frame,
+            },
+        );
+        glyphs
+    }
+
+    /// End-of-frame bookkeeping for [`Self::shape_line_memo`]: advance
+    /// the frame counter and, once a memo map holds more than
+    /// `2 * keep` rows, drop all but the `keep` most recently used.
+    pub fn trim_line_memo(&mut self, keep: usize) {
+        self.memo_frame += 1;
+        for m in &mut self.line_memo {
+            if m.len() <= keep.saturating_mul(2) {
+                continue;
+            }
+            let mut stamps: Vec<u64> = m.values().map(|e| e.last_used).collect();
+            let cut = stamps.len() - keep;
+            let cutoff = *stamps.select_nth_unstable(cut).1;
+            m.retain(|_, e| e.last_used >= cutoff);
+        }
+    }
+
+    /// Rows currently memoised (both mode-2027 states).
+    #[must_use]
+    pub fn line_memo_len(&self) -> usize {
+        self.line_memo.iter().map(HashMap::len).sum()
     }
 
     /// Slow path: cosmic-text shaping. Populates `char_cache` /
@@ -998,12 +1304,11 @@ impl GlyphRasterizer {
                 if p.cluster_chars.len() == 1 && p.ch.width() == Some(1) {
                     let standalone = self.standalone_glyph_id_of(p.ch);
                     if standalone == Some(p.glyph.glyph_id) {
-                        self.char_cache.entry(p.ch).or_insert(slot);
-                    } else if self.uncacheable_chars.insert(p.ch) {
-                        // Already-cached entries from earlier
-                        // standalone-only renders would now be wrong
-                        // (the font wants to substitute), so evict.
-                        self.char_cache.remove(&p.ch);
+                        self.cache_standalone(p.ch, slot);
+                    } else if self.mark_uncacheable(p.ch) {
+                        // Earlier standalone-only cache entries would now
+                        // be wrong (the font wants to substitute), so
+                        // `mark_uncacheable` evicted them.
                         tracing::debug!(
                             target: "toastty_render::glyph",
                             "marking {:?} (U+{:04X}) as contextually-shaped; \
@@ -1021,8 +1326,7 @@ impl GlyphRasterizer {
                     // the ligature visual. Force the slow path on any
                     // line containing these chars from now on.
                     for ch in &p.cluster_chars {
-                        if self.uncacheable_chars.insert(*ch) {
-                            self.char_cache.remove(ch);
+                        if self.mark_uncacheable(*ch) {
                             tracing::debug!(
                                 target: "toastty_render::glyph",
                                 "marking {:?} (U+{:04X}) as multi-char-cluster member; \
@@ -1046,7 +1350,7 @@ impl GlyphRasterizer {
             if ch == ' ' || ch == '\0' {
                 continue;
             }
-            if !produced_chars.contains(&ch) && self.char_cache_misses.insert(ch) {
+            if !produced_chars.contains(&ch) && self.mark_cache_miss(ch) {
                 tracing::debug!(
                     target: "toastty_render::glyph",
                     "marking {ch:?} (U+{:04X}) as cache miss; future renders will skip it",
@@ -1065,6 +1369,13 @@ impl GlyphRasterizer {
     /// [`Self::baseline_y`] to convert swash's bearing into a cell-relative
     /// offset — never a per-line value (see that field's docs for why).
     fn ensure_atlas_slot(&mut self, queue: &Queue, glyph: &LayoutGlyph) -> Option<GlyphSlot> {
+        let slot = self.ensure_atlas_slot_inner(queue, glyph);
+        self.slot_failed |= slot.is_none();
+        slot
+    }
+
+    /// [`Self::ensure_atlas_slot`] without the failure bookkeeping.
+    fn ensure_atlas_slot_inner(&mut self, queue: &Queue, glyph: &LayoutGlyph) -> Option<GlyphSlot> {
         let baseline_y = self.baseline_y;
         let physical = glyph.physical((0.0, 0.0), 1.0);
         let cache_key: CacheKey = physical.cache_key;
@@ -1144,6 +1455,8 @@ impl GlyphRasterizer {
                 "atlas {layer:?} full — evicting LRU shelf to make room for {w}x{h} glyph",
             );
             self.atlas.evict_oldest_shelf(layer);
+            // Memoised rows may point at the evicted shelf.
+            self.clear_line_memo();
             match self.atlas.reserve(key, layer, w, h) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1178,6 +1491,22 @@ impl GlyphRasterizer {
             AtlasLayer::Color => &self.color_texture,
         }
     }
+}
+
+/// `fast_chars` index of `ch`, if it has one.
+#[inline]
+fn fast_char_index(ch: char) -> Option<usize> {
+    let i = ch as usize;
+    (i < FAST_CHARS_LEN).then_some(i)
+}
+
+/// `fast_chars` with nothing cached: blanks skip, everything else bails
+/// to the slow path until it is cached.
+fn initial_fast_chars() -> Box<[FastChar]> {
+    let mut t = vec![FastChar::Bail; FAST_CHARS_LEN].into_boxed_slice();
+    t[' ' as usize] = FastChar::Skip;
+    t[0] = FastChar::Skip;
+    t
 }
 
 fn stable_key(k: CacheKey) -> u64 {
@@ -1226,7 +1555,7 @@ fn measure_decorations(
     cell_h: f32,
     baseline_y: f32,
 ) -> DecorationMetrics {
-    let mut probe = Buffer::new(font_system, metrics);
+    let mut probe = Buffer::new_empty(metrics);
     probe.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
     let attrs = Attrs::new()
         .family(Family::Name(family.unwrap_or("monospace")))
@@ -1299,7 +1628,16 @@ fn measure_cell(
     family: Option<&str>,
     weight: Weight,
 ) -> (f32, f32, f32) {
-    let mut probe = Buffer::new(font_system, metrics);
+    // `Buffer::new_empty`, not `Buffer::new`, here and for every other
+    // buffer in this file: `Buffer::new` shapes an empty line with the
+    // default `Attrs` (sans-serif, weight 400), and the first shape of a
+    // given `Attrs` makes cosmic-text rank every installed face against
+    // it (`get_font_matches`, ~10 ms with 1000 system faces, opening each
+    // variable font to read its weight axis). We never shape with the
+    // default `Attrs`, so that ranking was pure startup cost. Every buffer
+    // gets `set_text` before it is shaped, so the missing empty line is
+    // never observed.
+    let mut probe = Buffer::new_empty(metrics);
     probe.set_size(Some(f32::INFINITY), Some(f32::INFINITY));
     let fam = family.unwrap_or("monospace");
     let attrs = Attrs::new().family(Family::Name(fam)).weight(weight);
@@ -1663,6 +2001,41 @@ mod tests {
         }
     }
 
+    /// Fonts loaded on another thread (the binary's startup path) give a
+    /// rasterizer identical to one that loads its own: same family, weight,
+    /// metrics and glyphs.
+    #[test]
+    // Same inputs, same code: the glyph geometry must match bit for bit.
+    #[allow(clippy::float_cmp)]
+    fn fonts_loaded_on_another_thread_match_inline_load() {
+        let (device, queue, mut inline) = make_rasterizer();
+        let mut fonts =
+            std::thread::spawn(|| LoadedFonts::load(Some("Fira Mono"), Some(TEST_FONT)))
+                .join()
+                .expect("font thread");
+        assert_eq!(fonts.font_name(), Some("Fira Mono"));
+        assert!(fonts.requested_family_available);
+        let attrs = family_attrs("Fira Mono", "Fira Mono", fonts.primary_weight);
+        assert!(!fonts.font_system.get_font_matches(&attrs).is_empty());
+        let mut loaded =
+            GlyphRasterizer::with_fonts(&device, fonts, 16.0, DEFAULT_LINE_HEIGHT_RATIO);
+        assert_eq!(loaded.family_name(), inline.family_name());
+        assert_eq!(loaded.primary_weight, inline.primary_weight);
+        assert_eq!(loaded.cell_size(), inline.cell_size());
+        assert!((loaded.baseline_y - inline.baseline_y).abs() < 1e-6);
+        assert_eq!(
+            loaded.requested_family_available(),
+            inline.requested_family_available()
+        );
+        let a = inline.shape_line(&queue, "Hello", false);
+        let b = loaded.shape_line(&queue, "Hello", false);
+        for (col, ch) in (0u16..).zip("Hello".chars()) {
+            let (x, y) = (a.get(col, ch).unwrap(), b.get(col, ch).unwrap());
+            assert_eq!(x.glyph_size, y.glyph_size, "{ch}");
+            assert_eq!(x.glyph_offset, y.glyph_offset, "{ch}");
+        }
+    }
+
     /// Wide / zero-width characters must not enter `char_cache`: their
     /// cell-width != 1 violates invariant #3, so the fast path bails
     /// before consulting the cache and the slow path skips insertion.
@@ -1858,8 +2231,7 @@ mod tests {
         // Simulate the slow path having observed `=` shaping to a
         // contextual variant (the half-ligature case). Future fast-
         // path attempts on any line containing `=` must bail.
-        rasterizer.uncacheable_chars.insert('=');
-        rasterizer.char_cache.remove(&'=');
+        rasterizer.mark_uncacheable('=');
 
         assert!(
             rasterizer.try_shape_line_fast("ab=").is_none(),
@@ -2322,5 +2694,190 @@ mod tests {
         // Cached: a second shape takes the same decision without a scan.
         assert!(rasterizer.vs16_color_override.contains_key(&heart));
         let _ = rasterizer.shape_line(&queue, "\u{2764}\u{FE0F}", true);
+    }
+
+    /// The fast path as it was before the dense `fast_chars` table: one
+    /// hash lookup per set, slots inserted column by column. Kept as the
+    /// oracle for `fast_table_matches_hashed_reference`.
+    fn reference_fast(r: &GlyphRasterizer, text: &str) -> Option<LineGlyphs> {
+        let mut out = LineGlyphs::default();
+        for (col, ch) in text.chars().enumerate() {
+            if ch == ' ' || ch == '\0' {
+                continue;
+            }
+            if ch.width() != Some(1) || r.uncacheable_chars.contains(&ch) {
+                return None;
+            }
+            if r.char_cache_misses.contains(&ch) {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            out.insert(col as u16, ch, *r.char_cache.get(&ch)?);
+        }
+        Some(out)
+    }
+
+    /// The dense table gives exactly the old hashed fast path's answer
+    /// (bail vs. not, and the same slots in the same columns), and stays
+    /// in sync with the char sets as shaping adds entries, misses and
+    /// uncacheable chars.
+    #[test]
+    fn fast_table_matches_hashed_reference() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        let warm = [
+            "The quick brown fox jumps over the lazy dog 0123456789",
+            "│ ├── src/main.rs ┼ ═ ░▒▓ ⣿⡇ → ← … «» ¿¡ ñ é ü Ω λ Ж",
+            "tab\there \u{200B}zero width \u{7}bell",
+            "a != b => c -> d",
+            "你好 wide 😀 emoji",
+        ];
+        for line in warm {
+            let _ = rasterizer.shape_line(&queue, line, false);
+        }
+        // Force one ASCII char uncacheable to cover that state.
+        rasterizer.mark_uncacheable('q');
+        let probes = [
+            "",
+            "   ",
+            "hello world   ",
+            "hello\0world\0\0",
+            "The lazy dog",
+            "The quick dog",
+            "│ ├── ┼ ═ ░▒▓ ⣿⡇ → …",
+            "zero\u{200B}width",
+            "bell\u{7}x",
+            "你好",
+            "Ω λ Ж ñ é ü   trailing   ",
+            "never seen: ʬ ʭ",
+            "trailing miss\u{200B}",
+        ];
+        for probe in probes {
+            let got = rasterizer.try_shape_line_fast(probe);
+            let want = reference_fast(&rasterizer, probe);
+            assert_eq!(
+                got.as_ref().map(|g| (&g.by_column, &g.secondary)),
+                want.as_ref().map(|g| (&g.by_column, &g.secondary)),
+                "fast path disagrees with the hashed reference on {probe:?}",
+            );
+        }
+        // Table invariant: every dense entry equals what the sets say.
+        for i in 0..FAST_CHARS_LEN {
+            let Some(ch) = char::from_u32(u32::try_from(i).unwrap()) else {
+                continue;
+            };
+            let want = reference_fast(&rasterizer, &ch.to_string()).map(|g| g.by_column);
+            let got = rasterizer
+                .try_shape_line_fast(&ch.to_string())
+                .map(|g| g.by_column);
+            assert_eq!(got, want, "fast_chars out of sync for {ch:?}");
+        }
+    }
+
+    /// The row memo hands back the same shared shape for the same text
+    /// and mode, keeps the two modes apart, is dropped when a char turns
+    /// uncacheable, and is bounded by `trim_line_memo`.
+    #[test]
+    fn line_memo_reuses_and_invalidates() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        let a = rasterizer.shape_line_memo(&queue, "memo 你好 row", false);
+        let b = rasterizer.shape_line_memo(&queue, "memo 你好 row", false);
+        assert!(Arc::ptr_eq(&a, &b), "same text must hit the memo");
+        let fresh = rasterizer.shape_line(&queue, "memo 你好 row", false);
+        assert_eq!(a.by_column, fresh.by_column);
+        assert_eq!(a.secondary, fresh.secondary);
+
+        let c = rasterizer.shape_line_memo(&queue, "memo 你好 row", true);
+        assert!(!Arc::ptr_eq(&a, &c), "mode 2027 has its own memo");
+
+        rasterizer.mark_uncacheable('m');
+        assert_eq!(
+            rasterizer.line_memo_len(),
+            0,
+            "uncacheable char drops the memo"
+        );
+        let d = rasterizer.shape_line_memo(&queue, "memo 你好 row", false);
+        assert!(!Arc::ptr_eq(&a, &d));
+
+        for i in 0..50 {
+            let _ = rasterizer.shape_line_memo(&queue, &format!("row {i}"), false);
+            rasterizer.trim_line_memo(8);
+        }
+        assert!(rasterizer.line_memo_len() <= 2 * 8 + 1);
+        // The most recent rows survive a trim.
+        let last = rasterizer.shape_line_memo(&queue, "row 49", false);
+        let again = rasterizer.shape_line_memo(&queue, "row 49", false);
+        assert!(Arc::ptr_eq(&last, &again));
+    }
+
+    /// A new cache miss drops the memo, like a new uncacheable char.
+    #[test]
+    fn cache_miss_drops_line_memo() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        let _ = rasterizer.shape_line_memo(&queue, "memo row", false);
+        assert_eq!(rasterizer.line_memo_len(), 1);
+        assert!(rasterizer.mark_cache_miss('\u{E0001}'));
+        assert_eq!(rasterizer.line_memo_len(), 0);
+        // Already known: nothing to drop.
+        let _ = rasterizer.shape_line_memo(&queue, "memo row", false);
+        assert!(!rasterizer.mark_cache_miss('\u{E0001}'));
+        assert_eq!(rasterizer.line_memo_len(), 1);
+    }
+
+    /// A row whose glyph got no atlas slot (here: a glyph bigger than the
+    /// whole atlas) is not memoised, so it is shaped again next time.
+    #[test]
+    fn row_with_failed_slot_is_not_memoised() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        rasterizer.set_font_size(1500.0, DEFAULT_LINE_HEIGHT_RATIO);
+        let lg = rasterizer.shape_line_memo(&queue, "W", false);
+        assert!(lg.get(0, 'W').is_none(), "glyph should not fit the atlas");
+        assert_eq!(rasterizer.line_memo_len(), 0);
+        // A row that does fit is memoised as usual.
+        let _ = rasterizer.shape_line_memo(&queue, " ", false);
+        assert_eq!(rasterizer.line_memo_len(), 1);
+    }
+
+    /// Regression (review of the dropped shape-run cache): a neutral-only
+    /// word shaped at RTL level must not leak its mirrored glyphs into an
+    /// LTR line with the same word, through any cache. The RTL line opens
+    /// with a Latin char so the paragraph stays LTR: an RTL paragraph is
+    /// right-aligned in the infinitely wide shaping buffer, and its glyph
+    /// x overflows cosmic-text's subpixel binning in debug builds.
+    #[test]
+    fn rtl_neutral_word_does_not_leak_into_ltr_row() {
+        type Cell = Option<(char, [f32; 2], [f32; 2], bool)>;
+        let (_device, queue, mut warm) = make_rasterizer();
+        let (_device, queue2, mut fresh) = make_rasterizer();
+        let rtl =
+            "a \u{05E9}\u{05DC}\u{05D5}\u{05DD} (( \u{05E2}\u{05D5}\u{05DC}\u{05DD} [< \u{05E9}";
+        let ltr = "x (( y [<";
+        let _ = warm.shape_line_memo(&queue, rtl, false);
+        let got = warm.shape_line_memo(&queue, ltr, false);
+        let want = fresh.shape_line(&queue2, ltr, false);
+        // Slots sit at different atlas positions in the two rasterizers;
+        // compare what each visible cell draws (blanks draw nothing).
+        let cells = |lg: &LineGlyphs| -> Vec<Cell> {
+            lg.by_column
+                .iter()
+                .map(|c| {
+                    c.filter(|(ch, _)| *ch != ' ')
+                        .map(|(ch, s)| (ch, s.glyph_size, s.glyph_offset, s.is_color))
+                })
+                .collect()
+        };
+        assert_eq!(cells(&got), cells(&want));
+        assert!(got.get(7, '[').is_some() && got.get(8, '<').is_some());
+    }
+
+    /// `set_font_size` rebuilds the dense table: nothing stays cached at
+    /// the old size, so the next line goes through the slow path.
+    #[test]
+    fn set_font_size_resets_fast_table() {
+        let (_device, queue, mut rasterizer) = make_rasterizer();
+        let _ = rasterizer.shape_line(&queue, "abc", false);
+        assert!(rasterizer.try_shape_line_fast("abc").is_some());
+        rasterizer.set_font_size(20.0, DEFAULT_LINE_HEIGHT_RATIO);
+        assert!(rasterizer.try_shape_line_fast("abc").is_none());
+        assert_eq!(rasterizer.line_memo_len(), 0);
     }
 }

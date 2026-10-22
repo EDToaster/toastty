@@ -31,6 +31,10 @@ fn params(p: &Params) -> Vec<Vec<u16>> {
     p.iter().map(<[u16]>::to_vec).collect()
 }
 
+fn vte_params(p: &vte::Params) -> Vec<Vec<u16>> {
+    p.iter().map(<[u16]>::to_vec).collect()
+}
+
 #[derive(Debug, Default)]
 struct Rec(Vec<Ev>);
 
@@ -99,7 +103,7 @@ impl vte::Perform for VteRec {
         self.0.push(Ev::Exec(b));
     }
     fn hook(&mut self, p: &vte::Params, i: &[u8], ig: bool, a: char) {
-        self.0.push(Ev::Hook(params(p), i.to_vec(), ig, a));
+        self.0.push(Ev::Hook(vte_params(p), i.to_vec(), ig, a));
     }
     fn put(&mut self, b: u8) {
         self.0.push(Ev::Put(b));
@@ -112,7 +116,7 @@ impl vte::Perform for VteRec {
             .push(Ev::Osc(p.iter().map(|s| s.to_vec()).collect(), bell));
     }
     fn csi_dispatch(&mut self, p: &vte::Params, i: &[u8], ig: bool, a: char) {
-        self.0.push(Ev::Csi(params(p), i.to_vec(), ig, a));
+        self.0.push(Ev::Csi(vte_params(p), i.to_vec(), ig, a));
     }
     fn esc_dispatch(&mut self, i: &[u8], ig: bool, b: u8) {
         self.0.push(Ev::Esc(i.to_vec(), ig, b));

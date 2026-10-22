@@ -47,7 +47,7 @@ fn snapshot(t: &mut Term) -> Snapshot {
     let cells = (0..ROWS)
         .map(|r| {
             t.row(r)
-                .cells
+                .cells()
                 .iter()
                 .map(|c| {
                     (
@@ -294,10 +294,10 @@ fn real_tmux_outer_output_parses() {
     // tmux forwarded "link" (inside its OSC 8) at the outer cursor,
     // which its preceding DECSTBM had homed to column 0, then drew the
     // pane's "AFTER" at column 2 over the tail of it.
-    let row: String = t.row(0).cells.iter().map(|c| c.ch).collect();
+    let row: String = t.row(0).cells().iter().map(|c| c.ch).collect();
     assert_eq!(row.trim_end(), "liAFTER");
     let url = |col: usize| {
-        t.row(0).cells[col]
+        t.row(0).cells()[col]
             .hyperlink_id
             .and_then(|id| t.hyperlink_url(id))
             .map(str::to_owned)

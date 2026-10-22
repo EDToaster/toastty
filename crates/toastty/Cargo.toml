@@ -17,6 +17,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 base64 = "0.22"
 icy_sixel = "0.5"
+memchr.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 # `wayland-data-control` makes arboard use the native Wayland clipboard
 # (wl_data_control) when WAYLAND_DISPLAY is set, falling back to X11
@@ -44,6 +45,10 @@ toastty-pty.workspace = true
 toastty-render.workspace = true
 toastty-term.workspace = true
 toastty-window.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+# `malloc_trim` (see `src/heap.rs`).
+libc = "0.2"
 
 [features]
 pprof = ["dep:pprof"]

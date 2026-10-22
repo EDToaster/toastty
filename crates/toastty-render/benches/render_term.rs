@@ -9,8 +9,14 @@
 //!   iterations (the realistic keystroke case).
 //! - `fullframe_300x120` / `single_cell_change_300x120`: the same two
 //!   cases at twice the row count, to show how shaping cost scales.
+//! - `fullframe_unicode_200x60`: full repaint of unchanged mixed-script
+//!   text (CJK, emoji, box drawing), the rows that need cosmic-text.
+//! - `scroll_ascii_200x60` / `scroll_unicode_200x60`: one new line of
+//!   output per frame at the live bottom, so every row shifts.
 //!
 //! Run with `cargo bench -p toastty-render --bench render_term -- --quick`.
+//! `TOASTTY_BENCH_CPU_ONLY=1` stops each frame after shaping + instance
+//! building (no GPU work), for low-noise CPU numbers.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,9 +26,12 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use pollster::block_on;
 use toastty_parser::Parser;
 use toastty_render::DEFAULT_LINE_HEIGHT;
-use toastty_render::text::glyph_rasterizer::{GlyphRasterizer, LineGlyphs};
-use toastty_render::text::instance::{CellInstance, EdgeBleed, Theme, build_instances_into};
+use toastty_render::text::glyph_rasterizer::GlyphRasterizer;
+use toastty_render::text::instance::{
+    CellInstance, CellRenderOpts, EdgeBleed, Theme, build_instances_into_opts,
+};
 use toastty_render::text::pipeline::{self, GlobalsUbo, TextPipeline};
+use toastty_render::text::row_shaper::RowShaper;
 use toastty_render::{instance_descriptor, instance_flags_for_release};
 use toastty_term::Term;
 use wgpu::{
@@ -50,10 +59,14 @@ struct Harness {
     width: u32,
     height: u32,
     theme: Theme,
-    /// Mirrors `TextState::line_cache` in `Renderer`.
-    line_cache: Vec<Option<LineGlyphs>>,
+    /// The renderer's own row-shape cache + shaping loop.
+    rows: RowShaper,
     /// Mirrors `TextState::instances_scratch` in `Renderer`.
     instances: Vec<CellInstance>,
+    /// `TOASTTY_BENCH_CPU_ONLY=1`: stop after shaping + instance
+    /// building, so the numbers exclude GPU work (and the noise of other
+    /// processes sharing the GPU).
+    cpu_only: bool,
 }
 
 impl Harness {
@@ -134,8 +147,9 @@ impl Harness {
             width,
             height,
             theme: Theme::default_dark(),
-            line_cache: Vec::new(),
+            rows: RowShaper::new(),
             instances: Vec::new(),
+            cpu_only: std::env::var_os("TOASTTY_BENCH_CPU_ONLY").is_some(),
         }
     }
 
@@ -151,47 +165,32 @@ impl Harness {
         let cell_size = self.rasterizer.cell_size();
         let atlas_dims = self.rasterizer.atlas_dims();
 
-        if self.line_cache.len() != rows as usize {
-            self.line_cache.resize(rows as usize, None);
-        }
-
-        let damage = term.damage();
-        for r in 0..rows {
-            let is_dirty = damage.all
-                || damage.rows.get(r as usize).is_some_and(|rd| !rd.is_empty())
-                || self.line_cache[r as usize].is_none();
-            if !is_dirty {
-                continue;
-            }
-            let row = term.row(r);
-            let line_text: String = row
-                .cells
-                .iter()
-                .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
-                .collect();
-            self.line_cache[r as usize] = Some(self.rasterizer.shape_line(
-                &self.queue,
-                &line_text,
-                term.grapheme_cluster_mode(),
-            ));
-        }
+        self.rows
+            .shape_rows(&mut self.rasterizer, &self.queue, term, rows, &[]);
 
         let theme = self.theme;
-        let line_cache_ref = &self.line_cache;
-        build_instances_into(
+        let rows_ref = &self.rows;
+        // Same options as the renderer's full-redraw frames.
+        let opts = CellRenderOpts {
+            blink_on: true,
+            decor: Some(self.rasterizer.decoration_metrics()),
+            skip_default_bg: true,
+        };
+        build_instances_into_opts(
             &mut self.instances,
             term,
             cell_size,
             &theme,
             None,
-            |row, col, ch, _style| {
-                let lg = line_cache_ref.get(row as usize)?.as_ref()?;
-                lg.get(col, ch)
-            },
+            |row, col, ch, _style| rows_ref.glyph(row, col, ch),
             |_, _| false,
             EdgeBleed::default(),
             f32::from(term.size().0) * cell_size.1,
+            &opts,
         );
+        if self.cpu_only {
+            return;
+        }
         let instances = &self.instances;
 
         let mut encoder = self
@@ -273,35 +272,16 @@ impl Harness {
         let cell_size = self.rasterizer.cell_size();
         let atlas_dims = self.rasterizer.atlas_dims();
 
-        if self.line_cache.len() != rows as usize {
-            self.line_cache.resize(rows as usize, None);
-        }
-        let damage = term.damage();
-        let mut shaped = 0usize;
-
-        // Phase A: shape (dirty rows only, unless `force_full`).
+        // Phase A: shape (dirty rows only; `force_full` also drops the
+        // row-shape cache, though rows still hit the rasterizer's
+        // row-text memo).
         let t_shape = Instant::now();
-        for r in 0..rows {
-            let is_dirty = force_full
-                || damage.all
-                || damage.rows.get(r as usize).is_some_and(|rd| !rd.is_empty())
-                || self.line_cache[r as usize].is_none();
-            if !is_dirty {
-                continue;
-            }
-            let row = term.row(r);
-            let line_text: String = row
-                .cells
-                .iter()
-                .map(|c| if c.ch == '\0' { ' ' } else { c.ch })
-                .collect();
-            self.line_cache[r as usize] = Some(self.rasterizer.shape_line(
-                &self.queue,
-                &line_text,
-                term.grapheme_cluster_mode(),
-            ));
-            shaped += 1;
+        if force_full {
+            self.rows.invalidate();
         }
+        let shaped = self
+            .rows
+            .shape_rows(&mut self.rasterizer, &self.queue, term, rows, &[]);
         let shape_ms = t_shape.elapsed().as_secs_f64() * 1000.0;
 
         // Phase B: bind group (post-fix this is a no-op; left here for
@@ -319,20 +299,24 @@ impl Harness {
         // Phase C: build_instances.
         let t_build = Instant::now();
         let theme = self.theme;
-        let line_cache_ref = &self.line_cache;
-        build_instances_into(
+        let rows_ref = &self.rows;
+        // Same options as the renderer's full-redraw frames.
+        let opts = CellRenderOpts {
+            blink_on: true,
+            decor: Some(self.rasterizer.decoration_metrics()),
+            skip_default_bg: true,
+        };
+        build_instances_into_opts(
             &mut self.instances,
             term,
             cell_size,
             &theme,
             None,
-            |row, col, ch, _style| {
-                let lg = line_cache_ref.get(row as usize)?.as_ref()?;
-                lg.get(col, ch)
-            },
+            |row, col, ch, _style| rows_ref.glyph(row, col, ch),
             |_, _| false,
             EdgeBleed::default(),
             f32::from(term.size().0) * cell_size.1,
+            &opts,
         );
         let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
         let n_instances = self.instances.len();
@@ -546,6 +530,269 @@ fn bench_single_cell_change_fullscreen(c: &mut Criterion) {
     });
 }
 
+/// Mixed-script lines: CJK, emoji, box drawing, accents. Every line
+/// with a wide char goes through cosmic-text (the slow path) whenever
+/// it is shaped.
+const UNICODE_LINES: [&str; 4] = [
+    "│ src/main.rs │ 你好世界 ideographs こんにちは 한글 — CJK wide cells ├──┤ ",
+    "Emoji 🚀 rocket ✨ sparkles 👍 thumbs ═══ café naïve résumé Ω λ Ж ░▒▓█ ",
+    "日本語のテキスト mixed with ASCII words and → arrows ← and … ellipses ",
+    "status: ok ✔ 进度 50% ⣿⣿⣿⣿⡇ elapsed 00:12 — 中文 漢字 ",
+];
+
+fn unicode_line(i: usize, cols: u16) -> String {
+    let base = UNICODE_LINES[i % UNICODE_LINES.len()];
+    let mut line = format!("{i:>6} ");
+    // Fill to (roughly) the grid width without wrapping; wide chars
+    // count as two columns.
+    let mut w = line.len();
+    for ch in base.chars().cycle() {
+        let cw = if ch.is_ascii() || ('\u{2190}'..='\u{2bff}').contains(&ch) {
+            1
+        } else {
+            2
+        };
+        if w + cw > usize::from(cols) {
+            break;
+        }
+        line.push(ch);
+        w += cw;
+    }
+    line
+}
+
+fn make_term_unicode(rows: u16, cols: u16) -> Term {
+    let mut term = Term::new(rows, cols, 0);
+    let mut parser = Parser::new();
+    for i in 0..usize::from(rows) {
+        let mut l = unicode_line(i, cols);
+        if i + 1 < usize::from(rows) {
+            l.push_str("\r\n");
+        }
+        parser.advance(&mut term, l.as_bytes());
+    }
+    term
+}
+
+fn bench_fullframe_unicode(c: &mut Criterion) {
+    let (width, height) = viewport_pixels(ROWS, COLS);
+    let mut harness = Harness::new(width, height);
+    let mut term = make_term_unicode(ROWS, COLS);
+    harness.render_term(&term);
+    term.clear_damage();
+    c.bench_function("fullframe_unicode_200x60", |b| {
+        b.iter(|| {
+            // Full repaint of unchanged text (a TUI repainting in new
+            // colours, or a viewport change).
+            term.mark_all_dirty();
+            harness.render_term(&term);
+            term.clear_damage();
+        });
+    });
+}
+
+/// New output at the live bottom: one new line per frame, every other
+/// row shifts up one (and is dirty).
+fn bench_scroll(c: &mut Criterion, name: &str, unicode: bool) {
+    let (width, height) = viewport_pixels(ROWS, COLS);
+    let mut harness = Harness::new(width, height);
+    let mut term = if unicode {
+        make_term_unicode(ROWS, COLS)
+    } else {
+        make_term_filled(ROWS, COLS)
+    };
+    let mut parser = Parser::new();
+    parser.advance(&mut term, b"\x1b[60;1H");
+    harness.render_term(&term);
+    term.clear_damage();
+    let mut i = 0usize;
+    c.bench_function(name, |b| {
+        b.iter(|| {
+            i += 1;
+            let line = if unicode {
+                unicode_line(i, COLS)
+            } else {
+                format!("{i:>6} lorem ipsum dolor sit amet, consectetur adipiscing elit")
+            };
+            parser.advance(&mut term, b"\r\n");
+            parser.advance(&mut term, line.as_bytes());
+            harness.render_term(&term);
+            term.clear_damage();
+        });
+    });
+}
+
+fn bench_scroll_ascii(c: &mut Criterion) {
+    bench_scroll(c, "scroll_ascii_200x60", false);
+}
+
+fn bench_scroll_unicode(c: &mut Criterion) {
+    bench_scroll(c, "scroll_unicode_200x60", true);
+}
+
+/// Wide (2-cell) words for the `newtext_cjk` min-time scenario.
+const CJK_WORDS: [&str; 10] = [
+    "你好",
+    "世界",
+    "日本語",
+    "テキスト",
+    "한글",
+    "漢字",
+    "中文",
+    "进度",
+    "🚀",
+    "👍",
+];
+
+/// Frames per `TOASTTY_BENCH_MIN` scenario.
+const MIN_FRAMES: usize = 400;
+
+/// Print the minimum and median of per-frame times (µs).
+fn report_min(name: &str, mut times: Vec<f64>) {
+    times.sort_by(f64::total_cmp);
+    println!(
+        "min-time {name:<26} min {:>8.1} us  p50 {:>8.1} us",
+        times[0],
+        times[times.len() / 2]
+    );
+}
+
+/// Time `frames` CPU-only frames; `step` mutates the term before each.
+fn time_frames(
+    h: &mut Harness,
+    term: &mut Term,
+    frames: usize,
+    mut step: impl FnMut(&mut Term, usize),
+) -> Vec<f64> {
+    let mut times = Vec::with_capacity(frames);
+    for i in 0..frames {
+        step(term, i);
+        let t0 = Instant::now();
+        h.render_term(term);
+        times.push(t0.elapsed().as_secs_f64() * 1e6);
+        term.clear_damage();
+    }
+    times
+}
+
+/// One screen of new coloured words, `kind` = `256` / `rgb` / `cjk`
+/// (256-colour with CJK / emoji words mixed in). `seed` carries the
+/// LCG state between screens.
+fn new_text_screen(kind: &str, rows: u16, cols: u16, frame: usize, seed: &mut u32) -> String {
+    use std::fmt::Write as _;
+    const LOREM: [&str; 19] = [
+        "lorem",
+        "ipsum",
+        "dolor",
+        "sit",
+        "amet",
+        "consectetur",
+        "adipiscing",
+        "elit",
+        "sed",
+        "do",
+        "eiusmod",
+        "tempor",
+        "incididunt",
+        "ut",
+        "labore",
+        "et",
+        "dolore",
+        "magna",
+        "aliqua",
+    ];
+    let mut screen = String::from("\x1b[H");
+    for row in 0..rows {
+        let _ = write!(screen, "\x1b[{};1H", row + 1);
+        let mut width = 0usize;
+        while width + 12 < usize::from(cols) {
+            *seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let s = *seed;
+            let (word, word_w) = if kind == "cjk" && (s >> 20) % 10 < 3 {
+                let w = CJK_WORDS[(s >> 16) as usize % CJK_WORDS.len()];
+                (w, 2 * w.chars().count())
+            } else {
+                let w = LOREM[(s >> 16) as usize % LOREM.len()];
+                (w, w.len())
+            };
+            if kind == "rgb" {
+                let (red, green, blue) = (s >> 8 & 255, s >> 12 & 255, s >> 4 & 255);
+                let _ = write!(screen, "\x1b[38;2;{red};{green};{blue}m{word} ");
+            } else {
+                let _ = write!(screen, "\x1b[38;5;{}m{word} ", (s >> 8) % 256);
+            }
+            width += word_w + 1;
+        }
+        let _ = write!(screen, "{frame}\x1b[K");
+    }
+    screen
+}
+
+/// Low-noise CPU numbers — runs when `TOASTTY_BENCH_MIN=1` is set,
+/// otherwise a no-op. Each scenario renders 400 frames CPU-only
+/// (shaping + instance building, no GPU) and prints the minimum and
+/// median frame time: the minimum is what the code costs, the median
+/// what it costs on a busy machine.
+fn bench_min_times(c: &mut Criterion) {
+    if std::env::var_os("TOASTTY_BENCH_MIN").is_none() {
+        return;
+    }
+    let repaint = |term: &mut Term, _| term.mark_all_dirty();
+    for (rows, cols) in [(ROWS, COLS), (BIG_ROWS, BIG_COLS)] {
+        let (width, height) = viewport_pixels(rows, cols);
+        let mut h = Harness::new(width, height);
+        h.cpu_only = true;
+        // Full repaint of unchanged text.
+        let mut term = make_term_filled(rows, cols);
+        h.render_term(&term);
+        let times = time_frames(&mut h, &mut term, MIN_FRAMES, repaint);
+        report_min(&format!("repaint_{cols}x{rows}"), times);
+        // Every row new text every frame (no memo hits), coloured words:
+        // 256-colour, truecolor, and 256-colour with CJK / emoji words
+        // mixed in (every row needs cosmic-text; fewer frames, it's slow).
+        for kind in ["256", "rgb", "cjk"] {
+            let frames = if kind == "cjk" {
+                MIN_FRAMES / 4
+            } else {
+                MIN_FRAMES
+            };
+            let mut parser = Parser::new();
+            let mut seed = 1u32;
+            let times = time_frames(&mut h, &mut term, frames, |term, f| {
+                let screen = new_text_screen(kind, rows, cols, f, &mut seed);
+                parser.advance(term, screen.as_bytes());
+            });
+            report_min(&format!("newtext_{kind}_{cols}x{rows}"), times);
+        }
+    }
+    let (width, height) = viewport_pixels(ROWS, COLS);
+    let mut h = Harness::new(width, height);
+    h.cpu_only = true;
+    // Full repaint of faint (SGR 2) text.
+    let mut term = Term::new(ROWS, COLS, 0);
+    Parser::new().advance(&mut term, b"\x1b[2;33m");
+    let filled = make_term_filled(ROWS, COLS);
+    let text: String = (0..ROWS)
+        .flat_map(|r| filled.row(r).cells().iter().map(|cell| cell.ch))
+        .collect();
+    Parser::new().advance(&mut term, text.as_bytes());
+    h.render_term(&term);
+    let times = time_frames(&mut h, &mut term, MIN_FRAMES, repaint);
+    report_min("repaint_dim_200x60", times);
+    let mut term = make_term_unicode(ROWS, COLS);
+    h.render_term(&term);
+    let times = time_frames(&mut h, &mut term, MIN_FRAMES, repaint);
+    report_min("repaint_unicode_200x60", times);
+    let mut parser = Parser::new();
+    parser.advance(&mut term, b"\x1b[60;1H");
+    let times = time_frames(&mut h, &mut term, MIN_FRAMES, |term, i| {
+        parser.advance(term, b"\r\n");
+        parser.advance(term, unicode_line(i + 1000, COLS).as_bytes());
+    });
+    report_min("scroll_unicode_200x60", times);
+    c.bench_function("min_times_dummy", |b| b.iter(|| {}));
+}
+
 /// Phase breakdown — runs once when `TOASTTY_BENCH_BREAKDOWN=1` is set,
 /// otherwise registered as a no-op criterion bench. Prints per-section
 /// wall time for both the cached single-cell case and the worst-case
@@ -594,6 +841,10 @@ criterion_group!(
     bench_single_cell_change,
     bench_fullframe_fullscreen,
     bench_single_cell_change_fullscreen,
+    bench_fullframe_unicode,
+    bench_scroll_ascii,
+    bench_scroll_unicode,
     bench_phase_breakdown,
+    bench_min_times,
 );
 criterion_main!(benches);

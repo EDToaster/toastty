@@ -207,13 +207,14 @@ pub enum Event {
     /// A user-event posted via `WindowHandle::wake`. Used by the mio PTY
     /// thread to nudge the event loop.
     User,
-    /// PTY bytes arrived on the master fd (delivered via
-    /// `toastty_io::spawn_pty_reader`). The binary feeds these to the
-    /// parser and requests a redraw.
-    PtyBytes(Vec<u8>),
-    /// PTY master closed (child exited / EIO). The binary should reap
-    /// and exit.
-    PtyClosed,
+    /// The PTY reader (`toastty_io::spawn_pty_reader`) has new bytes
+    /// buffered, or saw the master close. The binary drains its
+    /// `toastty_io::PtyReader`, feeds the parser and requests a redraw;
+    /// once the reader reports finished it reaps the child and exits.
+    ///
+    /// Also delivered after a [`ControlSignal::Yield`] frame, to resume
+    /// parsing where the binary left off.
+    PtyReady,
     /// IME committed text — should be inserted into the editor (written to the PTY),
     /// the same as typed text. Arrives via the platform text-input protocol
     /// (e.g. fcitx5 Hangul/CJK composition), NOT through `Event::Key`.
@@ -240,4 +241,17 @@ pub enum ControlSignal {
     Exit,
     /// Schedule a redraw at most `Duration` from now.
     RedrawIn(Duration),
+    /// Redraw now, like `RedrawIn(Duration::ZERO)`, and deliver
+    /// [`Event::PtyReady`] again once that frame is out. Returned from
+    /// `PtyReady` when the app stopped parsing with bytes left so a frame
+    /// could be drawn (flood output). Reader wakes that arrive before the
+    /// frame are dropped: the resumed `PtyReady` drains everything
+    /// buffered anyway, and delivering them would parse again before the
+    /// frame (winit hands out every queued user event before it gets to
+    /// `RedrawRequested`).
+    Yield,
+    /// Like [`Yield`](Self::Yield) without the redraw: let the loop
+    /// handle input, then deliver [`Event::PtyReady`] again. Returned
+    /// while mode 2026 holds frames back, when a redraw would be skipped.
+    Defer,
 }

@@ -13,7 +13,7 @@ fn run(rows: u16, cols: u16, bytes: &[u8]) -> Term {
 }
 
 fn row_text(t: &Term, r: u16) -> String {
-    let mut s: String = t.row(r).cells.iter().map(|c| c.ch).collect();
+    let mut s: String = t.row(r).cells().iter().map(|c| c.ch).collect();
     while s.ends_with(' ') {
         s.pop();
     }
@@ -44,7 +44,7 @@ fn cup_with_only_row_specified_homes_column() {
     // `CSI 3 H` — row 3 col 1 (column defaults).
     let bytes = b"...\x1b[3HZ";
     let t = run(5, 4, bytes);
-    assert_eq!(t.row(2).cells[0].ch, 'Z');
+    assert_eq!(t.row(2).cells()[0].ch, 'Z');
 }
 
 #[test]
@@ -410,12 +410,12 @@ mod selection {
         assert!(!t.is_cell_selected(pos_for(&t, 0, 0).line_id, 0));
         // Row lookup addresses the alt grid while it's active…
         let row = t.row_by_line_id(id).unwrap();
-        assert_eq!(row.cells[0].ch, 'a');
+        assert_eq!(row.cells()[0].ch, 'a');
         // …and the primary accessor still reaches the primary grid.
         assert_eq!(
             t.primary_row_by_line_id(pos_for(&t, 0, 0).line_id)
                 .unwrap()
-                .cells[0]
+                .cells()[0]
                 .ch,
             'p'
         );
@@ -711,4 +711,37 @@ mod selection {
         feed(&mut t, b"\x1bc");
         assert!(t.selection().is_none());
     }
+}
+
+/// WIRE-17 across a read boundary: a DEL inside an open sequence at the
+/// end of one read, then a non-ASCII byte, aborts the sequence just as
+/// when it all arrives at once (it used to depend on where the read
+/// split: the split form printed nothing).
+#[test]
+fn del_in_open_sequence_split_from_non_ascii_matches_one_read() {
+    for (a, b) in [
+        (&b"\x1b[1\x7f"[..], &b"\xc3\xa9X"[..]),
+        (b"\x1b(\x7f", b"\x9ca"),
+        (b"\x1b-\x7f", b"\x8f\xbd"),
+    ] {
+        let whole = run(3, 10, &[a, b].concat());
+        let mut split = Term::new(3, 10, 32);
+        let mut p = Parser::new();
+        p.advance(&mut split, a);
+        p.advance(&mut split, b);
+        for r in 0..3 {
+            assert_eq!(
+                row_text(&split, r),
+                row_text(&whole, r),
+                "{a:?} | {b:?} row {r}"
+            );
+        }
+        assert_eq!(split.cursor(), whole.cursor(), "{a:?} | {b:?}");
+    }
+    let mut t = Term::new(3, 10, 32);
+    let mut p = Parser::new();
+    p.advance(&mut t, b"\x1b[1\x7f");
+    p.advance(&mut t, b"\xc3\xa9X");
+    assert_eq!(row_text(&t, 0), "\u{fffd}X");
+    assert_eq!((t.cursor().row, t.cursor().col), (0, 2));
 }

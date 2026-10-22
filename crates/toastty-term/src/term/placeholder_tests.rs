@@ -92,7 +92,7 @@ fn diacritics_and_placement_id_are_stored_in_the_cell() {
     let mut t = Term::new(2, 6, 0);
     feed(&mut t, b"\x1b[38;5;7m\x1b[58;5;3m");
     feed(&mut t, cell(&[2, 4, 1]).as_bytes());
-    let c = t.active_grid().row(0).cells[0];
+    let c = t.active_grid().row(0).cells()[0];
     assert_eq!(c.ch, crate::PLACEHOLDER);
     assert_eq!(
         t.cell_extra(&c),
@@ -232,7 +232,7 @@ fn stray_diacritic_after_text_is_not_a_placeholder() {
     feed(&mut t, "\u{0305}".as_bytes());
     assert!(runs(&t, 0).is_empty());
     assert_eq!(
-        t.grapheme_tail(&t.active_grid().row(0).cells[0]),
+        t.grapheme_tail(&t.active_grid().row(0).cells()[0]),
         "\u{0305}"
     );
 }
@@ -516,7 +516,7 @@ fn a_full_extras_table_reclaims_scrolled_off_placeholders() {
     // …and so does a combining mark.
     feed(&mut t, "\x1b[39me\u{301}".as_bytes());
     let row = t.active_grid().row(t.cursor().row);
-    let e = row.cells[usize::from(t.cursor().col) - 1];
+    let e = row.cells()[usize::from(t.cursor().col) - 1];
     assert_eq!(t.grapheme_tail(&e), "\u{301}");
 }
 
@@ -535,7 +535,7 @@ fn long_icat_loops_stay_bounded() {
     // Reclamation never frees what's still on screen.
     let r = runs(&t, 3);
     assert!(!r.is_empty());
-    for c in &t.active_grid().row(3).cells {
+    for c in t.active_grid().row(3).cells() {
         if c.ch == crate::PLACEHOLDER {
             assert!(matches!(t.cell_extra(c), Some(CellExtra::Placeholder(_))));
         }
@@ -642,7 +642,7 @@ fn scrollback_full_of_live_images_drops_the_oldest_not_the_newest() {
     // Combining marks are unaffected.
     feed(&mut t, "\x1b[39me\u{301}".as_bytes());
     let row = t.active_grid().row(t.cursor().row);
-    let e = row.cells[usize::from(t.cursor().col) - 1];
+    let e = row.cells()[usize::from(t.cursor().col) - 1];
     assert_eq!(t.grapheme_tail(&e), "\u{301}");
 }
 
@@ -669,7 +669,7 @@ fn low_yield_sweeps_back_off_exponentially() {
     let mut k: u16 = 0;
     'fill: for n in 0..t.primary.history_lines() {
         let row = t.primary.scrollback_row_mut(n).unwrap();
-        for c in &mut row.cells {
+        for c in row.cells_mut() {
             let Some(id) = t.extras.intern(CellExtra::Tab(k)) else {
                 break 'fill;
             };
@@ -700,7 +700,7 @@ fn low_yield_sweeps_back_off_exponentially() {
     // Once the cells go away, a sweep frees plenty and the streak resets.
     t.extras_gc_cooldown = 0;
     for n in 0..t.primary.history_lines() {
-        for c in &mut t.primary.scrollback_row_mut(n).unwrap().cells {
+        for c in t.primary.scrollback_row_mut(n).unwrap().cells_mut() {
             c.extra = None;
         }
     }

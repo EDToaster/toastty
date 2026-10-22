@@ -10,23 +10,17 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use toastty_io::{EventSink, SinkClosed, UserEvent, spawn_pty_reader_with_sink};
+use toastty_io::test_support::{Batch, ChannelSink, recv_batch};
+use toastty_io::{PtyReader, UserEvent, spawn_pty_reader_with_sink};
 use toastty_pty::{Pty, PtySpec};
 
-/// Test sink: forwards `UserEvent` into an mpsc channel.
-struct ChannelSink(Mutex<mpsc::Sender<UserEvent>>);
-
-impl EventSink for ChannelSink {
-    fn send(&self, ev: UserEvent) -> Result<(), SinkClosed> {
-        let g = self.0.lock().map_err(|_| SinkClosed)?;
-        g.send(ev).map_err(|_| SinkClosed)
-    }
-}
-
-/// Collect events from the channel for at most `max` time, returning all
-/// `PtyBytes` payloads concatenated and a flag indicating whether
-/// `PtyClosed` was seen.
-fn collect(rx: &mpsc::Receiver<UserEvent>, max: Duration) -> (Vec<u8>, bool) {
+/// Collect output for at most `max` time, returning all bytes
+/// concatenated and a flag indicating whether the close was seen.
+fn collect(
+    reader: &mut PtyReader,
+    rx: &mpsc::Receiver<UserEvent>,
+    max: Duration,
+) -> (Vec<u8>, bool) {
     let deadline = Instant::now() + max;
     let mut bytes = Vec::new();
     let mut closed = false;
@@ -35,13 +29,13 @@ fn collect(rx: &mpsc::Receiver<UserEvent>, max: Duration) -> (Vec<u8>, bool) {
         if now >= deadline {
             break;
         }
-        match rx.recv_timeout(deadline - now) {
-            Ok(UserEvent::PtyBytes(mut b)) => bytes.append(&mut b),
-            Ok(UserEvent::PtyClosed) => {
+        match recv_batch(reader, rx, deadline - now) {
+            Some(Batch::Bytes(mut b)) => bytes.append(&mut b),
+            Some(Batch::Closed) => {
                 closed = true;
                 break;
             }
-            Err(_) => break,
+            None => break,
         }
     }
     (bytes, closed)
@@ -54,9 +48,9 @@ fn reads_echo_output_and_observes_close() {
 
     let (tx, rx) = mpsc::channel();
     let sink = ChannelSink(Mutex::new(tx));
-    let _join = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("spawn reader");
+    let mut reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("spawn reader");
 
-    let (bytes, closed) = collect(&rx, Duration::from_secs(3));
+    let (bytes, closed) = collect(&mut reader, &rx, Duration::from_secs(3));
     let s = String::from_utf8_lossy(&bytes);
     assert!(s.contains("hello, toastty-io"), "got: {s:?}");
     assert!(closed, "expected PtyClosed once child exits");
@@ -71,7 +65,7 @@ fn reads_multiple_chunks_from_cat() {
 
     let (tx, rx) = mpsc::channel();
     let sink = ChannelSink(Mutex::new(tx));
-    let _join = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("spawn reader");
+    let mut reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("spawn reader");
 
     // Write a few separate lines; cat echoes them back.
     for line in &[b"alpha\n".as_slice(), b"beta\n", b"gamma\n"] {
@@ -83,10 +77,10 @@ fn reads_multiple_chunks_from_cat() {
     let start = Instant::now();
     let mut bytes = Vec::new();
     while start.elapsed() < Duration::from_secs(2) {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(UserEvent::PtyBytes(mut b)) => bytes.append(&mut b),
-            Ok(UserEvent::PtyClosed) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+        match recv_batch(&mut reader, &rx, Duration::from_millis(200)) {
+            Some(Batch::Bytes(mut b)) => bytes.append(&mut b),
+            Some(Batch::Closed) => break,
+            None => {
                 if !bytes.is_empty() {
                     // Got something + nothing new for 200 ms — done.
                     break;
@@ -110,9 +104,9 @@ fn reports_close_when_child_exits() {
 
     let (tx, rx) = mpsc::channel();
     let sink = ChannelSink(Mutex::new(tx));
-    let _join = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("spawn reader");
+    let mut reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("spawn reader");
 
-    let (_bytes, closed) = collect(&rx, Duration::from_secs(3));
+    let (_bytes, closed) = collect(&mut reader, &rx, Duration::from_secs(3));
     assert!(closed, "expected PtyClosed when child exits");
     drop(pty);
 }

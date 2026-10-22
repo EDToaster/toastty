@@ -41,7 +41,7 @@ fn copy_row(t: &mut Term, r: u16) -> String {
 
 /// Full text of the cell at `(r, c)`: `ch` + grapheme tail.
 fn cell_text(t: &Term, r: u16, c: u16) -> String {
-    let cell = t.row(r).cells[c as usize];
+    let cell = t.row(r).cells()[c as usize];
     format!("{}{}", cell.ch, t.grapheme_tail(&cell))
 }
 
@@ -62,9 +62,9 @@ fn zwj_family_occupies_first_emoji_width() {
     let fam = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
     let mut t = run(4, 20, &format!("{fam}x"));
     let row = t.row(0);
-    assert_eq!(row.cells[0].ch, '\u{1F468}');
-    assert!(row.cells[1].is_continuation);
-    assert_eq!(row.cells[2].ch, 'x');
+    assert_eq!(row.cells()[0].ch, '\u{1F468}');
+    assert!(row.cells()[1].is_continuation);
+    assert_eq!(row.cells()[2].ch, 'x');
     assert_eq!(cell_text(&t, 0, 0), fam);
     assert_eq!(t.cursor().col, 3);
     assert_eq!(copy_row(&mut t, 0), format!("{fam}x"));
@@ -82,15 +82,15 @@ fn zwj_family_same_under_2027() {
 fn vs16_heart_legacy_stays_one_cell() {
     let mut t = run(4, 20, "\u{2764}\u{FE0F}|");
     assert_eq!(t.cursor().col, 2);
-    assert_eq!(t.row(0).cells[1].ch, '|');
+    assert_eq!(t.row(0).cells()[1].ch, '|');
     assert_eq!(copy_row(&mut t, 0), "\u{2764}\u{FE0F}|");
 }
 
 #[test]
 fn vs16_heart_under_2027_grows_to_two_cells() {
     let mut t = run(4, 20, "\x1b[?2027h\u{2764}\u{FE0F}|");
-    assert!(t.row(0).cells[1].is_continuation);
-    assert_eq!(t.row(0).cells[2].ch, '|');
+    assert!(t.row(0).cells()[1].is_continuation);
+    assert_eq!(t.row(0).cells()[2].ch, '|');
     assert_eq!(t.cursor().col, 3);
     assert_eq!(copy_row(&mut t, 0), "\u{2764}\u{FE0F}|");
 }
@@ -102,9 +102,9 @@ fn growth_clobbers_wide_neighbour_cleanly() {
     let mut t = run(4, 20, "\x1b[?2027h\u{2764}\u{4F60}\x1b[1;2H\u{FE0F}");
     // The cursor is at col 1 (on 你's primary); the left cell is ❤.
     let row = t.row(0);
-    assert!(row.cells[1].is_continuation);
-    assert_eq!(row.cells[2].ch, ' ');
-    assert!(!row.cells[2].is_continuation);
+    assert!(row.cells()[1].is_continuation);
+    assert_eq!(row.cells()[2].ch, ' ');
+    assert!(!row.cells()[2].is_continuation);
     assert_eq!(copy_row(&mut t, 0), "\u{2764}\u{FE0F}");
 }
 
@@ -114,7 +114,7 @@ fn zwj_with_narrow_base_grows_to_two_cells() {
     // the grid must reserve both cells in either mode.
     let s = "\u{2764}\u{200D}\u{1F525}";
     let mut t = run(4, 20, &format!("{s}|"));
-    assert!(t.row(0).cells[1].is_continuation);
+    assert!(t.row(0).cells()[1].is_continuation);
     assert_eq!(t.cursor().col, 3);
     assert_eq!(copy_row(&mut t, 0), format!("{s}|"));
 }
@@ -124,7 +124,7 @@ fn no_growth_in_last_column() {
     let mut t = run(4, 4, "\x1b[?2027habc\u{2764}\u{FE0F}");
     // ❤ sits in the last column (pending wrap); no room to grow.
     assert_eq!(cell_text(&t, 0, 3), "\u{2764}\u{FE0F}");
-    assert!(!t.row(1).cells[0].is_continuation);
+    assert!(!t.row(1).cells()[0].is_continuation);
     assert_eq!(copy_row(&mut t, 0), "abc\u{2764}\u{FE0F}");
 }
 
@@ -134,13 +134,13 @@ fn skin_tone_modifier_joins_its_base() {
     for prefix in ["", "\x1b[?2027h"] {
         let mut t = run(4, 20, &format!("{prefix}{s}|"));
         assert_eq!(cell_text(&t, 0, 0), s);
-        assert!(t.row(0).cells[1].is_continuation);
-        assert_eq!(t.row(0).cells[2].ch, '|');
+        assert!(t.row(0).cells()[1].is_continuation);
+        assert_eq!(t.row(0).cells()[2].ch, '|');
         assert_eq!(copy_row(&mut t, 0), format!("{s}|"));
     }
     // A lone modifier (no emoji base) stays its own wide cell.
     let mut t = run(4, 20, "a\u{1F3FD}|");
-    assert_eq!(t.row(0).cells[1].ch, '\u{1F3FD}');
+    assert_eq!(t.row(0).cells()[1].ch, '\u{1F3FD}');
     assert_eq!(copy_row(&mut t, 0), "a\u{1F3FD}|");
     // A narrow Dingbats base (✌) takes the modifier and grows to 2 cells.
     let mut t = run(4, 20, "\u{270C}\u{1F3FD}|");
@@ -158,7 +158,7 @@ fn regional_indicator_flag_legacy_and_2027() {
     // 2027: one cluster, two cells.
     let mut t = run(4, 20, &format!("\x1b[?2027h{flag}|"));
     assert_eq!(cell_text(&t, 0, 0), flag);
-    assert!(t.row(0).cells[1].is_continuation);
+    assert!(t.row(0).cells()[1].is_continuation);
     assert_eq!(t.cursor().col, 3);
     // A third RI starts a new cluster.
     let mut t2 = run(4, 20, &format!("\x1b[?2027h{flag}\u{1F1FA}"));
@@ -191,15 +191,15 @@ fn hangul_jamo_compose_into_one_cell() {
 fn combining_mark_after_wide_char_attaches_to_primary() {
     let mut t = run(4, 20, "\u{4F60}\u{301}x");
     assert_eq!(cell_text(&t, 0, 0), "\u{4F60}\u{301}");
-    assert!(t.row(0).cells[1].is_continuation);
+    assert!(t.row(0).cells()[1].is_continuation);
     assert_eq!(copy_row(&mut t, 0), "\u{4F60}\u{301}x");
 }
 
 #[test]
 fn combining_mark_at_column_zero_is_dropped() {
     let mut t = run(4, 20, "\u{301}a");
-    assert_eq!(t.row(0).cells[0].ch, 'a');
-    assert_eq!(t.row(0).cells[0].extra, None);
+    assert_eq!(t.row(0).cells()[0].ch, 'a');
+    assert_eq!(t.row(0).cells()[0].extra, None);
     assert_eq!(copy_row(&mut t, 0), "a");
 }
 
@@ -207,7 +207,7 @@ fn combining_mark_at_column_zero_is_dropped() {
 fn combining_mark_in_pending_wrap_attaches_to_last_column() {
     let mut t = run(4, 3, "abc\u{301}d");
     assert_eq!(cell_text(&t, 0, 2), "c\u{301}");
-    assert_eq!(t.row(1).cells[0].ch, 'd');
+    assert_eq!(t.row(1).cells()[0].ch, 'd');
     assert_eq!(copy(&mut t, 0, 0, 1, 2), "abc\u{301}d");
 }
 
@@ -215,7 +215,7 @@ fn combining_mark_in_pending_wrap_attaches_to_last_column() {
 fn ascii_after_zwj_starts_new_cell() {
     let mut t = run(4, 20, "\u{1F468}\u{200D}a");
     assert_eq!(cell_text(&t, 0, 0), "\u{1F468}\u{200D}");
-    assert_eq!(t.row(0).cells[2].ch, 'a');
+    assert_eq!(t.row(0).cells()[2].ch, 'a');
     assert_eq!(copy_row(&mut t, 0), "\u{1F468}\u{200D}a");
 }
 
@@ -223,7 +223,7 @@ fn ascii_after_zwj_starts_new_cell() {
 fn non_joining_wide_char_after_zwj_tail_starts_new_cell() {
     // CJK after ZWJ: UAX #29 breaks (GB11 needs ExtPict on both sides).
     let t = run(4, 20, "\u{1F468}\u{200D}\u{4F60}");
-    assert_eq!(t.row(0).cells[2].ch, '\u{4F60}');
+    assert_eq!(t.row(0).cells()[2].ch, '\u{4F60}');
     assert_eq!(t.cursor().col, 4);
 }
 
@@ -232,10 +232,10 @@ fn overwrite_and_erase_drop_the_grapheme() {
     let mut t = run(4, 20, "e\u{301}x");
     feed(&mut t, b"\r");
     feed(&mut t, b"E");
-    assert_eq!(t.row(0).cells[0].extra, None);
+    assert_eq!(t.row(0).cells()[0].extra, None);
     assert_eq!(copy_row(&mut t, 0), "Ex");
     let mut t = run(4, 20, "e\u{301}x\r\x1b[K");
-    assert_eq!(t.row(0).cells[0].extra, None);
+    assert_eq!(t.row(0).cells()[0].extra, None);
     assert_eq!(copy_row(&mut t, 0), "");
 }
 
@@ -266,7 +266,7 @@ fn graphemes_survive_scrollback_and_reflow() {
             break;
         };
         if let Some(row) = t.primary_row_by_line_id(id)
-            && row.cells.first().is_some_and(|c| c.ch == 'a')
+            && row.cells().first().is_some_and(|c| c.ch == 'a')
         {
             found = Some(id);
         }
@@ -282,7 +282,7 @@ fn graphemes_survive_scrollback_and_reflow() {
 fn ris_resets_extras() {
     let mut t = run(4, 20, "e\u{301}");
     feed(&mut t, b"\x1bc");
-    assert_eq!(t.row(0).cells[0].extra, None);
+    assert_eq!(t.row(0).cells()[0].extra, None);
     // Interning still works after the reset.
     feed(&mut t, "o\u{308}".as_bytes());
     assert_eq!(cell_text(&t, 0, 0), "o\u{308}");
@@ -296,11 +296,11 @@ fn grapheme_length_is_capped() {
     }
     s.push('b');
     let t = run(4, 20, &s);
-    let tail = t.grapheme_tail(&t.row(0).cells[0]).to_string();
+    let tail = t.grapheme_tail(&t.row(0).cells()[0]).to_string();
     assert!(tail.len() <= 64 && !tail.is_empty());
     assert!(tail.chars().all(|c| c == '\u{301}'));
     // The overflow marks were swallowed, not printed as new cells.
-    assert_eq!(t.row(0).cells[1].ch, 'b');
+    assert_eq!(t.row(0).cells()[1].ch, 'b');
 }
 
 #[test]
@@ -314,9 +314,9 @@ fn alt_screen_cells_keep_graphemes() {
 #[test]
 fn tab_copies_as_literal_tab() {
     let mut t = run(4, 40, "a\tb\tc");
-    assert_eq!(t.row(0).cells[8].ch, 'b');
+    assert_eq!(t.row(0).cells()[8].ch, 'b');
     assert!(matches!(
-        t.cell_extra(&t.row(0).cells[1]),
+        t.cell_extra(&t.row(0).cells()[1]),
         Some(CellExtra::Tab(7))
     ));
     assert_eq!(copy_row(&mut t, 0), "a\tb\tc");

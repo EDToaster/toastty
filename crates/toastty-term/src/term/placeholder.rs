@@ -202,9 +202,6 @@ impl Term {
     /// Returns `false` (print `c` normally) when that cell isn't a
     /// placeholder or `c` isn't one of kitty's diacritics.
     pub(super) fn attach_placeholder_diacritic(&mut self, c: char) -> bool {
-        let Some(idx) = toastty_graphics::diacritic_to_index(c) else {
-            return false;
-        };
         let row = self.cursor.row;
         // With a deferred wrap the cursor sits on the cell just written.
         let cur = if self.wrap_pending() {
@@ -215,12 +212,17 @@ impl Term {
         let Some(col) = cur.checked_sub(1) else {
             return false;
         };
-        let Some(&cell) = self.active_grid().row(row).cells.get(usize::from(col)) else {
+        let Some(&cell) = self.active_grid().row(row).cells().get(usize::from(col)) else {
             return false;
         };
         if cell.ch != crate::PLACEHOLDER || cell.is_continuation {
             return false;
         }
+        // Checked after the cell: the diacritic table is a linear scan,
+        // and every non-ASCII character printed comes through here.
+        let Some(idx) = toastty_graphics::diacritic_to_index(c) else {
+            return false;
+        };
         let mut ph = match cell.extra.and_then(|id| self.extras.get(id)) {
             Some(CellExtra::Placeholder(p)) => *p,
             _ => PlaceholderExtra::default(),
@@ -259,7 +261,7 @@ impl Term {
         let mut seen = vec![false; crate::extra::MAX_ENTRIES + 1];
         let mut count = 0usize;
         let mut note = |row: &Row, count: &mut usize| {
-            for c in &row.cells {
+            for c in row.cells() {
                 if let Some(id) = c.extra
                     && !seen[usize::from(id.get())]
                     && is_placeholder(id)
@@ -295,7 +297,7 @@ impl Term {
             let Some(row) = self.primary.scrollback_row_mut(n) else {
                 continue;
             };
-            for c in &mut row.cells {
+            for c in row.cells_mut() {
                 if c.extra.is_some_and(|id| {
                     matches!(self.extras.get(id), Some(CellExtra::Placeholder(_)))
                 }) {
@@ -366,7 +368,7 @@ impl Term {
     /// Append the placeholder runs of `row` (any row: live grid,
     /// scrollback, or [`Term::view_row`]'s result) to `out`.
     pub fn placeholder_runs(&self, row: &Row, out: &mut Vec<PlaceholderRun>) {
-        resolve_runs(&row.cells, &self.extras, out);
+        resolve_runs(row.cells(), &self.extras, out);
     }
 
     /// The virtual placement `run` draws, if it exists right now.
