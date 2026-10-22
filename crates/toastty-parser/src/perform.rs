@@ -1,4 +1,4 @@
-use vte::Params;
+use crate::Params;
 
 /// Handler trait. Implementors receive every parsed event from a
 /// [`crate::Parser`]. All methods default to no-ops; override the ones
@@ -176,8 +176,9 @@ impl<P: Perform + ?Sized> vte::Perform for VteAdapter<'_, P> {
     fn execute(&mut self, byte: u8) {
         self.inner.execute(byte);
     }
-    fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
-        self.inner.hook(params, intermediates, ignore, action);
+    fn hook(&mut self, params: &vte::Params, intermediates: &[u8], ignore: bool, action: char) {
+        self.inner
+            .hook(&Params::from_vte(params), intermediates, ignore, action);
     }
     fn put(&mut self, byte: u8) {
         self.inner.put(byte);
@@ -188,9 +189,15 @@ impl<P: Perform + ?Sized> vte::Perform for VteAdapter<'_, P> {
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         self.inner.osc_dispatch(params, bell_terminated);
     }
-    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+    fn csi_dispatch(
+        &mut self,
+        params: &vte::Params,
+        intermediates: &[u8],
+        ignore: bool,
+        action: char,
+    ) {
         self.inner
-            .csi_dispatch(params, intermediates, ignore, action);
+            .csi_dispatch(&Params::from_vte(params), intermediates, ignore, action);
     }
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
         self.inner.esc_dispatch(intermediates, ignore, byte);

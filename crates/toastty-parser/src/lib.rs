@@ -17,10 +17,11 @@
 
 #![forbid(unsafe_code)]
 
+mod params;
 mod parser;
 mod perform;
 mod utf8;
 
+pub use params::{Params, ParamsIter};
 pub use parser::{MAX_OSC_LEN, MAX_PASSTHROUGH_LEN, Parser};
 pub use perform::{BufferingApcHandler, Perform};
-pub use vte::Params;

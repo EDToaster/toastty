@@ -1,3 +1,4 @@
+use crate::Params;
 use crate::perform::{Perform, VteAdapter};
 use crate::utf8::Utf8Sanitizer;
 
@@ -277,6 +278,93 @@ fn dispatch_ground<P: Perform + ?Sized>(
     true
 }
 
+/// Parse and dispatch a whole CSI sequence (`bytes` follows the `ESC [`)
+/// without vte, when it has the everyday shape: an optional private
+/// marker, parameters (digits, `;`, `:`), up to two intermediates and a
+/// final byte, with nothing vte would treat specially (C0 controls, DEL,
+/// CAN / SUB / ESC, bytes >= 0x80, misplaced `<=>?` or digits, too many
+/// parameters or intermediates). Returns the bytes consumed through the
+/// final byte, or `None` with nothing dispatched, leaving the sequence
+/// to vte. Matches vte 0.15's CSI states byte for byte on the shapes it
+/// accepts (including the trailing empty parameter vte always pushes),
+/// and reports [`Perform::csi_param_digits`] first, as the scanner does.
+/// vte must be in ground: the sequence then takes it from ground back
+/// to ground, so skipping it changes nothing in vte.
+#[inline]
+fn fast_csi<P: Perform + ?Sized>(perform: &mut P, bytes: &[u8]) -> Option<usize> {
+    /// Where in the sequence we are: vte's `CsiEntry`, `CsiParam` and
+    /// `CsiIntermediate` states.
+    #[derive(PartialEq, Eq)]
+    enum At {
+        Entry,
+        Param,
+        Intermediate,
+    }
+    let mut params = Params::default();
+    let mut param: u16 = 0;
+    let mut inter = [0u8; 2];
+    let mut n_inter = 0;
+    let mut at = At::Entry;
+    // `csi_param_digits`: bit per parameter that held a digit.
+    let (mut digits, mut idx) = (0u32, 0u32);
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'0'..=b'9' if at != At::Intermediate => {
+                if params.is_full() {
+                    return None;
+                }
+                param = param.saturating_mul(10).saturating_add(u16::from(b - b'0'));
+                if idx < 32 {
+                    digits |= 1 << idx;
+                }
+                at = At::Param;
+            }
+            b':' if at != At::Intermediate => {
+                if params.is_full() {
+                    return None;
+                }
+                params.extend(param);
+                param = 0;
+                at = At::Param;
+            }
+            b';' if at != At::Intermediate => {
+                if params.is_full() {
+                    return None;
+                }
+                params.push(param);
+                param = 0;
+                idx = idx.saturating_add(1);
+                at = At::Param;
+            }
+            // Private marker: only as the first byte.
+            0x3C..=0x3F if at == At::Entry => {
+                inter[0] = b;
+                n_inter = 1;
+                at = At::Param;
+            }
+            0x20..=0x2F => {
+                if n_inter == inter.len() {
+                    return None;
+                }
+                inter[n_inter] = b;
+                n_inter += 1;
+                at = At::Intermediate;
+            }
+            0x40..=0x7E => {
+                if params.is_full() {
+                    return None;
+                }
+                params.push(param);
+                perform.csi_param_digits(digits);
+                perform.csi_dispatch(&params, &inter[..n_inter], false, char::from(b));
+                return Some(i + 1);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// The APC / OSC-cap pre-scanner plus vte: everything the parser does
 /// except tmux passthrough unwrapping, which [`Parser`] layers on top
 /// so unwrapped payloads can be fed back through this same path.
@@ -325,6 +413,16 @@ impl Scanner {
     fn feed_vte<P: Perform + ?Sized>(&mut self, perform: &mut P, bytes: &[u8]) {
         self.vte_ground = false;
         vte_advance(&mut self.vte, perform, bytes);
+    }
+
+    /// vte is in ground and the bypasses may be used.
+    #[inline]
+    fn bypass_ok(&self) -> bool {
+        #[cfg(test)]
+        if self.no_bypass {
+            return false;
+        }
+        self.vte_ground
     }
 
     /// Ground text known to be clean (see [`ground_text`]).
@@ -535,7 +633,19 @@ impl Scanner {
                                 span_ok = false; // No longer on a character boundary.
                                 continue 'input;
                             }
-                            after_esc::CSI => true,
+                            after_esc::CSI => {
+                                if self.bypass_ok()
+                                    && let Some(n) = fast_csi(perform, bytes)
+                                {
+                                    // Dispatched; vte never saw it and is
+                                    // still in ground.
+                                    self.csi_digits = None;
+                                    self.apc = ApcState::Ground;
+                                    bytes = &bytes[n..];
+                                    continue;
+                                }
+                                true
+                            }
                             after_esc::ESC_SEQ => false,
                             _ => {
                                 // A complete escape: replay ESC + this byte.

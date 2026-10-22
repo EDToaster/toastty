@@ -261,3 +261,66 @@ proptest! {
         check(&chunks);
     }
 }
+
+#[test]
+fn fast_csi_matches_vte_on_edge_shapes() {
+    let mut long = b"\x1b[".to_vec();
+    for i in 0..40 {
+        long.extend_from_slice(format!("{i};").as_bytes());
+    }
+    long.push(b'm');
+    let mut subs = b"\x1b[38".to_vec();
+    for _ in 0..40 {
+        subs.extend_from_slice(b":1");
+    }
+    subs.push(b'm');
+    for input in [
+        &b"\x1b[m\x1b[;m\x1b[0;;1m\x1b[38:2::10:20:30m"[..],
+        b"\x1b[?1049h\x1b[>4;2m\x1b[=5u\x1b[<1;2;3M",
+        b"\x1b[2 q\x1b[1$p\x1b[?1$p\x1b[!p\x1b[1 !p\x1b[1 !#p",
+        b"\x1b[99999999m\x1b[65535;65536H",
+        b"\x1b[1?m\x1b[1 2m\x1b[??1h\x1b[1;2<m",
+        b"\x1b[1\x05m\x1b[1\x7fm\x1b[1\x18m\x1b[1\x1b[2m",
+        &long,
+        &subs,
+        // 31 and 32 entries: just under and at vte's cap.
+        b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20;21;22;23;24;25;26;27;28;29;30;31m",
+        b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20;21;22;23;24;25;26;27;28;29;30;31;32m",
+        b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20;21;22;23;24;25;26;27;28;29;30;31;m",
+    ] {
+        check(&[input]);
+    }
+}
+
+/// CSI bodies from the bytes vte distinguishes inside one.
+fn csi_body() -> impl Strategy<Value = Vec<u8>> {
+    let byte = prop_oneof![
+        6 => proptest::sample::select(b"0123456789".to_vec()),
+        3 => Just(b';'),
+        1 => Just(b':'),
+        1 => proptest::sample::select(b"<=>?".to_vec()),
+        1 => proptest::sample::select(b" !\"#$%&'()*+,-./".to_vec()),
+        2 => proptest::sample::select(b"@ABHJKmhlpqrsu~`".to_vec()),
+        1 => proptest::sample::select(vec![0x05, 0x07, 0x0A, 0x18, 0x1A, 0x1B, 0x7F, 0x80, 0xC3, 0xFF]),
+    ];
+    proptest::collection::vec(byte, 0..40)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 3000, ..ProptestConfig::default() })]
+
+    #[test]
+    fn fast_csi_matches_vte(
+        seqs in proptest::collection::vec((csi_body(), "[ -~]{0,4}"), 1..8),
+        cut in any::<prop::sample::Index>(),
+    ) {
+        let mut input = Vec::new();
+        for (body, text) in &seqs {
+            input.extend_from_slice(b"\x1b[");
+            input.extend_from_slice(body);
+            input.extend_from_slice(text.as_bytes());
+        }
+        let (a, b) = input.split_at(cut.index(input.len() + 1));
+        check(&[a, b]);
+    }
+}
