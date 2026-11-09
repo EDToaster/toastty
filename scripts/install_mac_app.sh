@@ -96,7 +96,17 @@ cat > "${macos}/toastty-launch" <<LAUNCH
 # shim exits, keeps its inherited WindowServer connection, and creates its
 # own window. The binary lives outside the bundle, so each launch => an
 # independent, non-bundle-associated process + window.
-"${support_bin}" >/dev/null 2>&1 &
+#
+# Because this shim is a script (no Mach-O header), LaunchServices can't infer
+# its architecture and on Apple Silicon may start it under Rosetta. A
+# translated parent prefers the x86_64 slice of universal binaries, which
+# leaks into the terminal's shell (\`uname -m\` => x86_64). Explicitly request
+# the native slice on arm64 hardware.
+if [ "\$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
+    /usr/bin/arch -arm64 "${support_bin}" >/dev/null 2>&1 &
+else
+    "${support_bin}" >/dev/null 2>&1 &
+fi
 exit 0
 LAUNCH
 chmod 0755 "${macos}/toastty-launch"
@@ -113,6 +123,11 @@ cat > "${contents}/Info.plist" <<PLIST
     <key>CFBundleShortVersionString</key><string>${version}</string>
     <key>CFBundleExecutable</key>       <string>toastty-launch</string>
     <key>LSMultipleInstancesProhibited</key><false/>
+    <key>LSArchitecturePriority</key>
+    <array>
+        <string>arm64</string>
+        <string>x86_64</string>
+    </array>
     <key>CFBundlePackageType</key>      <string>APPL</string>
     <key>LSMinimumSystemVersion</key>   <string>11.0</string>
     <key>NSHighResolutionCapable</key>  <true/>
