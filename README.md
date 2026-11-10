@@ -186,6 +186,10 @@ The full matrix is in [docs/protocols.md](docs/protocols.md), and
 
 ### 🛋️ Small comforts
 
+- **Reference Pin**: select an error, identifier or command recipe and press
+  Ctrl+Shift+P (Cmd+Shift+P on macOS) to keep a copy visible while you keep
+  working. The card stays put as output scrolls; Copy puts its text on the
+  clipboard and Dismiss removes it.
 - **Smooth scrolling** through 10,000 lines of scrollback (configurable),
   for wheel and touchpad.
 - A **scroll-to-bottom button** appears while you're reading history.
@@ -281,6 +285,7 @@ OSC 52 and Markdown.
 | Copy selection | Ctrl+Shift+C | Cmd+C |
 | Paste clipboard | Ctrl+Shift+V | Cmd+V |
 | Paste PRIMARY selection | Shift+Insert | Shift+Insert (clipboard) |
+| Pin or replace selected text; dismiss pin when nothing is selected | Ctrl+Shift+P | Cmd+Shift+P |
 | Open hyperlink | Ctrl+click | Cmd+click |
 | Copy a Markdown block's source | click the copy chip shown at the block's top right on hover | same |
 | Zoom in | Ctrl+= (also Ctrl++, Ctrl+Shift+=, Ctrl+keypad +) | Cmd+= (same variants) |
@@ -289,6 +294,20 @@ OSC 52 and Markdown.
 
 Mouse: double-click selects a word, triple-click a line, and middle-click
 pastes PRIMARY. See [docs/selection.md](docs/selection.md).
+
+Reference Pin keeps one plain-text snapshot per window, only in memory. It
+survives scrolling, clearing the screen and entering a full-screen app, but
+is not saved when the window closes. A new selection replaces the old pin.
+The card previews up to six wrapped lines; Copy includes the retained text,
+not just the preview. Snapshots are limited to 16 KiB at a grapheme boundary,
+with a visible notice when capped. On very small windows the card hides until
+there is room again; the keyboard shortcut can still dismiss it. The pin
+shortcut never runs a command or writes the clipboard; normal select-to-copy
+still applies, and Copy on the card copies the retained snapshot. Escape
+remains available to your shell or app.
+
+For a hands-on demo with synthetic output, run `bash demos/reference-pin.sh`
+inside toastty and follow the on-screen instructions.
 
 <details>
 <summary><b>More on <code>toastty md</code> and <code>toastty image</code></b></summary>

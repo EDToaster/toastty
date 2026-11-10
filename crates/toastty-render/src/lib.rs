@@ -28,6 +28,7 @@ pub mod color;
 pub mod dialog;
 pub mod image;
 pub mod post;
+pub mod reference_pin;
 #[cfg(test)]
 mod render_tests;
 pub mod rgp;
@@ -59,6 +60,7 @@ use crate::image::instance::{
 use crate::image::pipeline::ImagePipeline;
 pub use crate::post::{PostAnimation, PostShaderSource, ShaderError};
 use crate::post::{PostChain, PostState};
+use crate::reference_pin::{PinButton, ReferencePin};
 use crate::rgp::{GpuAssetCache, Rgp3dPipeline};
 use crate::text::glyph_rasterizer::{DEFAULT_LINE_HEIGHT_RATIO, GlyphRasterizer};
 use crate::text::instance::{CellInstance, CellRenderOpts, Theme};
@@ -598,6 +600,13 @@ pub struct Renderer {
     /// SDF pipeline for the close dialog's shapes. Lazily built
     /// alongside the text pipeline.
     ui_pipeline: Option<UiPipeline>,
+    /// Static session-only reference. Its presence never schedules frames.
+    reference_pin: Option<ReferencePin>,
+    reference_pin_hover: Option<PinButton>,
+    /// Separate instance buffer from the modal dialog.
+    reference_pin_pipeline: Option<UiPipeline>,
+    /// Uploaded text range retained for shader-only frames.
+    reference_pin_glyphs: std::ops::Range<usize>,
     /// Optional IME preedit (in-progress composition) string drawn inline
     /// at the terminal cursor every frame. Fed by the platform IME
     /// (e.g. fcitx5) while the user composes Hangul/CJK; it is NOT part of
@@ -1224,12 +1233,12 @@ impl std::fmt::Debug for TextState {
     }
 }
 
-/// Append glyph instances for one line of close-dialog text. `run`'s
+/// Append glyph instances for one line of UI text. `run`'s
 /// origin is absolute (physical px); instances are content-relative, so
 /// `content_origin` (which the vertex shader adds back) is subtracted.
 /// Columns come from the shaper, so wide characters land where it put
 /// them; each glyph takes the colour of the span covering its column.
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
 fn push_dialog_text(
     queue: &Queue,
     text: &mut TextState,
@@ -1238,20 +1247,28 @@ fn push_dialog_text(
     color: impl Fn(dialog::Tone) -> [f32; 4],
     cell: (f32, f32),
     content_origin: [f32; 2],
+    grapheme_mode: bool,
 ) {
     use crate::text::instance::{FLAG_COLOR_GLYPH, FLAG_OVERLAY};
     use toastty_protocols::unicode_core::char_cell_width;
+    use unicode_segmentation::UnicodeSegmentation;
     let mut line = String::new();
     // (end column, tone) per span, for colouring by column.
     let mut tones: Vec<(usize, dialog::Tone)> = Vec::with_capacity(run.spans.len());
     let mut end = 0;
     for span in &run.spans {
         line.push_str(&span.text);
-        end += span
-            .text
-            .chars()
-            .map(|c| usize::from(char_cell_width(c, false)))
-            .sum::<usize>();
+        end += if grapheme_mode {
+            span.text
+                .graphemes(true)
+                .map(|g| usize::from(cluster_cell_width(g, true)))
+                .sum::<usize>()
+        } else {
+            span.text
+                .chars()
+                .map(|c| usize::from(char_cell_width(c, false)))
+                .sum::<usize>()
+        };
         tones.push((end, span.tone));
     }
     if line.is_empty() {
@@ -1264,7 +1281,7 @@ fn push_dialog_text(
             .or(tones.last())
             .map_or(dialog::Tone::Strong, |t| t.1)
     };
-    let lg = text.rasterizer.shape_line(queue, &line, false);
+    let lg = text.rasterizer.shape_line(queue, &line, grapheme_mode);
     let x0 = run.origin[0] - content_origin[0];
     let y0 = run.origin[1] - content_origin[1];
     let primary = lg
@@ -1454,6 +1471,10 @@ impl Renderer {
             close_prompt: None,
             close_dialog_hover: None,
             ui_pipeline: None,
+            reference_pin: None,
+            reference_pin_hover: None,
+            reference_pin_pipeline: None,
+            reference_pin_glyphs: 0..0,
             preedit: None,
             trace_render: std::env::var_os("TOASTTY_TRACE_RENDER").is_some(),
             // The very first frame is always a full clear → goes
@@ -1886,6 +1907,56 @@ impl Renderer {
     #[must_use]
     pub fn has_close_prompt(&self) -> bool {
         self.close_prompt.is_some()
+    }
+
+    /// Replace the in-memory reference without changing terminal content.
+    pub fn set_reference_pin(&mut self, pin: Option<ReferencePin>) {
+        if pin != self.reference_pin {
+            self.needs_full_clear = true;
+            self.reference_pin_hover = None;
+            self.reference_pin = pin;
+        }
+    }
+
+    fn reference_pin_layout(&self) -> Option<reference_pin::PinLayout> {
+        if self.close_prompt.is_some() {
+            return None;
+        }
+        let pin = self.reference_pin.as_ref()?;
+        let cell = self.cell_size();
+        reference_pin::pin_layout(
+            pin,
+            &reference_pin::PinMetrics {
+                origin: self.content_origin(),
+                content: self.content_dims(cell),
+                cell,
+                scale: self.ui_scale,
+            },
+        )
+    }
+
+    /// Hit-test the visible card in physical framebuffer coordinates.
+    #[must_use]
+    pub fn reference_pin_contains(&self, x: f32, y: f32) -> bool {
+        self.reference_pin_layout()
+            .is_some_and(|l| l.contains(x, y))
+    }
+
+    /// Hit-test the visible controls in physical framebuffer coordinates.
+    #[must_use]
+    pub fn reference_pin_button_at(&self, x: f32, y: f32) -> Option<PinButton> {
+        self.reference_pin_layout()?.button_at(x, y)
+    }
+
+    /// Update hover and return whether a redraw is needed.
+    pub fn set_reference_pin_hover(&mut self, hover: Option<PinButton>) -> bool {
+        let hover = hover.filter(|_| self.reference_pin.is_some() && self.close_prompt.is_none());
+        if hover == self.reference_pin_hover {
+            return false;
+        }
+        self.reference_pin_hover = hover;
+        self.needs_full_clear = true;
+        true
     }
 
     /// Where the close dialog goes this frame, if shown.
@@ -2926,10 +2997,12 @@ impl Renderer {
         }
         self.chip_drawn_last = chip_alpha > 0.0;
 
-        // The close dialog's scrim is translucent and covers the whole
-        // window: repaint everything under it each frame it's up (its
-        // removal already forces a full clear in `set_close_prompt`).
-        if self.close_prompt.is_some() && self.post.is_none() {
+        // Repaint beneath viewport UI on active frames, so panel pixels
+        // cannot stack or survive partial draws. This is after the idle
+        // skip gate; merely having a pin does not cause any work.
+        if (self.close_prompt.is_some() || self.reference_pin_layout().is_some())
+            && self.post.is_none()
+        {
             self.needs_full_clear = true;
             term.mark_all_dirty();
         }
@@ -3141,6 +3214,10 @@ impl Renderer {
             let colors = dialog::dialog_colors(theme.bg, theme.fg, self.close_dialog_hover);
             (layout, colors)
         });
+        let pin_layout = self.reference_pin_layout();
+        if pin_layout.is_some() && self.reference_pin_pipeline.is_none() {
+            self.reference_pin_pipeline = Some(UiPipeline::new(&self.device, self.config.format));
+        }
         // Build instances using the cached row glyphs. Reuse the
         // scratch vec across frames. We have to temporarily extract
         // the scratch out of TextState because the builders need to
@@ -3331,9 +3408,25 @@ impl Renderer {
             );
         }
 
-        // Close dialog text, last so it can be drawn on its own after the
-        // dialog panel (see the render pass). Glyph-only instances, so the
-        // bg pass skips them.
+        // Card and modal text have separate ranges, each drawn after its
+        // own panel. Glyph-only instances are excluded from the cell pass.
+        let pin_glyphs_start = instances.len();
+        if let Some(layout) = pin_layout.as_ref() {
+            let colors = dialog::dialog_colors(theme.bg, theme.fg, None);
+            for run in &layout.lines {
+                push_dialog_text(
+                    &self.queue,
+                    text,
+                    &mut instances,
+                    run,
+                    |tone| colors.text(tone),
+                    cell_size,
+                    content_origin,
+                    true,
+                );
+            }
+        }
+        self.reference_pin_glyphs = pin_glyphs_start..instances.len();
         let dialog_glyphs_start = instances.len();
         if let Some((layout, colors)) = close_dialog.as_ref() {
             for run in &layout.lines {
@@ -3345,6 +3438,7 @@ impl Renderer {
                     |tone| colors.text(tone),
                     cell_size,
                     content_origin,
+                    false,
                 );
             }
             for button in layout.buttons() {
@@ -3362,6 +3456,7 @@ impl Renderer {
                         |tone| bc.text(tone),
                         cell_size,
                         content_origin,
+                        false,
                     );
                 }
             }
@@ -3680,11 +3775,7 @@ impl Renderer {
             // The close dialog's glyphs (if any) sit at the end and are
             // drawn after its panel, below. With post shaders, the UI
             // instances (from `ui_start`) are drawn in the UI pass instead.
-            let inst_count = if post_on {
-                ui_start
-            } else {
-                dialog_glyphs_start
-            };
+            let inst_count = if post_on { ui_start } else { pin_glyphs_start };
             text_ref
                 .pipeline
                 .render_bg(&mut rp, &text_ref.bind_group, inst_count);
@@ -3770,6 +3861,20 @@ impl Renderer {
                 chip_pipe.render(&self.queue, &mut rp, &uniform);
             }
 
+            if !post_on
+                && let Some(layout) = pin_layout.as_ref()
+                && let Some(pipe) = self.reference_pin_pipeline.as_mut()
+            {
+                let rects =
+                    reference_pin::pin_rects(layout, theme.bg, theme.fg, self.reference_pin_hover);
+                pipe.render(&self.device, &self.queue, &mut rp, &rects, viewport);
+                text_ref.pipeline.render_glyph_range(
+                    &mut rp,
+                    &text_ref.bind_group,
+                    self.reference_pin_glyphs.clone(),
+                );
+            }
+
             // 8. close dialog, topmost: scrim, shadow, panel, buttons and
             //    icon, then its text on the panel.
             if !post_on
@@ -3794,7 +3899,7 @@ impl Renderer {
                 frame.texture(),
                 term,
                 chip_alpha,
-                ui_start..dialog_glyphs_start,
+                ui_start..pin_glyphs_start,
                 close_dialog
                     .as_ref()
                     .map(|d| (d, dialog_glyphs_start..instances.len())),
@@ -3867,7 +3972,8 @@ impl Renderer {
     /// A frame where the content hasn't changed but the post chain wants
     /// one (an animation tick or an input event it reads): re-run the post
     /// passes over the scratch texture as it is, then the UI pass. Only the
-    /// chips can be up here; every other overlay forces a full frame.
+    /// chips and the static reference pin can be up here; other overlays
+    /// force a full frame. Pin glyphs reuse the last uploaded text range.
     fn render_post_only(
         &mut self,
         term: &Term,
@@ -3964,6 +4070,7 @@ impl Renderer {
         } else {
             None
         };
+        let pin_layout = self.reference_pin_layout();
         let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("toastty-render UI pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -4005,6 +4112,24 @@ impl Renderer {
             let uniform = ChipUniform::new(viewport, &geom, self.ui_scale, 1.0, &colors)
                 .with_icon(chip::pipeline::ICON_COPY);
             chip_pipe.render(&self.queue, &mut rp, &uniform);
+        }
+        if let Some(layout) = pin_layout.as_ref()
+            && let Some(pipe) = self.reference_pin_pipeline.as_mut()
+        {
+            let rects = reference_pin::pin_rects(
+                layout,
+                self.theme.bg,
+                self.theme.fg,
+                self.reference_pin_hover,
+            );
+            pipe.render(&self.device, &self.queue, &mut rp, &rects, viewport);
+            if let Some(text) = self.text.as_ref() {
+                text.pipeline.render_glyph_range(
+                    &mut rp,
+                    &text.bind_group,
+                    self.reference_pin_glyphs.clone(),
+                );
+            }
         }
         if let Some(((layout, colors), glyphs)) = dialog
             && let Some(ui_pipe) = self.ui_pipeline.as_mut()

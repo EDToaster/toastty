@@ -79,6 +79,72 @@ fn px(img: &[u8], x: u32, y: u32) -> [u8; 4] {
 }
 
 #[test]
+fn reference_pin_survives_post_only_frames_and_dismissal_restores_content() {
+    use crate::reference_pin::ReferencePin;
+    let Some(mut r) = Renderer::headless(900, 600, true) else {
+        return;
+    };
+    r.with_font(None, DEFAULT_FONT_SIZE_PX);
+    let mut t = Term::new(30, 90, 100);
+    feed(&mut t, b"\x1b[2 qunderlying terminal\r\n");
+    let baseline = frame(&mut r, &mut t).1;
+    r.set_reference_pin(ReferencePin::new(
+        "keep this nearby\ncargo test --workspace",
+    ));
+    let pinned = frame(&mut r, &mut t).1;
+    assert!(pinned != baseline, "the card must be visible");
+    assert_eq!(frame(&mut r, &mut t).0, RenderOutcome::Skipped);
+    assert_eq!(
+        r.next_redraw_deadline(&t),
+        None,
+        "a pin is not an animation"
+    );
+
+    let l = r.reference_pin_layout().expect("large viewport fits card");
+    assert!(r.reference_pin_contains(l.copy[0] + 1.0, l.copy[1] + 1.0));
+    r.set_close_prompt(Some(crate::ClosePrompt::default()));
+    assert!(!r.reference_pin_contains(l.copy[0] + 1.0, l.copy[1] + 1.0));
+    let _ = frame(&mut r, &mut t);
+    r.set_close_prompt(None);
+    assert!(
+        frame(&mut r, &mut t).1 == pinned,
+        "pin returns after modal dismissal"
+    );
+
+    r.set_post_shaders(&shader("pin-mouse.glsl", MOUSE))
+        .expect("compiles");
+    let post_pinned = frame(&mut r, &mut t).1;
+    assert!(
+        post_pinned == pinned,
+        "pass-through post keeps pin unchanged"
+    );
+    assert_eq!(frame(&mut r, &mut t).0, RenderOutcome::Skipped);
+    r.set_pointer((1.0, 1.0), true);
+    let (outcome, post_only) = frame(&mut r, &mut t);
+    assert_eq!(outcome, RenderOutcome::Rendered);
+    // Every interior card pixel (including its text) is unshaded and
+    // survives the cached-scratch post-only path.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    for y in (l.panel[1] as usize + 12)..(l.panel[3] as usize - 12) {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        for x in (l.panel[0] as usize + 12)..(l.panel[2] as usize - 12) {
+            let i = (y * 900 + x) * 4;
+            assert_eq!(&post_only[i..i + 4], &pinned[i..i + 4], "pin pixel {x},{y}");
+        }
+    }
+    assert!(
+        post_only != pinned,
+        "shader actually changed content behind the pin"
+    );
+    r.set_post_shaders(&[]).expect("disabled");
+    r.set_reference_pin(None);
+    assert!(
+        frame(&mut r, &mut t).1 == baseline,
+        "dismissal leaves no stale panel or glyphs"
+    );
+}
+
+#[test]
 fn pass_through_chain_matches_the_plain_frame_path() {
     for view_formats in [true, false] {
         let (Some(mut plain), Some(mut post)) = (renderer(view_formats), renderer(view_formats))
