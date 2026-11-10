@@ -22,6 +22,7 @@ use toastty_parser::Parser;
 use toastty_protocols::resize_inband::encode_resize_report;
 use toastty_protocols::synchronized::{BSU_TIMEOUT, should_force_flush};
 use toastty_pty::{Pty, PtySpec, WinSize};
+use toastty_render::reference_pin::{PinButton, ReferencePin};
 use toastty_render::{
     ClosePrompt, DialogButton, PostAnimation, PostShaderSource, RenderOutcome, Renderer,
 };
@@ -54,6 +55,7 @@ use toastty::paste::wrap_for_paste;
 use toastty::perf_stats::PerfStats;
 use toastty::preload::Preload;
 use toastty::pty_log::{Direction, PtyLogger};
+use toastty::reference_pin::{ReferenceHit, ReferencePointer, is_pin_binding};
 use toastty::shader_files;
 use toastty::shader_watcher::ShaderWatcher;
 use toastty::shell::resolve_command;
@@ -356,7 +358,14 @@ struct Toastty {
     /// keeps a connection to the OS clipboard server; constructing it
     /// failed on the user's box is recoverable — we just log + skip.
     clipboard: Option<arboard::Clipboard>,
-    /// Keys whose *press* toastty consumed as a copy/paste shortcut.
+    /// Explicit, window-local reference snapshot. Never written to disk or
+    /// sent to the shell; the renderer owns an identical bounded copy.
+    reference_pin: Option<ReferencePin>,
+    reference_pointer: ReferencePointer,
+    /// Pin-owned physical key until release, including repeats after
+    /// the shortcut modifiers have been released.
+    pin_key_down: Option<String>,
+    /// Keys whose *press* toastty consumed as a local shortcut.
     /// Under the kitty keyboard protocol (flag 2, report events) the
     /// matching release would otherwise reach the app as an orphan
     /// (`ESC[118;1:3u` after Ctrl+Shift+V), so we swallow it too. Keyed
@@ -557,6 +566,9 @@ impl Toastty {
             link_pointer: false,
             last_reported_cell: None,
             clipboard: None,
+            reference_pin: None,
+            reference_pointer: ReferencePointer::default(),
+            pin_key_down: None,
             swallowed_releases: Vec::new(),
             pressed_keys: Vec::new(),
             held_modifier_keys: Vec::new(),
@@ -1647,6 +1659,7 @@ impl Toastty {
     /// swallowed whenever it comes.
     fn open_close_prompt(&mut self, prompt: ClosePrompt) {
         self.close_pending = true;
+        self.reference_pointer.cancel_actions();
         self.close_prompt_press = None;
         let local_drag = self.selecting.is_some();
         self.finish_selection_drag();
@@ -1686,6 +1699,7 @@ impl Toastty {
             self.refresh_scroll_chip_hover();
             self.refresh_rich_chip();
             self.refresh_link_hover();
+            self.refresh_reference_hover();
         }
     }
 
@@ -1892,6 +1906,14 @@ impl Toastty {
         repeat: bool,
         is_synthetic: bool,
     ) -> ControlSignal {
+        let pin_owned =
+            self.pin_key_down.as_deref() == Some(key_identity(logical, physical).as_str());
+        if pin_owned {
+            if state == KeyState::Pressed && repeat {
+                return ControlSignal::Continue;
+            }
+            self.pin_key_down = None;
+        }
         // While the close-confirmation prompt is up the window is modal:
         // keystrokes drive the prompt and are never forwarded to the PTY.
         // Releases / synthetic focus-loss events are swallowed silently.
@@ -1921,6 +1943,18 @@ impl Toastty {
         {
             self.swallowed_releases.swap_remove(i);
             return ControlSignal::Continue;
+        }
+        // Pin a selection without touching the clipboard or sending a
+        // command. With no selection the same chord dismisses an existing
+        // pin; with neither, leave the shortcut available to the app.
+        if state == KeyState::Pressed
+            && !is_synthetic
+            && is_pin_binding(logical, modifiers, cfg!(target_os = "macos"))
+            && self.pin_selection_or_dismiss()
+        {
+            self.pin_key_down = Some(key_id.clone());
+            self.swallow_release(key_id);
+            return ControlSignal::RedrawIn(Duration::ZERO);
         }
         // Intercept paste bindings *before* the regular encoder.
         // Shift+Insert pastes PRIMARY on X11/Wayland (xterm, Alacritty),
@@ -2112,8 +2146,21 @@ impl Toastty {
         self.mouse_pos = position;
         self.pointer_inside = true;
         self.link_modifiers = modifiers;
-        let hover_changed =
-            self.refresh_scroll_chip_hover() | self.refresh_link_hover() | self.refresh_rich_chip();
+        let hit = self.reference_hit(position);
+        self.reference_pointer.motion(hit);
+        let hover_changed = self.refresh_scroll_chip_hover()
+            | self.refresh_link_hover()
+            | self.refresh_rich_chip()
+            | self.refresh_reference_hover();
+        if hit != ReferenceHit::Outside || self.reference_pointer.is_captured() {
+            self.selection_autoscroll = 0;
+            self.last_reported_cell = None;
+            return if hover_changed {
+                ControlSignal::RedrawIn(Duration::ZERO)
+            } else {
+                ControlSignal::Continue
+            };
+        }
         let signal = self.handle_mouse_motion_inner(position, modifiers);
         if hover_changed && signal == ControlSignal::Continue {
             ControlSignal::RedrawIn(Duration::ZERO)
@@ -2126,14 +2173,15 @@ impl Toastty {
     /// visible scroll-to-bottom chip and push that to the renderer.
     /// Returns `true` when the hover state changed.
     fn refresh_scroll_chip_hover(&mut self) -> bool {
+        let covered = self.reference_hit(self.mouse_pos) != ReferenceHit::Outside;
         let Some(r) = self.renderer.as_mut() else {
             return false;
         };
         #[allow(clippy::cast_possible_truncation)]
         let (x, y) = (self.mouse_pos.0 as f32, self.mouse_pos.1 as f32);
-        let hovered = r
-            .scroll_button_rect(&self.term)
-            .is_some_and(|rect| x >= rect[0] && x < rect[2] && y >= rect[1] && y < rect[3]);
+        let hovered = !covered
+            && r.scroll_button_rect(&self.term)
+                .is_some_and(|rect| x >= rect[0] && x < rect[2] && y >= rect[1] && y < rect[3]);
         r.set_scroll_button_hover(hovered)
     }
 
@@ -2149,7 +2197,10 @@ impl Toastty {
             return false;
         };
         let on_chip = r.rich_chip_rect(&self.term).is_some_and(inside);
-        let block = if !self.pointer_inside || self.close_pending {
+        let block = if !self.pointer_inside
+            || self.close_pending
+            || self.reference_hit(self.mouse_pos) != ReferenceHit::Outside
+        {
             None
         } else if on_chip && self.rich_chip_block.is_some() {
             self.rich_chip_block
@@ -2250,6 +2301,21 @@ impl Toastty {
         {
             self.modal_buttons_down.swap_remove(i);
             return ControlSignal::Continue;
+        }
+        let hit = self.reference_hit(position);
+        let outcome = self.reference_pointer.mouse(button, state, hit);
+        if outcome.consume {
+            match outcome.activate {
+                Some(PinButton::Copy) => {
+                    if let Some(pin) = &self.reference_pin {
+                        self.write_clipboard(pin.text().to_owned());
+                    }
+                }
+                Some(PinButton::Dismiss) => self.set_reference_pin(None),
+                None => {}
+            }
+            self.refresh_reference_hover();
+            return ControlSignal::RedrawIn(Duration::ZERO);
         }
         match state {
             KeyState::Pressed => self.mouse_held = Some(button),
@@ -2611,6 +2677,86 @@ impl Toastty {
         }
     }
 
+    /// Returns whether the pin shortcut belongs to toastty this time.
+    fn pin_selection_or_dismiss(&mut self) -> bool {
+        let selected_text = self.term.extract_selection_text();
+        let selected = selected_text.as_deref().and_then(ReferencePin::new);
+        if selected_text.is_some() && selected.is_none() {
+            // A blank or non-pinnable selection is not a request to
+            // dismiss an existing reference.
+            return true;
+        }
+        if selected.is_none() && self.reference_pin.is_none() {
+            return false;
+        }
+        if self.selecting.is_some() {
+            // Capture the unfinished local drag's release before clearing
+            // its selection: a tracking app must not see an orphan release.
+            self.selecting = None;
+            if self.buttons_down.contains(&MouseButton::Left) {
+                let _ = self.reference_pointer.mouse(
+                    MouseButton::Left,
+                    KeyState::Pressed,
+                    ReferenceHit::Body,
+                );
+            }
+            if self.mouse_held == Some(MouseButton::Left) {
+                self.mouse_held = None;
+            }
+        }
+        self.set_reference_pin(selected);
+        self.term.clear_selection();
+        self.selection_autoscroll = 0;
+        true
+    }
+
+    fn set_reference_pin(&mut self, pin: Option<ReferencePin>) {
+        self.reference_pointer.cancel_actions();
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_reference_pin(pin.clone());
+        }
+        self.reference_pin = pin;
+        self.clear_link_hover();
+        self.refresh_rich_chip();
+        self.refresh_reference_hover();
+    }
+
+    fn reference_hit(&self, position: (f64, f64)) -> ReferenceHit {
+        if self.close_pending {
+            return ReferenceHit::Outside;
+        }
+        let Some(r) = &self.renderer else {
+            return ReferenceHit::Outside;
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let (x, y) = (position.0 as f32, position.1 as f32);
+        if let Some(button) = r.reference_pin_button_at(x, y) {
+            ReferenceHit::Button(button)
+        } else if r.reference_pin_contains(x, y) {
+            ReferenceHit::Body
+        } else {
+            ReferenceHit::Outside
+        }
+    }
+
+    fn refresh_reference_hover(&mut self) -> bool {
+        let hit = if self.pointer_inside {
+            self.reference_hit(self.mouse_pos)
+        } else {
+            ReferenceHit::Outside
+        };
+        let button = match hit {
+            ReferenceHit::Button(button) => Some(button),
+            ReferenceHit::Outside | ReferenceHit::Body => None,
+        };
+        if let Some(w) = &self.window {
+            w.set_pointer_cursor(button.is_some() || self.link_pointer);
+        }
+        self.renderer
+            .as_mut()
+            .is_some_and(|r| r.set_reference_pin_hover(button))
+    }
+
     /// Stable `(line_id, col)` of the cell under the pointer, or `None`
     /// when the pointer is outside the cell grid (padding, the leftover
     /// sliver). Honors the scrollback offset like selection does.
@@ -2648,7 +2794,8 @@ impl Toastty {
         // Nothing behind the close prompt reacts to the pointer.
         let want = toastty::links::is_open_link_modifiers(self.link_modifiers)
             && self.selecting.is_none()
-            && !self.close_pending;
+            && !self.close_pending
+            && self.reference_hit(self.mouse_pos) == ReferenceHit::Outside;
         if !want && self.term.link_hover().is_none() && !self.link_pointer {
             return false;
         }
@@ -3063,6 +3210,9 @@ impl App for Toastty {
         {
             return ControlSignal::RedrawIn(Duration::ZERO);
         }
+        if relayout && self.refresh_reference_hover() && signal == ControlSignal::Continue {
+            return ControlSignal::RedrawIn(Duration::ZERO);
+        }
         signal
     }
 }
@@ -3350,6 +3500,9 @@ impl Toastty {
                 ControlSignal::RedrawIn(Duration::ZERO)
             }
             Event::Focus(focused) => {
+                if !focused {
+                    self.reference_pointer.cancel_actions();
+                }
                 if let Some(bytes) = encode_focus(focused, self.term.report_focus()) {
                     self.write_pty(bytes);
                 }
@@ -3385,8 +3538,9 @@ impl Toastty {
             }
             Event::PointerLeft => {
                 self.pointer_inside = false;
+                self.reference_pointer.cancel_actions();
                 let chip = self.refresh_rich_chip();
-                if self.clear_link_hover() | chip {
+                if self.clear_link_hover() | chip | self.refresh_reference_hover() {
                     ControlSignal::RedrawIn(Duration::ZERO)
                 } else {
                     ControlSignal::Continue
@@ -3416,6 +3570,13 @@ impl Toastty {
                 modifiers,
             } => self.handle_mouse_motion(position, modifiers),
             Event::Scroll { .. } if self.close_pending => ControlSignal::Continue,
+            Event::Scroll { .. }
+                if self.reference_pointer.is_captured()
+                    || (self.pointer_inside
+                        && self.reference_hit(self.mouse_pos) != ReferenceHit::Outside) =>
+            {
+                ControlSignal::Continue
+            }
             Event::Scroll {
                 kind,
                 phase,
@@ -3676,6 +3837,193 @@ mod tests {
             None,
             Preload::default(),
         )
+    }
+
+    fn pin_key(state: KeyState, repeat: bool, is_synthetic: bool) -> Event {
+        Event::Key {
+            logical: ch("P"),
+            unmodified: ch("p"),
+            physical: PhysicalKey::Code("KeyP".to_owned()),
+            text: Some("\u{10}".to_owned()),
+            modifiers: Modifiers::SHIFT
+                | if cfg!(target_os = "macos") {
+                    Modifiers::SUPER
+                } else {
+                    Modifiers::CONTROL
+                },
+            state,
+            repeat,
+            is_synthetic,
+        }
+    }
+
+    fn select_first_row(app: &mut Toastty) {
+        let top = app.term.bottom_id() - u64::from(app.term.size().0 - 1);
+        app.term.set_selection(Selection {
+            anchor: Pos::new(top, 0),
+            active: Pos::new(top, app.term.size().1 - 1),
+            mode: SelectionMode::Line,
+        });
+        app.term.commit_selection();
+    }
+
+    #[test]
+    fn reference_pin_shortcut_captures_replaces_and_dismisses_without_pty_input() {
+        let mut app = headless_app();
+        app.parser.advance(&mut app.term, b"request-id: abc-123");
+        select_first_row(&mut app);
+        app.event(pin_key(KeyState::Pressed, false, false));
+        assert_eq!(
+            app.reference_pin.as_ref().unwrap().text(),
+            "request-id: abc-123"
+        );
+        assert!(app.term.selection().is_none());
+        // Repeat must not dismiss the pin now that capture cleared selection.
+        app.event(pin_key(KeyState::Pressed, true, false));
+        let mut repeat_without_modifiers = pin_key(KeyState::Pressed, true, false);
+        if let Event::Key {
+            modifiers, logical, ..
+        } = &mut repeat_without_modifiers
+        {
+            *modifiers = Modifiers::empty();
+            *logical = ch("p");
+        }
+        app.event(repeat_without_modifiers);
+        app.event(pin_key(KeyState::Released, false, false));
+        assert!(app.reference_pin.is_some());
+        assert_eq!(app.swallowed_releases, Vec::<String>::new());
+
+        app.parser.advance(&mut app.term, b"\r\x1b[2Kreplacement");
+        select_first_row(&mut app);
+        app.event(pin_key(KeyState::Pressed, false, false));
+        app.event(pin_key(KeyState::Released, false, false));
+        assert_eq!(app.reference_pin.as_ref().unwrap().text(), "replacement");
+        app.event(pin_key(KeyState::Pressed, false, false));
+        app.event(pin_key(KeyState::Released, false, false));
+        assert!(app.reference_pin.is_none());
+        assert_eq!(app.pty_sent, b"");
+        assert!(
+            app.clipboard.is_none(),
+            "pinning never reads or writes the clipboard"
+        );
+    }
+
+    #[test]
+    fn reference_pin_survives_eviction_resize_and_screen_switches() {
+        let mut app = headless_app();
+        app.term = Term::new(3, 30, 2);
+        app.parser.advance(&mut app.term, b"keep this reference");
+        select_first_row(&mut app);
+        app.event(pin_key(KeyState::Pressed, false, false));
+        app.event(pin_key(KeyState::Released, false, false));
+        for _ in 0..20 {
+            app.parser.advance(&mut app.term, b"\r\nnew output");
+        }
+        app.term.resize(4, 12);
+        app.parser
+            .advance(&mut app.term, b"\x1b[?1049hfull-screen app\x1b[?1049l");
+        assert_eq!(
+            app.reference_pin.as_ref().unwrap().text(),
+            "keep this reference"
+        );
+        assert_eq!(app.pty_sent, b"");
+    }
+
+    #[test]
+    fn reference_pin_keeps_previous_snapshot_when_selection_is_blank() {
+        let mut app = headless_app();
+        app.set_reference_pin(ReferencePin::new("keep me"));
+        select_first_row(&mut app);
+        app.event(pin_key(KeyState::Pressed, false, false));
+        app.event(pin_key(KeyState::Released, false, false));
+        assert_eq!(app.reference_pin.as_ref().unwrap().text(), "keep me");
+        assert_eq!(app.pty_sent, b"");
+        assert!(app.term.selection().is_some());
+    }
+
+    #[test]
+    fn reference_pin_does_not_steal_unused_shortcut_or_ordinary_keys() {
+        let mut app = headless_app();
+        // Request kitty key events so both press and release are observable.
+        app.parser.advance(&mut app.term, b"\x1b[>3u");
+        app.event(pin_key(KeyState::Pressed, false, false));
+        app.event(pin_key(KeyState::Released, false, false));
+        assert!(!app.pty_sent.is_empty(), "unused chord belongs to the app");
+        app.pty_sent.clear();
+
+        app.set_reference_pin(ReferencePin::new("reference"));
+        app.event(Event::Key {
+            logical: ch("x"),
+            unmodified: ch("x"),
+            physical: PhysicalKey::Code("KeyX".to_owned()),
+            text: Some("x".to_owned()),
+            modifiers: Modifiers::empty(),
+            state: KeyState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+        });
+        assert!(!app.pty_sent.is_empty(), "typing still reaches the app");
+        assert_eq!(app.reference_pin.as_ref().unwrap().text(), "reference");
+        app.pty_sent.clear();
+        app.event(pin_key(KeyState::Pressed, true, true));
+        assert!(
+            app.reference_pin.is_some(),
+            "synthetic focus events do not dismiss"
+        );
+        assert_eq!(app.pty_sent, b"");
+    }
+
+    #[test]
+    fn reference_pin_capture_keeps_mouse_release_owned_across_close_prompt() {
+        let mut app = headless_app();
+        app.parser.advance(&mut app.term, b"\x1b[?1000;1006h");
+        // Headless equivalent of a card-owned press, followed by the
+        // real modal dispatch and eventual release path.
+        let outcome = app.reference_pointer.mouse(
+            MouseButton::Left,
+            KeyState::Pressed,
+            ReferenceHit::Button(PinButton::Dismiss),
+        );
+        assert!(outcome.consume);
+        app.track_button_down(MouseButton::Left, KeyState::Pressed);
+        app.open_close_prompt(ClosePrompt::default());
+        app.event(mouse(MouseButton::Left, KeyState::Released, (5.0, 5.0)));
+        assert!(!app.reference_pointer.is_captured());
+        assert!(app.pty_sent.is_empty(), "no orphan mouse release");
+        assert!(
+            app.close_pending,
+            "release does not activate the modal dialog"
+        );
+    }
+
+    #[test]
+    fn reference_pin_during_local_drag_does_not_leak_release_to_tracking_app() {
+        let mut app = headless_app();
+        app.parser
+            .advance(&mut app.term, b"\x1b[?1000;1006hreference");
+        app.event(Event::Mouse {
+            button: MouseButton::Left,
+            state: KeyState::Pressed,
+            position: (5.0, 5.0),
+            modifiers: Modifiers::SHIFT,
+        });
+        assert!(app.selecting.is_some());
+        select_first_row(&mut app);
+        app.event(pin_key(KeyState::Pressed, false, false));
+        assert!(app.reference_pin.is_some());
+        assert!(app.selecting.is_none());
+        app.event(Event::MouseMotion {
+            position: (200.0, 200.0),
+            modifiers: Modifiers::empty(),
+        });
+        app.event(mouse(MouseButton::Left, KeyState::Released, (200.0, 200.0)));
+        app.event(pin_key(KeyState::Released, false, false));
+        assert!(!app.reference_pointer.is_captured());
+        assert_eq!(app.pty_sent, b"");
+        assert!(
+            app.clipboard.is_none(),
+            "pin action does not copy the selection"
+        );
     }
 
     fn mouse(button: MouseButton, state: KeyState, position: (f64, f64)) -> Event {
