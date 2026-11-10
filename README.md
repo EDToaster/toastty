@@ -242,6 +242,7 @@ toastty reads `~/.config/toastty/config.toml` and reloads it when it
 changes. Start from the defaults:
 
 ```sh
+mkdir -p ~/.config/toastty
 toastty --print-default-config > ~/.config/toastty/config.toml
 ```
 
