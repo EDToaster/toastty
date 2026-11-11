@@ -29,6 +29,7 @@ mod link;
 mod reflow;
 mod rich;
 mod selection;
+mod smooth;
 mod term;
 mod viewport;
 
@@ -44,6 +45,7 @@ pub use rich::{
     RichPalette, RichParams, RichRow, RichTextRun, parse_osc_7700,
 };
 pub use selection::{Pos, Selection, SelectionMode};
+pub use smooth::{SmoothRect, SmoothRegion};
 pub use term::{
     ClipboardRequest, ClipboardTarget, ClipboardTargets, KITTY_FLAG_DISAMBIGUATE,
     KITTY_FLAG_REPORT_ALL_AS_ESC, KITTY_FLAG_REPORT_ALTERNATE, KITTY_FLAG_REPORT_EVENTS,

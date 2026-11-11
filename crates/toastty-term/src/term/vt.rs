@@ -491,6 +491,7 @@ impl Term {
     /// pen state xterm's soft reset covers, without clearing the screen
     /// or moving the cursor.
     pub(super) fn soft_reset(&mut self) {
+        self.clear_smooth_regions();
         if !self.cursor_visible {
             self.cursor_visible = true;
             let col = self.cursor.col.min(self.cols.saturating_sub(1));
