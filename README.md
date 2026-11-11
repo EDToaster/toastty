@@ -188,6 +188,9 @@ The full matrix is in [docs/protocols.md](docs/protocols.md), and
 
 - **Smooth scrolling** through 10,000 lines of scrollback (configurable),
   for wheel and touchpad.
+- Experimental [smooth regions for alternate-screen TUIs](docs/smooth-regions.md):
+  cooperating apps declare rectangles that move by fractions of a cell while
+  headers, footers and neighboring panes remain fixed.
 - A **scroll-to-bottom button** appears while you're reading history.
 - **Font zoom** with Ctrl+= / Ctrl+- / Ctrl+0, which reflows like a resize.
 - **Transparent backgrounds**: give the theme background an alpha, e.g.

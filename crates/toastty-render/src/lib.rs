@@ -31,6 +31,7 @@ pub mod post;
 #[cfg(test)]
 mod render_tests;
 pub mod rgp;
+mod smooth;
 pub mod surface_format;
 #[cfg(test)]
 mod test_gpu;
@@ -2893,7 +2894,7 @@ impl Renderer {
         // Rich slices are alpha-blended over the cell backgrounds, so a
         // partial (LoadOp::Load) frame would stack them on last frame's
         // pixels. Repaint everything while blocks are (or just were) shown.
-        if rich_active || self.rich_drawn_last {
+        if rich_active || self.rich_drawn_last || !term.smooth_regions().is_empty() {
             self.needs_full_clear = true;
             term.mark_all_dirty();
         }
@@ -3210,6 +3211,8 @@ impl Renderer {
             tracing::info!(target: "render_trace", "build_instances n={} took={ms:.3}ms", instances.len());
         }
 
+        smooth::cells(&mut instances, term.smooth_regions(), cell_size);
+
         // Without post shaders the overlays below go into the same draws as
         // the cells, in this order. With them, everything from `ui_start`
         // on is UI, drawn after the post passes and never shaded; the IME
@@ -3430,6 +3433,7 @@ impl Renderer {
                     (!(self.needs_full_clear || damage_all)).then(|| term.damage()),
                 );
             }
+            smooth::images(&mut tmp, term.smooth_regions(), cell_size);
             let stats = image_pipeline.resolve_kitty_textures(
                 &self.device,
                 &self.queue,
@@ -3528,6 +3532,7 @@ impl Renderer {
         // zero-area rect).
         let cursor_rect = if cursor_visible {
             let r = crate::text::instance::cursor_pixel_rect(term, cell_size);
+            let r = smooth::cursor_rect(r, term.smooth_regions(), cell_size);
             [
                 r[0] + origin[0],
                 r[1] + origin[1],

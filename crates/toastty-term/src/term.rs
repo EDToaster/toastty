@@ -46,6 +46,7 @@ mod placeholder;
 #[cfg(test)]
 mod relative_tests;
 mod rich_term;
+mod smooth_term;
 mod vt;
 
 pub use placeholder::PlaceholderRun;
@@ -255,6 +256,7 @@ pub struct Term {
     csi_param_digits: u32,
     /// DECSET 2026 — synchronized output (BSU/ESU) state.
     sync_output: SyncOutput,
+    smooth_scroll: crate::smooth::SmoothScroll,
     /// DECSET 2027 — grapheme cluster processing opt-in.
     grapheme_cluster_mode: bool,
     /// DECSET 2048 — in-band resize notifications opt-in.
@@ -594,6 +596,7 @@ impl Term {
             kitty_keyboard_stacks: [Vec::new(), Vec::new()],
             csi_param_digits: 0,
             sync_output: SyncOutput::default(),
+            smooth_scroll: crate::smooth::SmoothScroll::default(),
             grapheme_cluster_mode: false,
             inband_resize_mode: false,
             cwd: String::new(),
@@ -680,6 +683,8 @@ impl Term {
     /// one doesn't stay resident when no further graphics command comes.
     pub fn drain_pty_replies(&mut self) -> Vec<u8> {
         self.image_handler.expire_pending(Instant::now());
+        self.expire_smooth_scroll(Instant::now());
+        self.smooth_scroll.drain_requests(&mut self.pty_replies);
         std::mem::take(&mut self.pty_replies)
     }
 
@@ -905,6 +910,7 @@ impl Term {
         if new == self.cell_pixel_size {
             return;
         }
+        self.clear_smooth_regions();
         self.rich_dirty = true;
         self.cell_pixel_size = new;
         let cell = (u32::from(new.0), u32::from(new.1));
@@ -2130,6 +2136,7 @@ impl Term {
     /// only (full-screen apps redraw on SIGWINCH). The cursor is remapped
     /// through the reflow and then clamped to the new dimensions.
     pub fn resize(&mut self, rows: u16, cols: u16) {
+        self.clear_smooth_regions();
         let rows = rows.max(1);
         let cols = cols.max(1);
         let primary_cap = rows as usize + self.scrollback as usize;
@@ -4114,6 +4121,7 @@ impl Term {
         if self.alt_active {
             return;
         }
+        self.clear_smooth_regions();
         // Drop any selection from the primary grid — once we're on
         // alt, the user can't see the primary content anyway, and
         // selection state would resurface as a phantom highlight on
@@ -4150,6 +4158,7 @@ impl Term {
         if !self.alt_active {
             return;
         }
+        self.clear_smooth_regions();
         // A selection made on the alt screen addresses alt-grid line
         // ids; resolving those against the primary grid would
         // highlight unrelated rows.
@@ -4179,6 +4188,7 @@ impl Term {
     /// (the kitty hard requirement) clear all image placements. RIS
     /// clears what's *on screen*, matching kitty, which drops placements.
     fn ris(&mut self) {
+        self.clear_smooth_regions();
         // Leave the alt screen first so the reset lands on the primary
         // grid the user will see.
         if self.alt_active {
@@ -4759,7 +4769,9 @@ impl Perform for Term {
         if payload.is_empty() {
             return;
         }
-        if payload[0] == b'G' {
+        if payload.starts_with(b"smooth;") {
+            self.handle_smooth_apc(&payload);
+        } else if payload[0] == b'G' {
             // Kitty graphics. Split on the first `;` into header
             // vs body.
             let split = payload.iter().position(|&b| b == b';');

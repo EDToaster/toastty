@@ -79,6 +79,105 @@ fn px(img: &[u8], x: u32, y: u32) -> [u8; 4] {
 }
 
 #[test]
+fn smooth_region_frames_clip_neighbours_commit_atomically_and_restore() {
+    let mut r = renderer(false).expect("GPU required for smooth region rendering test");
+    let mut t = term(&r);
+    feed(&mut t, b"\x1b[?1049h\x1b[?25l");
+    for row in 1..=10 {
+        feed(
+            &mut t,
+            format!(
+                "\x1b[{row};1H\x1b[48;5;{}m{:40}\x1b[0m",
+                20 + row,
+                "stationary | moving | stationary"
+            )
+            .as_bytes(),
+        );
+    }
+    let original = frame(&mut r, &mut t).1;
+    feed(&mut t, b"\x1b_smooth;1;2;9;2;18;0;0;0;0\x1b\\");
+    let unshifted = frame(&mut r, &mut t).1;
+    assert_eq!(
+        frame(&mut r, &mut t).0,
+        RenderOutcome::Skipped,
+        "an idle active region needs no frame"
+    );
+    feed(
+        &mut t,
+        b"\x1b[?2026h\x1b_smooth;1;2;9;2;18;0;0;500;500\x1b\\",
+    );
+    let (outcome, paused) = frame(&mut r, &mut t);
+    assert_eq!(outcome, RenderOutcome::Skipped);
+    assert_eq!(paused, unshifted, "metadata must not appear before ESU");
+    feed(&mut t, b"\x1b[?2026l");
+    let shifted = frame(&mut r, &mut t).1;
+    assert_ne!(
+        shifted, unshifted,
+        "fractional movement must reach the real GPU frame"
+    );
+    let (cw, ch) = r.cell_size();
+    for y in 0..H {
+        for x in 0..W {
+            let inside = f64::from(x) >= 2.0 * f64::from(cw)
+                && f64::from(x) < 19.0 * f64::from(cw)
+                && f64::from(y) >= 2.0 * f64::from(ch)
+                && f64::from(y) < 10.0 * f64::from(ch);
+            if !inside {
+                assert_eq!(
+                    px(&shifted, x, y),
+                    px(&original, x, y),
+                    "neighbour changed at {x},{y}"
+                );
+            }
+        }
+    }
+    feed(&mut t, b"\x1b_smooth;off\x1b\\");
+    assert_eq!(
+        frame(&mut r, &mut t).1,
+        original,
+        "removal must erase shifted pixels"
+    );
+    assert_eq!(
+        frame(&mut r, &mut t).0,
+        RenderOutcome::Skipped,
+        "idle regions must not animate"
+    );
+}
+
+#[test]
+fn smooth_region_moves_real_kitty_pixels_with_padding() {
+    let mut r = renderer(false).expect("GPU required for smooth image rendering test");
+    r.set_padding(7, 11, 7, 11);
+    let mut t = term(&r);
+    feed(&mut t, b"\x1b[?1049h\x1b[?25l\x1b[H");
+    // A red/blue 1x2 RGBA texture spans both the region and its exterior.
+    feed(
+        &mut t,
+        b"\x1b_Ga=T,f=32,s=1,v=2,c=30,r=10,z=1,q=2;/wAA/wAA//8=\x1b\\",
+    );
+    assert!(!t.image_grid().is_empty());
+    feed(&mut t, b"\x1b_smooth;1;2;9;2;18;0;0;0;0\x1b\\");
+    let before = frame(&mut r, &mut t).1;
+    feed(&mut t, b"\x1b_smooth;1;2;9;2;18;0;0;500;500\x1b\\");
+    let after = frame(&mut r, &mut t).1;
+    let (cw, ch) = r.cell_size();
+    let (ox, oy) = r.content_origin_px();
+    let sample = |col: f32, row: f32| ((ox + col * cw) as u32, (oy + row * ch) as u32);
+    let (x, y) = sample(8.0, 4.5);
+    assert_ne!(
+        px(&before, x, y),
+        px(&after, x, y),
+        "raster pixels must follow the offset"
+    );
+    let (x, y) = sample(25.0, 4.5);
+    assert_eq!(
+        px(&before, x, y),
+        px(&after, x, y),
+        "the same image outside the region must stay fixed"
+    );
+}
+
+#[test]
 fn pass_through_chain_matches_the_plain_frame_path() {
     for view_formats in [true, false] {
         let (Some(mut plain), Some(mut post)) = (renderer(view_formats), renderer(view_formats))

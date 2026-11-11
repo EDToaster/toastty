@@ -55,6 +55,7 @@ Tracking list of escape sequences, modes, and extensions toastty intends to supp
 | Protocol | Sequence / Mode | Notes |
 | --- | --- | --- |
 | Synchronized output | DECSET 2026 (BSU/ESU) | Atomic redraws; tmux/neovim/Textual rely on it. Must-have |
+| Smooth scroll regions (experimental) | `APC smooth;… ST` | Protocol 3 wire forms from Ghostty Smooth, not an upstream standard. Up to eight alternate-screen rectangles, fractional text/raster rendering, SGR wheel acknowledgements and app-set offsets. Requires client opt-in and overscan cells; see [design, integration and limitations](smooth-regions.md) |
 | Grapheme cluster processing | DECSET 2027 | Terminal Unicode Core; opt-in correct emoji/ZWJ width |
 | In-band resize notifications | DECSET 2048 | Stream-based resize, no SIGWINCH race. Sent on window resize, font zoom, and config reloads that change the grid |
 | Kitty keyboard protocol | CSI u + progressive enhancement flags | Push/pop via `CSI > flags u` / `CSI < u`. Neovim/helix/zellij use it |

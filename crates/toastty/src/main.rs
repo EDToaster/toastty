@@ -741,7 +741,16 @@ impl Toastty {
                 (r.cell_size(), r.content_origin_px())
             });
         let (rows, cols) = self.term.size();
-        pixel_to_cell(self.mouse_pos, origin, cell_size, (rows, cols))
+        let cell = (
+            (self.mouse_pos.0 - f64::from(origin.0)) / f64::from(cell_size.0),
+            (self.mouse_pos.1 - f64::from(origin.1)) / f64::from(cell_size.1),
+        );
+        let adjusted = self.term.smooth_input_cell(cell);
+        let position = (
+            f64::from(origin.0) + adjusted.0 * f64::from(cell_size.0),
+            f64::from(origin.1) + adjusted.1 * f64::from(cell_size.1),
+        );
+        pixel_to_cell(position, origin, cell_size, (rows, cols))
     }
 
     /// Translate the current pointer position into a stable selection
@@ -2676,6 +2685,35 @@ impl Toastty {
         self.term.set_link_hover(span)
     }
 
+    /// The window boundary supplies physical pixels; protocol state and PTY
+    /// forwarding stay here so scale, padding and row direction agree.
+    fn scroll_smooth_region(
+        &mut self,
+        kind: toastty_window::ScrollKind,
+        delta_y: f64,
+        cell_size: (f32, f32),
+        origin: (f32, f32),
+    ) -> bool {
+        if kind != toastty_window::ScrollKind::Pixels || !self.config.scrollback.smooth_scrolling {
+            return false;
+        }
+        let point = (
+            (self.mouse_pos.0 - f64::from(origin.0)) / f64::from(cell_size.0),
+            (self.mouse_pos.1 - f64::from(origin.1)) / f64::from(cell_size.1),
+        );
+        if !self
+            .term
+            .scroll_smooth_region(point, delta_y / f64::from(cell_size.1), Instant::now())
+        {
+            return false;
+        }
+        let replies = self.term.drain_pty_replies();
+        if !replies.is_empty() {
+            self.write_pty(&replies);
+        }
+        true
+    }
+
     fn handle_scroll(
         &mut self,
         scroll_kind: toastty_window::ScrollKind,
@@ -2756,6 +2794,13 @@ impl Toastty {
         };
         if protocol_wants_event(mode, &pre_kind) {
             let cell = self.current_cell();
+            let r = self.renderer.as_ref().expect("renderer checked above");
+            let smooth_y = self.scroll_smooth_region(
+                scroll_kind,
+                delta_y,
+                r.cell_size(),
+                r.content_origin_px(),
+            );
             let (notches_y, notches_x): (i32, i32) = match scroll_kind {
                 toastty_window::ScrollKind::Lines => {
                     // Reset pixel accumulators when a wheel notch
@@ -2772,7 +2817,11 @@ impl Toastty {
                 }
                 toastty_window::ScrollKind::Pixels => {
                     let threshold = self.pixel_scroll_threshold(2.0, f64::from(cell_h));
-                    self.mouse_scroll_accum_y += delta_y;
+                    if smooth_y {
+                        self.mouse_scroll_accum_y = 0.0;
+                    } else {
+                        self.mouse_scroll_accum_y += delta_y;
+                    }
                     self.mouse_scroll_accum_x += delta_x;
                     let cy = (self.mouse_scroll_accum_y / threshold).trunc();
                     let cx = (self.mouse_scroll_accum_x / threshold).trunc();
@@ -2805,7 +2854,11 @@ impl Toastty {
                     }
                 }
             }
-            return ControlSignal::Continue;
+            return if smooth_y {
+                ControlSignal::RedrawIn(Duration::ZERO)
+            } else {
+                ControlSignal::Continue
+            };
         }
 
         // Priority 2: alt screen + no mouse mode. Apps like `less`,
@@ -3165,6 +3218,7 @@ impl Toastty {
                 // newly-lerped position. When the animation is at rest,
                 // `advance_viewport` is a cheap no-op that returns false.
                 let now = Instant::now();
+                self.term.expire_smooth_scroll(now);
                 if let Some(r) = self.renderer.as_ref() {
                     let cell_h = r.cell_size().1;
                     if cell_h > 0.0 {
@@ -3276,6 +3330,11 @@ impl Toastty {
                         .next_animation_frame()
                         .map(|t| t.saturating_duration_since(Instant::now()));
                     next_blink = min_deadline(next_blink, next_image_frame);
+                    let next_scroll_ack = self
+                        .term
+                        .smooth_scroll_deadline()
+                        .map(|t| t.saturating_duration_since(Instant::now()));
+                    next_blink = min_deadline(next_blink, next_scroll_ack);
                 }
                 // If the viewport is still animating, schedule the next
                 // frame ~60 Hz. Combined with any blink deadline via
@@ -3676,6 +3735,42 @@ mod tests {
             None,
             Preload::default(),
         )
+    }
+
+    #[test]
+    fn smooth_region_routes_precision_pixels_to_fractional_rows_and_pty() {
+        let mut app = headless_app();
+        let (cw, ch) = (10.0, 19.0);
+        let (ox, oy) = (11.0, 7.0);
+        app.config.scrollback.smooth_scrolling = true;
+        app.mouse_pos = (f64::from(ox + 2.5 * cw), f64::from(oy + 2.5 * ch));
+        Parser::new().advance(
+            &mut app.term,
+            b"\x1b[?1049h\x1b[?1000;1006h\x1b_smooth;1;1;10;1;20;10;100\x1b\\",
+        );
+        let scroll = |app: &mut Toastty, rows: f64| {
+            app.scroll_smooth_region(
+                toastty_window::ScrollKind::Pixels,
+                rows * f64::from(ch),
+                (cw, ch),
+                (ox, oy),
+            )
+        };
+        scroll(&mut app, 0.25);
+        assert_eq!(app.term.smooth_regions()[0].shift()[1], 0.25);
+        assert_eq!(app.pty_sent, b"");
+        scroll(&mut app, 1.0);
+        assert_eq!(app.pty_sent, b"\x1b[<65;3;3M");
+        Parser::new().advance(&mut app.term, b"\x1b_smooth;1;1;10;1;20;11;100\x1b\\");
+        assert_eq!(app.term.smooth_regions()[0].shift()[1], 0.25);
+        app.config.scrollback.smooth_scrolling = false;
+        app.pty_sent.clear();
+        assert!(
+            !scroll(&mut app, 2.0),
+            "disabled smoothing must leave legacy forwarding in charge"
+        );
+        assert_eq!(app.pty_sent, b"");
+        assert_eq!(app.term.smooth_regions()[0].shift()[1], 0.25);
     }
 
     fn mouse(button: MouseButton, state: KeyState, position: (f64, f64)) -> Event {
