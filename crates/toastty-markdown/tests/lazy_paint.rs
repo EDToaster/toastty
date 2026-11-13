@@ -7,6 +7,7 @@ use toastty_markdown::{LayoutParams, Renderer, ResourcePolicy, Theme};
 
 const DEMO: &str = include_str!("golden/demo.md");
 const KITCHEN_SINK: &str = include_str!("golden/kitchen_sink.md");
+const RESPONSIVE: &str = include_str!("../../../docs/fixtures/mermaid-responsive.md");
 
 fn params(cols: u16) -> LayoutParams {
     LayoutParams {
@@ -100,6 +101,59 @@ fn warm_caches_do_not_change_the_output() {
         warm.layout(DEMO, &params(cols)).unwrap();
     }
     assert_eq!(warm.render(DEMO, &p).unwrap(), cold);
+}
+
+#[test]
+fn responsive_diagrams_survive_resize_scroll_and_width_revisits() {
+    for block in RESPONSIVE.split("```mermaid\n").skip(1).take(2) {
+        let source = block.split("\n```").next().unwrap();
+        let markdown = format!("```mermaid\n{source}\n```");
+        let prepared =
+            toastty_markdown::mermaid::prepare_mermaid(source, 16.0, &Theme::default()).unwrap();
+        let mut warm = Renderer::hermetic();
+        for cols in [120, 48, 120] {
+            let p = params(cols);
+            // Require real diagram output, not a coincidentally matching
+            // code fallback in both paths.
+            prepared.size_for(u32::from(cols - 2) * p.cell_w).unwrap();
+            let cold = Renderer::hermetic().render(&markdown, &p).unwrap();
+            let layout = warm.layout(&markdown, &p).unwrap();
+            assert_eq!(layout.text(), cold.text.as_slice());
+            assert_eq!(layout.links(), cold.links.as_slice());
+            for band in [352, 37] {
+                // A normalized cache band must not become a visible seam
+                // when the terminal requests differently aligned GPU tiles.
+                let pixels = stitched(&mut warm, &layout, band);
+                if let Some(m) = mismatch(&pixels, &cold.image.pixels, layout.width) {
+                    panic!(
+                        "{}: cols {cols}, band {band}: {m}",
+                        source.lines().next().unwrap()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn unreadable_diagrams_show_the_complete_code_fallback() {
+    let p = params(48);
+    for block in RESPONSIVE.split("```mermaid\n").skip(3) {
+        let source = block.split("\n```").next().unwrap();
+        let prepared =
+            toastty_markdown::mermaid::prepare_mermaid(source, p.font_px, &p.theme).unwrap();
+        assert!(prepared.size_for(u32::from(p.cols - 2) * p.cell_w).is_err());
+        let mut renderer = Renderer::hermetic();
+        let fallback = renderer
+            .render(&format!("```mermaid\n{source}\n```"), &p)
+            .unwrap();
+        let code = renderer
+            .render(&format!("```text\n{source}\n```"), &p)
+            .unwrap();
+        // Public selection/copy text and pixels must both match an ordinary
+        // wrapped code block, rather than a blank or partially lost diagram.
+        assert_eq!(fallback, code);
+    }
 }
 
 #[test]

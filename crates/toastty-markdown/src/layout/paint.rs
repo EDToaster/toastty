@@ -6,7 +6,7 @@ use tiny_skia::{
     Stroke, Transform,
 };
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::mermaid::PreparedDiagram;
 use crate::{Raster, Rgba};
@@ -51,7 +51,7 @@ impl Src {
     pub(crate) fn id(&self) -> usize {
         match self {
             Src::Img(i) => Arc::as_ptr(i) as usize,
-            Src::Diagram(d, w) => (Arc::as_ptr(d) as usize) ^ (*w as usize).rotate_left(48),
+            Src::Diagram(d, _) => Arc::as_ptr(d) as usize,
         }
     }
 }
@@ -287,39 +287,131 @@ fn blit(dst: &mut Pixmap, src: &Pixmap, x: i32, y: i32) {
     }
 }
 
-/// Images resampled to their placed size, so every band blits the same
-/// pixels (resampling per band would depend on the band's offset) and a
-/// tall image is resampled once, not once per tile. The key's `Src` is
-/// kept alive with the entry, so its pointer can't be reused.
+/// Images resampled to their placed size and fixed-height diagram bands.
+/// Every paint blits identical pixels regardless of its vertical offset.
+/// Images retain their source; diagram entries retain only a weak
+/// identity, so cached pixels cannot keep old prepared scenes alive.
 #[derive(Default)]
 pub(crate) struct Scaled {
-    map: std::collections::HashMap<(usize, u32, u32), (Src, Arc<Pixmap>)>,
+    map: std::collections::HashMap<ScaledKey, ScaledEntry>,
     bytes: u64,
+    clock: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ScaledKey {
+    Image(usize, u32, u32),
+    /// Source identity, canonical fit, band top and height. The requested
+    /// width is deliberately absent: multiple widths can fit identically.
+    Diagram(usize, (u8, u32, u32, u32), u32, u32),
+}
+
+struct ScaledEntry {
+    source: SourceOwner,
+    pixels: Arc<Pixmap>,
+    used: u64,
+}
+
+enum SourceOwner {
+    Image { _image: Arc<Img> },
+    // A weak handle reserves the allocation identity without retaining
+    // the SVG scene. Expired owners must never produce a cache hit.
+    Diagram(Weak<PreparedDiagram>),
+}
+
+impl SourceOwner {
+    fn new(source: &Src) -> Self {
+        match source {
+            Src::Img(image) => Self::Image {
+                _image: Arc::clone(image),
+            },
+            Src::Diagram(diagram, _) => Self::Diagram(Arc::downgrade(diagram)),
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        match self {
+            Self::Image { .. } => true,
+            Self::Diagram(diagram) => diagram.upgrade().is_some(),
+        }
+    }
 }
 
 const MAX_SCALED_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SCALED_ENTRIES: usize = 512;
+const DIAGRAM_BAND_HEIGHT: u32 = 256;
 
 impl Scaled {
-    fn get(&mut self, src: &Src, w: u32, h: u32) -> Option<Arc<Pixmap>> {
-        let key = (src.id(), w, h);
-        if let Some((_, pm)) = self.map.get(&key) {
-            return Some(Arc::clone(pm));
+    fn cached(&mut self, key: &ScaledKey) -> Option<Arc<Pixmap>> {
+        let entry = self.map.get_mut(key)?;
+        if !entry.source.is_live() {
+            self.discard(key);
+            return None;
         }
-        let diagram: Option<Arc<Pixmap>> = match src {
-            Src::Img(_) => None,
-            Src::Diagram(d, max_w) => Some(d.pixmap(*max_w).ok()?),
-        };
-        let from: &Pixmap = match (src, &diagram) {
-            (_, Some(p)) => p,
-            (Src::Img(img), None) => &img.pm,
-            (Src::Diagram(..), None) => return None,
-        };
-        let pm = if from.width() == w && from.height() == h {
-            match diagram {
-                // Already at size and shared: no copy.
-                Some(p) => return Some(p),
-                None => Arc::new(from.clone()),
+        self.clock = self.clock.saturating_add(1);
+        entry.used = self.clock;
+        Some(Arc::clone(&entry.pixels))
+    }
+
+    fn discard(&mut self, key: &ScaledKey) {
+        if let Some(old) = self.map.remove(key) {
+            self.bytes -= old.pixels.data().len() as u64;
+        }
+    }
+
+    fn purge_stale(&mut self) {
+        let bytes = &mut self.bytes;
+        self.map.retain(|_, entry| {
+            if entry.source.is_live() {
+                true
+            } else {
+                *bytes -= entry.pixels.data().len() as u64;
+                false
             }
+        });
+    }
+
+    fn remember(&mut self, key: ScaledKey, src: &Src, pixels: &Arc<Pixmap>) {
+        let bytes = pixels.data().len() as u64;
+        // An oversized image can still be painted, but must not flush
+        // useful entries or make the retained-byte budget a soft limit.
+        if bytes > MAX_SCALED_BYTES {
+            return;
+        }
+        self.purge_stale();
+        self.discard(&key);
+        while self.bytes + bytes > MAX_SCALED_BYTES || self.map.len() >= MAX_SCALED_ENTRIES {
+            let Some(oldest) = self
+                .map
+                .iter()
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.discard(&oldest);
+        }
+        self.clock = self.clock.saturating_add(1);
+        self.bytes += bytes;
+        self.map.insert(
+            key,
+            ScaledEntry {
+                source: SourceOwner::new(src),
+                pixels: Arc::clone(pixels),
+                used: self.clock,
+            },
+        );
+    }
+
+    fn get_image(&mut self, src: &Src, w: u32, h: u32) -> Option<Arc<Pixmap>> {
+        let Src::Img(img) = src else { return None };
+        let key = ScaledKey::Image(src.id(), w, h);
+        if let Some(pm) = self.cached(&key) {
+            return Some(pm);
+        }
+        let from = &img.pm;
+        let pm = if from.width() == w && from.height() == h {
+            Arc::new(from.clone())
         } else {
             let mut out = Pixmap::new(w, h)?;
             let pp = PixmapPaint {
@@ -339,21 +431,60 @@ impl Scaled {
             );
             Arc::new(out)
         };
-        let bytes = u64::from(w) * u64::from(h) * 4;
-        if self.bytes + bytes > MAX_SCALED_BYTES {
-            self.map.clear();
-            self.bytes = 0;
-        }
-        self.bytes += bytes;
-        self.map.insert(key, (src.clone(), Arc::clone(&pm)));
+        self.remember(key, src, &pm);
         Some(pm)
+    }
+
+    /// Rasterize only normalized bands intersecting the destination. The
+    /// diagram is already fitted by layout, so no second resampling pass
+    /// (and no full-height intermediate raster) is needed.
+    fn draw_diagram(
+        &mut self,
+        dst: &mut Pixmap,
+        src: &Src,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+    ) -> Option<()> {
+        let Src::Diagram(diagram, max_w) = src else {
+            return None;
+        };
+        let fit = diagram.raster_key(*max_w).ok()?;
+        if (fit.2, fit.3) != (w, h) {
+            return None;
+        }
+        if x >= dst.width() as i32 || x + w as i32 <= 0 {
+            return Some(());
+        }
+        let top = (-y).max(0) as u32;
+        let bottom = (dst.height() as i32 - y).max(0) as u32;
+        let bottom = bottom.min(h);
+        if top >= bottom {
+            return Some(());
+        }
+        let first = top / DIAGRAM_BAND_HEIGHT * DIAGRAM_BAND_HEIGHT;
+        for band_y in (first..bottom).step_by(DIAGRAM_BAND_HEIGHT as usize) {
+            let band_h = DIAGRAM_BAND_HEIGHT.min(h - band_y);
+            let key = ScaledKey::Diagram(Arc::as_ptr(diagram) as usize, fit, band_y, band_h);
+            let pixels = if let Some(hit) = self.cached(&key) {
+                hit
+            } else {
+                let pixels = diagram.pixmap_band(*max_w, band_y, band_h).ok()?;
+                self.remember(key, src, &pixels);
+                pixels
+            };
+            blit(dst, &pixels, x, y + band_y as i32);
+        }
+        Some(())
     }
 }
 
 /// Paint `ops` into `pm`, whose top edge is at block y = `oy` (a whole
 /// pixel). Ops entirely outside the band are skipped. Painting is
 /// translation-invariant: any band gives the same pixels as the
-/// corresponding rows of a full paint.
+/// corresponding rows of a full paint. Returns false when a raster
+/// cannot be painted, so callers can retain their text fallback.
 pub(crate) fn execute(
     pm: &mut Pixmap,
     ops: &[Op],
@@ -361,7 +492,7 @@ pub(crate) fn execute(
     fs: &mut FontSystem,
     swash: &mut SwashCache,
     scaled: &mut Scaled,
-) {
+) -> bool {
     let (pw, ph) = (pm.width() as i32, pm.height() as i32);
     let (top, bottom) = (oy as f32, oy as f32 + ph as f32);
     let tf = Transform::from_translate(0.0, -top);
@@ -447,10 +578,17 @@ pub(crate) fn execute(
                 if iw == 0 || ih == 0 {
                     continue;
                 }
-                let Some(img) = scaled.get(&src, iw, ih) else {
+                let (x, y) = (x.round() as i32, y.round() as i32);
+                if matches!(src, Src::Diagram(..)) {
+                    if scaled.draw_diagram(pm, &src, x, y, iw, ih).is_none() {
+                        return false;
+                    }
                     continue;
+                }
+                let Some(img) = scaled.get_image(&src, iw, ih) else {
+                    return false;
                 };
-                blit(pm, &img, x.round() as i32, y.round() as i32);
+                blit(pm, &img, x, y);
             }
             Op::Circle {
                 cx,
@@ -513,6 +651,7 @@ pub(crate) fn execute(
             }
         }
     }
+    true
 }
 
 /// Premultiplied pixmap → straight-alpha raster.
@@ -538,6 +677,191 @@ pub(crate) fn into_raster(pm: Pixmap) -> Raster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sequence() -> Arc<PreparedDiagram> {
+        let mut source = String::from("sequenceDiagram\nparticipant A\nparticipant B\n");
+        for i in 0..45 {
+            use std::fmt::Write as _;
+            writeln!(source, "A->>B: Message {i}").unwrap();
+        }
+        crate::mermaid::prepare_mermaid(&source, 16.0, &crate::Theme::default()).unwrap()
+    }
+
+    #[test]
+    fn diagram_paints_only_visible_bands_and_reuses_equivalent_fits() {
+        let diagram = sequence();
+        let (w, h) = diagram.size_for(1200).unwrap();
+        assert!(h > 3 * DIAGRAM_BAND_HEIGHT);
+        assert_eq!(
+            diagram.raster_key(1200).unwrap(),
+            diagram.raster_key(1600).unwrap()
+        );
+        let mut cache = Scaled::default();
+        let mut viewport = Pixmap::new(w, 40).unwrap();
+        let source = Src::Diagram(Arc::clone(&diagram), 1200);
+        cache
+            .draw_diagram(&mut viewport, &source, 0, -300, w, h)
+            .unwrap();
+        assert_eq!(cache.map.len(), 1);
+        assert_eq!(cache.bytes, u64::from(w) * DIAGRAM_BAND_HEIGHT as u64 * 4);
+        let key = *cache.map.keys().next().unwrap();
+        let pixels = Arc::clone(&cache.map[&key].pixels);
+
+        viewport.fill(tiny_skia::Color::TRANSPARENT);
+        cache
+            .draw_diagram(
+                &mut viewport,
+                &Src::Diagram(Arc::clone(&diagram), 1600),
+                0,
+                -300,
+                w,
+                h,
+            )
+            .unwrap();
+        assert_eq!(cache.map.len(), 1);
+        assert!(Arc::ptr_eq(&pixels, &cache.map[&key].pixels));
+
+        let full = diagram.pixmap_band(1200, 0, h).unwrap();
+        for (y0, band_h) in [(0, 37), (249, 37), (501, 300), (h - 17, 17)] {
+            let mut band = Pixmap::new(w, band_h).unwrap();
+            cache
+                .draw_diagram(&mut band, &source, 0, -(y0 as i32), w, h)
+                .unwrap();
+            let start = y0 as usize * w as usize * 4;
+            let expected = &full.data()[start..start + band.data().len()];
+            assert!(
+                band.data()
+                    .iter()
+                    .zip(expected)
+                    .all(|(a, b)| a.abs_diff(*b) <= 4),
+                "diagram band differs at y={y0}"
+            );
+        }
+        let before = cache.map.len();
+        cache
+            .draw_diagram(&mut viewport, &source, 0, 100, w, h)
+            .unwrap();
+        assert_eq!(cache.map.len(), before, "offscreen diagram was rasterized");
+    }
+
+    #[test]
+    fn raster_cache_evicts_cold_entries_without_flushing_hot_ones() {
+        let source = Src::Diagram(sequence(), 1200);
+        let mut cache = Scaled::default();
+        let key = |i| ScaledKey::Diagram(source.id(), (0, 1.0_f32.to_bits(), 512, 20_000), i, 256);
+        let band_bytes = 512 * 256 * 4;
+        let count = MAX_SCALED_BYTES / band_bytes;
+        for i in 0..count {
+            let pixels = Arc::new(Pixmap::new(512, 256).unwrap());
+            cache.remember(key(i as u32), &source, &pixels);
+        }
+        let hot = cache.cached(&key(0)).unwrap();
+        cache.remember(
+            key(count as u32),
+            &source,
+            &Arc::new(Pixmap::new(512, 256).unwrap()),
+        );
+        assert!(cache.cached(&key(1)).is_none(), "oldest cold band survived");
+        assert!(Arc::ptr_eq(&hot, &cache.cached(&key(0)).unwrap()));
+        assert_eq!(cache.map.len(), count as usize);
+        assert_eq!(cache.bytes, MAX_SCALED_BYTES);
+        assert_eq!(
+            cache.bytes,
+            cache
+                .map
+                .values()
+                .map(|e| e.pixels.data().len() as u64)
+                .sum::<u64>()
+        );
+
+        let before = cache.bytes;
+        cache.remember(
+            key(1000),
+            &source,
+            &Arc::new(Pixmap::new(4096, (MAX_SCALED_BYTES / (4096 * 4) + 1) as u32).unwrap()),
+        );
+        assert_eq!(cache.bytes, before, "oversized raster displaced the cache");
+        assert!(cache.cached(&key(1000)).is_none());
+    }
+
+    #[test]
+    fn raster_cache_bounds_tiny_entries_without_retaining_diagram_scenes() {
+        let diagram = sequence();
+        let weak = Arc::downgrade(&diagram);
+        let source = Src::Diagram(diagram, 1200);
+        let mut cache = Scaled::default();
+        for i in 0..=MAX_SCALED_ENTRIES {
+            let key = ScaledKey::Diagram(source.id(), (0, 1.0_f32.to_bits(), 1, 1000), i as u32, 1);
+            cache.remember(key, &source, &Arc::new(Pixmap::new(1, 1).unwrap()));
+        }
+        assert_eq!(cache.map.len(), MAX_SCALED_ENTRIES);
+        assert_eq!(cache.bytes, MAX_SCALED_ENTRIES as u64 * 4);
+        let key = *cache.map.keys().next().unwrap();
+        drop(source);
+        assert!(
+            weak.upgrade().is_none(),
+            "band cache retained its prepared diagram"
+        );
+        assert!(
+            cache.cached(&key).is_none(),
+            "stale diagram pixels were returned"
+        );
+        assert_eq!(cache.map.len(), MAX_SCALED_ENTRIES - 1);
+        assert_eq!(cache.bytes, (MAX_SCALED_ENTRIES - 1) as u64 * 4);
+
+        // A new admission sweeps the remaining expired owners without
+        // disturbing live image entries or keeping their byte charges.
+        let image = Img::new(&Raster {
+            width: 1,
+            height: 1,
+            pixels: vec![255; 4],
+            baseline: None,
+        })
+        .unwrap();
+        let image_weak = Arc::downgrade(&image);
+        let image_source = Src::Img(image);
+        let image_key = ScaledKey::Image(image_source.id(), 1, 1);
+        cache.remember(
+            image_key,
+            &image_source,
+            &Arc::new(Pixmap::new(1, 1).unwrap()),
+        );
+        assert_eq!(cache.map.len(), 1);
+        assert_eq!(cache.bytes, 4);
+        drop(image_source);
+        assert!(
+            image_weak.upgrade().is_some(),
+            "image cache no longer retains its source identity"
+        );
+        assert!(cache.cached(&image_key).is_some());
+        drop(cache);
+        assert!(image_weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn failed_diagram_paint_is_reported_instead_of_succeeding_blank() {
+        let mut pm = Pixmap::new(10, 10).unwrap();
+        let mut fonts = FontSystem::new_with_locale_and_db(
+            "en-US".into(),
+            cosmic_text::fontdb::Database::new(),
+        );
+        let op = Op::Image {
+            // A zero-width fit is rejected by the real Mermaid backend.
+            src: Src::Diagram(sequence(), 0),
+            x: 0.0,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+        };
+        assert!(!execute(
+            &mut pm,
+            &[op],
+            0,
+            &mut fonts,
+            &mut SwashCache::new(),
+            &mut Scaled::default(),
+        ));
+    }
 
     #[test]
     fn premultiplied_round_trip() {

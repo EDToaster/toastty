@@ -1,0 +1,80 @@
+Native Mermaid benchmark comparison, recorded 2026-11-13
+
+Baseline:
+  commit: 546c7a337f2daab5cb5c4b7251d06b2b419855db
+  detached checkout: /tmp/toastty-mermaid-baseline-546c7a3
+  only the benchmark example and fixture were copied into this checkout
+
+After:
+  responsive implementation in this change
+  shared Scaled cache budget: 64 * 1024 * 1024 bytes
+  production code finalized before the timed runs
+  test-only edits during the task do not change the benchmark executable
+
+Build:
+  cargo build --release -j 2 -p toastty-markdown --example mermaid_bench
+  repository release profile: thin LTO, codegen-units=1, stripped symbols
+  repository package-specific optimization overrides retained
+  compilation excluded from measurements
+
+Run order, each with --rounds 50 --size-passes 32:
+  before-546c7a3-run1
+  after-64MiB-run1
+  before-546c7a3-run2
+  after-64MiB-run2
+
+Final output completion times (UTC):
+  before-1.csv: 2026-11-13 19:06:19
+  after-1.csv:  2026-11-13 19:07:14
+  before-2.csv: 2026-11-13 19:08:01
+  after-2.csv:  2026-11-13 19:08:55
+
+Each run completed with exit code 0 and empty stderr.
+Each CSV has 140 coverage rows and 55 metric rows.
+All four final runs are preserved; none was selected as a fastest run.
+Earlier exploratory 32 MiB runs are not included.
+No other Cargo/rustc/test processes were active during the timed runs.
+No CPU affinity was set. This is a virtual CPU environment, not dedicated
+benchmark hardware; shared-host variation cannot be ruled out.
+
+System:
+  Linux 6.1.155 x86_64 GNU/Linux
+  4 online vCPUs, 1 thread per core, 4 cores, 1 socket
+  Intel(R) Xeon(R) Processor @ 2.90GHz, family 6, model 106, stepping 6
+  KVM full virtualization
+  process CPU clock: /proc/self/stat, getconf CLK_TCK=100
+  hardware counters: not collected; perf unavailable
+
+Compiler:
+  rustc 1.100.0 (0ef1bc386 2026-11-09)
+  commit-hash: 0ef1bc386059596dada8fb65b50425aab2ea637a
+  commit-date: 2026-11-09
+  host: x86_64-unknown-linux-gnu
+  LLVM version: 23.1.5
+
+Rendering:
+  only bundled fonts; Renderer::hermetic()
+  default dark Theme, label font_px=16
+  application grid cell_w=10, cell_h=22, max_rows=2000
+  coverage widths: 320, 640, 960, 1600, 4096
+  application width revisits: 640, 960, 1200, 960, 640, 1200
+  viewport height: 50 rows = 1100 px
+  first/warm size sweep: every integer width 320..=1200 and back
+  each warm sample repeats that round trip 32 times
+
+SHA-256, identical harness and fixture in both checkouts:
+  3fc129f76ddb3c4043f212bc3b3b07dc9e8e2253e7b2e5f46e5d4a446fc56ccb  crates/toastty-markdown/examples/mermaid_bench.rs
+  0220119f79056ee9fd4c616112b86d30265d50643d175e3821d479355d59a8e5  docs/fixtures/mermaid-responsive.md
+
+SHA-256, executed binaries:
+  0562c3d8ed2b33dbf11c0d0ecdc8aa2d7926def501c6b83e36424ef824f2c4a9  before mermaid_bench
+  7ce508639b5ffa0f9a2ecb6e01e713214fbf8d3906c45de73644a0ef3ae289c5  after mermaid_bench
+
+SHA-256, dependency lockfiles:
+  3d0d70548d79df7a198fcfa636d5b80d3d9445b5d8d3540798e98c8e883497f4  before Cargo.lock
+  5f56f79c325524cee8d5c8394f9d0ab9e10b6460a3b9ba57f42dcac98ef626d2  after Cargo.lock
+
+SHA-256, after renderer source tree (includes test-only code):
+  3d215c2d50a8165a07c244cf87b0e0db0eb291827d90bc71a5d08fbfa658b08a  crates/toastty-markdown/src/mermaid.rs
+  eba1e9acc38ebe878de24b38543614919969905b9ac4cbede403353b0d1e3bb5  crates/toastty-markdown/src/mermaid/labels.rs
+  b3c6b9e4a5a83e7a27cf4b17a7ce1907e061e652f771b9f38b896753e86d87c3  crates/toastty-markdown/src/layout/paint.rs

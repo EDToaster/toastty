@@ -9,14 +9,16 @@
 //!   match the terminal. The few colours the renderer hard-codes (gantt
 //!   bars, marker fills) are remapped in the SVG. The canvas is
 //!   transparent; only the diagram's own shapes are painted.
-//! - **Fonts:** hermetic. The renderer estimates text widths itself
-//!   (no font access) and resvg sees a font database holding only the
-//!   bundled faces.
-//! - **Size:** laid out at [`BASE_FONT_PX`] and scaled so labels come out
-//!   at `font_px`, then scaled down to fit `max_width_px` (at most
+//! - **Fonts:** hermetic. Supported plain-text labels are wrapped using
+//!   the bundled Noto Sans metrics before layout. Unsupported rich labels
+//!   retain the upstream layout. resvg sees only the bundled faces.
+//! - **Size:** at most two immutable layouts, with standard and compact
+//!   wrapping. Resize selects one and a cheap transform; no per-pixel
+//!   parsing, wrapping or graph layout. Fitted to `max_width_px` (at most
 //!   [`MAX_WIDTH_PX`]), [`MAX_HEIGHT_PX`] and [`MAX_PIXELS`]. The canvas
 //!   grows to the drawn content when the renderer's view box is too
-//!   tight, so nothing is clipped.
+//!   tight. If the smallest label cannot meet the readable floor, the
+//!   caller shows the source instead of a microscopic diagram.
 //! - **Robustness:** sources over [`MAX_SOURCE_BYTES`], or graphs with
 //!   more than [`MAX_NODES`] nodes / [`MAX_EDGES`] edges, are rejected
 //!   before layout, and panics inside the renderer are caught and
@@ -32,6 +34,8 @@ use resvg::usvg;
 use tiny_skia::{Pixmap, Transform};
 
 use crate::{Raster, Rgba, Theme};
+
+mod labels;
 
 /// Largest accepted Mermaid source.
 pub const MAX_SOURCE_BYTES: usize = 64 * 1024;
@@ -50,7 +54,7 @@ pub const MAX_HEIGHT_PX: u32 = 8192;
 pub const MAX_PIXELS: u64 = 16 * 1024 * 1024;
 /// Smallest label size worth showing: diagrams that only fit by shrinking
 /// labels below this are rejected (the caller shows the source instead).
-pub const MIN_LABEL_PX: f32 = 4.0;
+pub const MIN_LABEL_PX: f32 = 12.0;
 /// Label font size the diagram is laid out at (the renderer's tuning
 /// size) before scaling to `font_px`.
 pub const BASE_FONT_PX: f32 = 14.0;
@@ -93,29 +97,38 @@ pub fn render_mermaid(
     prepared.rasterize(max_width_px)
 }
 
-/// A parsed, themed Mermaid diagram, ready to rasterize at any width.
-///
-/// Parsing, layout and SVG generation don't depend on the block width, so
-/// the layout engine prepares a diagram once per (source, font size,
-/// theme) and only re-rasterizes it, lazily and only when painted, when
-/// the width it must fit changes.
+/// Immutable geometry, shared by all widths. At most one compact layout
+/// is prepared, on first demand; pixel-sized resize steps never rerun it.
 pub struct PreparedDiagram {
+    diagram: Diagram,
+    theme: Theme,
+    standard: Scene,
+    compact: OnceLock<Result<Option<Scene>, String>>,
+    font_px: f32,
+}
+
+struct Scene {
     tree: usvg::Tree,
-    /// Canvas origin and size in SVG units (covers spill past the view box).
     x0: f32,
     y0: f32,
     w: f32,
     h: f32,
-    font_px: f32,
-    /// Last rasterization: (max width it was fitted to, pixels).
-    last: std::sync::Mutex<Option<(u32, Arc<Pixmap>)>>,
+    min_font_px: f32,
+}
+
+#[derive(Clone, Copy)]
+struct Fit {
+    variant: u8,
+    scale: f32,
+    width: u32,
+    height: u32,
 }
 
 impl std::fmt::Debug for PreparedDiagram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedDiagram")
-            .field("w", &self.w)
-            .field("h", &self.h)
+            .field("w", &self.standard.w)
+            .field("h", &self.standard.h)
             .finish_non_exhaustive()
     }
 }
@@ -144,7 +157,23 @@ pub fn prepare_mermaid(
         return Err(format!("invalid font size {font_px}"));
     }
     guarded(|| {
-        let svg = render_svg(src, theme)?;
+        let diagram = parse_checked(src)?;
+        let mut wrapped = diagram.clone();
+        labels::prepare(&mut wrapped, labels::Profile::Standard)?;
+        let standard = Scene::new(&wrapped, theme)?;
+        Ok(Arc::new(PreparedDiagram {
+            diagram,
+            theme: theme.clone(),
+            standard,
+            compact: OnceLock::new(),
+            font_px,
+        }))
+    })
+}
+
+impl Scene {
+    fn new(diagram: &Diagram, theme: &Theme) -> Result<Self, String> {
+        let svg = diagram_svg(diagram, theme)?;
         let opts = usvg::Options {
             font_family: FONT_FAMILY.to_owned(),
             fontdb: fontdb(),
@@ -168,16 +197,59 @@ pub fn prepare_mermaid(
         if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
             return Err("diagram has no size".into());
         }
-        Ok(Arc::new(PreparedDiagram {
+        let min_font_px = smallest_font(tree.root()).unwrap_or(BASE_FONT_PX);
+        Ok(Self {
             tree,
             x0,
             y0,
             w,
             h,
-            font_px,
-            last: std::sync::Mutex::new(None),
-        }))
-    })
+            min_font_px,
+        })
+    }
+
+    fn fit(&self, width: u32, font_px: f32, variant: u8) -> Result<Fit, String> {
+        let floor = MIN_LABEL_PX.min(font_px);
+        // Edge labels and chart ticks are often smaller than node labels.
+        // Measure the actual smallest SVG span rather than assuming 14px.
+        let natural_font = font_px.max(floor / self.min_font_px * BASE_FONT_PX);
+        let (scale, width, height) = fit(self.w, self.h, width, natural_font);
+        if scale * self.min_font_px + 0.01 < floor {
+            return Err("diagram cannot fit legibly at this width; showing source".into());
+        }
+        Ok(Fit {
+            variant,
+            scale,
+            width,
+            height,
+        })
+    }
+}
+
+fn smallest_font(root: &usvg::Group) -> Option<f32> {
+    let mut minimum: Option<f32> = None;
+    let mut groups = vec![root];
+    while let Some(group) = groups.pop() {
+        for node in group.children() {
+            match node {
+                usvg::Node::Group(g) => groups.push(g),
+                usvg::Node::Text(t) => {
+                    let transform = t.abs_transform();
+                    let sy = transform.kx.hypot(transform.sy);
+                    for span in t.chunks().iter().flat_map(usvg::TextChunk::spans) {
+                        if span.start() < span.end() {
+                            let size = span.font_size().get() * sy;
+                            if size.is_finite() && size > 0.0 {
+                                minimum = Some(minimum.map_or(size, |old| old.min(size)));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    minimum
 }
 
 impl PreparedDiagram {
@@ -187,46 +259,88 @@ impl PreparedDiagram {
     /// # Errors
     /// When the diagram would be too small to read at that width.
     pub fn size_for(&self, max_width_px: u32) -> Result<(u32, u32), String> {
-        self.fit(max_width_px).map(|(_, w, h)| (w, h))
+        self.plan(max_width_px).map(|p| (p.width, p.height))
     }
 
-    fn fit(&self, max_width_px: u32) -> Result<(f32, u32, u32), String> {
+    fn plan(&self, max_width_px: u32) -> Result<Fit, String> {
         if max_width_px == 0 {
             return Err("zero width".into());
         }
-        let (scale, pw, ph) = fit(self.w, self.h, max_width_px, self.font_px);
-        if scale * BASE_FONT_PX < MIN_LABEL_PX.min(self.font_px) {
-            return Err(format!(
-                "diagram too large to show legibly ({:.0}x{:.0} at {max_width_px} px wide)",
-                self.w, self.h
-            ));
+        if let Ok(plan) = self.standard.fit(max_width_px, self.font_px, 0) {
+            return Ok(plan);
         }
-        Ok((scale, pw, ph))
+        let compact = self.compact.get_or_init(|| {
+            guarded(|| {
+                let mut diagram = self.diagram.clone();
+                if !labels::prepare(&mut diagram, labels::Profile::Compact)? {
+                    return Ok(None);
+                }
+                Scene::new(&diagram, &self.theme).map(Some)
+            })
+        });
+        if let Ok(Some(scene)) = compact {
+            return scene.fit(max_width_px, self.font_px, 1);
+        }
+        Err("diagram cannot fit legibly at this width; showing source".into())
     }
 
-    /// Premultiplied pixels fitted to `max_width_px`. The last result is
-    /// kept, so painting several tiles of one diagram rasterizes once.
-    pub(crate) fn pixmap(&self, max_width_px: u32) -> Result<Arc<Pixmap>, String> {
-        if let Ok(last) = self.last.lock()
-            && let Some((w, pm)) = last.as_ref()
-            && *w == max_width_px
-        {
-            return Ok(Arc::clone(pm));
+    /// Canonical geometry key: window widths beyond the natural size
+    /// share pixels. Scale bits distinguish subpixel fits with equal sizes.
+    pub(crate) fn raster_key(&self, max_width_px: u32) -> Result<(u8, u32, u32, u32), String> {
+        let p = self.plan(max_width_px)?;
+        Ok((p.variant, p.scale.to_bits(), p.width, p.height))
+    }
+
+    /// Only paint the requested rows. The renderer owns the shared,
+    /// byte-bounded band cache; a diagram never retains a full raster.
+    // All coordinates are bounded by MAX_WIDTH_PX / MAX_HEIGHT_PX.
+    #[allow(clippy::cast_precision_loss)]
+    pub(crate) fn pixmap_band(
+        &self,
+        max_width_px: u32,
+        y0: u32,
+        height: u32,
+    ) -> Result<Arc<Pixmap>, String> {
+        let p = self.plan(max_width_px)?;
+        if height == 0 || y0 >= p.height {
+            return Err("empty diagram band".into());
         }
-        let (scale, pw, ph) = self.fit(max_width_px)?;
-        let pm = guarded(|| {
-            let mut pixmap = Pixmap::new(pw, ph).ok_or("cannot allocate raster")?;
-            resvg::render(
-                &self.tree,
-                Transform::from_translate(-self.x0, -self.y0).post_scale(scale, scale),
-                &mut pixmap.as_mut(),
-            );
-            Ok(Arc::new(pixmap))
-        })?;
-        if let Ok(mut last) = self.last.lock() {
-            *last = Some((max_width_px, Arc::clone(&pm)));
-        }
-        Ok(pm)
+        let scene = if p.variant == 0 {
+            &self.standard
+        } else {
+            self.compact
+                .get()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(Option::as_ref)
+                .ok_or("missing compact scene")?
+        };
+        let height = height.min(p.height - y0);
+        guarded(|| {
+            // Guard rows keep filter/antialias boundaries away from the
+            // cache-band seam; copy only the requested interior afterwards.
+            const GUARD: u32 = 8;
+            let start = y0.saturating_sub(GUARD);
+            let end = y0
+                .saturating_add(height)
+                .saturating_add(GUARD)
+                .min(p.height);
+            let mut pixmap = Pixmap::new(p.width, end - start).ok_or("cannot allocate raster")?;
+            let transform = Transform::from_translate(-scene.x0, -scene.y0)
+                .post_scale(p.scale, p.scale)
+                .post_translate(0.0, -(start as f32));
+            // Keep resvg's scene traversal: render_node rejects zero-area
+            // centerline bounds even for visible stroked horizontal/vertical
+            // paths, so naive node culling drops lifelines and arrow shafts.
+            resvg::render(&scene.tree, transform, &mut pixmap.as_mut());
+            if start == y0 && end == y0 + height {
+                return Ok(Arc::new(pixmap));
+            }
+            let rect = tiny_skia::IntRect::from_xywh(0, (y0 - start) as i32, p.width, height)
+                .ok_or("invalid diagram band")?;
+            Ok(Arc::new(
+                pixmap.clone_rect(rect).ok_or("cannot copy diagram band")?,
+            ))
+        })
     }
 
     /// Straight-alpha raster fitted to `max_width_px`.
@@ -234,7 +348,8 @@ impl PreparedDiagram {
     /// # Errors
     /// Too small to read, allocation failure, or an empty render.
     pub fn rasterize(&self, max_width_px: u32) -> Result<Raster, String> {
-        let pixmap = self.pixmap(max_width_px)?;
+        let (_, height) = self.size_for(max_width_px)?;
+        let pixmap = self.pixmap_band(max_width_px, 0, height)?;
         let mut pixels = Vec::with_capacity(pixmap.width() as usize * pixmap.height() as usize * 4);
         for px in pixmap.pixels() {
             let c = px.demultiply();
@@ -268,7 +383,13 @@ fn guarded<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
 }
 
 /// Mermaid source → themed SVG string.
+#[cfg(test)]
 fn render_svg(src: &str, theme: &Theme) -> Result<String, String> {
+    let diagram = parse_checked(src)?;
+    diagram_svg(&diagram, theme)
+}
+
+fn parse_checked(src: &str) -> Result<Diagram, String> {
     let mut diagram = mermaid_svg::parse(src).map_err(|e| e.to_string())?;
     check_complexity(&diagram)?;
     if let Diagram::Gantt(g) = &mut diagram {
@@ -278,9 +399,13 @@ fn render_svg(src: &str, theme: &Theme) -> Result<String, String> {
         // is sized to the width instead.
         g.tick_interval = None;
     }
+    Ok(diagram)
+}
+
+fn diagram_svg(diagram: &Diagram, theme: &Theme) -> Result<String, String> {
     let palette = Palette::new(theme);
     // `render_diagram_with` ignores the source's theme/config preamble.
-    let svg = mermaid_svg::render_diagram_with(&diagram, &palette.mermaid_theme())
+    let svg = mermaid_svg::render_diagram_with(diagram, &palette.mermaid_theme())
         .map_err(|e| e.to_string())?;
     Ok(palette.remap_literals(&svg, matches!(diagram, Diagram::Gantt(_))))
 }
@@ -665,6 +790,10 @@ impl Palette {
             // Default-theme note colours (state notes).
             ("#fff5ad", self.note_fill),
             ("#aaaa33", self.note_stroke),
+            // Packet field boxes and requirement relationship-label panels
+            // otherwise retain pale fills behind terminal-colored light text.
+            ("#efefef", self.fill),
+            ("#e8e8e8", bg),
         ];
         let mut text: Vec<(&str, Rgba)> = vec![
             ("#fff", light),
@@ -1169,13 +1298,9 @@ mod tests {
         let wide = "flowchart LR\n  A[A fairly long first label] --> B[Another long label] --> C[Yet another label here] --> D[And the final long label]\n";
         let natural = render_mermaid(wide, 4096, 16.0, &dark()).unwrap();
         assert!(natural.width > 300, "natural width {}", natural.width);
-        for cap in [natural.width - 1, 800, 600, 400] {
+        for cap in [natural.width - 1, natural.width - 20] {
             let r = render_mermaid(wide, cap, 16.0, &dark()).unwrap();
             assert!(r.width <= cap, "width {} > cap {cap}", r.width);
-            assert!(r.width + 1 >= cap, "width {} far below cap {cap}", r.width);
-            // Aspect ratio kept.
-            let ratio = |r: &Raster| f64::from(r.width) / f64::from(r.height);
-            assert!((ratio(&r) - ratio(&natural)).abs() / ratio(&natural) < 0.05);
         }
         // So narrow that labels would be specks: an error, not a smear.
         let e = render_mermaid(wide, 100, 16.0, &dark()).unwrap_err();
@@ -1190,26 +1315,153 @@ mod tests {
     }
 
     #[test]
-    fn height_cap_respected() {
+    fn height_cap_does_not_make_labels_unreadable() {
         use std::fmt::Write as _;
         let mut src = String::from("sequenceDiagram\n  participant A\n  participant B\n");
         for i in 0..400 {
             let _ = writeln!(src, "  A->>B: message {i}");
         }
         let t = Instant::now();
-        let r = render_mermaid(&src, 4096, 16.0, &dark()).unwrap();
-        eprintln!(
-            "400-message sequence: {}x{} in {:?}",
-            r.width,
-            r.height,
-            t.elapsed()
-        );
-        assert!(r.height <= MAX_HEIGHT_PX);
-        assert!(
-            r.height >= MAX_HEIGHT_PX - 1,
-            "expected scale-down, got {}",
-            r.height
-        );
+        let error = render_mermaid(&src, 4096, 16.0, &dark()).unwrap_err();
+        assert!(error.contains("legibly"), "{error}");
+        eprintln!("400-message sequence rejected legibly in {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn compact_layout_is_deterministic_across_resize_order() {
+        let src = "flowchart LR\n A[The first descriptive node that needs wrapping] --> B[The second descriptive node that needs wrapping]\n";
+        let prepared = prepare_mermaid(src, 16.0, &dark()).unwrap();
+        // A cold narrow request and a wide-to-narrow resize must make the
+        // same choice. Reversing the drag must not retain compact geometry.
+        let widths = [360, 480, 640, 1000, 640, 480, 360, 1000];
+        for width in widths {
+            let fresh = prepare_mermaid(src, 16.0, &dark()).unwrap();
+            assert_eq!(prepared.size_for(width), fresh.size_for(width));
+            assert_eq!(prepared.raster_key(width), fresh.raster_key(width));
+            if let Ok(plan) = prepared.plan(width) {
+                let scene = if plan.variant == 0 {
+                    &prepared.standard
+                } else {
+                    prepared
+                        .compact
+                        .get()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                };
+                assert!(plan.scale * scene.min_font_px >= MIN_LABEL_PX - 0.01);
+                assert!(plan.width <= width);
+            }
+        }
+    }
+
+    #[test]
+    fn gallery_bands_match_resvg_whole_scene_for_every_type() {
+        // The oracle deliberately bypasses pixmap_band. Comparing stitched
+        // bands with our own full-export path would miss common-mode bugs,
+        // such as dropping stroked zero-area paths in both outputs.
+        let gallery = include_str!("../../../docs/mermaid-gallery.md");
+        let mut count = 0;
+        for block in gallery.split("```mermaid\n").skip(1) {
+            let src = block.split("\n```").next().unwrap();
+            let prepared = prepare_mermaid(src, 16.0, &dark()).unwrap();
+            let plan = prepared.plan(4096).unwrap();
+            assert_eq!(plan.variant, 0);
+            let scene = &prepared.standard;
+            let mut whole = Pixmap::new(plan.width, plan.height).unwrap();
+            resvg::render(
+                &scene.tree,
+                Transform::from_translate(-scene.x0, -scene.y0).post_scale(plan.scale, plan.scale),
+                &mut whole.as_mut(),
+            );
+            assert!(whole.pixels().iter().any(|p| p.alpha() > 0));
+            for y in [0, plan.height / 2, plan.height.saturating_sub(37)] {
+                let band = prepared.pixmap_band(4096, y, 300).unwrap();
+                let start = y as usize * plan.width as usize * 4;
+                let reference = &whole.data()[start..start + band.data().len()];
+                let max_difference = band
+                    .data()
+                    .iter()
+                    .zip(reference)
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap();
+                let changed = band
+                    .data()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(reference.as_chunks::<4>().0)
+                    .filter(|(a, b)| a.iter().zip(b.iter()).any(|(a, b)| a.abs_diff(*b) > 4))
+                    .count();
+                // Clipping changes tiny-skia's curve subdivision at sparse
+                // edge pixels (especially pie/radar curves). Bound both
+                // magnitude and area, not just an average pixel error.
+                let pixels = band.data().len() / 4;
+                assert!(
+                    max_difference <= 96 && changed * 1000 <= pixels,
+                    "{}: band at {y}, max difference {max_difference}, {changed}/{pixels} pixels",
+                    src.lines().next().unwrap()
+                );
+                // The zero-area stroke regression specifically dropped
+                // horizontal arrow shafts and vertical lifelines. Require
+                // tight coverage for the independent sequence oracle.
+                if matches!(&prepared.diagram, Diagram::Sequence(_)) {
+                    assert!(max_difference <= 4, "sequence stroke changed at y={y}");
+                }
+            }
+            count += 1;
+        }
+        assert_eq!(count, 23, "gallery coverage unexpectedly changed");
+    }
+
+    #[test]
+    fn minimum_size_includes_edge_labels_and_chart_ticks() {
+        let prepared = prepare_mermaid(FLOWCHART, 16.0, &dark()).unwrap();
+        assert!(prepared.standard.min_font_px < BASE_FONT_PX);
+        for width in [200, 400, 800, 1600] {
+            if let Ok(plan) = prepared.plan(width) {
+                let scene = if plan.variant == 0 {
+                    &prepared.standard
+                } else {
+                    prepared
+                        .compact
+                        .get()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                };
+                assert!(
+                    scene.min_font_px * plan.scale >= MIN_LABEL_PX - 0.01,
+                    "accepted unreadable edge text at width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dark_packet_and_requirement_panels_follow_the_palette() {
+        let theme = dark();
+        let palette = Palette::new(&theme);
+        for (src, forbidden) in [
+            (
+                "packet-beta\n 0-15: \"Source\"\n 16-31: \"Destination\"\n",
+                "#efefef",
+            ),
+            (
+                "requirementDiagram\nrequirement a {\n id: 1\n text: readable\n}\nelement b {\n type: test\n}\nb - verifies -> a\n",
+                "#e8e8e8",
+            ),
+        ] {
+            let svg = render_svg(src, &theme).unwrap();
+            assert!(!svg.contains(forbidden), "{forbidden} still hard-coded");
+            assert!(svg.contains(&hex(palette.fg)));
+            assert!(contrast(palette.fg, palette.fill) >= 4.5);
+        }
     }
 
     #[test]

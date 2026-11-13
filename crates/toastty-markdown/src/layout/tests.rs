@@ -527,7 +527,14 @@ fn mermaid_diagram_renders_as_image() {
     let pal = Palette::new(&Theme::default());
     assert_ne!(px(&b, 30, 4), pal.code_bg);
     assert!(b.rows > 4, "rows = {}", b.rows);
-    let ink = b.image.pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
+    let ink = b
+        .image
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[3] > 0)
+        .count();
     assert!(ink > 500, "diagram has ink: {ink}");
 }
 
@@ -1169,7 +1176,7 @@ fn assert_all_code_on_grid(l: &crate::BlockLayout, p: &LayoutParams, code: &[&st
         .filter(|t| texts.iter().filter(|u| u == t).count() == 1)
         .map(String::as_str)
         .collect();
-    assert!(!unique.is_empty());
+    assert_ne!(unique, [] as [&str; 0]);
     assert_on_grid(l, p, &unique);
 }
 
