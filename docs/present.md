@@ -16,6 +16,10 @@ Mermaid diagrams all work. Try `toastty present examples/present/demo.md`.
   skipped, so Marp decks open as they are.
 - HTML comments (`<!-- … -->`) outside code are removed. Use them for
   speaker notes.
+- Slides are top-aligned below a one-row margin, so headings stay on the
+  same row from slide to slide. A one-line `<!-- center -->` comment
+  anywhere on a slide centres it vertically instead, for title and
+  section slides.
 - Slides that are empty after that are dropped.
 - Relative image paths resolve against the deck's directory when
   `[security] markdown_local_files` is on.
@@ -46,20 +50,20 @@ toastty's internals, so the same binary works over ssh.
    newlines from the last row), hides the cursor and puts the tty in raw mode.
 2. Each slide is drawn on the **primary** screen, since OSC 7700 blocks are
    ignored on the alternate screen. Inside synchronized output
-   (`CSI ? 2026 h` … `l`), it erases the display, sends the slide as one
-   `OSC 7700 ; md ; cwd=… ; <base64> ST` block, then asks for the cursor
-   position (`CSI 6 n`). The block leaves the cursor on the row below it, so
-   the reply gives the block's height in rows.
-3. If the slide fits above the last row, it erases again, moves the cursor
-   down to centre the block vertically, sends it again, and writes the page
-   counter (`3 / 12`, dimmed) on the last row. Only this final frame is
-   shown. A slide taller than the window is left drawn from the top (it
-   scrolls, and the top is in the scrollback) and gets no counter, since
-   writing on its rows would overwrite the block.
+   (`CSI ? 2026 h` … `l`), it erases the display, moves below the top
+   margin, sends the slide as one `OSC 7700 ; md ; cwd=… ; <base64> ST`
+   block, then asks for the cursor position (`CSI 6 n`). The block leaves
+   the cursor on the row below it, so the reply says where the block ended.
+3. If the slide fits above the last row, the page counter (`3 / 12`,
+   dimmed) goes on the last row. A centred slide is first sent from row 1,
+   measured the same way, then erased and sent again lower down; only the
+   final frame is shown. A slide taller than the window scrolls (its top is
+   in the scrollback) and gets no counter, since writing on its rows would
+   overwrite the block.
 4. On quit it clears the screen, shows the cursor and restores the tty mode.
 
 Outside toastty, and inside tmux / screen / zellij / herdr, the slides are
-shown as plain Markdown text (the `toastty md` fallback), top-aligned.
+shown as plain Markdown text (the `toastty md` fallback), placed the same way.
 
 ## Limits
 

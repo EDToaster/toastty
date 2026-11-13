@@ -8,12 +8,13 @@
 //! - Slides are separated by a line holding only `---` (outside fenced
 //!   code), as in Marp and reveal.js. A YAML front-matter block at the
 //!   top is skipped, and HTML comments (`<!-- … -->`) are dropped, so
-//!   they can hold speaker notes.
+//!   they can hold speaker notes. `<!-- center -->` centres its slide.
 //! - Each slide is drawn on the primary screen (rich blocks are ignored
 //!   on the alternate screen): erase the display, send the slide as one
-//!   block, then ask for the cursor position (DSR 6) to learn how many
-//!   rows the block took. A slide that fits is drawn again, centred
-//!   vertically, and a page counter goes on the last row. Each redraw is
+//!   block below a one-row top margin, then ask for the cursor position
+//!   (DSR 6) to learn where the block ended. A slide that fits gets a
+//!   page counter on the last row. A centred slide is drawn from row 1,
+//!   measured the same way, then drawn again centred. Each redraw is
 //!   wrapped in synchronized output (DECSET 2026), so only the final
 //!   frame is shown.
 //! - The file is re-read when it changes on disk, and the slide is
@@ -29,15 +30,31 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::md_cmd;
 
+/// One slide of a deck.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Slide {
+    /// The slide's Markdown, comments removed.
+    pub source: String,
+    /// Centre the slide vertically (a `<!-- center -->` comment on it).
+    /// Slides are top-aligned otherwise.
+    pub center: bool,
+}
+
+/// Whether a comment's text is the centring directive.
+fn is_center_directive(comment: &str) -> bool {
+    matches!(comment.trim(), "center" | "centre")
+}
+
 /// Split a deck into slides.
 ///
 /// A separator is a line that is exactly `---` (up to three spaces of
 /// indent and trailing whitespace allowed) outside a fenced code block.
 /// Front matter at the very top (`---` … `---` with only YAML-looking
-/// lines between) is skipped. HTML comments outside code are removed.
-/// Slides that are empty after that are dropped.
+/// lines between) is skipped. HTML comments outside code are removed;
+/// a one-line `<!-- center -->` marks its slide as centred. Slides that
+/// are empty after that are dropped.
 #[must_use]
-pub fn split_slides(source: &str) -> Vec<String> {
+pub fn split_slides(source: &str) -> Vec<Slide> {
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let source = source.replace("\r\n", "\n");
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
@@ -45,6 +62,8 @@ pub fn split_slides(source: &str) -> Vec<String> {
 
     let mut slides = Vec::new();
     let mut cur = String::new();
+    let mut center = false;
+    let mut comments = Vec::new();
     let mut fence: Option<(u8, usize)> = None;
     let mut in_comment = false;
     for line in &lines[start..] {
@@ -68,7 +87,7 @@ pub fn split_slides(source: &str) -> Vec<String> {
             continue;
         }
         if is_separator(body) {
-            slides.push(std::mem::take(&mut cur));
+            slides.push((std::mem::take(&mut cur), std::mem::take(&mut center)));
             continue;
         }
         if let Some(f) = fence_open(body) {
@@ -76,8 +95,9 @@ pub fn split_slides(source: &str) -> Vec<String> {
             cur.push_str(line);
             continue;
         }
-        let (kept, open) = strip_comments(body);
+        let (kept, open) = strip_comments(body, &mut comments);
         in_comment = open;
+        center |= comments.drain(..).any(|c| is_center_directive(&c));
         if kept.len() != body.len() && kept.trim().is_empty() {
             // A line that held only a comment: drop it entirely.
             continue;
@@ -87,11 +107,14 @@ pub fn split_slides(source: &str) -> Vec<String> {
             cur.push('\n');
         }
     }
-    slides.push(cur);
+    slides.push((cur, center));
     slides
         .into_iter()
-        .map(|s| s.trim_matches('\n').to_string() + "\n")
-        .filter(|s| !s.trim().is_empty())
+        .filter(|(s, _)| !s.trim().is_empty())
+        .map(|(s, center)| Slide {
+            source: s.trim_matches('\n').to_string() + "\n",
+            center,
+        })
         .collect()
 }
 
@@ -131,10 +154,11 @@ fn is_fence_close(line: &str, ch: u8, len: usize) -> bool {
 }
 
 /// Remove `<!-- … -->` from one line. Returns the remaining text and
-/// whether a comment is still open at the end of the line. Comments
+/// whether a comment is still open at the end of the line; the text of
+/// each comment closed on the line is pushed to `comments`. Comments
 /// inside inline code spans (`` `<!-- x -->` ``) are kept.
 #[allow(clippy::many_single_char_names)]
-fn strip_comments(line: &str) -> (String, bool) {
+fn strip_comments(line: &str, comments: &mut Vec<String>) -> (String, bool) {
     let b = line.as_bytes();
     let mut out = String::new();
     let mut i = 0;
@@ -164,6 +188,7 @@ fn strip_comments(line: &str) -> (String, bool) {
             out.push_str(&line[copied..i]);
             match line[i + 4..].find("-->") {
                 Some(k) => {
+                    comments.push(line[i + 4..i + 4 + k].to_string());
                     i += 4 + k + 3;
                     copied = i;
                 }
@@ -319,7 +344,7 @@ pub fn decode(buf: &[u8], eof: bool) -> Option<(Input, usize)> {
 /// The deck and where we are in it.
 #[derive(Debug)]
 pub struct Deck {
-    pub slides: Vec<String>,
+    pub slides: Vec<Slide>,
     pub index: usize,
     /// Digits typed toward "go to slide N".
     pub pending: Option<usize>,
@@ -338,7 +363,7 @@ pub enum Step {
 
 impl Deck {
     #[must_use]
-    pub fn new(slides: Vec<String>) -> Self {
+    pub fn new(slides: Vec<Slide>) -> Self {
         Self {
             slides,
             index: 0,
@@ -390,7 +415,7 @@ impl Deck {
     }
 
     /// Replace the slides (file changed), keeping the position in range.
-    pub fn replace(&mut self, slides: Vec<String>) {
+    pub fn replace(&mut self, slides: Vec<Slide>) {
         self.slides = slides;
         self.index = self.index.min(self.slides.len().saturating_sub(1));
     }
@@ -411,6 +436,9 @@ impl Deck {
     }
 }
 
+/// Blank rows above a top-aligned slide.
+const TOP_MARGIN: u16 = 1;
+
 /// Rows above a block of `height` rows that centre it on a screen of
 /// `rows` rows, keeping the last row for the status line. `None` when
 /// the block doesn't fit (it is drawn from the top and may scroll).
@@ -421,7 +449,7 @@ pub fn centre_offset(height: u16, rows: u16) -> Option<u16> {
 }
 
 /// Read and split the deck file.
-fn load(path: &Path) -> anyhow::Result<Vec<String>> {
+fn load(path: &Path) -> anyhow::Result<Vec<Slide>> {
     let bytes = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("toastty present: {}: {e}", path.display()))?;
     let src = String::from_utf8(bytes)
@@ -475,7 +503,6 @@ struct Presenter {
     raw: RawTty,
     path: PathBuf,
     cwd: Option<PathBuf>,
-    rich: bool,
     deck: Deck,
     /// Bytes read but not decoded yet.
     input: Vec<u8>,
@@ -541,7 +568,7 @@ impl Presenter {
 
     fn slide_bytes(&self) -> Vec<u8> {
         let env = |k: &str| std::env::var(k).ok();
-        let src = &self.deck.slides[self.deck.index];
+        let src = &self.deck.slides[self.deck.index].source;
         md_cmd::plan(src, self.cwd.as_deref(), &env).stdout
     }
 
@@ -557,33 +584,31 @@ impl Presenter {
         let (cols, rows) = self.size();
         self.drawn_size = (cols, rows);
         let slide = self.slide_bytes();
+        let center = self.deck.slides[self.deck.index].center;
+        // Top-aligned slides start below a one-row margin; centred ones
+        // are measured from row 1 and then moved.
+        let first_row = if center { 1 } else { 1 + TOP_MARGIN };
         let mut out = Vec::with_capacity(slide.len() * 2 + 64);
         out.extend_from_slice(b"\x1b[?2026h\x1b[?25l\x1b[0m\x1b[H\x1b[2J");
+        out.extend_from_slice(format!("\x1b[{first_row};1H").as_bytes());
         out.extend_from_slice(&slide);
         self.raw.tty.write_all(&out)?;
-        // The block leaves the cursor at column 0 of the row below it,
-        // so the row number of the cursor is the block's height + 1.
-        let fits = match self.cursor_row()? {
-            Some(row) if self.rich => {
-                let height = row.saturating_sub(1);
-                // A block taller than the screen scrolled; the cursor is
-                // then on the last row, so a full-height reply means
-                // "doesn't fit" either way.
-                centre_offset(height, rows).filter(|_| row < rows)
-            }
-            Some(row) => (row < rows).then_some(0),
-            None => None,
-        };
-        self.status_row = fits.is_some();
+        // The block leaves the cursor at column 0 of the row below it.
+        // A block taller than the screen scrolled and leaves the cursor
+        // on the last row, so a reply of the last row means "doesn't
+        // fit" (no room for the counter) either way.
+        let end_row = self.cursor_row()?.filter(|row| *row < rows);
         let mut out = Vec::new();
-        if let Some(top) = fits {
-            if top > 0 {
+        if let Some(row) = end_row {
+            let height = row.saturating_sub(first_row);
+            if center && let Some(top) = centre_offset(height, rows).filter(|t| *t > 0) {
                 out.extend_from_slice(b"\x1b[H\x1b[2J");
                 out.extend_from_slice(format!("\x1b[{};1H", top + 1).as_bytes());
                 out.extend_from_slice(&slide);
             }
             out.extend_from_slice(&self.status_bytes(cols, rows));
         }
+        self.status_row = end_row.is_some();
         out.extend_from_slice(b"\x1b[?2026l");
         self.raw.tty.write_all(&out)?;
         self.raw.tty.flush()?;
@@ -667,15 +692,11 @@ pub fn run(file: &Path) -> anyhow::Result<()> {
         .write(true)
         .open("/dev/tty")
         .map_err(|e| anyhow::anyhow!("toastty present: needs a terminal (/dev/tty: {e})"))?;
-    let env = |k: &str| std::env::var(k).ok();
-    let rich = md_cmd::detect_multiplexer(&env).is_none()
-        && env("TERM_PROGRAM").as_deref() == Some("toastty");
     let cwd = md_cmd::base_dir_for(Some(file), std::env::current_dir().ok());
     let mut p = Presenter {
         raw: RawTty::new(tty)?,
         path: file.to_path_buf(),
         cwd,
-        rich,
         deck: Deck::new(slides),
         input: Vec::new(),
         drawn_size: (0, 0),
@@ -688,16 +709,22 @@ pub fn run(file: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn texts(slides: &[Slide]) -> Vec<String> {
+        slides.iter().map(|s| s.source.clone()).collect()
+    }
+
     #[test]
     fn splits_on_rule_lines() {
-        let s = split_slides("# One\n\ntext\n\n---\n\n# Two\n---\n# Three\n");
+        let s = texts(&split_slides(
+            "# One\n\ntext\n\n---\n\n# Two\n---\n# Three\n",
+        ));
         assert_eq!(s, ["# One\n\ntext\n", "# Two\n", "# Three\n"]);
     }
 
     #[test]
     fn rules_inside_code_fences_are_kept() {
         let src = "# A\n\n```yaml\n---\nkey: v\n---\n```\n\n---\n\n~~~~\n---\n~~~\n---\n~~~~\n";
-        let s = split_slides(src);
+        let s = texts(&split_slides(src));
         assert_eq!(s.len(), 2, "{s:?}");
         assert!(s[0].contains("```yaml\n---\nkey: v\n---\n```"));
         assert_eq!(s[1], "~~~~\n---\n~~~\n---\n~~~~\n");
@@ -705,7 +732,7 @@ mod tests {
 
     #[test]
     fn other_rules_and_indented_dashes_are_not_separators() {
-        let s = split_slides("a\n\n***\n\nb\n\n----\n\n    ---\n");
+        let s = texts(&split_slides("a\n\n***\n\nb\n\n----\n\n    ---\n"));
         assert_eq!(s.len(), 1);
         assert!(is_separator("---"));
         assert!(is_separator("   ---  "));
@@ -715,29 +742,36 @@ mod tests {
 
     #[test]
     fn front_matter_is_skipped() {
-        let s = split_slides("---\nmarp: true\ntheme: gaia\n---\n\n# Title\n---\n# Two\n");
+        let s = texts(&split_slides(
+            "---\nmarp: true\ntheme: gaia\n---\n\n# Title\n---\n# Two\n",
+        ));
         assert_eq!(s, ["# Title\n", "# Two\n"]);
         // Not YAML: the leading `---` is a separator and the first
         // (empty) slide is dropped.
-        let s = split_slides("---\n# Title\n\nSome text.\n---\n# Two\n");
+        let s = texts(&split_slides("---\n# Title\n\nSome text.\n---\n# Two\n"));
         assert_eq!(s, ["# Title\n\nSome text.\n", "# Two\n"]);
     }
 
     #[test]
     fn empty_slides_are_dropped_and_crlf_works() {
-        let s = split_slides("---\n\n---\n# A\r\n---\r\n```\r\nx\r\n```\r\n---\n\n");
+        let s = texts(&split_slides(
+            "---\n\n---\n# A\r\n---\r\n```\r\nx\r\n```\r\n---\n\n",
+        ));
         assert_eq!(s, ["# A\n", "```\nx\n```\n"]);
     }
 
     #[test]
     fn comments_become_speaker_notes() {
-        let s =
-            split_slides("# A\n<!-- note -->\ntext <!-- x --> more\n<!--\nmulti\nline\n-->\nend\n");
+        let s = texts(&split_slides(
+            "# A\n<!-- note -->\ntext <!-- x --> more\n<!--\nmulti\nline\n-->\nend\n",
+        ));
         assert_eq!(s, ["# A\ntext  more\nend\n"]);
         // Comments inside code are literal.
-        let s = split_slides("`<!-- a -->` and ``x ` <!-- b -->`` <!-- c -->\n");
+        let s = texts(&split_slides(
+            "`<!-- a -->` and ``x ` <!-- b -->`` <!-- c -->\n",
+        ));
         assert_eq!(s, ["`<!-- a -->` and ``x ` <!-- b -->`` \n"]);
-        let s = split_slides("```html\n<!-- keep -->\n```\n");
+        let s = texts(&split_slides("```html\n<!-- keep -->\n```\n"));
         assert_eq!(s, ["```html\n<!-- keep -->\n```\n"]);
     }
 
@@ -777,7 +811,7 @@ mod tests {
 
     #[test]
     fn deck_navigation_clamps() {
-        let mut d = Deck::new(vec!["a".into(), "b".into(), "c".into()]);
+        let mut d = deck(3);
         assert_eq!(d.apply(Command::Prev), Step::Nothing);
         assert_eq!(d.apply(Command::Next), Step::Redraw);
         assert_eq!(d.apply(Command::Last), Step::Redraw);
@@ -790,7 +824,7 @@ mod tests {
 
     #[test]
     fn typed_numbers_jump() {
-        let mut d = Deck::new((0..12).map(|i| i.to_string()).collect());
+        let mut d = deck(12);
         assert_eq!(d.apply(Command::Digit(1)), Step::Status);
         assert_eq!(d.apply(Command::Digit(1)), Step::Status);
         assert_eq!(d.status(14), "   go to 11_  ");
@@ -821,11 +855,36 @@ mod tests {
 
     #[test]
     fn reload_keeps_position_in_range() {
-        let mut d = Deck::new(vec!["a".into(), "b".into(), "c".into()]);
+        let mut d = deck(3);
         d.apply(Command::Last);
-        d.replace(vec!["x".into()]);
+        d.replace(deck(1).slides);
         assert_eq!(d.index, 0);
         assert_eq!(d.status(8), "  1 / 1  ".chars().skip(1).collect::<String>());
+    }
+
+    fn deck(n: usize) -> Deck {
+        Deck::new(
+            (0..n)
+                .map(|i| Slide {
+                    source: i.to_string(),
+                    center: false,
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn center_comment_marks_the_slide() {
+        let s = split_slides(
+            "<!-- center -->\n# Title\n---\n# Body\n<!-- centre? no -->\n---\n# End <!--  centre  -->\n---\n```\n<!-- center -->\n```\n",
+        );
+        let flags: Vec<bool> = s.iter().map(|s| s.center).collect();
+        assert_eq!(flags, [true, false, true, false]);
+        assert_eq!(s[0].source, "# Title\n");
+        assert_eq!(s[2].source, "# End \n");
+        // Multi-line comments are notes, never directives.
+        let s = split_slides("<!--\ncenter\n-->\n# A\n");
+        assert!(!s[0].center);
     }
 
     #[test]
@@ -841,12 +900,12 @@ mod tests {
         let s = split_slides("# One\n---\n# Two\n");
         let env = |k: &str| (k == "TERM_PROGRAM").then(|| "toastty".to_string());
         for slide in &s {
-            let out = md_cmd::plan(slide, None, &env).stdout;
+            let out = md_cmd::plan(&slide.source, None, &env).stdout;
             let text = std::str::from_utf8(&out).unwrap();
             let body = &text[2..text.len() - 2];
             let parts: Vec<&[u8]> = body.split(';').map(str::as_bytes).collect();
             let parsed = toastty_term::parse_osc_7700(&parts).unwrap();
-            assert_eq!(&parsed.source, slide);
+            assert_eq!(parsed.source, slide.source);
         }
     }
 }

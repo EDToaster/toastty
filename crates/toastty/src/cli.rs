@@ -269,7 +269,8 @@ PRESENT:
     `toastty present talk.md` shows a Markdown deck as full-screen slides,
     each rendered like `toastty md`. Slides are separated by lines holding
     only `---`; front matter is skipped and `<!-- -->` comments are hidden
-    (use them for notes). Keys: Space/→/l/PgDn next, ←/h/PgUp previous,
+    (use them for notes). Slides are top-aligned; a `<!-- center -->`
+    comment centres one. Keys: Space/→/l/PgDn next, ←/h/PgUp previous,
     g/Home first, G/End last, <number> Enter jump, r reload, q/Esc quit.
     The deck reloads when the file changes. To launch a program called
     `present`, use `toastty -- present`.

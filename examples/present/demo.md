@@ -2,6 +2,7 @@
 title: toastty present
 ---
 
+<!-- center -->
 # toastty present
 
 Markdown slides, rendered in your terminal
@@ -18,6 +19,7 @@ Markdown slides, rendered in your terminal
 - Everything `toastty md` renders works on a slide
 - Front matter at the top is skipped
 - `<!-- comments -->` are hidden, so they can hold **speaker notes**
+- Slides are top-aligned; `<!-- center -->` centres one
 
 ---
 
@@ -68,6 +70,7 @@ flowchart LR
 
 ---
 
+<!-- center -->
 # Thanks
 
 Questions?
