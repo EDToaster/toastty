@@ -204,6 +204,13 @@ fn main() -> Result<()> {
         cli::Action::Markdown { file } => {
             return toastty::md_cmd::run(file.as_deref());
         }
+        cli::Action::Present { file } => {
+            if let Err(e) = toastty::present_cmd::run(&file) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         cli::Action::Image { files, protocol } => {
             if let Err(e) = toastty::image_cmd::run(&files, protocol) {
                 eprintln!("{e}");

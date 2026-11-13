@@ -45,6 +45,8 @@ toastty-pty.workspace = true
 toastty-render.workspace = true
 toastty-term.workspace = true
 toastty-window.workspace = true
+# Raw mode, window size and poll for `toastty present`.
+rustix = { workspace = true, features = ["event"] }
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 # `malloc_trim` (see `src/heap.rs`).
