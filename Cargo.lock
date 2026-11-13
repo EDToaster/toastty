@@ -5015,6 +5015,8 @@ dependencies = [
  "ratex-render",
  "ratex-types",
  "resvg",
+ "roxmltree 0.21.1",
+ "rustybuzz",
  "syntect",
  "thiserror 2.0.18",
  "tiny-skia",

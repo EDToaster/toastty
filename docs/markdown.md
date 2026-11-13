@@ -151,15 +151,66 @@ make it so:
   hairlines, which may move by a few levels; `tests/lazy_paint.rs` checks this.
 - **Width-independent work is cached** in the renderer across layouts:
   shaped paragraphs (keyed by a 128-bit hash of their content), highlighted
-  code, maths rasters, decoded images, and Mermaid diagrams. Mermaid is split
-  into `prepare_mermaid` (parse, lay out, SVG tree: once) and a rasterization
-  at the fitted width that happens only when a tile showing it is painted,
-  and is reused by the other tiles.
+  code, maths rasters, decoded images, and Mermaid diagrams. Mermaid parses
+  once and keeps a standard scene plus, only if needed, one compact scene.
+  Resizing selects an immutable scene and computes its transform; it does
+  not wrap labels or rerun graph layout at each pixel width. Painting uses
+  256-pixel-high source bands rather than allocating the full canvas. A shared
+  64 MiB / 512-entry LRU holds image and diagram rasters, keyed by effective
+  fit rather than window width. Diagrams do not retain full-canvas rasters.
+  The prepared-diagram memo admits up to 64 entries incrementally and
+  protects entries already used in the current layout, avoiding clear-all
+  churn in documents just over the cap.
 
 Release build, demo document (415 rows), sweeping 120 → 40 columns
 (`cargo run --release -p toastty-markdown --example resize_bench -- doc.md`):
 layout 0.8 ms per width (was 54 ms for layout plus full paint), plus about
 2.4 ms to paint one screen of 50 rows.
+
+### Mermaid readability
+
+The Rust renderer keeps `mermaid-svg` for parsing and diagram layout and
+resvg for rasterization; it does not embed JavaScript, launch a browser,
+or depend on a service. All existing diagram types remain supported.
+
+Before layout, plain labels in multiline-capable fields are wrapped using
+the actual bundled Noto Sans glyph advances and ink bounds. Standard and
+compact profiles use fixed budgets, not the current pixel width, so node
+positions stay stable within each profile. Explicit graph directions,
+IDs, edges and sequence order are preserved. Words are kept together
+where possible; long identifiers break only at Unicode grapheme boundaries.
+
+This preprocessing applies to supported rectangular flowchart shapes,
+sequence participants and notes, and class notes. Rich markup,
+font-overriding styles, tapered shapes, single-line edge labels and
+sequence messages retain upstream layout. This is not a new implementation
+of every Mermaid layout algorithm and does not guarantee collision-free
+layout for arbitrary source.
+
+Fitting measures the smallest SVG text span, including edge labels and
+chart ticks, and requires at least 12 pixels (or the requested text size
+when zoomed below 12). It tries the standard scene first, then compact.
+If neither fits within the width, height and pixel limits, the existing
+source-code fallback is used instead of unreadably small or clipped
+diagrams. Crossing that boundary can change block height, like any other
+Markdown reflow; there is no horizontal-pan UI or streaming-layout
+stabilization in this change. Palette and font-size changes invalidate
+prepared scenes as before.
+
+For a repeatable release-build comparison, including cold preparation,
+resize sweeps, visible-band paint, revisit costs and fallback counts, see
+[the Mermaid benchmark](mermaid-benchmark.md). Full-image export via
+`render_mermaid`/`rasterize` intentionally allocates the whole output; the
+terminal uses the band-paint path.
+
+### Mermaid visual style
+
+Diagrams use quiet neutral surfaces and outlines, restrained notes, and
+softened terminal-derived colors for chart categories and status. Dark and
+light themes share the same visual hierarchy. Styling is part of scene
+preparation, so scrolling and resizing reuse the styled geometry rather than
+restyling it. See the [Mermaid style guide](mermaid-style.md) for the color,
+shape, typography and review rules.
 
 ### Vertical grid snapping
 

@@ -94,8 +94,8 @@ pub(crate) enum MermaidBackend {
     Fake(MermaidFn),
 }
 
-/// Entry caps: past one, that cache is cleared (documents rarely come
-/// close; this only bounds memory for pathological input).
+/// Entry caps. Diagram admission is incremental; the other caches are
+/// cleared past their limits between layouts.
 const MAX_MEMO_ENTRIES: usize = 8_192;
 const MAX_MEMO_DIAGRAMS: usize = 64;
 const MAX_MEMO_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
@@ -105,6 +105,12 @@ type ImageKey = (String, bool, Option<PathBuf>);
 type DiagramKey = (String, u32, Theme);
 type CodeKey = (String, String, Theme);
 
+struct DiagramMemo {
+    result: Result<Arc<PreparedDiagram>, String>,
+    used: u64,
+    layout: u64,
+}
+
 /// Width-independent results, kept across layouts so re-laying out a
 /// document at a new width (window resize) only re-wraps and re-places.
 #[derive(Default)]
@@ -112,7 +118,9 @@ pub(crate) struct Memo {
     math: HashMap<MathKey, Option<Arc<Img>>>,
     images: HashMap<ImageKey, Result<Arc<Img>, images::Denied>>,
     image_bytes: u64,
-    diagrams: HashMap<DiagramKey, Result<Arc<PreparedDiagram>, String>>,
+    diagrams: HashMap<DiagramKey, DiagramMemo>,
+    diagram_clock: u64,
+    diagram_layout: u64,
     code: HashMap<CodeKey, Arc<Vec<Vec<Tok>>>>,
     shaped: HashMap<u128, Arc<Shaped>>,
 }
@@ -126,15 +134,54 @@ impl Memo {
             self.images.clear();
             self.image_bytes = 0;
         }
-        if self.diagrams.len() > MAX_MEMO_DIAGRAMS {
-            self.diagrams.clear();
-        }
+        self.diagram_layout = self.diagram_layout.saturating_add(1);
         if self.code.len() > MAX_MEMO_ENTRIES {
             self.code.clear();
         }
         if self.shaped.len() > MAX_MEMO_ENTRIES * 4 {
             self.shaped.clear();
         }
+    }
+
+    fn diagram(
+        &mut self,
+        src: &str,
+        font_px: f32,
+        theme: &Theme,
+    ) -> Result<Arc<PreparedDiagram>, String> {
+        let key = (src.to_owned(), font_px.to_bits(), theme.clone());
+        self.diagram_clock = self.diagram_clock.saturating_add(1);
+        if let Some(hit) = self.diagrams.get_mut(&key) {
+            hit.used = self.diagram_clock;
+            hit.layout = self.diagram_layout;
+            return hit.result.clone();
+        }
+        let result = crate::mermaid::prepare_mermaid(src, font_px, theme);
+        if self.diagrams.len() >= MAX_MEMO_DIAGRAMS {
+            // Do not let a sequential scan just larger than the cache
+            // evict every warm diagram on every resize. Once all entries
+            // have been touched in this layout, bypass admission for the
+            // overflow; the layout still owns its prepared diagram.
+            let oldest = self
+                .diagrams
+                .iter()
+                .filter(|(_, entry)| entry.layout != self.diagram_layout)
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else {
+                return result;
+            };
+            self.diagrams.remove(&oldest);
+        }
+        self.diagrams.insert(
+            key,
+            DiagramMemo {
+                result: result.clone(),
+                used: self.diagram_clock,
+                layout: self.diagram_layout,
+            },
+        );
+        result
     }
 }
 
@@ -474,26 +521,30 @@ pub(crate) fn paint_band(
     let top = y0.saturating_sub(BAND_MARGIN);
     let bottom = (y0 + h + BAND_MARGIN).min(laid.height);
     let mut pm = tiny_skia::Pixmap::new(laid.width, bottom - top)?;
-    paint::execute(
+    if !paint::execute(
         &mut pm,
         &laid.ops,
         top,
         fs,
         &mut caches.swash,
         &mut caches.scaled,
-    );
+    ) {
+        return None;
+    }
     let clear_from = laid.text_rows * laid.cell_h;
     if clear_from < laid.height && bottom > clear_from {
         let from = clear_from.saturating_sub(top) as usize * laid.width as usize * 4;
         pm.data_mut()[from..].fill(0);
-        paint::execute(
+        if !paint::execute(
             &mut pm,
             &laid.note,
             top,
             fs,
             &mut caches.swash,
             &mut caches.scaled,
-        );
+        ) {
+            return None;
+        }
     }
     if caches.swash.image_cache.len() > MAX_CACHED_GLYPHS {
         caches.swash.image_cache.clear();
@@ -1518,14 +1569,7 @@ impl Lay<'_> {
         let max_w = w.max(1.0) as u32;
         let placed: Result<(Src, (u32, u32)), String> = match self.mermaid {
             MermaidBackend::Real => {
-                let key = (src.to_owned(), self.f.to_bits(), self.p.theme.clone());
-                let prepared = if let Some(hit) = self.memo.diagrams.get(&key) {
-                    hit.clone()
-                } else {
-                    let r = crate::mermaid::prepare_mermaid(src, self.f, &self.p.theme);
-                    self.memo.diagrams.insert(key, r.clone());
-                    r
-                };
+                let prepared = self.memo.diagram(src, self.f, &self.p.theme);
                 prepared.and_then(|d| {
                     let size = d.size_for(max_w)?;
                     Ok((Src::Diagram(d, max_w), size))
@@ -1858,4 +1902,72 @@ fn clip<'t>(t: &'t str, budget: &mut usize) -> &'t str {
     }
     *budget = 0;
     &t[..end]
+}
+
+#[cfg(test)]
+mod diagram_memo_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_document_keeps_warm_diagrams_and_caps_admission() {
+        let mut memo = Memo::default();
+        let theme = Theme::default();
+        memo.trim();
+        let mut warm = Vec::new();
+        for i in 0..=MAX_MEMO_DIAGRAMS {
+            let source = format!("flowchart TD\nA[Node {i}]\n");
+            let diagram = memo.diagram(&source, 16.0, &theme).unwrap();
+            warm.push((source, diagram));
+        }
+        assert_eq!(memo.diagrams.len(), MAX_MEMO_DIAGRAMS);
+        memo.trim();
+        for (source, expected) in warm.iter().take(MAX_MEMO_DIAGRAMS) {
+            let got = memo.diagram(source, 16.0, &theme).unwrap();
+            assert!(Arc::ptr_eq(&got, expected), "resize recomputed {source}");
+        }
+        let (source, overflow) = warm.last().unwrap();
+        let got = memo.diagram(source, 16.0, &theme).unwrap();
+        assert!(!Arc::ptr_eq(&got, overflow));
+        assert_eq!(memo.diagrams.len(), MAX_MEMO_DIAGRAMS);
+    }
+
+    #[test]
+    fn new_documents_replace_cold_diagrams_and_memoize_failures() {
+        let mut memo = Memo::default();
+        let theme = Theme::default();
+        memo.trim();
+        for i in 0..MAX_MEMO_DIAGRAMS {
+            let source = format!("not a diagram {i}");
+            assert!(memo.diagram(&source, 16.0, &theme).is_err());
+        }
+        memo.trim();
+        let hot_key = (
+            "not a diagram 0".to_owned(),
+            16.0_f32.to_bits(),
+            theme.clone(),
+        );
+        let error = memo.diagram(&hot_key.0, 16.0, &theme).unwrap_err();
+        assert_eq!(
+            error,
+            memo.diagrams[&hot_key]
+                .result
+                .as_ref()
+                .unwrap_err()
+                .as_str()
+        );
+        let fresh = memo
+            .diagram("flowchart TD\nA[Fresh]\n", 16.0, &theme)
+            .unwrap();
+        assert_eq!(memo.diagrams.len(), MAX_MEMO_DIAGRAMS);
+        assert!(memo.diagrams.contains_key(&hot_key));
+        assert!(!memo.diagrams.contains_key(&(
+            "not a diagram 1".to_owned(),
+            16.0_f32.to_bits(),
+            theme.clone()
+        )));
+        let reused = memo
+            .diagram("flowchart TD\nA[Fresh]\n", 16.0, &theme)
+            .unwrap();
+        assert!(Arc::ptr_eq(&fresh, &reused));
+    }
 }

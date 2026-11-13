@@ -7,6 +7,8 @@ use toastty_markdown::{LayoutParams, Renderer, ResourcePolicy, Theme};
 
 const DEMO: &str = include_str!("golden/demo.md");
 const KITCHEN_SINK: &str = include_str!("golden/kitchen_sink.md");
+const RESPONSIVE: &str = include_str!("../../../docs/fixtures/mermaid-responsive.md");
+const GALLERY: &str = include_str!("../../../docs/mermaid-gallery.md");
 
 fn params(cols: u16) -> LayoutParams {
     LayoutParams {
@@ -18,6 +20,59 @@ fn params(cols: u16) -> LayoutParams {
         resources: ResourcePolicy::default(),
         max_rows: 2000,
         mono_family: None,
+    }
+}
+
+/// The terminal's actual defaults from toastty-config/src/theme.rs, not
+/// the Markdown crate's softer demonstration palette.
+fn terminal_dark() -> Theme {
+    Theme {
+        fg: [0xd9, 0xd9, 0xd9, 0xff],
+        bg: [0x12, 0x12, 0x14, 0xff],
+        ansi: [
+            [0x00, 0x00, 0x00, 0xff],
+            [0xcc, 0x30, 0x30, 0xff],
+            [0x30, 0xcc, 0x30, 0xff],
+            [0xcc, 0xcc, 0x30, 0xff],
+            [0x30, 0x30, 0xcc, 0xff],
+            [0xcc, 0x30, 0xcc, 0xff],
+            [0x30, 0xcc, 0xcc, 0xff],
+            [0xcc, 0xcc, 0xcc, 0xff],
+            [0x66, 0x66, 0x66, 0xff],
+            [0xff, 0x50, 0x50, 0xff],
+            [0x50, 0xff, 0x50, 0xff],
+            [0xff, 0xff, 0x50, 0xff],
+            [0x50, 0x50, 0xff, 0xff],
+            [0xff, 0x50, 0xff, 0xff],
+            [0x50, 0xff, 0xff, 0xff],
+            [0xff, 0xff, 0xff, 0xff],
+        ],
+    }
+}
+
+/// Same light palette as the Mermaid renderer's fixture and app captures.
+fn mermaid_light() -> Theme {
+    Theme {
+        fg: [0x1f, 0x23, 0x28, 0xff],
+        bg: [0xfa, 0xfa, 0xf8, 0xff],
+        ansi: [
+            [0x00, 0x00, 0x00, 0xff],
+            [0xc8, 0x28, 0x29, 0xff],
+            [0x71, 0x8c, 0x00, 0xff],
+            [0xea, 0xb7, 0x00, 0xff],
+            [0x42, 0x71, 0xae, 0xff],
+            [0x89, 0x59, 0xa8, 0xff],
+            [0x3e, 0x99, 0x9f, 0xff],
+            [0xd6, 0xd6, 0xd6, 0xff],
+            [0x8e, 0x90, 0x8c, 0xff],
+            [0xc8, 0x28, 0x29, 0xff],
+            [0x71, 0x8c, 0x00, 0xff],
+            [0xea, 0xb7, 0x00, 0xff],
+            [0x42, 0x71, 0xae, 0xff],
+            [0x89, 0x59, 0xa8, 0xff],
+            [0x3e, 0x99, 0x9f, 0xff],
+            [0xff, 0xff, 0xff, 0xff],
+        ],
     }
 }
 
@@ -100,6 +155,148 @@ fn warm_caches_do_not_change_the_output() {
         warm.layout(DEMO, &params(cols)).unwrap();
     }
     assert_eq!(warm.render(DEMO, &p).unwrap(), cold);
+}
+
+#[test]
+fn gallery_theme_switches_preserve_geometry_source_and_tiled_output() {
+    let dark = terminal_dark();
+    let light = mermaid_light();
+    let mut warm = Renderer::hermetic();
+    let mut count = 0;
+    for block in GALLERY.split("```mermaid\n").skip(1) {
+        let source = block.split("\n```").next().unwrap();
+        let name = source.lines().next().unwrap();
+        let markdown = format!("```mermaid\n{source}\n```");
+        let natural = toastty_markdown::mermaid::prepare_mermaid(source, 16.0, &dark)
+            .unwrap()
+            .size_for(4096)
+            .unwrap();
+        // Use a viewport wide enough for this fixture's real diagram,
+        // without allocating a 4096px-wide Markdown block for every family.
+        let cols = u16::try_from(natural.0.div_ceil(10) + 2).unwrap();
+        let mut original: Option<toastty_markdown::RenderedBlock> = None;
+        for (index, theme) in [dark.clone(), light.clone(), dark.clone()]
+            .into_iter()
+            .enumerate()
+        {
+            let mut p = params(cols);
+            p.theme = theme;
+            let prepared =
+                toastty_markdown::mermaid::prepare_mermaid(source, p.font_px, &p.theme).unwrap();
+            assert_eq!(
+                prepared.size_for(4096).unwrap(),
+                natural,
+                "{name}: changing the theme changed diagram geometry"
+            );
+            // Prevent matching code fallbacks from passing as successful
+            // diagram rendering in both the cold and warm paths.
+            prepared.size_for(u32::from(cols - 2) * p.cell_w).unwrap();
+            let fresh_render = Renderer::hermetic().render(&markdown, &p).unwrap();
+            let layout = warm.layout(&markdown, &p).unwrap();
+            assert_eq!(layout.rows, fresh_render.rows, "{name}");
+            assert_eq!(layout.text(), fresh_render.text.as_slice(), "{name}");
+            assert_eq!(layout.links(), fresh_render.links.as_slice(), "{name}");
+            let copy_tokens: Vec<&str> = layout
+                .text()
+                .iter()
+                .flatten()
+                .flat_map(|run| run.text.split_whitespace())
+                .collect();
+            assert_eq!(
+                copy_tokens,
+                source.split_whitespace().collect::<Vec<_>>(),
+                "{name}: diagram source was changed or lost in selection/copy text"
+            );
+            for band in [352, 37] {
+                let pixels = stitched(&mut warm, &layout, band);
+                if let Some(m) = mismatch(&pixels, &fresh_render.image.pixels, layout.width) {
+                    panic!("{name}: theme pass {index}, band {band}: {m}");
+                }
+            }
+            if let Some(first) = &original {
+                assert_eq!(
+                    fresh_render.rows, first.rows,
+                    "{name}: theme changed block rows"
+                );
+                assert_eq!(
+                    fresh_render.text, first.text,
+                    "{name}: theme changed source rows"
+                );
+                assert_eq!(
+                    fresh_render.links, first.links,
+                    "{name}: theme changed links"
+                );
+                if index == 1 {
+                    assert_ne!(
+                        fresh_render.image.pixels, first.image.pixels,
+                        "{name}: light theme reused dark pixels"
+                    );
+                } else {
+                    assert_eq!(
+                        fresh_render, *first,
+                        "{name}: dark theme revisit changed output"
+                    );
+                }
+            } else {
+                original = Some(fresh_render);
+            }
+        }
+        count += 1;
+    }
+    assert_eq!(count, 23, "gallery syntax coverage unexpectedly changed");
+}
+
+#[test]
+fn responsive_diagrams_survive_resize_scroll_and_width_revisits() {
+    for block in RESPONSIVE.split("```mermaid\n").skip(1).take(2) {
+        let source = block.split("\n```").next().unwrap();
+        let markdown = format!("```mermaid\n{source}\n```");
+        let prepared =
+            toastty_markdown::mermaid::prepare_mermaid(source, 16.0, &Theme::default()).unwrap();
+        let mut warm = Renderer::hermetic();
+        for cols in [120, 48, 120] {
+            let p = params(cols);
+            // Require real diagram output, not a coincidentally matching
+            // code fallback in both paths.
+            prepared.size_for(u32::from(cols - 2) * p.cell_w).unwrap();
+            let cold = Renderer::hermetic().render(&markdown, &p).unwrap();
+            let layout = warm.layout(&markdown, &p).unwrap();
+            assert_eq!(layout.text(), cold.text.as_slice());
+            assert_eq!(layout.links(), cold.links.as_slice());
+            for band in [352, 37] {
+                // A normalized cache band must not become a visible seam
+                // when the terminal requests differently aligned GPU tiles.
+                let pixels = stitched(&mut warm, &layout, band);
+                if let Some(m) = mismatch(&pixels, &cold.image.pixels, layout.width) {
+                    panic!(
+                        "{}: cols {cols}, band {band}: {m}",
+                        source.lines().next().unwrap()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn unreadable_diagrams_show_the_complete_code_fallback() {
+    let p = params(48);
+    for block in RESPONSIVE.split("```mermaid\n").skip(3) {
+        let source = block.split("\n```").next().unwrap();
+        let prepared =
+            toastty_markdown::mermaid::prepare_mermaid(source, p.font_px, &p.theme).unwrap();
+        assert!(prepared.size_for(u32::from(p.cols - 2) * p.cell_w).is_err());
+        let mut renderer = Renderer::hermetic();
+        let fallback = renderer
+            .render(&format!("```mermaid\n{source}\n```"), &p)
+            .unwrap();
+        let code = renderer
+            .render(&format!("```text\n{source}\n```"), &p)
+            .unwrap();
+        // Public selection/copy text and pixels must both match an ordinary
+        // wrapped code block, rather than a blank or partially lost diagram.
+        assert_eq!(fallback, code);
+    }
 }
 
 #[test]
