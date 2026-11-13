@@ -27,6 +27,7 @@ pub mod mouse;
 pub mod paste;
 pub mod perf_stats;
 pub mod preload;
+pub mod present_cmd;
 pub mod pty_log;
 pub mod shader_files;
 pub mod shader_watcher;

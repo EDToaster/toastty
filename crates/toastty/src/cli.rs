@@ -40,6 +40,9 @@ pub enum Action {
     /// (or as plain text outside toastty) and exit. `None` / `-` reads
     /// stdin.
     Markdown { file: Option<PathBuf> },
+    /// `toastty present FILE`: show a Markdown deck (slides separated
+    /// by `---` lines) one slide at a time, until `q`.
+    Present { file: PathBuf },
     /// `toastty image [--sixel] <FILE|->...`: print images inline (Kitty
     /// graphics by default, Sixel with `--sixel`) and exit.
     Image {
@@ -95,6 +98,23 @@ where
             [f] => Err(ParseError { arg: f.clone() }),
             [_, extra, ..] => Err(ParseError {
                 arg: format!("md takes one file, got extra argument {extra}"),
+            }),
+        };
+    }
+    // Same rule for `toastty present …`.
+    if iter.peek().is_some_and(|a| a == "present") {
+        iter.next();
+        let rest: Vec<String> = iter.collect();
+        return match rest.as_slice() {
+            [f] if !f.starts_with('-') => Ok(Action::Present {
+                file: PathBuf::from(f),
+            }),
+            [] => Err(ParseError {
+                arg: "present requires a file".into(),
+            }),
+            [f] => Err(ParseError { arg: f.clone() }),
+            [_, extra, ..] => Err(ParseError {
+                arg: format!("present takes one file, got extra argument {extra}"),
             }),
         };
     }
@@ -227,6 +247,7 @@ USAGE:
     toastty [FLAGS] [-- | -e | --command] <command> [args...]
     toastty [FLAGS] <command> [args...]
     toastty md [FILE|-]
+    toastty present FILE
     toastty image [--sixel] <FILE|->...
 
 FLAGS:
@@ -243,6 +264,15 @@ MARKDOWN:
     document as a rendered block when run inside toastty, and as plain
     text elsewhere (other terminals, tmux, screen, zellij, herdr). To
     launch a program called `md`, use `toastty -- md`.
+
+PRESENT:
+    `toastty present talk.md` shows a Markdown deck as full-screen slides,
+    each rendered like `toastty md`. Slides are separated by lines holding
+    only `---`; front matter is skipped and `<!-- -->` comments are hidden
+    (use them for notes). Keys: Space/→/l/PgDn next, ←/h/PgUp previous,
+    g/Home first, G/End last, <number> Enter jump, r reload, q/Esc quit.
+    The deck reloads when the file changes. To launch a program called
+    `present`, use `toastty -- present`.
 
 IMAGE:
     `toastty image cat.png dog.jpg` prints each image inline at its native
@@ -321,6 +351,27 @@ mod tests {
             parse(["--help", "--print-default-config"]).unwrap(),
             Action::PrintDefaultConfig
         );
+    }
+
+    #[test]
+    fn present_subcommand() {
+        assert_eq!(
+            parse(["present", "talk.md"]).unwrap(),
+            Action::Present {
+                file: PathBuf::from("talk.md")
+            }
+        );
+        assert!(parse(["present"]).is_err());
+        assert!(parse(["present", "-x"]).is_err());
+        assert!(parse(["present", "a.md", "b.md"]).is_err());
+        // After `--` it's a program name.
+        assert!(matches!(
+            parse(["--", "present", "a.md"]).unwrap(),
+            Action::Run {
+                command: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]

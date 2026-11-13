@@ -49,6 +49,10 @@ cat notes.md | toastty md
 Outside toastty, and inside tmux / screen / zellij for now, `toastty md`
 prints the plain Markdown instead. See [docs/markdown.md](docs/markdown.md).
 
+`toastty present talk.md` turns the same renderer into a slide show: split
+the file into slides with `---` lines and step through them full screen.
+See [docs/present.md](docs/present.md).
+
 ### 🖼️ Inline images: Kitty graphics and Sixel
 
 Full [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
@@ -235,6 +239,7 @@ toastty                         # your shell
 toastty -d ~/src                # start in a directory
 toastty -- htop                 # run a program instead of the shell
 toastty md notes.md             # render Markdown (inside toastty)
+toastty present talk.md         # Markdown slide show (inside toastty)
 toastty image photo.jpg         # show an image (inside toastty)
 toastty --help                  # everything else
 ```
