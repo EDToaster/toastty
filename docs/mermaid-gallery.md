@@ -12,6 +12,8 @@ and rasterizes it with resvg, using only the bundled fonts. Colours come from
 your terminal palette, so `%%{init}%%` theme settings are ignored. If a
 diagram fails to parse or goes over the size limits, toastty shows its source
 as a code block instead. See [markdown.md](markdown.md) for details.
+The [visual style guide](mermaid-style.md) describes the shared dark/light
+color hierarchy and the shape and readability rules.
 
 | # | Type | Keyword |
 | ---: | --- | --- |

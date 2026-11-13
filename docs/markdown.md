@@ -203,6 +203,15 @@ resize sweeps, visible-band paint, revisit costs and fallback counts, see
 `render_mermaid`/`rasterize` intentionally allocates the whole output; the
 terminal uses the band-paint path.
 
+### Mermaid visual style
+
+Diagrams use quiet neutral surfaces and outlines, restrained notes, and
+softened terminal-derived colors for chart categories and status. Dark and
+light themes share the same visual hierarchy. Styling is part of scene
+preparation, so scrolling and resizing reuse the styled geometry rather than
+restyling it. See the [Mermaid style guide](mermaid-style.md) for the color,
+shape, typography and review rules.
+
 ### Vertical grid snapping
 
 The text written into each row's cells must sit on the text drawn there,

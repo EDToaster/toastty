@@ -94,6 +94,12 @@ GPU upload, terminal frame scheduling, and window-system presentation.
 
 ## Recorded comparison
 
+This section records the viewport-aware renderer before the modern
+styling changes, through commit `9651fa3`. Its numbers are historical,
+not measurements of the subsequently styled renderer. See the
+[modern styling comparison](mermaid-style-benchmark.md) for fresh
+pre-style versus styled measurements using the same harness.
+
 Measured on 2026-11-13 with Rust 1.100.0, the repository's release
 profile, and four KVM vCPUs reporting Intel Xeon 2.90 GHz. The baseline
 is `546c7a337f2daab5cb5c4b7251d06b2b419855db`; the after binary is the

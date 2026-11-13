@@ -1,0 +1,65 @@
+Native Mermaid modern-styling benchmark
+Measurement date: 2026-11-13 (UTC)
+Before commit: 9651fa30cc68c615722884f2c8f0fd61f51075b9
+After source: same parent plus final modern-styling worktree (uncommitted when built)
+No timing from the historical 546c7a3 or obsolete 32 MiB-cache runs is included.
+
+Build command (each revision): cargo build --release -j 2 -p toastty-markdown --example mermaid_bench
+Profile: repository release; thin LTO; codegen-units=1
+Compiler: rustc 1.100.0 (0ef1bc386 2026-11-09)
+Compiler commit: 0ef1bc386059596dada8fb65b50425aab2ea637a
+Host: x86_64-unknown-linux-gnu
+LLVM: 23.1.5
+OS: Linux 6.1.155 x86_64 GNU/Linux
+CPU: 4 KVM vCPUs; Intel(R) Xeon(R) Processor @ 2.90GHz
+Process CPU clock: /proc/self/stat user+system; getconf CLK_TCK=100
+No CPU affinity or hardware counters; no allocation or cache-hit counters.
+Other collaborating agents paused Cargo/rustc/test workloads during all four runs.
+The host is shared/virtualized; unobserved host scheduling remains a limitation.
+
+Before isolated checkout: /tmp/toastty-style-baseline-9651 (clean at above commit)
+Before frozen executable: /tmp/toastty-style-bench-binaries/before-9651fa3
+Before executable SHA256: 7ce508639b5ffa0f9a2ecb6e01e713214fbf8d3906c45de73644a0ef3ae289c5
+After frozen executable: /tmp/toastty-style-bench-binaries/after-style-final
+After executable SHA256: 2fd46b687f2aa1cebd97c5eec6f25b95c4b4d1c31f76c4d4687380576c5227b2
+Before binary copied and hashed before styled build; both hashes rechecked after runs.
+
+Final source SHA256 (rechecked after runs):
+mermaid.rs: 81422690e8f3edb3383d342765b30e9634cbcc9a71c120eb3ea51972d0e4fca5
+mermaid/style.rs: 5d324ba6964b7834516b6677949311b46da4919aa4ae7534ba2b28d8c3c541fe
+mermaid/labels.rs: eba1e9acc38ebe878de24b38543614919969905b9ac4cbede403353b0d1e3bb5
+layout/paint.rs: b3c6b9e4a5a83e7a27cf4b17a7ce1907e061e652f771b9f38b896753e86d87c3
+mermaid_bench.rs: 3fc129f76ddb3c4043f212bc3b3b07dc9e8e2253e7b2e5f46e5d4a446fc56ccb
+docs/fixtures/mermaid-responsive.md: 0220119f79056ee9fd4c616112b86d30265d50643d175e3821d479355d59a8e5
+Concatenated gallery Mermaid fence bodies (newline-preserving): 8cb3709d8c619425739ad50045d2dd1c270b25144bcbc8823b6656fc8259a93c
+Harness, stress fixture, Mermaid gallery fence content, labels.rs, and paint.rs match before.
+Gallery prose differs; the embedded Mermaid sources do not.
+Before Cargo.lock: 5f56f79c325524cee8d5c8394f9d0ab9e10b6460a3b9ba57f42dcac98ef626d2
+After Cargo.lock: f2cfc098c8400a2100ae1d69ae3ce9bd1de6de5bc3ac685b4cabea080c2ce3d0
+Lockfile delta: direct toastty-markdown dependency on already-resolved roxmltree 0.21.1.
+
+Arguments for every run: --rounds 50 --size-passes 32
+Order and labels:
+1. before-1.csv: before-style-9651-run1
+2. after-1.csv: after-style-run1
+3. before-2.csv: before-style-9651-run2
+4. after-2.csv: after-style-run2
+CSV final-write UTC timestamps:
+before-1.csv: 2026-11-13 19:52:53.112665349
+after-1.csv: 2026-11-13 19:53:46.608665349
+before-2.csv: 2026-11-13 19:54:39.704665349
+after-2.csv: 2026-11-13 19:55:32.844665349
+All four exit statuses: 0; all four stderr files empty.
+
+Font source: bundled fonts only; font_px=16; Theme::default() dark palette
+Shared scaled cache: 64 MiB, 512 entries, 256-row diagram bands in both versions
+Coverage widths: 320,640,960,1600,4096
+Coverage: 23 gallery diagrams plus 5 stress fixtures; 140 rows per run
+Every coverage status and raster dimension matches across all four runs.
+Per-run gallery: 74 rendered / 41 legibility-fallback
+Per-run stress: 17 rendered / 8 legibility-fallback
+All 23 gallery diagrams render at width 4096.
+Metric rows per run: 55
+Every metric rounds/operations/ok/fallback/pixels/output_bytes tuple matches all four runs.
+coverage-comparison.csv is derived from before-1.csv and after-1.csv.
+Reported means average both equal-sized runs; no fastest-run selection.

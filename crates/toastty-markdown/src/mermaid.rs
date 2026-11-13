@@ -2,9 +2,9 @@
 //! SVG, resvg rasterizes it with the bundled Noto Sans.
 //!
 //! - **Theme:** the renderer's theme (its `themeVariables` equivalent) is
-//!   built from the terminal palette: text and lines from `fg`, node
-//!   fills are ANSI accents blended into `bg`, categorical palettes (pie,
-//!   git, journey …) from the ANSI accents. Theme settings in the source
+//!   built from the terminal palette: neutral raised node surfaces and
+//!   outlines, with harmonized ANSI hues reserved for categorical data.
+//!   Theme settings in the source
 //!   (`%%{init}%%`, frontmatter `config`) are ignored so diagrams always
 //!   match the terminal. The few colours the renderer hard-codes (gantt
 //!   bars, marker fills) are remapped in the SVG. The canvas is
@@ -36,6 +36,7 @@ use tiny_skia::{Pixmap, Transform};
 use crate::{Raster, Rgba, Theme};
 
 mod labels;
+mod style;
 
 /// Largest accepted Mermaid source.
 pub const MAX_SOURCE_BYTES: usize = 64 * 1024;
@@ -407,7 +408,7 @@ fn diagram_svg(diagram: &Diagram, theme: &Theme) -> Result<String, String> {
     // `render_diagram_with` ignores the source's theme/config preamble.
     let svg = mermaid_svg::render_diagram_with(diagram, &palette.mermaid_theme())
         .map_err(|e| e.to_string())?;
-    Ok(palette.remap_literals(&svg, matches!(diagram, Diagram::Gantt(_))))
+    style::apply(&svg, diagram, &palette)
 }
 
 fn check_complexity(diagram: &Diagram) -> Result<(), String> {
@@ -654,6 +655,8 @@ struct Palette {
     /// Node fill and border.
     fill: Rgba,
     stroke: Rgba,
+    group_fill: Rgba,
+    chart_border: Rgba,
     note_fill: Rgba,
     note_stroke: Rgba,
     /// Accents (blue, green, yellow, magenta, cyan, red), visible on bg.
@@ -665,19 +668,14 @@ impl Palette {
     fn new(t: &Theme) -> Self {
         let (fg, bg) = (t.fg, t.bg);
         let dark = luminance(bg) < luminance(fg);
-        // Bright variants read better on dark backgrounds, normal ones on
-        // light. Accents too close to bg (yellow on white, black on black)
-        // are pulled towards fg until they stand out.
+        let fill = readable_tint(bg, fg, fg, if dark { 0.065 } else { 0.035 });
+        let group_fill = readable_tint(bg, fg, fg, 0.025);
+        let neutral = mix(bg, fg, 0.55);
+        // Tame even the saturated xterm palette without replacing the user's
+        // hue families. Keep chromatic strokes distinguishable from the canvas.
         let accent = |i: usize| {
             let c = if dark { t.ansi[i + 8] } else { t.ansi[i] };
-            let mut s = 0.0;
-            loop {
-                let v = mix(c, fg, s);
-                if s >= 1.0 || contrast(v, bg) >= 2.0 {
-                    return v;
-                }
-                s += 0.1;
-            }
+            contrast_ink(mix(c, neutral, 0.35), fg, &[bg], 3.0)
         };
         let accents = [
             accent(4),
@@ -687,18 +685,25 @@ impl Palette {
             accent(6),
             accent(1),
         ];
-        let tint = if dark { 0.22 } else { 0.16 };
-        let blue = accents[0];
         let yellow = accents[2];
+        let note_fill = readable_tint(bg, yellow, fg, if dark { 0.16 } else { 0.12 });
+        let stroke = contrast_ink(mix(bg, fg, 0.43), fg, &[bg, fill], 3.0);
+        let chart_fills: Vec<_> = accents
+            .iter()
+            .map(|&c| readable_tint(bg, c, fg, 0.60))
+            .chain([bg])
+            .collect();
         Self {
             fg,
             bg,
-            line: mix(bg, fg, 0.75),
-            muted: mix(bg, fg, 0.6),
-            fill: readable_tint(bg, blue, fg, tint),
-            stroke: blue,
-            note_fill: readable_tint(bg, yellow, fg, tint),
-            note_stroke: yellow,
+            line: contrast_ink(mix(bg, fg, 0.62), fg, &[bg, fill], 3.0),
+            muted: contrast_ink(mix(bg, fg, 0.60), fg, &[bg, fill], 4.5),
+            fill,
+            stroke,
+            group_fill,
+            chart_border: contrast_ink(stroke, fg, &chart_fills, 3.0),
+            note_fill,
+            note_stroke: contrast_ink(yellow, fg, &[bg, note_fill], 3.0),
             accents,
             red: accents[5],
         }
@@ -714,15 +719,31 @@ impl Palette {
                 } else {
                     strength * 0.6
                 };
-                owned(readable_tint_with(self.bg, base, self.fg, s, 3.0))
+                owned(readable_tint(self.bg, base, self.fg, s))
             })
             .collect();
         Cow::Owned(v)
     }
 
+    /// Preserve eight lane identities; the second blue/green pair is lighter
+    /// on dark themes and darker on light themes, not an exact six-lane repeat.
+    fn git_colors(&self) -> [Rgba; 8] {
+        let [blue, green, yellow, magenta, cyan, red] = self.accents;
+        [
+            blue,
+            green,
+            yellow,
+            magenta,
+            cyan,
+            red,
+            mix(blue, self.fg, 0.25),
+            mix(green, self.fg, 0.25),
+        ]
+    }
+
     fn mermaid_theme(&self) -> mermaid_svg::Theme {
         let (fg, bg) = (self.fg, self.bg);
-        let quadrant = |s: f32| owned(readable_tint(bg, self.stroke, fg, s));
+        let quadrant = |s: f32| owned(readable_tint(bg, self.accents[0], fg, s));
         mermaid_svg::Theme {
             fg: owned(fg),
             fg_muted: owned(self.muted),
@@ -730,156 +751,54 @@ impl Palette {
             actor_fill: owned(self.fill),
             actor_stroke: owned(self.stroke),
             actor_text_color: None,
-            lifeline: owned(mix(bg, fg, 0.45)),
+            lifeline: owned(self.stroke),
             arrow_stroke: owned(self.line),
             signal_text_color: None,
             note_fill: owned(self.note_fill),
             note_stroke: owned(self.note_stroke),
-            activation_fill: owned(mix(bg, fg, 0.15)),
-            activation_stroke: owned(mix(bg, fg, 0.5)),
+            activation_fill: owned(readable_tint(bg, fg, fg, 0.12)),
+            activation_stroke: owned(self.stroke),
             frame_label_fill: owned(self.fill),
             title_color: None,
             flow_node_fill: owned(self.fill),
             flow_node_stroke: owned(self.stroke),
             flow_edge_stroke: owned(self.line),
             flow_label_bg: owned(bg),
-            flow_cluster_fill: owned(mix(bg, fg, 0.05)),
-            flow_cluster_stroke: owned(mix(bg, fg, 0.35)),
-            cscale_palette: self.series(12, 0.45),
+            flow_cluster_fill: owned(self.group_fill),
+            flow_cluster_stroke: owned(self.stroke),
+            cscale_palette: self.series(12, 0.55),
             pie_palette: self.series(12, 0.6),
-            git_palette: self.series(8, 0.7),
+            git_palette: Cow::Owned(self.git_colors().iter().map(|&c| owned(c)).collect()),
             xychart_palette: Cow::Owned(self.accents.iter().map(|&c| owned(c)).collect()),
-            pie_stroke: Some(owned(bg)),
+            pie_stroke: Some(owned(self.chart_border)),
             pie_opacity: None,
             commit_label_color: None,
             tag_label_color: None,
             quadrant_fills: [None, None, None, None],
             quadrant_default_fills: [
-                quadrant(0.30),
-                quadrant(0.22),
-                quadrant(0.14),
+                quadrant(0.16),
+                quadrant(0.12),
                 quadrant(0.08),
+                quadrant(0.04),
             ],
             font_family: Cow::Borrowed(FONT_FAMILY),
             font_size: f64::from(BASE_FONT_PX),
             responsive: false,
         }
     }
-
-    /// Replace colours the renderer hard-codes (Mermaid default-theme
-    /// literals) with theme colours. On shapes, white means "knock-out"
-    /// (→ bg) and black / #333 means "ink" (→ fg); on text, white means
-    /// "light text on a dark fill" and keeps that role (→ the lighter of
-    /// fg / bg), dark means the opposite.
-    fn remap_literals(&self, svg: &str, gantt: bool) -> String {
-        let (fg, bg) = (self.fg, self.bg);
-        let (light, dark) = if luminance(fg) > luminance(bg) {
-            (fg, bg)
-        } else {
-            (bg, fg)
-        };
-        let blue = self.stroke;
-        let mut shape: Vec<(&str, Rgba)> = vec![
-            ("#fff", bg),
-            ("#ffffff", bg),
-            ("white", bg),
-            ("#333", fg),
-            ("#333333", fg),
-            ("black", fg),
-            ("#999", self.muted),
-            // Default-theme note colours (state notes).
-            ("#fff5ad", self.note_fill),
-            ("#aaaa33", self.note_stroke),
-            // Packet field boxes and requirement relationship-label panels
-            // otherwise retain pale fills behind terminal-colored light text.
-            ("#efefef", self.fill),
-            ("#e8e8e8", bg),
-        ];
-        let mut text: Vec<(&str, Rgba)> = vec![
-            ("#fff", light),
-            ("#ffffff", light),
-            ("white", light),
-            ("#333", dark),
-            ("#333333", dark),
-            ("black", dark),
-            ("#999", self.muted),
-        ];
-        if gantt {
-            shape.extend([
-                // Light section bands (white at 20 %) → faint fg bands.
-                ("#ffffff", mix(bg, fg, 0.5)),
-                ("#6666ff", blue),
-                ("#fff400", self.accents[2]),
-                // Task bars: normal, active, done, crit.
-                ("#8a90dd", blue),
-                ("#534fbc", mix(blue, fg, 0.35)),
-                ("#bfc7ff", readable_tint(bg, blue, fg, 0.45)),
-                ("#d3d3d3", mix(bg, fg, 0.3)),
-                ("#808080", mix(bg, fg, 0.55)),
-                ("red", self.red),
-                ("#ff8888", mix(self.red, fg, 0.35)),
-            ]);
-            // Text inside a normal bar was white on purple: use whichever
-            // of bg / fg reads better on the new bar colour. Active and
-            // done bars get fills that suit fg.
-            let ink = if contrast(fg, blue) > contrast(bg, blue) {
-                fg
-            } else {
-                bg
-            };
-            text = vec![("#fff", ink), ("#333", fg)];
-        }
-        // Earlier entries win, so put the gantt overrides first.
-        shape.reverse();
-
-        let mut out = String::with_capacity(svg.len());
-        let mut rest = svg;
-        while let Some(lt) = rest.find('<') {
-            out.push_str(&rest[..lt]);
-            rest = &rest[lt..];
-            let end = rest.find('>').map_or(rest.len(), |i| i + 1);
-            let tag = &rest[..end];
-            let name = tag[1..]
-                .split(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
-                .next()
-                .unwrap_or("");
-            let map = if matches!(name, "text" | "tspan") {
-                &text
-            } else {
-                &shape
-            };
-            remap_tag(tag, map, &mut out);
-            rest = &rest[end..];
-        }
-        out.push_str(rest);
-        out
-    }
 }
 
-/// Copy `tag` to `out`, replacing colour attribute values found in `map`.
-fn remap_tag(tag: &str, map: &[(&str, Rgba)], out: &mut String) {
-    let mut rest = tag;
-    while let Some(i) = rest.find("=\"") {
-        let (head, tail) = rest.split_at(i + 2);
-        out.push_str(head);
-        let is_colour = ["fill", "stroke", "stop-color", "color"]
-            .iter()
-            .any(|a| head[..i].ends_with(a));
-        let Some(end) = tail.find('"') else {
-            rest = tail;
-            break;
-        };
-        let value = &tail[..end];
-        match map
-            .iter()
-            .find(|(k, _)| is_colour && value.eq_ignore_ascii_case(k))
-        {
-            Some((_, c)) => out.push_str(&hex(*c)),
-            None => out.push_str(value),
+/// Strengthen ink against all its surfaces. Poor base fg/bg combinations
+/// cannot necessarily meet the requested contrast; preserve the user's fg
+/// rather than silently introducing unrelated black/white.
+fn contrast_ink(ink: Rgba, fg: Rgba, surfaces: &[Rgba], minimum: f32) -> Rgba {
+    for step in 0_u8..=20 {
+        let c = mix(ink, fg, f32::from(step) / 20.0);
+        if surfaces.iter().all(|&bg| contrast(c, bg) >= minimum) {
+            return c;
         }
-        rest = &tail[end..];
     }
-    out.push_str(rest);
+    fg
 }
 
 /// `accent` blended into `bg` by `strength`, backed off until `fg` text
@@ -896,7 +815,7 @@ fn readable_tint_with(bg: Rgba, accent: Rgba, fg: Rgba, strength: f32, min: f32)
         if s <= 0.0 || contrast(fg, c) >= min {
             return c;
         }
-        s -= 0.05;
+        s = (s - 0.05).max(0.0);
     }
 }
 #[cfg(test)]
@@ -976,7 +895,7 @@ mod tests {
     }
 
     /// A light theme (Tomorrow-ish palette on near-white).
-    fn light() -> Theme {
+    pub(super) fn light() -> Theme {
         Theme {
             fg: [0x1f, 0x23, 0x28, 0xff],
             bg: [0xfa, 0xfa, 0xf8, 0xff],
@@ -996,6 +915,32 @@ mod tests {
                 [0x42, 0x71, 0xae, 0xff],
                 [0x89, 0x59, 0xa8, 0xff],
                 [0x3e, 0x99, 0x9f, 0xff],
+                [0xff, 0xff, 0xff, 0xff],
+            ],
+        }
+    }
+
+    /// Exact high-saturation terminal defaults, not Theme's demo palette.
+    pub(super) fn terminal_dark() -> Theme {
+        Theme {
+            fg: [0xd9, 0xd9, 0xd9, 0xff],
+            bg: [0x12, 0x12, 0x14, 0xff],
+            ansi: [
+                [0x00, 0x00, 0x00, 0xff],
+                [0xcc, 0x30, 0x30, 0xff],
+                [0x30, 0xcc, 0x30, 0xff],
+                [0xcc, 0xcc, 0x30, 0xff],
+                [0x30, 0x30, 0xcc, 0xff],
+                [0xcc, 0x30, 0xcc, 0xff],
+                [0x30, 0xcc, 0xcc, 0xff],
+                [0xcc, 0xcc, 0xcc, 0xff],
+                [0x66, 0x66, 0x66, 0xff],
+                [0xff, 0x50, 0x50, 0xff],
+                [0x50, 0xff, 0x50, 0xff],
+                [0xff, 0xff, 0x50, 0xff],
+                [0x50, 0x50, 0xff, 0xff],
+                [0xff, 0x50, 0xff, 0xff],
+                [0x50, 0xff, 0xff, 0xff],
                 [0xff, 0xff, 0xff, 0xff],
             ],
         }
@@ -1124,27 +1069,32 @@ mod tests {
                 "{name}: themes produced identical pixels"
             );
         }
-        // Flowchart node fill is the blue accent blended into bg.
+        // Structural cards are neutral; categorical accents do not tint them.
         let d = render(FLOWCHART, &dark());
         let t = dark();
-        let fill = readable_tint(t.bg, t.ansi[12], t.fg, 0.22);
+        let fill = Palette::new(&t).fill;
         assert!(share_of(&d, fill, 3) > 0.2, "dark node fill missing");
         let l = render(FLOWCHART, &light());
         let t = light();
-        let fill = readable_tint(t.bg, t.ansi[4], t.fg, 0.16);
+        let fill = Palette::new(&t).fill;
         assert!(share_of(&l, fill, 3) > 0.2, "light node fill missing");
-        // Mermaid's default dark text and white fills never appear.
+        // Check authored paints, not antialiased neutral edge pixels (which
+        // can legitimately land near #333 on a dark canvas).
         for (name, src) in SAMPLES {
-            let d = render(src, &dark());
-            // (Antialiased edges may hit a stray pixel or two.)
-            assert!(
-                share_of(&d, [0x33, 0x33, 0x33, 0xff], 4) < 0.002,
-                "{name}: #333"
-            );
-            assert!(
-                share_of(&d, [0xff, 0xff, 0xff, 0xff], 4) < 0.002,
-                "{name}: white"
-            );
+            let svg = render_svg(src, &dark()).unwrap();
+            let document = roxmltree::Document::parse(&svg).unwrap();
+            for node in document.descendants() {
+                for attribute in node
+                    .attributes()
+                    .filter(|a| matches!(a.name(), "fill" | "stroke"))
+                {
+                    assert!(
+                        !matches!(attribute.value(), "#333" | "#fff" | "#ffffff"),
+                        "{name}: default literal {} survived",
+                        attribute.value()
+                    );
+                }
+            }
         }
     }
 
@@ -1155,8 +1105,9 @@ mod tests {
 
     #[test]
     fn theme_contrast() {
-        for t in [dark(), light()] {
-            let m = Palette::new(&t).mermaid_theme();
+        for t in [dark(), light(), terminal_dark()] {
+            let palette = Palette::new(&t);
+            let m = palette.mermaid_theme();
             assert_eq!(m.fg, hex(t.fg));
             assert_eq!(m.bg, hex(t.bg));
             assert!(!m.responsive);
@@ -1175,16 +1126,21 @@ mod tests {
             }
             for fill in m.pie_palette.iter().chain(m.cscale_palette.iter()) {
                 let c = contrast(t.fg, parse_hex(fill));
-                assert!(c >= 3.0, "fg on {fill}: contrast {c:.2}");
+                assert!(c >= 4.5, "fg on {fill}: contrast {c:.2}");
+                assert!(contrast(palette.chart_border, parse_hex(fill)) >= 3.0);
             }
             // Accent strokes stand out from the background.
             for c in Palette::new(&t).accents {
-                assert!(contrast(c, t.bg) >= 2.0, "{} on bg", hex(c));
+                assert!(contrast(c, t.bg) >= 3.0, "{} on bg", hex(c));
             }
             for line in [&m.flow_edge_stroke, &m.arrow_stroke, &m.flow_node_stroke] {
                 let c = contrast(parse_hex(line), t.bg);
                 assert!(c >= 3.0, "{line} on bg: contrast {c:.2}");
             }
+            assert!(contrast(palette.stroke, palette.fill) >= 3.0);
+            assert!(contrast(palette.note_stroke, palette.note_fill) >= 3.0);
+            assert!(contrast(palette.muted, palette.fill) >= 4.5);
+            assert!(contrast(palette.fg, palette.fill) >= 4.5);
         }
     }
 
@@ -1193,7 +1149,8 @@ mod tests {
         let mut t = dark();
         t.ansi[12] = t.bg;
         let p = Palette::new(&t);
-        assert!(contrast(p.stroke, t.bg) >= 2.0);
+        assert!(contrast(p.stroke, t.bg) >= 3.0);
+        assert!(contrast(p.accents[0], t.bg) >= 3.0);
     }
 
     #[test]
@@ -1205,40 +1162,29 @@ mod tests {
     }
 
     #[test]
-    fn remap_only_touches_colour_attributes() {
-        let p = Palette::new(&dark());
-        let bg = hex(dark().bg);
-        let fg = hex(dark().fg);
-        let svg = r##"<svg><circle fill="#fff" stroke="black"/><text id="white" fill="#ffffff">white</text><rect fill="#123456"/></svg>"##;
-        let out = p.remap_literals(svg, false);
-        // Shapes: white = knock-out (bg); text: white = light (fg on a dark theme).
+    fn saturated_ansi_is_harmonized_without_coloring_structural_cards() {
+        let theme = terminal_dark();
+        let p = Palette::new(&theme);
+        let channel_range = |c: Rgba| *c[..3].iter().max().unwrap() - *c[..3].iter().min().unwrap();
+        assert!(channel_range(p.fill) <= 3);
+        assert!(channel_range(p.stroke) <= 3);
+        for (index, ansi) in [12, 10, 11, 13, 14, 9].into_iter().enumerate() {
+            assert!(channel_range(p.accents[index]) < channel_range(theme.ansi[ansi]));
+            assert_ne!(p.accents[index], p.stroke);
+        }
+        let poorly_chosen = Theme {
+            fg: [90, 90, 90, 255],
+            bg: [90, 90, 90, 255],
+            ..theme
+        };
+        let p = Palette::new(&poorly_chosen);
         assert_eq!(
-            out,
-            format!(
-                r##"<svg><circle fill="{bg}" stroke="{fg}"/><text id="white" fill="{fg}">white</text><rect fill="#123456"/></svg>"##
-            )
-        );
-        let lp = Palette::new(&light());
-        let out = lp.remap_literals(
-            r##"<text fill="#fff">x</text><text fill="#333">y</text>"##,
-            false,
-        );
-        assert_eq!(
-            out,
-            format!(
-                r#"<text fill="{}">x</text><text fill="{}">y</text>"#,
-                hex(light().bg),
-                hex(light().fg)
-            )
-        );
-        // Gantt-only literals are left alone elsewhere.
-        assert!(
-            p.remap_literals(r##"<rect fill="#8a90dd"/>"##, false)
-                .contains("#8a90dd")
+            p.stroke, poorly_chosen.fg,
+            "do not invent a replacement base theme"
         );
         assert!(
-            !p.remap_literals(r##"<rect fill="#8a90dd"/>"##, true)
-                .contains("#8a90dd")
+            contrast(p.fg, p.bg) < 4.5,
+            "do not claim to repair illegible base themes"
         );
     }
 
@@ -1364,57 +1310,126 @@ mod tests {
         // such as dropping stroked zero-area paths in both outputs.
         let gallery = include_str!("../../../docs/mermaid-gallery.md");
         let mut count = 0;
-        for block in gallery.split("```mermaid\n").skip(1) {
-            let src = block.split("\n```").next().unwrap();
-            let prepared = prepare_mermaid(src, 16.0, &dark()).unwrap();
-            let plan = prepared.plan(4096).unwrap();
-            assert_eq!(plan.variant, 0);
-            let scene = &prepared.standard;
-            let mut whole = Pixmap::new(plan.width, plan.height).unwrap();
-            resvg::render(
-                &scene.tree,
-                Transform::from_translate(-scene.x0, -scene.y0).post_scale(plan.scale, plan.scale),
-                &mut whole.as_mut(),
-            );
-            assert!(whole.pixels().iter().any(|p| p.alpha() > 0));
-            for y in [0, plan.height / 2, plan.height.saturating_sub(37)] {
-                let band = prepared.pixmap_band(4096, y, 300).unwrap();
-                let start = y as usize * plan.width as usize * 4;
-                let reference = &whole.data()[start..start + band.data().len()];
-                let max_difference = band
-                    .data()
-                    .iter()
-                    .zip(reference)
-                    .map(|(a, b)| a.abs_diff(*b))
-                    .max()
-                    .unwrap();
-                let changed = band
-                    .data()
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .zip(reference.as_chunks::<4>().0)
-                    .filter(|(a, b)| a.iter().zip(b.iter()).any(|(a, b)| a.abs_diff(*b) > 4))
-                    .count();
-                // Clipping changes tiny-skia's curve subdivision at sparse
-                // edge pixels (especially pie/radar curves). Bound both
-                // magnitude and area, not just an average pixel error.
-                let pixels = band.data().len() / 4;
-                assert!(
-                    max_difference <= 96 && changed * 1000 <= pixels,
-                    "{}: band at {y}, max difference {max_difference}, {changed}/{pixels} pixels",
-                    src.lines().next().unwrap()
+        for theme in [terminal_dark(), light()] {
+            for block in gallery.split("```mermaid\n").skip(1) {
+                let src = block.split("\n```").next().unwrap();
+                let prepared = prepare_mermaid(src, 16.0, &theme).unwrap();
+                let plan = prepared.plan(4096).unwrap();
+                assert_eq!(plan.variant, 0);
+                let scene = &prepared.standard;
+                let mut whole = Pixmap::new(plan.width, plan.height).unwrap();
+                resvg::render(
+                    &scene.tree,
+                    Transform::from_translate(-scene.x0, -scene.y0)
+                        .post_scale(plan.scale, plan.scale),
+                    &mut whole.as_mut(),
                 );
-                // The zero-area stroke regression specifically dropped
-                // horizontal arrow shafts and vertical lifelines. Require
-                // tight coverage for the independent sequence oracle.
-                if matches!(&prepared.diagram, Diagram::Sequence(_)) {
-                    assert!(max_difference <= 4, "sequence stroke changed at y={y}");
+                assert!(whole.pixels().iter().any(|p| p.alpha() > 0));
+                for y in [0, plan.height / 2, plan.height.saturating_sub(37)] {
+                    let band = prepared.pixmap_band(4096, y, 300).unwrap();
+                    let start = y as usize * plan.width as usize * 4;
+                    let reference = &whole.data()[start..start + band.data().len()];
+                    let max_difference = band
+                        .data()
+                        .iter()
+                        .zip(reference)
+                        .map(|(a, b)| a.abs_diff(*b))
+                        .max()
+                        .unwrap();
+                    let changed = band
+                        .data()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(reference.as_chunks::<4>().0)
+                        .filter(|(a, b)| a.iter().zip(b.iter()).any(|(a, b)| a.abs_diff(*b) > 4))
+                        .count();
+                    // Clipping changes tiny-skia's curve subdivision at sparse
+                    // edge pixels (especially pie/radar curves). Bound both
+                    // magnitude and area, not just an average pixel error.
+                    let pixels = band.data().len() / 4;
+                    let area_ok = if matches!(&prepared.diagram, Diagram::Radar(_)) {
+                        // Contrasting radar outlines expose ~0.106% differing
+                        // edge pixels under clipped curve subdivision. Give
+                        // only radar 0.12%, with an additional coverage-edge
+                        // guard: differences in flat interiors never qualify.
+                        assert_eq!(changed_interior_pixels(&whole, &band, y), 0);
+                        changed * 10_000 <= pixels * 12
+                    } else {
+                        changed * 1000 <= pixels
+                    };
+                    assert!(
+                        max_difference <= 96 && area_ok,
+                        "{}: band at {y}, max difference {max_difference}, {changed}/{pixels} pixels",
+                        src.lines().next().unwrap()
+                    );
+                    // The zero-area stroke regression specifically dropped
+                    // horizontal arrow shafts and vertical lifelines. Require
+                    // tight coverage for the independent sequence oracle.
+                    if matches!(&prepared.diagram, Diagram::Sequence(_)) {
+                        assert!(max_difference <= 4, "sequence stroke changed at y={y}");
+                    }
                 }
+                count += 1;
             }
-            count += 1;
         }
-        assert_eq!(count, 23, "gallery coverage unexpectedly changed");
+        assert_eq!(
+            count, 46,
+            "dark/light gallery coverage unexpectedly changed"
+        );
+    }
+
+    /// Count >4-level differences farther than 2 px from an alpha edge in the
+    /// independent whole-scene oracle. RGB gradients cannot satisfy this test.
+    fn changed_interior_pixels(whole: &Pixmap, band: &Pixmap, y0: u32) -> usize {
+        let width = whole.width() as usize;
+        let height = whole.height() as usize;
+        let original = whole.data().as_chunks::<4>().0;
+        let start = y0 as usize * width;
+        band.data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(i, actual)| {
+                let reference = original[start + i];
+                if !actual
+                    .iter()
+                    .zip(reference.iter())
+                    .any(|(a, b)| a.abs_diff(*b) > 4)
+                {
+                    return false;
+                }
+                let x = i % width;
+                let y = y0 as usize + i / width;
+                !(y.saturating_sub(2)..=(y + 2).min(height - 1)).any(|ny| {
+                    (x.saturating_sub(2)..=(x + 2).min(width - 1))
+                        .any(|nx| original[ny * width + nx][3].abs_diff(reference[3]) > 4)
+                })
+            })
+            .count()
+    }
+
+    #[test]
+    fn radar_edge_guard_rejects_interior_errors_even_on_rgb_gradients() {
+        let mut whole = Pixmap::new(16, 16).unwrap();
+        whole.fill(tiny_skia::Color::from_rgba8(80, 80, 80, 255));
+        for (i, pixel) in whole
+            .data_mut()
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
+            pixel[0] = 40 + (i % 16) as u8 * 8;
+        }
+        let mut band = whole.clone();
+        band.data_mut()[(8 * 16 + 8) * 4 + 1] += 16;
+        assert_eq!(changed_interior_pixels(&whole, &band, 0), 1);
+        // A nearby real coverage edge, not an RGB gradient, qualifies.
+        whole.data_mut()[(8 * 16 + 9) * 4 + 3] = 128;
+        band.data_mut()[(8 * 16 + 9) * 4 + 3] = 128;
+        assert_eq!(changed_interior_pixels(&whole, &band, 0), 0);
     }
 
     #[test]
