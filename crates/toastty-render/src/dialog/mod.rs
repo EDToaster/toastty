@@ -862,7 +862,7 @@ mod tests {
         let f = fit_spans(&spans, 10);
         assert_eq!(text(&f), "averyvery…");
         assert_eq!(spans_cols(&f), 10);
-        assert!(fit_spans(&spans, 0).is_empty());
+        assert_eq!(fit_spans(&spans, 0), [] as [crate::dialog::Span; 0]);
         // Fits: unchanged.
         assert_eq!(fit_spans(&spans, 100), spans);
     }

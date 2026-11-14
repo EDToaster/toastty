@@ -1367,7 +1367,10 @@ mod tests {
         p.advance(&mut r, b"\x1b[3\xe2");
         p.advance(&mut r, b"\x82\xac1mX");
         assert_eq!(r.text, "\u{fffd}\u{fffd}1mX");
-        assert!(r.csi.is_empty());
+        assert_eq!(
+            r.csi,
+            [] as [(std::vec::Vec<std::vec::Vec<u16>>, std::vec::Vec<u8>, char); 0]
+        );
         // An all-ASCII read that ends inside a sequence (the fast path
         // that leaves sequences to vte) still lets the next read abort it.
         for (a, b, want) in [
@@ -1496,12 +1499,12 @@ mod tests {
         // One byte over the cap, BEL-terminated: no dispatch, and the
         // remainder of the string never prints.
         let r = parse_capped(8, &[b"\x1b]52;c;aGk=", b"zzzz", b"zz\x07ok"]);
-        assert!(r.osc.is_empty());
+        assert_eq!(r.osc, [] as [std::vec::Vec<std::vec::Vec<u8>>; 0]);
         assert_eq!(r.text, "ok");
         assert!(r.execs.is_empty(), "abort CAN must not leak: {:?}", r.execs);
         // ST-terminated variant, overflow detected in a single chunk.
         let r = parse_capped(4, &[b"\x1b]0;long title\x1b\\ok"]);
-        assert!(r.osc.is_empty());
+        assert_eq!(r.osc, [] as [std::vec::Vec<std::vec::Vec<u8>>; 0]);
         assert_eq!(r.text, "ok");
         // An endless unterminated OSC stays discarded across chunks;
         // the next OSC after a terminator parses normally.
@@ -1511,7 +1514,7 @@ mod tests {
         for _ in 0..100 {
             p.advance(&mut r, b"QUFBQUFBQUFB");
         }
-        assert!(r.text.is_empty());
+        assert_eq!(r.text, "");
         p.advance(&mut r, b"\x18\x1b]2;t\x07z");
         assert_eq!(r.osc, vec![vec![b"2".to_vec(), b"t".to_vec()]]);
         assert_eq!(r.text, "z");
@@ -1864,7 +1867,15 @@ mod tests {
         }
         // BEL before the final byte: no hook, nothing printed.
         let r = parse(b"\x1bP1\x07x");
-        assert!(r.dcs.is_empty());
+        assert_eq!(
+            r.dcs,
+            [] as [(
+                std::vec::Vec<std::vec::Vec<u16>>,
+                std::vec::Vec<u8>,
+                char,
+                std::vec::Vec<u8>
+            ); 0]
+        );
         assert_eq!(r.text, "x");
         // A DCS that started like a tmux passthrough.
         let r = parse(b"\x1bPtm\x07x");
@@ -1911,7 +1922,10 @@ mod tests {
         }
         // A PM cuts off a CSI in progress, as the ESC did before.
         let r = parse(b"\x1b[1\x1b^zz\x07x");
-        assert!(r.csi.is_empty());
+        assert_eq!(
+            r.csi,
+            [] as [(std::vec::Vec<std::vec::Vec<u16>>, std::vec::Vec<u8>, char); 0]
+        );
         assert_eq!(r.text, "x");
     }
 
@@ -2006,7 +2020,7 @@ mod tests {
         // ESC = is an esc_dispatch, must not be consumed by APC scanner.
         let r = parse(b"\x1b=");
         assert_eq!(r.esc, vec![(vec![], b'=')]);
-        assert!(r.apc.is_empty());
+        assert_eq!(r.apc, [] as [std::vec::Vec<u8>; 0]);
     }
 
     #[test]

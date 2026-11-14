@@ -804,7 +804,7 @@ mod tests {
         let mut r = ImageRegistry::<u32>::new(64 * 1024);
         let res = r.insert(0, img(2, 2, 0)).unwrap();
         assert_eq!(res.id, 1);
-        assert!(res.evicted.is_empty());
+        assert_eq!(res.evicted, [] as [u32; 0]);
         let res = r.insert(0, img(2, 2, 0)).unwrap();
         assert_eq!(res.id, 2);
     }
@@ -1061,7 +1061,7 @@ mod tests {
         let mut r = ImageRegistry::<u32>::new(32);
         r.insert(1, img(2, 2, 1)).unwrap();
         let res = r.insert(1, img(2, 2, 9)).unwrap();
-        assert!(res.evicted.is_empty());
+        assert_eq!(res.evicted, [] as [u32; 0]);
         assert!(r.contains(1));
         assert_eq!(r.get(1).unwrap().pixels[0], 9);
     }
@@ -1332,7 +1332,7 @@ mod tests {
         let now = Instant::now();
         assert_eq!(r.tick_animations(now, |_| false), (vec![], None));
         let (changed, next) = r.tick_animations(now, |_| true);
-        assert!(changed.is_empty());
+        assert_eq!(changed, [] as [u32; 0]);
         assert_eq!(next, Some(now + std::time::Duration::from_millis(50)));
         // Due within ANIMATION_SLACK: shown now, with the next frame
         // scheduled from when this one was due (no drift).

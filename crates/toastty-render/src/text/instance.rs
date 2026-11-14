@@ -1709,7 +1709,7 @@ mod tests {
             .iter()
             .find(|i| i.flags & FLAG_COLOR_GLYPH != 0)
             .expect("expected glyph instance");
-        assert!(glyph_inst.flags & FLAG_NO_GLYPH == 0);
+        assert_eq!(glyph_inst.flags & FLAG_NO_GLYPH, 0);
     }
 
     #[test]

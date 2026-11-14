@@ -3879,7 +3879,10 @@ mod tests {
             app.event(mouse(MouseButton::Right, KeyState::Released, (5.0, 5.0))),
             ControlSignal::Continue
         );
-        assert!(app.modal_buttons_down.is_empty());
+        assert_eq!(
+            app.modal_buttons_down,
+            [] as [toastty_window::MouseButton; 0]
+        );
         // Back to normal: a left press selects again.
         app.event(mouse(MouseButton::Left, KeyState::Pressed, (5.0, 5.0)));
         assert!(app.selecting.is_some());

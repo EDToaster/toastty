@@ -278,7 +278,7 @@ mod tests {
     fn kitty_empty_payload_emits_nothing() {
         // `chunks` on an empty slice yields nothing. Unreachable in
         // practice: `decode` rejects empty input first.
-        assert!(kitty_apcs(b"").is_empty());
+        assert_eq!(kitty_apcs(b""), [] as [u8; 0]);
     }
 
     #[test]
@@ -469,7 +469,7 @@ mod tests {
         let (res, out, err) = run_capture(std::slice::from_ref(&path), Protocol::Kitty);
         std::fs::remove_file(&path).unwrap();
         res.unwrap();
-        assert!(err.is_empty());
+        assert_eq!(err, "");
         assert_eq!(out, render(&bytes, Protocol::Kitty).unwrap());
     }
 
@@ -482,7 +482,7 @@ mod tests {
         for protocol in [Protocol::Kitty, Protocol::Sixel] {
             let (res, out, err) = run_capture(&[pa.clone(), pb.clone()], protocol);
             res.unwrap();
-            assert!(err.is_empty());
+            assert_eq!(err, "");
             let mut want = render(&a, protocol).unwrap();
             want.push(b'\n');
             want.extend(render(&b, protocol).unwrap());
@@ -507,7 +507,7 @@ mod tests {
     fn run_missing_file_is_reported_with_path() {
         let missing = PathBuf::from("/nonexistent/toastty-test.png");
         let (res, out, err) = run_capture(std::slice::from_ref(&missing), Protocol::Kitty);
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [u8; 0]);
         assert!(
             err.starts_with("toastty image: /nonexistent/toastty-test.png: "),
             "{err}"
@@ -524,7 +524,7 @@ mod tests {
         let (res, out, err) = run_capture(std::slice::from_ref(&path), Protocol::Sixel);
         std::fs::remove_file(&path).unwrap();
         assert!(res.is_err());
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [u8; 0]);
         assert!(err.contains(&path.display().to_string()), "{err}");
         assert!(err.contains("not a supported image"), "{err}");
     }

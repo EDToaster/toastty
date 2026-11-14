@@ -310,7 +310,7 @@ mod tests {
         let mut s = Utf8Sanitizer::default();
         let mut v = Vec::new();
         s.feed(b"\xe2", false, &mut |b| v.extend_from_slice(b));
-        assert!(v.is_empty());
+        assert_eq!(v, [] as [u8; 0]);
         s.feed(b"", true, &mut |b| v.extend_from_slice(b));
         assert_eq!(v, "\u{FFFD}".as_bytes());
         s.feed(b"ok", false, &mut |b| v.extend_from_slice(b));
