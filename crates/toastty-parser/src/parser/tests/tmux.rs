@@ -156,6 +156,18 @@ fn stray_esc_inside_payload_keeps_the_next_byte() {
 }
 
 #[test]
+fn partial_dcs_introducer_continues_after_passthrough() {
+    // The minimal CI property-test counterexample ended before the DCS
+    // completed: inner=ESC P, after=t. Compare the actual dispatch once
+    // its terminator arrives, including every possible input split.
+    let wrapped = concat(&[&wrap(b"\x1bP"), b"t\x1b\\"]);
+    assert_same_as_direct(&wrapped, b"\x1bPt\x1b\\");
+    let got = parse(&wrapped);
+    assert_eq!(got.dcs, vec![(vec![vec![0]], vec![], 't', vec![])]);
+    assert!(got.dcs_active.is_none());
+}
+
+#[test]
 fn ordinary_dcs_is_unaffected() {
     let cases: &[&[u8]] = &[
         // DECRQSS
@@ -397,8 +409,13 @@ proptest! {
         after in proptest::collection::vec(inner_byte(), 0..16),
         split in any::<prop::sample::Index>(),
     ) {
-        let wrapped = concat(&[b"ab", &wrap(&inner), &after]);
-        let direct = concat(&[b"ab", &inner, &after]);
+        // Finish partial sequences before comparing events. Direct
+        // input holds a possible `ESC P tmux;` introducer, whereas a
+        // passthrough payload deliberately disables nested detection.
+        // For e.g. inner=ESC P, after=t, their intermediate dcs_active
+        // states differ even though the completed DCS is identical.
+        let wrapped = concat(&[b"ab", &wrap(&inner), &after, b"\x1b\\"]);
+        let direct = concat(&[b"ab", &inner, &after, b"\x1b\\"]);
         let want = parse(&direct);
         prop_assert_eq!(&parse(&wrapped), &want);
         let i = split.index(wrapped.len() + 1);

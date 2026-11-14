@@ -1,7 +1,7 @@
 use crate::error::{PtyError, Result};
 use crate::spec::{PtySpec, WinSize};
 use rustix::fs::{Mode, OFlags, open};
-use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+use rustix::pty::{grantpt, ptsname, unlockpt};
 use std::ffi::OsStr;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
@@ -15,7 +15,8 @@ use std::process::{Child, ExitStatus, Stdio};
 /// Owns the master `OwnedFd`. Drop will best-effort kill + reap the child.
 #[derive(Debug)]
 pub struct Pty {
-    master: OwnedFd,
+    // Present until Drop closes it, before waiting for the child.
+    master: Option<OwnedFd>,
     child: Child,
     size: WinSize,
 }
@@ -57,14 +58,17 @@ impl Pty {
         drop(slave);
 
         Ok(Self {
-            master,
+            master: Some(master),
             child,
             size: spec.size,
         })
     }
 
     pub fn master_fd(&self) -> BorrowedFd<'_> {
-        self.master.as_fd()
+        self.master
+            .as_ref()
+            .expect("master is open until drop")
+            .as_fd()
     }
 
     pub fn size(&self) -> WinSize {
@@ -74,7 +78,7 @@ impl Pty {
     /// Update both the kernel's recorded size and our cached value.
     /// The kernel will send SIGWINCH to the foreground process group.
     pub fn resize(&mut self, size: WinSize) -> Result<()> {
-        set_winsize(self.master.as_fd(), size)?;
+        set_winsize(self.master_fd(), size)?;
         self.size = size;
         Ok(())
     }
@@ -82,7 +86,7 @@ impl Pty {
     /// Toggle `O_NONBLOCK` on the master fd. The mio loop in `toastty-io`
     /// will normally do this; here so callers (tests, examples) can too.
     pub fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
-        let fd = self.master.as_raw_fd();
+        let fd = self.master_fd().as_raw_fd();
         // SAFETY: master fd is valid and owned by this Pty.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 {
@@ -105,7 +109,13 @@ impl Pty {
     /// data right now."
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
         // SAFETY: master fd is valid; buf describes a valid mutable slice.
-        let n = unsafe { libc::read(self.master.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        let n = unsafe {
+            libc::read(
+                self.master_fd().as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
         if n < 0 {
             return Err(PtyError::Io(io::Error::last_os_error()));
         }
@@ -116,7 +126,8 @@ impl Pty {
     /// as stdin.
     pub fn write(&self, buf: &[u8]) -> Result<usize> {
         // SAFETY: master fd is valid; buf describes a valid slice.
-        let n = unsafe { libc::write(self.master.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
+        let n =
+            unsafe { libc::write(self.master_fd().as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
         if n < 0 {
             return Err(PtyError::Io(io::Error::last_os_error()));
         }
@@ -147,7 +158,7 @@ impl Pty {
     /// attached), so a dead/absent child never blocks close.
     #[must_use]
     pub fn has_running_program(&self) -> bool {
-        match crate::foreground_cwd::foreground_pid(self.master.as_fd()) {
+        match crate::foreground_cwd::foreground_pid(self.master_fd()) {
             Some(fg) => fg != self.child.id(),
             None => false,
         }
@@ -159,7 +170,7 @@ impl Pty {
     /// be read.
     #[must_use]
     pub fn running_program_name(&self) -> Option<String> {
-        let fg = crate::foreground_cwd::foreground_pid(self.master.as_fd())?;
+        let fg = crate::foreground_cwd::foreground_pid(self.master_fd())?;
         if fg == self.child.id() {
             return None;
         }
@@ -169,8 +180,13 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        // Best-effort: signal + reap so we never leak a child.
+        // Close our master BEFORE reaping. On macOS the killed shell
+        // can be stuck in slave teardown waiting for pending output to
+        // drain. Waiting while we still own the unread master deadlocks.
+        // CLOEXEC on every master copy also prevents a foreground job
+        // from inheriting a master and keeping that cycle alive.
         let _ = self.child.kill();
+        drop(self.master.take());
         let _ = self.child.wait();
     }
 }
@@ -233,14 +249,35 @@ fn reset_signals() {
 }
 
 fn open_pair(size: WinSize) -> Result<(OwnedFd, OwnedFd)> {
-    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).map_err(PtyError::Open)?;
+    // Both supported hosts expose /dev/ptmx. Open it directly so CLOEXEC
+    // is atomic even on macOS, where posix_openpt only accepts RDWR and
+    // NOCTTY. A later fcntl would race another thread's fork+exec.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let master = open(
+        "/dev/ptmx",
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(PtyError::Open)?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let master = {
+        use rustix::pty::{OpenptFlags, openpt};
+        let fd = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).map_err(PtyError::Open)?;
+        rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC).map_err(PtyError::Open)?;
+        fd
+    };
     grantpt(&master).map_err(PtyError::Open)?;
     unlockpt(&master).map_err(PtyError::Open)?;
 
     let name = ptsname(&master, Vec::new()).map_err(PtyError::Open)?;
     let path = Path::new(OsStr::from_bytes(name.as_bytes()));
 
-    let slave = open(path, OFlags::RDWR | OFlags::NOCTTY, Mode::empty()).map_err(PtyError::Open)?;
+    let slave = open(
+        path,
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(PtyError::Open)?;
 
     set_winsize(master.as_fd(), size)?;
 

@@ -3,27 +3,35 @@
 //! These are why `toastty-pty` is exempt from the 95% line gate —
 //! you can't usefully unit-test a PTY without forking.
 
+use std::os::fd::AsRawFd;
 use std::thread;
 use std::time::{Duration, Instant};
 use toastty_pty::{Pty, PtySpec, WinSize};
 
-/// Run a child and collect its output. Reads non-blockingly while the
-/// child is alive — important because slave-close behaviour after
-/// `wait()` is OS- and load-sensitive (macOS may drop buffered bytes;
-/// Linux returns EIO). Bounded by `max_ms`.
-fn run_and_drain(pty: &mut Pty, max_ms: u64) -> Vec<u8> {
+/// Collect a child's output, acknowledging `expected` with a newline.
+/// The child waits for that acknowledgement before exiting: merely
+/// reading concurrently with an instant exit still loses bytes on macOS
+/// when the last slave closes before the reader runs. Bounded by `max_ms`.
+fn run_and_drain(pty: &mut Pty, expected: &[u8], max_ms: u64) -> Vec<u8> {
     pty.set_nonblocking(true).expect("nonblocking");
     let deadline = Instant::now() + Duration::from_millis(max_ms);
     let mut all = Vec::new();
     let mut buf = [0u8; 4096];
     let mut child_exited = false;
+    let mut acknowledged = false;
     loop {
         if Instant::now() > deadline {
             break;
         }
         match pty.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => all.extend_from_slice(&buf[..n]),
+            Ok(n) => {
+                all.extend_from_slice(&buf[..n]);
+                if !acknowledged && all.windows(expected.len()).any(|s| s == expected) {
+                    assert_eq!(pty.write(b"\n").expect("acknowledge output"), 1);
+                    acknowledged = true;
+                }
+            }
             Err(toastty_pty::PtyError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if child_exited {
                     break;
@@ -65,10 +73,24 @@ fn drain_now(pty: &Pty, max_ms: u64) -> Vec<u8> {
 }
 
 #[test]
+fn child_does_not_inherit_another_ptys_master() {
+    let first = Pty::spawn(&PtySpec::program("/bin/sleep").arg("60")).expect("first PTY");
+    let inherited_fd = first.master_fd().as_raw_fd();
+    let mut second = Pty::spawn(
+        &PtySpec::program("/bin/sh").args(["-c", &format!("test ! -e /dev/fd/{inherited_fd}")]),
+    )
+    .expect("second PTY");
+    assert!(
+        second.wait().expect("wait").success(),
+        "child inherited another PTY's master fd {inherited_fd}"
+    );
+}
+
+#[test]
 fn spawn_echo_captures_output() {
-    let spec = PtySpec::program("/bin/echo").arg("hello, toastty");
+    let spec = PtySpec::program("/bin/sh").args(["-c", "echo 'hello, toastty'; read -r ack"]);
     let mut pty = Pty::spawn(&spec).expect("spawn");
-    let out = run_and_drain(&mut pty, 3000);
+    let out = run_and_drain(&mut pty, b"hello, toastty", 3000);
     let s = String::from_utf8_lossy(&out);
     assert!(s.contains("hello, toastty"), "got: {s:?}");
 }
@@ -110,10 +132,10 @@ fn winsize_is_set_on_spawn() {
     };
     let spec = PtySpec::program("/bin/sh")
         .arg("-c")
-        .arg("stty size")
+        .arg("stty size; read -r ack")
         .size(size);
     let mut pty = Pty::spawn(&spec).expect("spawn");
-    let out = run_and_drain(&mut pty, 3000);
+    let out = run_and_drain(&mut pty, b"30 100", 3000);
     let s = String::from_utf8_lossy(&out);
     assert!(s.contains("30 100"), "expected '30 100' in: {s:?}");
 }
@@ -122,7 +144,7 @@ fn winsize_is_set_on_spawn() {
 fn resize_propagates_to_child() {
     let spec = PtySpec::program("/bin/sh")
         .arg("-c")
-        .arg("sleep 0.05; stty size");
+        .arg("read -r ready; stty size; read -r ack");
     let mut pty = Pty::spawn(&spec).expect("spawn");
     pty.resize(WinSize {
         rows: 50,
@@ -131,7 +153,8 @@ fn resize_propagates_to_child() {
         pixel_height: 0,
     })
     .expect("resize");
-    let out = run_and_drain(&mut pty, 3000);
+    assert_eq!(pty.write(b"\n").expect("request size after resize"), 1);
+    let out = run_and_drain(&mut pty, b"50 200", 3000);
     let s = String::from_utf8_lossy(&out);
     assert!(s.contains("50 200"), "expected '50 200' in: {s:?}");
 }
@@ -189,12 +212,43 @@ fn running_program_name_reports_job_started_by_interactive_shell() {
     while Instant::now() < deadline {
         drain_now(&pty, 20);
         name = pty.running_program_name();
-        if name.is_some() {
+        // Job control publishes the new pgrp before the child execs;
+        // its name can briefly still be "bash".
+        if name.as_deref() == Some("sleep") {
             break;
         }
     }
     assert_eq!(name.as_deref(), Some("sleep"));
     assert!(pty.has_running_program());
+}
+
+#[test]
+fn drop_reaps_child_with_unread_output() {
+    // Leave bytes queued, as an interactive shell can do while handling
+    // SIGHUP during teardown. Waiting before closing/draining the master
+    // deadlocked in macOS CI even though SIGKILL had been delivered.
+    let pty =
+        Pty::spawn(&PtySpec::program("/bin/sh").args(["-c", "printf pending; exec /bin/sleep 60"]))
+            .expect("spawn");
+    let pid = pty.child_id() as i32;
+    let mut ready = libc::pollfd {
+        fd: pty.master_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: ready is one valid pollfd, and the PTY remains open.
+    assert_eq!(unsafe { libc::poll(&raw mut ready, 1, 3000) }, 1);
+    assert_ne!(ready.revents & libc::POLLIN, 0, "expected unread output");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let teardown = thread::spawn(move || {
+        drop(pty);
+        tx.send(()).unwrap();
+    });
+    rx.recv_timeout(Duration::from_secs(3))
+        .expect("PTY drop must reap without waiting for a reader");
+    teardown.join().unwrap();
+    // SAFETY: signal 0 only checks for existence.
+    assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "child was not reaped");
 }
 
 #[test]

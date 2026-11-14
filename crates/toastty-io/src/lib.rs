@@ -36,13 +36,13 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::io::{self, ErrorKind, Read};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 
 use mio::unix::SourceFd;
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Interest, Poll, Token, Waker};
 use tracing::{debug, trace, warn};
 use winit::event_loop::EventLoopProxy;
 
@@ -63,6 +63,7 @@ pub enum UserEvent {
 
 /// Token for the PTY fd inside the mio poll set.
 const PTY_TOKEN: Token = Token(0);
+const DETACH_TOKEN: Token = Token(1);
 
 /// How many bytes the reader buffers ahead of the main thread before it
 /// stops reading (it can overshoot by one [`READ_BUF_SIZE`] batch). Big
@@ -202,8 +203,9 @@ pub struct PtyReader {
     /// The reader thread reported close at the last take, so `buf` holds
     /// the final bytes.
     closed: bool,
-    /// Held, not joined: the thread may be parked in `poll` on an fd that
-    /// stays open until the process exits.
+    /// Wakes `poll` on detach, even if the child stays open and idle.
+    detach_waker: Arc<Waker>,
+    /// Held, not joined, so dropping the reader never blocks the UI.
     handle: Option<JoinHandle<()>>,
 }
 
@@ -250,9 +252,12 @@ impl PtyReader {
 
 impl Drop for PtyReader {
     fn drop(&mut self) {
-        // Release a reader blocked on a full buffer so its thread exits.
+        // The thread may be waiting for buffer space OR for readable
+        // input. A WouldBlock can put it back in poll just as its final
+        // partial batch fills the shared buffer, so notify both.
         self.shared.lock().detached = true;
         self.shared.space.notify_all();
+        let _ = self.detach_waker.wake();
     }
 }
 
@@ -291,40 +296,39 @@ pub fn spawn_pty_reader_with_sink<S: EventSink>(
     fd: BorrowedFd<'_>,
     sink: S,
 ) -> io::Result<PtyReader> {
-    // Dup the fd up-front so the thread owns its own `OwnedFd`. We rely
-    // on libc::dup; rustix's dup is similar but we already need libc for
-    // fcntl below, so keep it consistent.
-    let raw = fd.as_raw_fd();
-    // SAFETY: `raw` is a valid open fd from the caller's `BorrowedFd`.
-    // `libc::dup` returns a new fd referring to the same kernel object,
-    // or -1 on error.
-    let duped_raw = unsafe { libc::dup(raw) };
-    if duped_raw < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `duped_raw` is a fresh fd we own from the libc::dup above.
-    let owned = unsafe { OwnedFd::from_raw_fd(duped_raw) };
+    // Clone with CLOEXEC atomically: a concurrently spawned shell must
+    // not inherit another terminal's reader and keep its master alive.
+    let owned = fd.try_clone_to_owned()?;
 
     set_nonblocking(&owned)?;
 
     // Build the poll + events buffer on the spawning thread so initial
     // failures surface as Result on the caller.
     let poll = Poll::new()?;
-    let source_fd = duped_raw;
+    let source_fd = owned.as_raw_fd();
     poll.registry()
         .register(&mut SourceFd(&source_fd), PTY_TOKEN, Interest::READABLE)?;
+    let detach_waker = Arc::new(Waker::new(poll.registry(), DETACH_TOKEN)?);
+    let thread_waker = Arc::clone(&detach_waker);
 
     let shared = Arc::new(Shared::default());
     let thread_shared = Arc::clone(&shared);
     let handle = thread::Builder::new()
         .name("toastty-io::pty-reader".into())
-        .spawn(move || run_loop(owned, poll, &thread_shared, &sink))?;
+        .spawn(move || {
+            // Keep the wake fd registered until poll consumes the wake.
+            // Dropping the last Waker with PtyReader can otherwise remove
+            // an unread event before the new thread even starts polling.
+            let _keep_waker_alive = thread_waker;
+            run_loop(owned, poll, &thread_shared, &sink);
+        })?;
 
     Ok(PtyReader {
         shared,
         buf: Vec::new(),
         pos: 0,
         closed: false,
+        detach_waker,
         handle: Some(handle),
     })
 }
@@ -368,6 +372,9 @@ fn run_loop<S: EventSink>(owned: OwnedFd, mut poll: Poll, shared: &Shared, sink:
             }
             warn!("pty-reader poll error: {e}; exiting");
             close();
+            return;
+        }
+        if shared.lock().detached {
             return;
         }
 
@@ -600,14 +607,8 @@ impl Drop for PtyWriter {
 /// terminal write error (e.g. `EIO` after the child exits) makes the
 /// thread exit; further `send`s become no-ops.
 pub fn spawn_pty_writer(fd: BorrowedFd<'_>) -> io::Result<PtyWriter> {
-    let raw = fd.as_raw_fd();
-    // SAFETY: `raw` is a valid open fd from the caller's `BorrowedFd`.
-    let duped_raw = unsafe { libc::dup(raw) };
-    if duped_raw < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `duped_raw` is a fresh fd we own from the libc::dup above.
-    let owned = unsafe { OwnedFd::from_raw_fd(duped_raw) };
+    // Like the reader, never leak this master into later child processes.
+    let owned = fd.try_clone_to_owned()?;
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let handle = thread::Builder::new()
@@ -642,13 +643,7 @@ fn write_all_blocking(raw: i32, buf: &[u8]) -> bool {
     let mut off = 0;
     while off < buf.len() {
         // SAFETY: raw is a valid open fd; the slice is in-bounds.
-        let n = unsafe {
-            libc::write(
-                raw,
-                buf[off..].as_ptr().cast(),
-                buf.len() - off,
-            )
-        };
+        let n = unsafe { libc::write(raw, buf[off..].as_ptr().cast(), buf.len() - off) };
         if n > 0 {
             off += n as usize;
             continue;
@@ -938,6 +933,17 @@ mod tests {
         assert!(!h.reader.has_unconsumed());
         assert!(h.reader.peek(100).is_empty());
         assert!(!h.reader.is_finished());
+    }
+
+    #[test]
+    fn dropping_an_idle_reader_releases_its_thread() {
+        let mut h = harness();
+        let handle = h.reader.take_join_handle().unwrap();
+        // Keep both socket ends open and send no data. Detaching must
+        // wake a thread parked in mio::Poll, not just on back-pressure.
+        drop(h.reader);
+        wait_until(|| handle.is_finished());
+        handle.join().unwrap();
     }
 
     #[test]

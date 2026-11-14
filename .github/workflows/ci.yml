@@ -27,6 +27,8 @@ jobs:
   test:
     name: build + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # PTY regressions must fail in minutes, not occupy a runner for 6 h.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -60,7 +62,19 @@ jobs:
         run: cargo build --workspace --all-targets --locked
 
       - name: Test
+        timeout-minutes: 10
         run: cargo test --workspace --locked --no-fail-fast
+
+      # Repetition exposes scheduling/teardown races; these are not
+      # retries. The first failing iteration fails the job.
+      - name: Stress PTY lifecycle and I/O
+        timeout-minutes: 5
+        run: |
+          for attempt in {1..20}; do
+            echo "PTY/I/O stress iteration $attempt/20"
+            cargo test -p toastty-pty -p toastty-io --locked --lib --tests
+            cargo test -p toastty --locked --test end_to_end
+          done
 
       - name: Upload snapshot mismatches
         if: failure()
