@@ -111,6 +111,10 @@ exit 0
 LAUNCH
 chmod 0755 "${macos}/toastty-launch"
 
+# App icon, pre-rendered from share/icons/toastty.svg by
+# scripts/render_icons.py. Info.plist points at it via CFBundleIconFile.
+install -m 0644 share/icons/toastty.icns "${resources}/toastty.icns"
+
 cat > "${contents}/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -122,6 +126,7 @@ cat > "${contents}/Info.plist" <<PLIST
     <key>CFBundleVersion</key>          <string>${version}</string>
     <key>CFBundleShortVersionString</key><string>${version}</string>
     <key>CFBundleExecutable</key>       <string>toastty-launch</string>
+    <key>CFBundleIconFile</key>         <string>toastty</string>
     <key>LSMultipleInstancesProhibited</key><false/>
     <key>LSArchitecturePriority</key>
     <array>
