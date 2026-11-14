@@ -5,6 +5,20 @@ slides, each rendered by the Markdown block renderer (see
 [markdown.md](markdown.md)): headings, tables, highlighted code, maths and
 Mermaid diagrams all work. Try `toastty present examples/present/demo.md`.
 
+For a five-minute product tour, run this from the repository root in a direct
+Toastty shell (outside tmux, screen, zellij, or herdr):
+
+```sh
+toastty present examples/present/toastty-demo.md
+```
+
+The [12-slide product deck](../examples/present/toastty-demo.md) includes the
+app icon, product screenshots, live Markdown and Mermaid examples, and hidden
+speaker notes. Images are embedded as PNG data URIs, so the file can be copied
+on its own and `markdown_local_files` can stay disabled. The 3D and shader
+slides use static product captures, not interactive demos. Suggested viewing
+size: 1280×800 or larger, with a 22 px font or smaller.
+
 ## Writing a deck
 
 - Slides are separated by a line holding only `---` (up to three spaces of
