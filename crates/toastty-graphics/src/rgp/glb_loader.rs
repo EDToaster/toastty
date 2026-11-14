@@ -125,7 +125,7 @@ pub fn load_glb(bytes: &[u8]) -> Result<CpuAsset, GlbLoadError> {
 #[allow(clippy::many_single_char_names)]
 pub(crate) fn derive_flat_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
     let mut acc = vec![[0.0_f32; 3]; positions.len()];
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         let ia = tri[0] as usize;
         let ib = tri[1] as usize;
         let ic = tri[2] as usize;

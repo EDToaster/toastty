@@ -1703,7 +1703,7 @@ fn create_atlas_texture(device: &Device, format: TextureFormat, label: &str) -> 
 /// also swapped RGBA -> BGRA for the `Bgra8Unorm` atlas.
 fn color_rgba_to_bgra(data: &[u8], premultiply: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
-    for px in data.chunks_exact(4) {
+    for px in data.as_chunks::<4>().0 {
         let (r, g, b, a) = (px[0], px[1], px[2], px[3]);
         if premultiply {
             // Rounded c*a/255; idempotent at a==255 and a==0.
