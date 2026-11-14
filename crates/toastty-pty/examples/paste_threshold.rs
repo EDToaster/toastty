@@ -105,7 +105,10 @@ fn refine_threshold(mut lo: usize, mut hi: usize, mode: Mode) -> usize {
 
 fn sweep(mode: Mode) {
     println!("\n=== {} ===", mode.label());
-    println!("  {:>8}  {:>8}  {:>8}  {}", "request", "accepted", "dropped", "");
+    println!(
+        "  {:>8}  {:>8}  {:>8}  {}",
+        "request", "accepted", "dropped", ""
+    );
 
     let sizes = [
         256, 512, 768, 1024, 1280, 1536, 1792, 2048, 3072, 4096, 8192, 16384, 65536,
@@ -125,7 +128,10 @@ fn sweep(mode: Mode) {
     }
 
     if first_short == 0 {
-        println!("  (no truncation observed up to {} bytes)", sizes[sizes.len() - 1]);
+        println!(
+            "  (no truncation observed up to {} bytes)",
+            sizes[sizes.len() - 1]
+        );
         return;
     }
 

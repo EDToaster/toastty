@@ -22,9 +22,12 @@ use toastty_window::{KeyState, LogicalKey, Modifiers, NamedKey};
 
 #[test]
 fn pty_echo_drives_term_through_parser() {
-    // Spawn `echo hello` under a PTY at a known grid size.
-    let spec = PtySpec::program("/bin/echo")
-        .arg("hello, M5")
+    // Keep the slave open until the reader has consumed the output.
+    // macOS may discard queued bytes when the last slave closes, so an
+    // immediately exiting `echo` races reader startup rather than testing
+    // the PTY -> parser -> Term pipeline.
+    let spec = PtySpec::program("/bin/sh")
+        .args(["-c", "printf 'hello, M5\\n'; read -r ack"])
         .size(WinSize {
             rows: 24,
             cols: 80,
@@ -42,9 +45,18 @@ fn pty_echo_drives_term_through_parser() {
 
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut closed = false;
+    let mut received = Vec::new();
+    let mut acknowledged = false;
     while !closed && Instant::now() < deadline {
         match recv_batch(&mut reader, &rx, Duration::from_millis(200)) {
-            Some(Batch::Bytes(b)) => parser.advance(&mut term, &b),
+            Some(Batch::Bytes(b)) => {
+                parser.advance(&mut term, &b);
+                received.extend_from_slice(&b);
+                if !acknowledged && received.windows(9).any(|s| s == b"hello, M5") {
+                    assert_eq!(pty.write(b"\n").expect("acknowledge output"), 1);
+                    acknowledged = true;
+                }
+            }
             Some(Batch::Closed) => closed = true,
             None => {}
         }

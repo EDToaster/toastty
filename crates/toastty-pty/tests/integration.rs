@@ -3,6 +3,7 @@
 //! These are why `toastty-pty` is exempt from the 95% line gate —
 //! you can't usefully unit-test a PTY without forking.
 
+use std::os::fd::AsRawFd;
 use std::thread;
 use std::time::{Duration, Instant};
 use toastty_pty::{Pty, PtySpec, WinSize};
@@ -62,6 +63,20 @@ fn drain_now(pty: &Pty, max_ms: u64) -> Vec<u8> {
         }
     }
     all
+}
+
+#[test]
+fn child_does_not_inherit_another_ptys_master() {
+    let first = Pty::spawn(&PtySpec::program("/bin/sleep").arg("60")).expect("first PTY");
+    let inherited_fd = first.master_fd().as_raw_fd();
+    let mut second = Pty::spawn(
+        &PtySpec::program("/bin/sh").args(["-c", &format!("test ! -e /dev/fd/{inherited_fd}")]),
+    )
+    .expect("second PTY");
+    assert!(
+        second.wait().expect("wait").success(),
+        "child inherited another PTY's master fd {inherited_fd}"
+    );
 }
 
 #[test]
@@ -195,6 +210,35 @@ fn running_program_name_reports_job_started_by_interactive_shell() {
     }
     assert_eq!(name.as_deref(), Some("sleep"));
     assert!(pty.has_running_program());
+}
+
+#[test]
+fn drop_reaps_child_with_unread_output() {
+    // Leave bytes queued, as an interactive shell can do while handling
+    // SIGHUP during teardown. Waiting before closing/draining the master
+    // deadlocked in macOS CI even though SIGKILL had been delivered.
+    let pty =
+        Pty::spawn(&PtySpec::program("/bin/sh").args(["-c", "printf pending; exec /bin/sleep 60"]))
+            .expect("spawn");
+    let pid = pty.child_id() as i32;
+    let mut ready = libc::pollfd {
+        fd: pty.master_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: ready is one valid pollfd, and the PTY remains open.
+    assert_eq!(unsafe { libc::poll(&raw mut ready, 1, 3000) }, 1);
+    assert_ne!(ready.revents & libc::POLLIN, 0, "expected unread output");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let teardown = thread::spawn(move || {
+        drop(pty);
+        tx.send(()).unwrap();
+    });
+    rx.recv_timeout(Duration::from_secs(3))
+        .expect("PTY drop must reap without waiting for a reader");
+    teardown.join().unwrap();
+    // SAFETY: signal 0 only checks for existence.
+    assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "child was not reaped");
 }
 
 #[test]

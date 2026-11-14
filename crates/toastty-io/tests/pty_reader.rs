@@ -43,14 +43,28 @@ fn collect(
 
 #[test]
 fn reads_echo_output_and_observes_close() {
-    let spec = PtySpec::program("/bin/echo").arg("hello, toastty-io");
+    // Do not race an instant child exit against reader startup: macOS
+    // can discard unread PTY output on the last slave close.
+    let spec =
+        PtySpec::program("/bin/sh").args(["-c", "printf 'hello, toastty-io\\n'; read -r ack"]);
     let pty = Pty::spawn(&spec).expect("spawn echo");
 
     let (tx, rx) = mpsc::channel();
     let sink = ChannelSink(Mutex::new(tx));
     let mut reader = spawn_pty_reader_with_sink(pty.master_fd(), sink).expect("spawn reader");
 
-    let (bytes, closed) = collect(&mut reader, &rx, Duration::from_secs(3));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut bytes = Vec::new();
+    let expected = b"hello, toastty-io";
+    while !bytes.windows(expected.len()).any(|s| s == expected) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match recv_batch(&mut reader, &rx, remaining) {
+            Some(Batch::Bytes(b)) => bytes.extend_from_slice(&b),
+            other => panic!("expected echo before close/timeout, got {other:?}: {bytes:?}"),
+        }
+    }
+    assert_eq!(pty.write(b"\n").expect("acknowledge output"), 1);
+    let (_, closed) = collect(&mut reader, &rx, Duration::from_secs(3));
     let s = String::from_utf8_lossy(&bytes);
     assert!(s.contains("hello, toastty-io"), "got: {s:?}");
     assert!(closed, "expected PtyClosed once child exits");
