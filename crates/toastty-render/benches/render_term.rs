@@ -813,7 +813,7 @@ fn bench_phase_breakdown(c: &mut Criterion) {
         }
         term.clear_damage();
 
-        println!("\n=== phase breakdown: {label}  grid={rows}x{cols}  px={width}x{height} ===",);
+        println!("\n=== phase breakdown: {label}  grid={rows}x{cols}  px={width}x{height} ===");
 
         // Single-cell change (the realistic keystroke case): mark only
         // one row dirty.

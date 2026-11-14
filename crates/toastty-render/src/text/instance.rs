@@ -443,7 +443,7 @@ pub fn cursor_pixel_rect(term: &Term, cell_size: (f32, f32)) -> [f32; 4] {
     let cell_w = cell_size.0;
     let cell_h = cell_size.1;
     let view_pixel = term.view_offset_pixel();
-    let pixel_extra: u16 = if view_pixel > 0.0 { 1 } else { 0 };
+    let pixel_extra: u16 = u16::from(view_pixel > 0.0);
     let y_translate: f32 = if pixel_extra > 0 {
         view_pixel - cell_h
     } else {
@@ -1102,7 +1102,7 @@ pub fn build_instances_into_opts<F, S>(
     // cell_h`. At a whole-row offset (pixel == 0) no extra row is
     // needed and the y-translate is 0.
     let view_pixel = term.view_offset_pixel();
-    let pixel_extra: u16 = if view_pixel > 0.0 { 1 } else { 0 };
+    let pixel_extra: u16 = u16::from(view_pixel > 0.0);
     // Render through the trailing partial row at the bottom when the
     // content area isn't a whole number of cells tall, so text (and bg)
     // draws in the floor-divided grid's leftover sliver — e.g. content
@@ -1281,7 +1281,7 @@ enum DirtyCols<'a> {
     Slice(core::slice::Iter<'a, u16>),
 }
 
-impl<'a> Iterator for DirtyCols<'a> {
+impl Iterator for DirtyCols<'_> {
     type Item = u16;
     fn next(&mut self) -> Option<u16> {
         match self {
@@ -1393,7 +1393,7 @@ pub fn build_dirty_instances_into_opts<F, S>(
     // 0, view_offset_pixel == 0) the dirty builder is still relevant
     // (e.g. cursor blink) and needs `view_row` semantics.
     let view_pixel = term.view_offset_pixel();
-    let pixel_extra: u16 = if view_pixel > 0.0 { 1 } else { 0 };
+    let pixel_extra: u16 = u16::from(view_pixel > 0.0);
     let y_translate: f32 = if pixel_extra > 0 {
         view_pixel - cell_h
     } else {
@@ -2336,7 +2336,7 @@ mod tests {
             None,
             |_, _, _, _| None,
         );
-        assert!(cursor_instance(&v).size[1] < 16.0, "underline after Ps=4",);
+        assert!(cursor_instance(&v).size[1] < 16.0, "underline after Ps=4");
         // Back to block (Ps=2).
         feed(&mut t, b"\x1b[2 q");
         let v = build_instances(

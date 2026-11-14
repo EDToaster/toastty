@@ -2617,7 +2617,7 @@ impl Renderer {
     /// rule (time-reading shaders idle while unfocused). After a change
     /// that a shader reads, [`Self::next_redraw_deadline`] returns zero.
     pub fn set_focused(&mut self, focused: bool) {
-        let inputs = self.post.as_ref().map(|c| *c.inputs()).unwrap_or_default();
+        let inputs = self.post.as_ref().map_or_default(|c| *c.inputs());
         self.post_state
             .set_focused(focused, Instant::now(), &inputs, self.post_animation);
     }
@@ -2626,7 +2626,7 @@ impl Renderer {
     /// for `iMouse`. After a change that a shader reads,
     /// [`Self::next_redraw_deadline`] returns zero.
     pub fn set_pointer(&mut self, pos: (f32, f32), button1_down: bool) {
-        let inputs = self.post.as_ref().map(|c| *c.inputs()).unwrap_or_default();
+        let inputs = self.post.as_ref().map_or_default(|c| *c.inputs());
         self.post_state.set_pointer(pos, button1_down, &inputs);
     }
 

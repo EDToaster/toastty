@@ -332,7 +332,7 @@ mod tests {
         let out = snap_cluster_widths(&glyphs, 8.0, 1);
         assert_eq!(out.len(), 3);
         for (i, g) in out.iter().enumerate() {
-            let i_f = u16::try_from(i).map(f32::from).unwrap_or(0.0);
+            let i_f = u16::try_from(i).map_or(0.0, f32::from);
             assert!(approx(g.x, i_f * 8.0), "x at {i}: {}", g.x);
             assert!(approx(g.w, 8.0), "w at {i}: {}", g.w);
         }

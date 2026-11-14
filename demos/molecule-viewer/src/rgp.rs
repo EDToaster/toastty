@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_delete_all_exact() {
-        let out = run(|w| delete_all(w));
+        let out = run(delete_all);
         assert_eq!(out, b"\x1b_ratty;g;d\x1b\\");
     }
 

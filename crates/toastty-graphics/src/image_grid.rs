@@ -603,14 +603,15 @@ impl ImageGrid {
                     let (pimg, pplace) = p.parent?;
                     let parent = match p.parent_ref {
                         Some(h) => &self.placements[*index.get(&h)?].1,
-                        None => match self.parent_entry(p) {
-                            Some((_, parent)) => parent,
-                            None => {
+                        None => {
+                            if let Some((_, parent)) = self.parent_entry(p) {
+                                parent
+                            } else {
                                 // Virtual parent (REL-5).
                                 let origin = self.virtual_parent(pimg, pplace)?;
                                 return Some((i, offset_origin(origin, p.rel_offset), 0..p.rows));
                             }
-                        },
+                        }
                     };
                     let origin = offset_origin(self.origin_of(parent), p.rel_offset);
                     Some((i, origin, inherited_clip(parent, p.rows)))
