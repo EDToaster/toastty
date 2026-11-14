@@ -20,7 +20,7 @@
 //! User-facing behaviour is documented in `docs/selection.md`.
 //!
 //! The selection has *visual* ordering (top of the screen first), which
-//! is the opposite of `line_id` ordering (older line_ids are visually
+//! is the opposite of `line_id` ordering (older `line_ids` are visually
 //! higher because new rows push old ones up). [`Selection::ordered`]
 //! returns the pair `(first, last)` in visual order; reading `first`
 //! goes top-down and left-to-right.
@@ -81,7 +81,7 @@ impl Selection {
     /// is the top-leftmost cell. Visual "first" has the higher
     /// `line_id` (since older rows have lower ids and sit visually
     /// higher) — wait, the opposite. Newer rows have higher ids and
-    /// sit at the *bottom*. So `first` has the *lower* line_id.
+    /// sit at the *bottom*. So `first` has the *lower* `line_id`.
     #[must_use]
     pub fn ordered(&self) -> (Pos, Pos) {
         let (a, b) = (self.anchor, self.active);

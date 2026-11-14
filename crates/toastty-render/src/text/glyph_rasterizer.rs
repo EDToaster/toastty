@@ -711,7 +711,7 @@ impl GlyphRasterizer {
     /// codepoint (rare, but we don't want to crash on it).
     ///
     /// Cached after the first lookup — every subsequent call is a
-    /// HashMap hit. Used by [`Self::shape_line_slow`]'s caching block
+    /// `HashMap` hit. Used by [`Self::shape_line_slow`]'s caching block
     /// to detect contextual substitution: if the in-context glyph id
     /// differs from this standalone id, we know the font substituted
     /// the glyph (e.g. as part of a ligature) and we must not cache
@@ -2095,17 +2095,17 @@ mod tests {
         assert!(rasterizer.try_shape_line_fast("ab").is_some());
     }
 
-    /// Mode 2027 OFF: cluster_width falls back to `wcwidth` per
+    /// Mode 2027 OFF: `cluster_width` falls back to `wcwidth` per
     /// codepoint. CJK still snaps to 2 cells (legacy table); ZWJ
     /// emoji come out as 1. We don't render here — we just check
-    /// shape_line doesn't panic for both flag values.
+    /// `shape_line` doesn't panic for both flag values.
     #[test]
     fn mode_2027_off_uses_default_width() {
         let (_device, queue, mut rasterizer) = make_rasterizer();
         let _ = rasterizer.shape_line(&queue, "你 abc", false);
     }
 
-    /// Mode 2027 ON: cluster_width trusts UnicodeWidthStr. ZWJ family
+    /// Mode 2027 ON: `cluster_width` trusts `UnicodeWidthStr`. ZWJ family
     /// snaps to 2; VS16 emoji snaps to 2. Shape doesn't panic and
     /// produces some glyphs. Visual correctness requires a real GPU +
     /// snapshot harness — geometry-only smoke here.
