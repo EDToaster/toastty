@@ -25,10 +25,10 @@ fn make_raw(fd: BorrowedFd<'_>) {
     // tcgetattr before cfmakeraw reads it.
     unsafe {
         let mut t: libc::termios = std::mem::zeroed();
-        assert_eq!(libc::tcgetattr(fd.as_raw_fd(), &mut t), 0, "tcgetattr");
-        libc::cfmakeraw(&mut t);
+        assert_eq!(libc::tcgetattr(fd.as_raw_fd(), &raw mut t), 0, "tcgetattr");
+        libc::cfmakeraw(&raw mut t);
         assert_eq!(
-            libc::tcsetattr(fd.as_raw_fd(), libc::TCSANOW, &t),
+            libc::tcsetattr(fd.as_raw_fd(), libc::TCSANOW, &raw const t),
             0,
             "tcsetattr"
         );

@@ -57,9 +57,9 @@ fn make_raw(fd: std::os::fd::BorrowedFd<'_>) {
     // tcgetattr before use.
     unsafe {
         let mut t: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(fd.as_raw_fd(), &mut t) == 0 {
-            libc::cfmakeraw(&mut t);
-            libc::tcsetattr(fd.as_raw_fd(), libc::TCSANOW, &t);
+        if libc::tcgetattr(fd.as_raw_fd(), &raw mut t) == 0 {
+            libc::cfmakeraw(&raw mut t);
+            libc::tcsetattr(fd.as_raw_fd(), libc::TCSANOW, &raw const t);
         }
     }
 }
