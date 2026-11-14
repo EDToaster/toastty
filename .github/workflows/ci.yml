@@ -27,7 +27,8 @@ jobs:
   test:
     name: build + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # PTY regressions must fail in minutes, not occupy a runner for 6 h.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -57,39 +58,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Diagnose PTY hang
-        if: github.event_name == 'workflow_dispatch' && runner.os == 'macOS'
-        timeout-minutes: 5
-        run: |
-          cargo test -p toastty-pty --locked --no-run
-          for attempt in {1..30}; do
-            echo "Attempt $attempt"
-            cargo test -p toastty-pty --locked --test integration -- --nocapture &
-            cargo_pid=$!
-            (
-              sleep 15
-              ps -axo pid,ppid,pgid,state,wchan,command
-              for pid in $(pgrep -f '/integration-[0-9a-f]'); do
-                sample "$pid" 2 -file "/tmp/sample-$pid.txt" || true
-                cat "/tmp/sample-$pid.txt"
-                lsof -p "$pid" || true
-                kill -KILL "$pid" || true
-              done
-            ) &
-            watchdog=$!
-            result=0
-            wait "$cargo_pid" || result=$?
-            kill "$watchdog" 2>/dev/null || true
-            wait "$watchdog" 2>/dev/null || true
-            if [ "$result" -ne 0 ]; then exit "$result"; fi
-          done
-
       - name: Build
         run: cargo build --workspace --all-targets --locked
 
       - name: Test
         timeout-minutes: 10
         run: cargo test --workspace --locked --no-fail-fast
+
+      # Repetition exposes scheduling/teardown races; these are not
+      # retries. The first failing iteration fails the job.
+      - name: Stress PTY lifecycle and I/O
+        timeout-minutes: 5
+        run: |
+          for attempt in {1..20}; do
+            echo "PTY/I/O stress iteration $attempt/20"
+            cargo test -p toastty-pty -p toastty-io --locked --lib --tests
+            cargo test -p toastty --locked --test end_to_end
+          done
 
       - name: Upload snapshot mismatches
         if: failure()

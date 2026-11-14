@@ -111,9 +111,7 @@ fn raw_process_name(pid: u32) -> Option<String> {
     // Lossy: the kernel cuts `comm` at a byte boundary, which can split
     // a multi-byte character.
     let comm = std::fs::read(format!("/proc/{pid}/comm")).ok()?;
-    let comm = String::from_utf8_lossy(&comm)
-        .trim_end_matches('\n')
-        .to_owned();
+    let comm = String::from_utf8_lossy(&comm).trim_end_matches('\n').to_owned();
     if comm.len() < COMM_MAX {
         return Some(comm);
     }

@@ -11,7 +11,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use toastty_io::test_support::{Batch, ChannelSink, recv_batch};
-use toastty_io::{PtyReader, UserEvent, spawn_pty_reader_with_sink};
+use toastty_io::{PtyReader, UserEvent, spawn_pty_reader_with_sink, spawn_pty_writer};
 use toastty_pty::{Pty, PtySpec};
 
 /// Collect output for at most `max` time, returning all bytes
@@ -39,6 +39,33 @@ fn collect(
         }
     }
     (bytes, closed)
+}
+
+#[test]
+fn io_handles_are_not_inherited_by_spawned_children() {
+    let pty = Pty::spawn(&PtySpec::program("/bin/sleep").arg("60")).expect("spawn");
+    let (tx, _rx) = mpsc::channel();
+    let reader =
+        spawn_pty_reader_with_sink(pty.master_fd(), ChannelSink(Mutex::new(tx))).expect("reader");
+    let writer = spawn_pty_writer(pty.master_fd()).expect("writer");
+    // Command::output supplies non-terminal stdio. Any tty descriptor in
+    // this independent child is a leaked PTY master (original or clone).
+    let output = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            "for fd in /dev/fd/*; do if test -t \"${fd##*/}\"; then echo \"$fd\"; fi; done",
+        ])
+        .output()
+        .expect("inspect inherited descriptors");
+    assert!(output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "inherited terminal descriptors: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    drop(pty);
+    drop(reader);
+    drop(writer);
 }
 
 #[test]

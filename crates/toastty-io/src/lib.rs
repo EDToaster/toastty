@@ -204,7 +204,7 @@ pub struct PtyReader {
     /// the final bytes.
     closed: bool,
     /// Wakes `poll` on detach, even if the child stays open and idle.
-    detach_waker: Waker,
+    detach_waker: Arc<Waker>,
     /// Held, not joined, so dropping the reader never blocks the UI.
     handle: Option<JoinHandle<()>>,
 }
@@ -308,13 +308,20 @@ pub fn spawn_pty_reader_with_sink<S: EventSink>(
     let source_fd = owned.as_raw_fd();
     poll.registry()
         .register(&mut SourceFd(&source_fd), PTY_TOKEN, Interest::READABLE)?;
-    let detach_waker = Waker::new(poll.registry(), DETACH_TOKEN)?;
+    let detach_waker = Arc::new(Waker::new(poll.registry(), DETACH_TOKEN)?);
+    let thread_waker = Arc::clone(&detach_waker);
 
     let shared = Arc::new(Shared::default());
     let thread_shared = Arc::clone(&shared);
     let handle = thread::Builder::new()
         .name("toastty-io::pty-reader".into())
-        .spawn(move || run_loop(owned, poll, &thread_shared, &sink))?;
+        .spawn(move || {
+            // Keep the wake fd registered until poll consumes the wake.
+            // Dropping the last Waker with PtyReader can otherwise remove
+            // an unread event before the new thread even starts polling.
+            let _keep_waker_alive = thread_waker;
+            run_loop(owned, poll, &thread_shared, &sink);
+        })?;
 
     Ok(PtyReader {
         shared,
