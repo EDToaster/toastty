@@ -55,7 +55,8 @@ prints the plain Markdown instead. See [docs/markdown.md](docs/markdown.md).
 
 `toastty present talk.md` turns the same renderer into a slide show: split
 the file into slides with `---` lines and step through them full screen.
-See [docs/present.md](docs/present.md).
+Try `toastty present examples/present/toastty-demo.md` for a self-contained
+product tour, or see [docs/present.md](docs/present.md) to write your own deck.
 
 ### 🖼️ Inline images: Kitty graphics and Sixel
 
