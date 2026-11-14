@@ -48,68 +48,31 @@ contents="${app_path}/Contents"
 macos="${contents}/MacOS"
 resources="${contents}/Resources"
 
-# The real terminal binary lives OUTSIDE the .app bundle (see the shim comment
-# below for why). SUPPORT_DIR can override the location; it is resolved now,
-# at install time, and baked into the shim as an absolute path.
-support_dir="${SUPPORT_DIR:-${HOME}/Library/Application Support/${APP_NAME}}"
-support_bin="${support_dir}/toastty"
+# The real binary is the bundle's executable. That makes the terminal
+# process belong to the bundle, so the Dock shows the app's icon and name,
+# and pinning the Dock tile pins the app (not a bare Unix executable).
+#
+# macOS treats a bundle as single-instance: relaunching it while it runs
+# (Dock click, Spotlight, Finder) sends the running process a "reopen"
+# Apple Event instead of starting a new one. toastty handles that event by
+# starting a fresh instance with `open -n`, so every launch still opens a
+# new window. See crates/toastty-window/src/reopen.rs.
+#
+# Older installs put a launcher shim (toastty-launch) in the bundle and
+# the real binary outside it, in ~/Library/Application Support/<name>.
+# The detached process then had no bundle, so the Dock showed the generic
+# "exec" icon and a pinned tile pointed at the raw binary. Remove both.
+legacy_support_dir="${SUPPORT_DIR:-${HOME}/Library/Application Support/${APP_NAME}}"
 
-printf '==> installing launcher to %s\n' "${app_path}"
-printf '==> installing binary to   %s\n' "${support_bin}"
-mkdir -p "${macos}" "${resources}" "${support_dir}"
-# Drop any stale in-bundle binary from an older install: a window-owning
-# binary inside the bundle is exactly what breaks repeat launches.
-rm -f "${macos}/toastty"
-install -m 0755 "${bin_src}" "${support_bin}"
-
-# Launcher shim (the bundle's CFBundleExecutable).
-#
-# Goal: a brand-new terminal window on every Spotlight / Launchpad / Finder
-# launch. macOS normally treats an .app as single-instance -- launching it
-# again just reactivates the process it already associates with the bundle.
-#
-# Crucially, macOS decides which bundle a GUI process belongs to by walking
-# UP that process's executable path to the enclosing .app -- NOT by matching
-# CFBundleExecutable. So ANY window-owning binary inside Contents/MacOS/
-# registers as this bundle's running instance, and the next launch just
-# reactivates it. (An earlier version of this script kept the real `toastty`
-# in the bundle and relied on the shim exiting; it didn't work, because the
-# detached child -- though named differently from CFBundleExecutable -- still
-# lived inside the bundle and so claimed it.)
-#
-# Fix: the real binary lives OUTSIDE any bundle (${support_bin}). This shim,
-# the only executable in the bundle, spawns that external binary fully
-# detached and exits immediately. Because the shim is gone a beat later and
-# the terminal process is not inside any .app, LaunchServices never considers
-# the bundle "running": every launch re-runs the shim and spawns another
-# independent, non-bundle-associated terminal + window.
-#
-# We intentionally do NOT forward "$@": a Spotlight launch carries no useful
-# user args, and legacy LaunchServices args (e.g. -psn_0_...) would trip
-# toastty's CLI parser. Launch the binary from a real terminal for flags.
-#
-# NOTE: unquoted heredoc -- ${support_bin} is expanded now, at install time,
-# and baked into the shim as an absolute path.
-cat > "${macos}/toastty-launch" <<LAUNCH
-#!/bin/sh
-# Detached background spawn: the child is reparented to launchd when this
-# shim exits, keeps its inherited WindowServer connection, and creates its
-# own window. The binary lives outside the bundle, so each launch => an
-# independent, non-bundle-associated process + window.
-#
-# Because this shim is a script (no Mach-O header), LaunchServices can't infer
-# its architecture and on Apple Silicon may start it under Rosetta. A
-# translated parent prefers the x86_64 slice of universal binaries, which
-# leaks into the terminal's shell (\`uname -m\` => x86_64). Explicitly request
-# the native slice on arm64 hardware.
-if [ "\$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
-    /usr/bin/arch -arm64 "${support_bin}" >/dev/null 2>&1 &
-else
-    "${support_bin}" >/dev/null 2>&1 &
+printf '==> installing %s\n' "${app_path}"
+mkdir -p "${macos}" "${resources}"
+rm -f "${macos}/toastty-launch"
+if [ -f "${legacy_support_dir}/toastty" ]; then
+    printf '==> removing old out-of-bundle binary %s\n' "${legacy_support_dir}/toastty"
+    rm -f "${legacy_support_dir}/toastty"
+    rmdir "${legacy_support_dir}" 2>/dev/null || true
 fi
-exit 0
-LAUNCH
-chmod 0755 "${macos}/toastty-launch"
+install -m 0755 "${bin_src}" "${macos}/toastty"
 
 # App icon, pre-rendered from share/icons/toastty.svg by
 # scripts/render_icons.py. Info.plist points at it via CFBundleIconFile.
@@ -125,7 +88,7 @@ cat > "${contents}/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key>       <string>${BUNDLE_ID}</string>
     <key>CFBundleVersion</key>          <string>${version}</string>
     <key>CFBundleShortVersionString</key><string>${version}</string>
-    <key>CFBundleExecutable</key>       <string>toastty-launch</string>
+    <key>CFBundleExecutable</key>       <string>toastty</string>
     <key>CFBundleIconFile</key>         <string>toastty</string>
     <key>LSMultipleInstancesProhibited</key><false/>
     <key>LSArchitecturePriority</key>
@@ -140,9 +103,11 @@ cat > "${contents}/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Strip the quarantine xattr so Gatekeeper doesn't refuse to launch the
-# unsigned binary on first run (covers both the bundle and the external binary).
-xattr -dr com.apple.quarantine "${app_path}" "${support_bin}" 2>/dev/null || true
+# Ad-hoc sign the whole bundle so its signature covers Info.plist and the
+# icon, not just the binary (the linker signs only the Mach-O). Then strip
+# the quarantine xattr so Gatekeeper doesn't refuse the first launch.
+codesign --force --sign - "${app_path}" >/dev/null 2>&1 || true
+xattr -dr com.apple.quarantine "${app_path}" 2>/dev/null || true
 
 # Nudge Spotlight / LaunchServices so the new bundle is indexed right away.
 touch "${app_path}"

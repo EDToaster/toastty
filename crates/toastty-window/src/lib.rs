@@ -19,13 +19,14 @@
 //! `ControlFlow::WaitUntil(now + d)` for that frame only. No constant
 //! 60Hz redraw when nothing is happening.
 
-// `deny` rather than `forbid` so the `led` module can opt back in to
-// unsafe FFI for platform LED-state reads (a narrowly-scoped need —
-// see `led/mod.rs`).
+// `deny` rather than `forbid` so the `led` and `reopen` modules can opt
+// back in to unsafe FFI (narrowly-scoped needs: platform LED-state reads,
+// see `led/mod.rs`, and the macOS reopen handler, see `reopen.rs`).
 #![deny(unsafe_code)]
 
 mod event;
 pub mod led;
+mod reopen;
 
 pub use event::{
     ControlSignal, Event, KeyState, LogicalKey, Modifiers, MouseButton, NamedKey, PhysicalKey,
@@ -442,6 +443,12 @@ impl<A: App> ApplicationHandler<UserEvent> for Runner<'_, A> {
         };
 
         window.set_ime_allowed(self.options.ime);
+
+        // macOS: a relaunch of the running bundle (Dock, Spotlight, Finder)
+        // opens a new window instead of only focusing this one. winit
+        // calls `resumed` after the app finished launching, so AppKit's
+        // default handlers are already in place and ours replaces them.
+        reopen::install();
 
         debug!(
             size = ?window.inner_size(),
