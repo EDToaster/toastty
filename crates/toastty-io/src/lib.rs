@@ -170,7 +170,7 @@ impl Shared {
     /// Main side: swap the shared buffer with `into` (which must be
     /// empty) and re-arm the wake. Returns whether the PTY has closed.
     fn take(&self, into: &mut Vec<u8>) -> bool {
-        debug_assert!(into.is_empty());
+        debug_assert_eq!(into.as_slice(), []);
         let mut st = self.lock();
         std::mem::swap(&mut st.buf, into);
         st.wake_pending = false;
@@ -931,7 +931,7 @@ mod tests {
         assert_eq!(h.reader.peek(100), b" world");
         h.reader.consume(6);
         assert!(!h.reader.has_unconsumed());
-        assert!(h.reader.peek(100).is_empty());
+        assert_eq!(h.reader.peek(100), []);
         assert!(!h.reader.is_finished());
     }
 

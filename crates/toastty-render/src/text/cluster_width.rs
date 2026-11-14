@@ -146,7 +146,10 @@ mod tests {
 
     #[test]
     fn empty_input_returns_empty() {
-        assert!(snap_cluster_widths(&[], 8.0, 1).is_empty());
+        assert_eq!(
+            snap_cluster_widths(&[], 8.0, 1),
+            [] as [crate::text::cluster_width::GlyphPos; 0]
+        );
     }
 
     #[test]

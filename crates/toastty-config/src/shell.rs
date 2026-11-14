@@ -42,7 +42,7 @@ mod tests {
     fn shell_defaults() {
         let s = ShellConfig::defaults();
         assert_eq!(s.program, "auto");
-        assert!(s.args.is_empty());
+        assert_eq!(s.args, [] as [std::string::String; 0]);
     }
 
     #[test]
