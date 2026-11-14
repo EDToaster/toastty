@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>toastty</title>
+  <!-- Charcoal tile on the macOS 824px icon grid, so the mark lines up with other dock icons. -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="#1E1E1E"/>
+  <g transform="translate(512 512) scale(1.12) translate(-512 -505)" fill="none" stroke="#F5A623" stroke-width="38" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Bread slice: domed crown pinching in at the shoulders, straight sides, rounded base. -->
+    <path d="M 352 432 C 300 414 288 352 318 322 C 368 270 656 270 706 322 C 736 352 724 414 672 432 L 672 708 Q 672 740 640 740 L 384 740 Q 352 740 352 708 Z"/>
+    <!-- >_ prompt -->
+    <path d="M 420 500 L 500 548 L 420 596"/>
+    <path d="M 530 616 L 610 616"/>
+  </g>
+</svg>

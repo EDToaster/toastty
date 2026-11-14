@@ -8,6 +8,7 @@
 # Env overrides:
 #   BIN_DIR=$HOME/.local/bin                    install location for the binary
 #   APP_DIR=$HOME/.local/share/applications     install location for the .desktop
+#   ICON_DIR=$HOME/.local/share/icons/hicolor   icon theme the app icon goes into
 #   APP_NAME=Toastty                            display name shown in krunner
 #   SKIP_BUILD=1                                reuse the existing release binary
 
@@ -23,6 +24,7 @@ cd "${repo_root}"
 
 BIN_DIR="${BIN_DIR:-${HOME}/.local/bin}"
 APP_DIR="${APP_DIR:-${HOME}/.local/share/applications}"
+ICON_DIR="${ICON_DIR:-${HOME}/.local/share/icons/hicolor}"
 APP_NAME="${APP_NAME:-Toastty}"
 
 version=$(awk -F\" '/^version = / { print $2; exit }' Cargo.toml)
@@ -50,6 +52,22 @@ printf '==> installing binary to %s\n' "${bin_dst}"
 mkdir -p "${BIN_DIR}"
 install -m 0755 "${bin_src}" "${bin_dst}"
 
+# App icon: the SVG for launchers that scale, plus pre-rendered PNGs (see
+# scripts/render_icons.py) for the ones that only look up fixed sizes.
+printf '==> installing icon to %s\n' "${ICON_DIR}"
+install -D -m 0644 share/icons/toastty.svg "${ICON_DIR}/scalable/apps/toastty.svg"
+for png in share/icons/png/toastty-*.png; do
+    size=${png##*-}
+    size=${size%.png}
+    install -D -m 0644 "${png}" "${ICON_DIR}/${size}x${size}/apps/toastty.png"
+done
+# Bump the theme dir's mtime so icon caches notice the change, then rebuild
+# the GTK cache if this theme already has one.
+touch "${ICON_DIR}"
+if [ -f "${ICON_DIR}/icon-theme.cache" ] && command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -t -f "${ICON_DIR}" >/dev/null 2>&1 || true
+fi
+
 printf '==> writing desktop entry to %s\n' "${desktop_file}"
 mkdir -p "${APP_DIR}"
 cat > "${desktop_file}" <<DESKTOP
@@ -60,7 +78,7 @@ Name=${APP_NAME}
 GenericName=Terminal
 Comment=A fast terminal emulator
 Exec=${bin_dst}
-Icon=utilities-terminal
+Icon=toastty
 Categories=System;TerminalEmulator;
 Keywords=terminal;shell;console;
 StartupNotify=true

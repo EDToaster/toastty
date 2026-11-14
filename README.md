@@ -1,4 +1,8 @@
-<h1 align="center">🍞 toastty</h1>
+<p align="center">
+  <img src="share/icons/toastty.svg" alt="toastty icon: an amber bread slice with a >_ prompt on a charcoal tile" width="128">
+</p>
+
+<h1 align="center">toastty</h1>
 
 <p align="center">
   <b>A lightweight, GPU-accelerated terminal emulator in Rust,<br>
@@ -213,7 +217,7 @@ toastty runs on **Linux** (Wayland and X11) and **macOS**. Windows support
 ```sh
 git clone https://github.com/EDToaster/toastty
 cd toastty
-make install        # release build + app launcher entry (Spotlight / app menu)
+make install        # release build + app launcher entry and icon (Spotlight / app menu)
 ```
 
 Or build it and run it from the checkout:
