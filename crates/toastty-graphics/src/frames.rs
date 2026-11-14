@@ -965,7 +965,12 @@ fn compose(under: &mut [u8], width: u32, height: u32, rect: &Rect, over: &[u8], 
         let start = ((rect.y as usize + y) * width as usize + rect.x as usize) * 4;
         let dst = &mut under[start..start + cols * 4];
         if blend {
-            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+            for (d, s) in dst
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<4>().0)
+            {
                 alpha_blend(d, s);
             }
         } else {

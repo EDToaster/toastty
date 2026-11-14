@@ -318,7 +318,7 @@ pub(crate) fn render_term_offscreen_with(
         out.extend_from_slice(&data[row_start..row_end]);
     }
     if bgra {
-        for px in out.chunks_exact_mut(4) {
+        for px in out.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
         }
     }

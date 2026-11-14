@@ -180,7 +180,11 @@ pub(super) fn cpu_levels(base: &[u8], width: u32, height: u32, count: u32) -> Ve
         out.push(encode_level(&dst));
         dst
     } else {
-        base.chunks_exact(4).map(decode).collect()
+        base.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| decode(pixel.as_slice()))
+            .collect()
     };
     while out.len() + 1 < count as usize {
         let dst = reduce(&src, sw, sh);
