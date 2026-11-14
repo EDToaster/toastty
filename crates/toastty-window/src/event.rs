@@ -129,7 +129,7 @@ pub enum ScrollKind {
 /// momentum-begin `Started`; consumers needing that distinction must
 /// combine `phase` with inter-event timing.
 ///
-/// Mouse wheels (LineDelta) on most platforms only emit `Moved`.
+/// Mouse wheels (`LineDelta`) on most platforms only emit `Moved`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrollPhase {
     /// A new gesture or momentum burst has begun.

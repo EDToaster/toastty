@@ -531,8 +531,8 @@ pub struct Renderer {
     image_revision_seen: u32,
     /// Reusable storage for the below-cell-bg / below-text / above-text
     /// instance vectors. Cleared every frame; allocation survives across
-    /// frames. The below-cell-bg band (z < INT32_MIN/2) draws beneath the
-    /// text background pass; below-text (INT32_MIN/2 <= z < 0) above bg
+    /// frames. The below-cell-bg band (z < `INT32_MIN/2`) draws beneath the
+    /// text background pass; below-text (`INT32_MIN/2` <= z < 0) above bg
     /// but below glyphs; above-text (z >= 0) on top.
     image_instances_below_bg: Vec<ImageInstance>,
     image_instances_below: Vec<ImageInstance>,
@@ -4458,7 +4458,7 @@ mod tests {
     /// Followup C1: when the blink toggles visible→invisible, the
     /// renderer must mark the cursor's cell dirty so the dirty-instance
     /// builder emits a fresh bg quad over the previous cursor block.
-    /// Otherwise, under LoadOp::Load, the old cursor ghosts.
+    /// Otherwise, under `LoadOp::Load`, the old cursor ghosts.
     ///
     /// This is the integration-level invariant: we simulate the
     /// `render_term` path's blink tick + `Term::mark_cell_dirty` +

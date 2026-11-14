@@ -2560,7 +2560,7 @@ mod tests {
     /// math and never looked at `palette_overrides`, so the override
     /// rebuilt into `ext_palette` was rendered-irrelevant. After the
     /// fix, the same color index resolves through `ext_palette` and the
-    /// CellInstance's fg reflects the override.
+    /// `CellInstance`'s fg reflects the override.
     #[test]
     fn osc4_palette_override_reaches_cell_instance() {
         let theme = Theme::default_dark();
