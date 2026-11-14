@@ -1219,7 +1219,7 @@ impl GlyphRasterizer {
                 .glyphs
                 .iter()
                 .zip(glyph_clusters.iter())
-                .zip(assignments.into_iter())
+                .zip(assignments)
                 .zip(snapped.iter())
             {
                 let cluster_str = run.text.get(g.start..g.end).unwrap_or("");
@@ -2169,13 +2169,11 @@ mod tests {
         );
 
         let lg = rasterizer.shape_line(&queue, "\u{1F600}", true);
-        if default_color {
-            if let Some(slot) = lg.get(0, grin) {
-                assert!(
-                    slot.is_color,
-                    "😀 must keep its color presentation; steering must not regress real emoji",
-                );
-            }
+        if default_color && let Some(slot) = lg.get(0, grin) {
+            assert!(
+                slot.is_color,
+                "😀 must keep its color presentation; steering must not regress real emoji",
+            );
         }
     }
 

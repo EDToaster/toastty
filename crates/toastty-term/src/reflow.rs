@@ -487,11 +487,11 @@ mod tests {
         let content: Vec<Cell> = "foo bar".chars().map(cell).collect();
         let rows = vec![row(content, false)];
         let (narrow, _) = reflow_rows(&rows, 4, 0, 0);
-        assert_eq!(text(&narrow[0].cells()), "foo ");
+        assert_eq!(text(narrow[0].cells()), "foo ");
         assert!(narrow[0].soft_wrap);
         let (widened, _) = reflow_rows(&narrow, 20, 0, 0);
         assert_eq!(widened.len(), 1);
-        assert_eq!(text(&widened[0].cells()).trim_end(), "foo bar");
+        assert_eq!(text(widened[0].cells()).trim_end(), "foo bar");
     }
 
     #[test]
@@ -510,7 +510,7 @@ mod tests {
             cur = reflow_rows(&cur, cols, 0, 0).0;
         }
         assert_eq!(cur.len(), 1);
-        assert_eq!(text(&cur[0].cells()).trim_end(), "a世界世界世界");
+        assert_eq!(text(cur[0].cells()).trim_end(), "a世界世界世界");
     }
 
     #[test]

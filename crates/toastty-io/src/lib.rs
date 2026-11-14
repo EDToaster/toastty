@@ -625,7 +625,7 @@ fn write_loop(owned: OwnedFd, rx: &Receiver<Vec<u8>>) {
     let raw = owned.as_raw_fd();
     debug!("toastty-io::pty-writer started");
     // Blocks until the next payload is queued; ends when the Sender drops.
-    for chunk in rx.iter() {
+    for chunk in rx {
         if !write_all_blocking(raw, &chunk) {
             // Terminal error (PTY closed). Drain remaining sends without
             // writing so producers don't wedge on a full channel, then exit.
