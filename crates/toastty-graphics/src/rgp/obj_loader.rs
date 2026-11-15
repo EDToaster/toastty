@@ -61,7 +61,9 @@ pub fn load_obj(bytes: &[u8]) -> Result<CpuAsset, ObjLoadError> {
     // tobj packs positions as flat `Vec<f32>` of xyz triples.
     let mut positions: Vec<[f32; 3]> = mesh
         .positions
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|c| [c[0], c[1], c[2]])
         .collect();
     // Normalize to a unit-extent box centered at the origin, matching
@@ -74,7 +76,9 @@ pub fn load_obj(bytes: &[u8]) -> Result<CpuAsset, ObjLoadError> {
     normalize_to_unit_extent(&mut positions);
     let mut uvs: Vec<[f32; 2]> = mesh
         .texcoords
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| [c[0], c[1]])
         .collect();
     let mut indices: Vec<u32> = if mesh.indices.is_empty() {
@@ -104,7 +108,9 @@ pub fn load_obj(bytes: &[u8]) -> Result<CpuAsset, ObjLoadError> {
         derive_flat_normals(&positions, &indices)
     } else {
         mesh.normals
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| [c[0], c[1], c[2]])
             .collect()
     };
@@ -200,7 +206,7 @@ mod tests {
         let indices = &asset.mesh.indices;
         assert_eq!(indices.len() % 3, 0, "indices must be triangles");
         assert_eq!(positions.len(), normals.len(), "parallel arrays");
-        for tri in indices.chunks_exact(3) {
+        for tri in indices.as_chunks::<3>().0 {
             let n0 = normals[tri[0] as usize];
             let n1 = normals[tri[1] as usize];
             let n2 = normals[tri[2] as usize];

@@ -136,7 +136,7 @@ pub fn decode(
     let pixels = if matches!(format, Format::Rgb24) {
         // Expand to RGBA8.
         let mut rgba = Vec::with_capacity(raw.len() / 3 * 4);
-        for chunk in raw.chunks_exact(3) {
+        for chunk in raw.as_chunks::<3>().0 {
             rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 0xFF]);
         }
         rgba
