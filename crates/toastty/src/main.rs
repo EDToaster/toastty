@@ -155,7 +155,7 @@ fn min_deadline(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
 
 /// Initial working directory to hand the spawned shell.
 ///
-/// macOS LaunchServices (Spotlight / Launchpad / Finder) starts apps with
+/// macOS `LaunchServices` (Spotlight / Launchpad / Finder) starts apps with
 /// CWD `/`, which leaves the shell stranded at root. Detect that case and
 /// fall back to `$HOME`; when launched from another shell, inherit its CWD.
 fn initial_cwd() -> std::path::PathBuf {

@@ -23,7 +23,7 @@
 //! **Canonical** (cooked) mode does not truncate, which is why the bug only
 //! shows up inside real TUIs / shells. This harness measures both.
 //!
-//! Run:  cargo run -p toastty-pty --example paste_threshold
+//! Run:  cargo run -p toastty-pty --example `paste_threshold`
 
 use std::os::fd::AsRawFd;
 use toastty_pty::{Pty, PtySpec};
@@ -35,7 +35,7 @@ const END: &[u8] = b"\x1b[201~";
 #[derive(Clone, Copy)]
 enum Mode {
     /// Default line discipline (cooked). A one-line (newline-free) blob is
-    /// capped at MAX_CANON here.
+    /// capped at `MAX_CANON` here.
     Canonical,
     /// `cfmakeraw` — what a TUI / shell line editor puts the tty in.
     Raw,

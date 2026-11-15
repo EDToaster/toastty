@@ -44,7 +44,7 @@ pub struct GlobalsUbo {
 /// in two passes with the RGP 3D pass sandwiched between them:
 ///   * `bg_pipeline` runs before RGP. Depth test/write disabled so 3D
 ///     overpaints the bg. Straight-alpha blend.
-///   * `glyph_pipeline` runs after RGP. Depth at z=0.5 LessEqual so
+///   * `glyph_pipeline` runs after RGP. Depth at z=0.5 `LessEqual` so
 ///     glyphs respect the protocol `depth` field. Premultiplied-alpha
 ///     blend.
 ///
@@ -256,7 +256,7 @@ impl TextPipeline {
     }
 
     /// Record the glyph-pass draw. Runs after the RGP 3D pass; glyphs
-    /// at z=0.5 with LessEqual depth test so per-placement `depth`
+    /// at z=0.5 with `LessEqual` depth test so per-placement `depth`
     /// controls foreground/background ordering.
     pub fn render_glyph<'pass>(
         &'pass self,
@@ -368,7 +368,7 @@ fn make_bg_pipeline(
     })
 }
 
-/// Glyph pass pipeline. Writes z=0.5 (from the shader) with LessEqual
+/// Glyph pass pipeline. Writes z=0.5 (from the shader) with `LessEqual`
 /// so RGP `depth < 0` objects occlude glyphs and `depth > 0` lose to
 /// them. Premultiplied-alpha blend — the glyph fragment shader already
 /// premultiplies mono mask coverage; the color atlas is premultiplied
