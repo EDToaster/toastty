@@ -324,7 +324,10 @@ mod tests {
         c.insert(k(1), entry(0, 40));
         c.begin_frame();
         c.insert(k(2), entry(1, 40));
-        assert!(c.evict_over_budget().is_empty());
+        assert_eq!(
+            c.evict_over_budget(),
+            [] as [(toastty_term::ImageKey, crate::image::atlas::ImageTexEntry); 0]
+        );
         assert_eq!(c.len(), 2);
     }
 
@@ -356,14 +359,20 @@ mod tests {
         for id in 0..10u32 {
             c.insert(k(id), entry(id as usize, 40));
         }
-        assert!(c.evict_over_budget().is_empty());
+        assert_eq!(
+            c.evict_over_budget(),
+            [] as [(toastty_term::ImageKey, crate::image::atlas::ImageTexEntry); 0]
+        );
         assert_eq!(c.len(), 10);
         // Next frame draws the same ten: all hits, nothing evicted.
         c.begin_frame();
         for id in 0..10u32 {
             assert!(c.get_touch(k(id)).is_some());
         }
-        assert!(c.evict_over_budget().is_empty());
+        assert_eq!(
+            c.evict_over_budget(),
+            [] as [(toastty_term::ImageKey, crate::image::atlas::ImageTexEntry); 0]
+        );
         // A frame that draws only two lets the other eight go.
         c.begin_frame();
         c.get_touch(k(3));

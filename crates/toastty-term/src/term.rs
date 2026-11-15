@@ -6651,7 +6651,7 @@ mod tests {
         for b in bytes {
             p.advance(&mut t, std::slice::from_ref(b));
         }
-        assert!(t.drain_pty_replies().is_empty());
+        assert_eq!(t.drain_pty_replies(), [] as [u8; 0]);
         assert_eq!(row_text(&t, 0), "\u{FFFD}\u{FFFD}A");
     }
 
@@ -7442,7 +7442,7 @@ mod tests {
         feed(&mut t, b"\x1b[<u");
         // CSI < u with no param defaults to 1.
         assert_eq!(t.kitty_flags(), 0);
-        assert!(t.kitty_stack().is_empty());
+        assert_eq!(t.kitty_stack(), [] as [u8; 0]);
     }
 
     #[test]
@@ -7451,7 +7451,7 @@ mod tests {
         feed(&mut t, b"\x1b[>5u");
         feed(&mut t, b"\x1b[<99u");
         assert_eq!(t.kitty_flags(), 0);
-        assert!(t.kitty_stack().is_empty());
+        assert_eq!(t.kitty_stack(), [] as [u8; 0]);
     }
 
     #[test]
@@ -7490,7 +7490,7 @@ mod tests {
     fn kitty_set_mode_3_on_empty_is_noop() {
         let mut t = Term::new(2, 4, 0);
         feed(&mut t, b"\x1b[=5;3u");
-        assert!(t.kitty_stack().is_empty());
+        assert_eq!(t.kitty_stack(), [] as [u8; 0]);
     }
 
     #[test]
@@ -7562,9 +7562,9 @@ mod tests {
         let mut t = Term::new(2, 4, 0);
         feed(&mut t, b"\x1b[>1u\x1b[?1049h\x1b[>2u\x1bc");
         assert!(!t.is_alt_active());
-        assert!(t.kitty_stack().is_empty());
+        assert_eq!(t.kitty_stack(), [] as [u8; 0]);
         feed(&mut t, b"\x1b[?1049h");
-        assert!(t.kitty_stack().is_empty());
+        assert_eq!(t.kitty_stack(), [] as [u8; 0]);
     }
 
     #[test]
@@ -8055,7 +8055,7 @@ mod tests {
         feed(&mut t, b"\x1b]2;A\xffB\x1b\\");
         // Don't assert exact content — just that we didn't crash and the
         // title is non-empty (since the bytes lossy-decode to something).
-        assert!(!t.title().is_empty());
+        assert_ne!(t.title(), "");
     }
 
     #[test]
@@ -8837,7 +8837,7 @@ mod tests {
     fn osc133_unknown_kind_ignored() {
         let mut t = Term::new(3, 8, 0);
         feed(&mut t, b"\x1b]133;Z\x1b\\");
-        assert!(t.prompt_marks().is_empty());
+        assert_eq!(t.prompt_marks(), []);
     }
 
     #[test]
@@ -8882,13 +8882,13 @@ mod tests {
         let drained = t.drain_pty_replies();
         assert_eq!(drained, b"hello world");
         // Second drain returns empty — drain consumes.
-        assert!(t.drain_pty_replies().is_empty());
+        assert_eq!(t.drain_pty_replies(), [] as [u8; 0]);
     }
 
     #[test]
     fn pty_reply_queue_starts_empty() {
         let mut t = Term::new(2, 4, 0);
-        assert!(t.drain_pty_replies().is_empty());
+        assert_eq!(t.drain_pty_replies(), [] as [u8; 0]);
     }
 
     // ----- OSC 4 (palette) -------------------------------------------------
@@ -9149,7 +9149,7 @@ mod tests {
         let mut da1 = Term::new(8, 8, 0);
         feed(&mut da1, b"\x1b[c");
         let da1 = da1.drain_pty_replies();
-        assert!(!da1.is_empty());
+        assert_ne!(da1, [] as [u8; 0]);
         feed(&mut t, b"\x1bP$qm\x1b[c");
         assert_eq!(t.drain_pty_replies(), da1, "ESC [ c");
         // Split across reads, and tmux-wrapped.
@@ -9316,7 +9316,7 @@ mod tests {
         feed(&mut t, b"\x1b[?2048h");
         assert_eq!(&t.drain_pty_replies()[..], b"\x1b[48;21;80;399;800t");
         feed(&mut t, b"\x1b[?2048l");
-        assert!(t.drain_pty_replies().is_empty());
+        assert_eq!(t.drain_pty_replies(), [] as [u8; 0]);
         assert!(!t.inband_resize_mode());
     }
 
@@ -9511,7 +9511,10 @@ mod tests {
         let mut t = Term::new(2, 4, 0);
         // Default security = both gates closed.
         feed(&mut t, b"\x1b]52;c;aGVsbG8=\x1b\\");
-        assert!(t.drain_clipboard_requests().is_empty());
+        assert_eq!(
+            t.drain_clipboard_requests(),
+            [] as [crate::term::ClipboardRequest; 0]
+        );
     }
 
     #[test]
@@ -9541,7 +9544,10 @@ mod tests {
     fn osc52_query_with_read_disabled_is_dropped() {
         let mut t = Term::new(2, 4, 0);
         feed(&mut t, b"\x1b]52;c;?\x1b\\");
-        assert!(t.drain_clipboard_requests().is_empty());
+        assert_eq!(
+            t.drain_clipboard_requests(),
+            [] as [crate::term::ClipboardRequest; 0]
+        );
     }
 
     #[test]
@@ -9587,7 +9593,10 @@ mod tests {
         );
         // Missing data separator is malformed: dropped.
         feed(&mut t, b"\x1b]52;c\x1b\\");
-        assert!(t.drain_clipboard_requests().is_empty());
+        assert_eq!(
+            t.drain_clipboard_requests(),
+            [] as [crate::term::ClipboardRequest; 0]
+        );
     }
 
     fn osc52_rw_term() -> Term {
@@ -9627,7 +9636,10 @@ mod tests {
         );
         // Only unsupported buffers (secondary / cut buffer): no-op.
         feed(&mut t, b"\x1b]52;q;aGk=\x07\x1b]52;0;\x07\x1b]52;q;?\x07");
-        assert!(t.drain_clipboard_requests().is_empty());
+        assert_eq!(
+            t.drain_clipboard_requests(),
+            [] as [crate::term::ClipboardRequest; 0]
+        );
     }
 
     #[test]
@@ -9650,7 +9662,10 @@ mod tests {
             ..SecurityFlags::default()
         });
         feed(&mut t, b"\x1b]52;p;\x1b\\");
-        assert!(t.drain_clipboard_requests().is_empty());
+        assert_eq!(
+            t.drain_clipboard_requests(),
+            [] as [crate::term::ClipboardRequest; 0]
+        );
     }
 
     #[test]
@@ -9695,7 +9710,7 @@ mod tests {
         assert!(t.image_store().contains(42));
         // OK reply was queued.
         let replies = t.drain_pty_replies();
-        assert!(!replies.is_empty());
+        assert_ne!(replies, [] as [u8; 0]);
         let s = String::from_utf8_lossy(&replies);
         assert!(s.contains(";OK"), "expected OK reply, got {s:?}");
     }
@@ -9899,7 +9914,7 @@ mod tests {
         payload.extend_from_slice(&b64_red_1x1());
         payload.extend_from_slice(b"\x1b\\\x1b_Ga=a,i=1,s=3,v=1\x1b\\");
         feed(&mut t, &payload);
-        assert!(t.drain_pty_replies().is_empty());
+        assert_eq!(t.drain_pty_replies(), [] as [u8; 0]);
         feed(&mut t, b"\x1b_Ga=c,i=1,C=2\x1b\\");
         assert_eq!(
             String::from_utf8_lossy(&t.drain_pty_replies()),
@@ -9993,7 +10008,7 @@ mod tests {
         // DEL-1: deletes never reply. Freeing the newest image numbered
         // 144 makes the older one the target again (kitty: `i=1,I=990`).
         feed(&mut t, b"\x1b_Ga=d,d=I,i=2\x1b\\\x1b_Ga=d,d=i,i=999\x1b\\");
-        assert!(t.drain_pty_replies().is_empty());
+        assert_eq!(t.drain_pty_replies(), [] as [u8; 0]);
         feed(&mut t, b"\x1b_Ga=p,I=144,C=1\x1b\\");
         assert_eq!(
             String::from_utf8_lossy(&t.drain_pty_replies()),
@@ -11781,7 +11796,7 @@ mod major_medium_term_tests {
             &mut t,
             format!("\x1b_Ga=T,f=32,s=2,v=2,i=315,t=s,S=16,q=2;{image_body}\x1b\\").as_bytes(),
         );
-        assert!(t.drain_pty_replies().is_empty());
+        assert_eq!(t.drain_pty_replies(), [] as [u8; 0]);
         assert!(t.image_store().contains(315));
         assert_eq!(t.image_grid().len(), 1, "a=T must place the image");
         assert!(!image.0.exists(), "t=s must unlink the object");

@@ -301,7 +301,10 @@ mod tests {
         // Cells of an image with no virtual placement (PH-9).
         let mut t = setup(42, 6, 5);
         print_block(&mut t, 43, 5, 6);
-        assert!(build(&t, None).is_empty());
+        assert_eq!(
+            build(&t, None),
+            [] as [crate::image::instance::ImageInstance; 0]
+        );
     }
 
     #[test]
@@ -320,7 +323,10 @@ mod tests {
         assert!(approx(out[1].pos, [50.0, 40.0]) && approx(out[1].size, [10.0, 20.0]));
         // A clean frame draws nothing.
         d.rows[2].clear();
-        assert!(build(&t, Some(&d)).is_empty());
+        assert_eq!(
+            build(&t, Some(&d)),
+            [] as [crate::image::instance::ImageInstance; 0]
+        );
     }
 
     #[test]

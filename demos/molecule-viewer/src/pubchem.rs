@@ -381,7 +381,7 @@ mod tests {
     #[ignore]
     fn test_search_live_formula() {
         let results = search("C2H6O").expect("live search");
-        assert!(!results.is_empty());
+        assert_ne!(results, [] as [crate::pubchem::Candidate; 0]);
         // All results should match the formula.
         for c in &results {
             assert_eq!(c.formula, "C2H6O");
@@ -393,7 +393,7 @@ mod tests {
     #[ignore]
     fn test_search_live_name() {
         let results = search("aspirin").expect("live name search");
-        assert!(!results.is_empty());
+        assert_ne!(results, [] as [crate::pubchem::Candidate; 0]);
     }
 
     /// Live network test — skipped in offline / CI environments.

@@ -533,7 +533,10 @@ mod tests {
             h: 0,
         };
         grid.add(p);
-        assert!(build(&grid, 200, 100, (10.0, 19.0), &view()).is_empty());
+        assert_eq!(
+            build(&grid, 200, 100, (10.0, 19.0), &view()),
+            [] as [crate::image::instance::ImageInstance; 0]
+        );
     }
 
     #[test]
@@ -556,7 +559,7 @@ mod tests {
         let reg = ImageRegistry::<ImageKey>::new(1024);
         let mut out = Vec::new();
         build_image_instances(&mut out, &grid, &reg, (10.0, 20.0), &view());
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [crate::image::instance::ImageInstance; 0]);
     }
 
     #[test]
@@ -566,7 +569,7 @@ mod tests {
         let reg = ImageRegistry::<ImageKey>::new(4096);
         let mut out = Vec::new();
         build_image_instances(&mut out, &grid, &reg, (10.0, 20.0), &view());
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [crate::image::instance::ImageInstance; 0]);
     }
 
     #[test]

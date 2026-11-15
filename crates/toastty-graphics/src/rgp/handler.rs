@@ -308,7 +308,15 @@ mod tests {
         assert_eq!(*id, 7);
         assert_eq!(*fmt, RgpFormat::Glb);
         assert_eq!(name, "Ferris.glb");
-        assert!(s.registered.is_empty());
+        assert_eq!(
+            s.registered,
+            [] as [(
+                u32,
+                crate::rgp::operation::RgpFormat,
+                std::option::Option<std::string::String>,
+                std::vec::Vec<u8>
+            ); 0]
+        );
     }
 
     #[test]
@@ -338,7 +346,15 @@ mod tests {
             b"ratty;g;r;id=42;fmt=glb;source=payload;more=1;aGVsbG8g",
         );
         // No dispatch yet — we're waiting for `more=0`.
-        assert!(s.registered.is_empty());
+        assert_eq!(
+            s.registered,
+            [] as [(
+                u32,
+                crate::rgp::operation::RgpFormat,
+                std::option::Option<std::string::String>,
+                std::vec::Vec<u8>
+            ); 0]
+        );
         assert_eq!(h.pending_count(), 1);
         run(
             &mut h,

@@ -806,7 +806,7 @@ mod tests {
             o.ime,
             "IME must be on by default; macOS dead keys depend on it"
         );
-        assert!(!o.title.is_empty());
+        assert_ne!(o.title, "");
         assert!(o.size.0 > 0 && o.size.1 > 0);
     }
 
@@ -896,7 +896,7 @@ mod tests {
         // Empty text + None cursor is how winit signals "clear the preedit".
         match translate_ime(Ime::Preedit(String::new(), None)) {
             Event::ImePreedit { text, cursor } => {
-                assert!(text.is_empty());
+                assert_eq!(text, "");
                 assert_eq!(cursor, None);
             }
             other => panic!("expected ImePreedit, got {other:?}"),

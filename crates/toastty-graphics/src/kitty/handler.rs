@@ -2019,7 +2019,7 @@ mod tests {
             (1, 2, 1, 2, 3, 4, 5, 6, 1)
         );
         assert_eq!(sink.registered.len(), 1);
-        assert!(sink.placements.is_empty());
+        assert_eq!(sink.placements, [] as [crate::image_grid::Placement; 0]);
         assert_eq!(h.pending_uploads(), 0);
     }
 
@@ -2045,7 +2045,10 @@ mod tests {
              \x1b_Gi=9,r=2;EINVAL:Zero width/height not allowed\x1b\\\
              \x1b_Gi=9,r=2;EINVAL:Failed to inflate image data with error: Z_DATA_ERROR\x1b\\"
         );
-        assert!(sink.frames.is_empty());
+        assert_eq!(
+            sink.frames,
+            [] as [(u32, crate::kitty::header::FrameKeys, (u32, u32)); 0]
+        );
     }
 
     #[test]
@@ -2094,7 +2097,7 @@ mod tests {
                     .to_vec()
             ]
         );
-        assert!(sink.placements.is_empty());
+        assert_eq!(sink.placements, [] as [crate::image_grid::Placement; 0]);
     }
 
     #[test]
@@ -2302,7 +2305,7 @@ mod tests {
             let mut sink = MockSink::with_budget(1 << 30);
             h.process(header, b"", &mut sink).unwrap();
             assert_eq!(joined(&sink), want, "{}", String::from_utf8_lossy(header));
-            assert!(sink.placements.is_empty());
+            assert_eq!(sink.placements, [] as [crate::image_grid::Placement; 0]);
             assert_eq!(sink.cursor_advances, 0);
         }
     }
@@ -2320,7 +2323,7 @@ mod tests {
             joined(&sink),
             format!("\x1b_Gi=500;{}\x1b\\", enoent_put(500, 0))
         );
-        assert!(sink.placements.is_empty());
+        assert_eq!(sink.placements, [] as [crate::image_grid::Placement; 0]);
         // A stored image still places and replies OK.
         h.process(b"Ga=t,i=501,f=32,s=1,v=1,q=2", px.as_bytes(), &mut sink)
             .unwrap();
@@ -2629,7 +2632,10 @@ mod tests {
             ("Ga=q,f=32,s=1,v=1", "/w=="),
         ]);
         assert!(sink.replies.is_empty(), "{}", joined(&sink));
-        assert!(sink.registered.is_empty());
+        assert_eq!(
+            sink.registered,
+            [] as [(u32, crate::registry::ImageData); 0]
+        );
         assert_eq!(h.pending_uploads(), 1);
         // Chunked anonymous query: not appended, no EILSEQ.
         let (_, sink) = run_seq(&[
@@ -2653,8 +2659,11 @@ mod tests {
             ("Ga=t,i=324,f=32,s=1,v=1,m=1", "/wAA"),
             ("Ga=q,I=9,f=32,s=1,v=1", "/w=="),
         ]);
-        assert!(sink.replies.is_empty());
-        assert!(sink.registered.is_empty());
+        assert_eq!(sink.replies, [] as [std::vec::Vec<u8>; 0]);
+        assert_eq!(
+            sink.registered,
+            [] as [(u32, crate::registry::ImageData); 0]
+        );
     }
 
     /// kitty: a second chunked `a=q` while a chunked query is loading
@@ -3094,7 +3103,10 @@ mod blocker_graphics_tests {
                 String::from_utf8_lossy(header),
                 sink.joined_replies()
             );
-            assert!(sink.registered.is_empty());
+            assert_eq!(
+                sink.registered,
+                [] as [(u32, crate::registry::ImageData); 0]
+            );
             assert_eq!(h.pending_uploads(), 0);
         }
     }
@@ -3676,7 +3688,7 @@ mod major_medium_tests {
             &mut sink,
         )
         .unwrap();
-        assert!(sink.replies.is_empty());
+        assert_eq!(sink.replies, [] as [std::vec::Vec<u8>; 0]);
         assert_eq!(sink.registered[0].1.pixels, RGBA_2X2);
         assert_eq!(sink.placements.len(), 1);
         assert!(!shm.exists());
@@ -3708,7 +3720,10 @@ mod major_medium_tests {
                 "{}",
                 String::from_utf8_lossy(keys)
             );
-            assert!(sink.registered.is_empty());
+            assert_eq!(
+                sink.registered,
+                [] as [(u32, crate::registry::ImageData); 0]
+            );
             assert!(!shm.exists(), "{}", String::from_utf8_lossy(keys));
         }
         // An invalid name (no leading `/`) gets the same reply.
@@ -3760,7 +3775,7 @@ mod major_medium_tests {
         let mut sink = MockSink::default();
         h.process(b"Ga=q,f=32,s=2,v=2,t=s", &anon.body(), &mut sink)
             .unwrap();
-        assert!(sink.replies.is_empty());
+        assert_eq!(sink.replies, [] as [std::vec::Vec<u8>; 0]);
         assert!(anon.exists(), "kitty doesn't read an anonymous query");
     }
 
@@ -3783,7 +3798,10 @@ mod major_medium_tests {
         assert_eq!(replies_joined(&sink), "\x1b_Gi=6;OK\x1b\\");
         // The next chunk starts nothing: the upload is gone.
         h.process(b"Gm=0", &b64(&RGBA_2X2[8..]), &mut sink).unwrap();
-        assert!(sink.registered.is_empty());
+        assert_eq!(
+            sink.registered,
+            [] as [(u32, crate::registry::ImageData); 0]
+        );
     }
 
     /// Off Linux, `t=s` can't be read without `mmap` (see

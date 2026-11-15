@@ -2443,7 +2443,7 @@ mod tests {
             let glyphs = [(0, 0, 0)];
             let out = assign_glyph_chars(&glyphs, "");
             assert_eq!(out[0].0, ' ');
-            assert!(out[0].1.is_empty());
+            assert_eq!(out[0].1, [] as [char; 0]);
         }
     }
 
@@ -2634,7 +2634,10 @@ mod tests {
     fn line_glyphs_secondary_without_primary_is_dropped() {
         let mut lg = LineGlyphs::default();
         lg.push_secondary(0, dummy_slot(1.0));
-        assert!(lg.secondary.is_empty());
+        assert_eq!(
+            lg.secondary,
+            [] as [(u16, crate::text::instance::GlyphSlot); 0]
+        );
     }
 
     #[test]

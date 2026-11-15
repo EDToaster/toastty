@@ -1119,7 +1119,10 @@ mod tests {
     fn scroll_region_zero_is_noop() {
         let mut g = ImageGrid::new();
         g.add(p(1, 5..10, 0..5, 0));
-        assert!(g.scroll_region(0, 0..20, 0).is_empty());
+        assert_eq!(
+            g.scroll_region(0, 0..20, 0),
+            [] as [crate::image_grid::Placement; 0]
+        );
         assert_eq!(g.iter().next().unwrap().line, 5);
     }
 
@@ -1127,7 +1130,10 @@ mod tests {
     fn scroll_region_moves_placement_entirely_inside() {
         let mut g = ImageGrid::new();
         g.add(p(1, 5..8, 0..5, 0));
-        assert!(g.scroll_region(0, 2..12, -2).is_empty());
+        assert_eq!(
+            g.scroll_region(0, 2..12, -2),
+            [] as [crate::image_grid::Placement; 0]
+        );
         let pl = g.iter().next().unwrap();
         assert_eq!(pl.line, 3);
         assert_eq!(pl.clip_rows, 0..3);
@@ -1236,7 +1242,10 @@ mod tests {
         let mut pl = p(1, 0..4, 0..1, 0);
         pl.clip_rows = 2..4;
         g.add(pl);
-        assert!(g.retain_lines(3, 100).is_empty());
+        assert_eq!(
+            g.retain_lines(3, 100),
+            [] as [crate::image_grid::Placement; 0]
+        );
         assert_eq!(g.retain_lines(4, 100).len(), 1);
     }
 
@@ -1439,18 +1448,27 @@ mod tests {
         assert_eq!(ids, vec![2, 4, 6]);
         let kept: Vec<u32> = g.iter().map(|p| p.image_id).collect();
         assert_eq!(kept, vec![1, 3, 5]);
-        assert!(g.remove_where(|_| false).is_empty());
+        assert_eq!(
+            g.remove_where(|_| false),
+            [] as [crate::image_grid::Placement; 0]
+        );
     }
 
     #[test]
     fn retain_lines_bounds_cache_tracks_mutations() {
         let mut g = ImageGrid::new();
         g.add(p(1, 10..12, 0..1, 0));
-        assert!(g.retain_lines(5, 100).is_empty()); // caches (12, 10)
+        assert_eq!(
+            g.retain_lines(5, 100),
+            [] as [crate::image_grid::Placement; 0]
+        ); // caches (12, 10)
         g.shift_lines(-8); // now 2..4: the cache must not hide it
         assert_eq!(g.retain_lines(5, 100).len(), 1);
         g.add(p(2, 10..12, 0..1, 0));
-        assert!(g.retain_lines(5, 100).is_empty());
+        assert_eq!(
+            g.retain_lines(5, 100),
+            [] as [crate::image_grid::Placement; 0]
+        );
         g.add(p(3, 1..3, 0..1, 0)); // a new, older placement
         assert_eq!(g.retain_lines(5, 100).len(), 1);
         // Below the live bottom.

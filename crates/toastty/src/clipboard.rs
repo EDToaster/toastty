@@ -177,7 +177,10 @@ mod tests {
             effective_targets(p_only),
             vec![effective_target(ClipboardTarget::Primary)]
         );
-        assert!(effective_targets(ClipboardTargets::default()).is_empty());
+        assert_eq!(
+            effective_targets(ClipboardTargets::default()),
+            [] as [toastty_term::ClipboardTarget; 0]
+        );
     }
 
     #[test]

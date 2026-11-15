@@ -155,7 +155,7 @@ fn animation_control_never_replies() {
     ] {
         feed(&mut t, &apc(keys, &[]));
     }
-    assert!(replies(&mut t).is_empty());
+    assert_eq!(replies(&mut t), [] as [std::string::String; 0]);
     feed(&mut t, &apc("a=a,i=99", &[]));
     assert_eq!(
         replies(&mut t),
@@ -502,7 +502,7 @@ fn compressed_frames_stretch_the_budget() {
             &apc("a=f,i=1,q=2,f=32,s=64,v=64", &solid(px, 64, 64)),
         );
     }
-    assert!(replies(&mut t).is_empty());
+    assert_eq!(replies(&mut t), [] as [std::string::String; 0]);
     assert_eq!(t.image_registry().frame_count(key(&t, 1)), Some(41));
     assert!(t.image_registry().frame_bytes() < 64 * 64 * 4);
     // And they come back intact.

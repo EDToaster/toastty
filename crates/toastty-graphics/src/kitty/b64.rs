@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn junk_byte_ends_the_chunk() {
         assert_eq!(chunks(&["/wAA", "!!!!/w=="]), vec![255, 0, 0]);
-        assert!(decode_all(b"!!!!").is_empty());
+        assert_eq!(decode_all(b"!!!!"), [] as [u8; 0]);
         assert_eq!(decode_all(b"/wAA*w=="), vec![255, 0, 0]);
         assert_eq!(chunks(&["/wAA", "/w=!"]), vec![255, 0, 0, 255]);
     }

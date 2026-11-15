@@ -64,7 +64,7 @@ mod tests {
     fn defaults_are_off_and_auto() {
         let d = ShaderConfig::defaults();
         assert_eq!(d, ShaderConfig::default());
-        assert!(d.paths.is_empty());
+        assert_eq!(d.paths, [] as [std::string::String; 0]);
         assert_eq!(d.animation, ShaderAnimation::Auto);
     }
 

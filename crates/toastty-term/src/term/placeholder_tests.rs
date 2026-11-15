@@ -139,7 +139,10 @@ fn bare_cells_without_a_row_show_nothing() {
     let mut t = Term::new(2, 8, 0);
     feed(&mut t, b"\x1b[38;5;42m");
     feed(&mut t, cell(&[]).repeat(4).as_bytes());
-    assert!(runs(&t, 0).is_empty());
+    assert_eq!(
+        runs(&t, 0),
+        [] as [crate::term::placeholder::PlaceholderRun; 0]
+    );
 }
 
 #[test]
@@ -230,7 +233,10 @@ fn stray_diacritic_after_text_is_not_a_placeholder() {
     let mut t = Term::new(2, 6, 0);
     feed(&mut t, b"\x1b[38;5;42ma");
     feed(&mut t, "\u{0305}".as_bytes());
-    assert!(runs(&t, 0).is_empty());
+    assert_eq!(
+        runs(&t, 0),
+        [] as [crate::term::placeholder::PlaceholderRun; 0]
+    );
     assert_eq!(
         t.grapheme_tail(&t.active_grid().row(0).cells()[0]),
         "\u{0305}"
@@ -252,7 +258,10 @@ fn overwriting_and_erasing_cells_removes_the_image() {
     assert_eq!(runs(&t, 1), vec![run(0, 1, 42, 1, 0)]);
     // ECH on row 2.
     feed(&mut t, b"\x1b[3;1H\x1b[6X");
-    assert!(runs(&t, 2).is_empty());
+    assert_eq!(
+        runs(&t, 2),
+        [] as [crate::term::placeholder::PlaceholderRun; 0]
+    );
 }
 
 #[test]
@@ -534,7 +543,7 @@ fn long_icat_loops_stay_bounded() {
     assert!(t.extras.len() <= 14 * 20, "{} live entries", t.extras.len());
     // Reclamation never frees what's still on screen.
     let r = runs(&t, 3);
-    assert!(!r.is_empty());
+    assert_ne!(r, [] as [crate::term::placeholder::PlaceholderRun; 0]);
     for c in t.active_grid().row(3).cells() {
         if c.ch == crate::PLACEHOLDER {
             assert!(matches!(t.cell_extra(c), Some(CellExtra::Placeholder(_))));

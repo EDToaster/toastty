@@ -212,7 +212,7 @@ mod tests {
         assert_eq!(cfg.cursor.shape, CursorShape::Block);
         assert!(cfg.cursor.blink);
         assert_eq!(cfg.shell.program, "auto");
-        assert!(cfg.shell.args.is_empty());
+        assert_eq!(cfg.shell.args, [] as [std::string::String; 0]);
         assert_eq!(cfg.scrollback.lines, 10_000);
         assert_eq!(cfg.theme.palette.len(), 16);
     }
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn shader_parses_and_defaults() {
         let d = Config::defaults();
-        assert!(d.shader.paths.is_empty());
+        assert_eq!(d.shader.paths, [] as [std::string::String; 0]);
         assert_eq!(d.shader.animation, ShaderAnimation::Auto);
         let cfg =
             Config::parse_str("[shader]\npaths = [\"a.glsl\"]\nanimation = \"always\"\n").unwrap();

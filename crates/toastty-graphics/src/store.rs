@@ -372,7 +372,7 @@ mod tests {
         let a = s.insert(k(5), 0, 0, img(1), &none()).unwrap();
         assert_eq!(a.client_id, 0);
         assert!(!s.contains(0));
-        assert!(s.clients_in(0, u32::MAX).is_empty());
+        assert_eq!(s.clients_in(0, u32::MAX), [] as [u32; 0]);
         // A client id that happens to equal the key is a different image.
         s.insert(k(6), 5, 0, img(2), &none()).unwrap();
         assert!(s.contains_key(k(5)), "anonymous image untouched");

@@ -97,7 +97,10 @@ fn bench(c: &mut Criterion) {
         b.iter(|| {
             out.clear();
             build_placeholder_instances(&mut out, &t, CELL, layout, None);
-            assert!(out.is_empty());
+            assert_eq!(
+                out,
+                [] as [toastty_render::image::instance::ImageInstance; 0]
+            );
         });
     });
 }
