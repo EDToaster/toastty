@@ -683,7 +683,7 @@ fn wait_writable(raw: i32) -> bool {
     };
     loop {
         // SAFETY: pfd points to one valid pollfd; -1 == wait indefinitely.
-        let rc = unsafe { libc::poll(&mut pfd, 1, -1) };
+        let rc = unsafe { libc::poll(&raw mut pfd, 1, -1) };
         if rc < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == ErrorKind::Interrupted {
