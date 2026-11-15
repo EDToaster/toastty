@@ -166,9 +166,7 @@ fn initial_cwd() -> std::path::PathBuf {
     if !launched_from_root && let Some(p) = cwd {
         return p;
     }
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+    std::env::var_os("HOME").map_or_else(|| std::path::PathBuf::from("/"), std::path::PathBuf::from)
 }
 
 /// Runtime security gates from the `[security]` config table.

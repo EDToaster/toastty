@@ -105,7 +105,7 @@ fn refine_threshold(mut lo: usize, mut hi: usize, mode: Mode) -> usize {
 
 fn sweep(mode: Mode) {
     println!("\n=== {} ===", mode.label());
-    println!("  {:>8}  {:>8}  {:>8}  {}", "request", "accepted", "dropped", "");
+    println!("  {:>8}  {:>8}  {:>8}  ", "request", "accepted", "dropped");
 
     let sizes = [
         256, 512, 768, 1024, 1280, 1536, 1792, 2048, 3072, 4096, 8192, 16384, 65536,
@@ -125,7 +125,10 @@ fn sweep(mode: Mode) {
     }
 
     if first_short == 0 {
-        println!("  (no truncation observed up to {} bytes)", sizes[sizes.len() - 1]);
+        println!(
+            "  (no truncation observed up to {} bytes)",
+            sizes[sizes.len() - 1]
+        );
         return;
     }
 
@@ -141,7 +144,7 @@ fn sweep(mode: Mode) {
     let text_len = threshold + 1; // total blob = START + text + END > threshold
     let mut paste = Vec::with_capacity(START.len() + text_len + END.len());
     paste.extend_from_slice(START);
-    paste.extend(std::iter::repeat(b'x').take(text_len));
+    paste.extend(std::iter::repeat_n(b'x', text_len));
     paste.extend_from_slice(END);
 
     let spec = PtySpec::program("/bin/sleep").arg("30");
@@ -161,8 +164,7 @@ fn sweep(mode: Mode) {
             "delivered".to_string()
         } else {
             format!(
-                "DROPPED (needed byte {}, only {} written) => app stuck in paste mode",
-                terminator_start, accepted
+                "DROPPED (needed byte {terminator_start}, only {accepted} written) => app stuck in paste mode"
             )
         }
     );

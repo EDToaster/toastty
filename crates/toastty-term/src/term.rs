@@ -3249,10 +3249,7 @@ impl Term {
             _ => {
                 // Collect params eagerly so the `{:?}` printout
                 // is readable rather than a vte internal type.
-                let params_vec: Vec<Vec<u16>> = params
-                    .iter()
-                    .map(|sub| sub.iter().copied().collect())
-                    .collect();
+                let params_vec: Vec<Vec<u16>> = params.iter().map(<[u16]>::to_vec).collect();
                 tracing::warn!(
                     target: "toastty_term::csi",
                     "unhandled CSI: action={action:?} priv={:?} intermediates={:?} params={params_vec:?}",
@@ -3802,12 +3799,12 @@ impl Term {
             let head = slice.first().copied().unwrap_or(0);
             match head {
                 38 if slice.len() >= 2 => {
-                    self.cursor.style.fg =
-                        parse_extended_color_from_slice(&slice[1..]).unwrap_or(self.cursor.style.fg)
+                    self.cursor.style.fg = parse_extended_color_from_slice(&slice[1..])
+                        .unwrap_or(self.cursor.style.fg);
                 }
                 48 if slice.len() >= 2 => {
-                    self.cursor.style.bg =
-                        parse_extended_color_from_slice(&slice[1..]).unwrap_or(self.cursor.style.bg)
+                    self.cursor.style.bg = parse_extended_color_from_slice(&slice[1..])
+                        .unwrap_or(self.cursor.style.bg);
                 }
                 58 if slice.len() >= 2 => {
                     // M11a: SGR 58 underline color is stored on
@@ -4557,7 +4554,7 @@ impl Perform for Term {
             // `rgb:RR/GG/BB` (or `RRRR/GGGG/BBBB`). We currently
             // honor the query only — set is silently accepted but not
             // applied (the binary still owns the theme).
-            10 | 11 | 12 => {
+            10..=12 => {
                 let payload = params.get(1).copied().unwrap_or(b"");
                 if payload == b"?" {
                     let rgb = match code {
@@ -8094,7 +8091,7 @@ mod tests {
             let mut t = Term::new(1, 4, 0);
             let seq = format!("\x1b[{ps} q");
             feed(&mut t, seq.as_bytes());
-            assert_eq!(t.cursor_shape(), want_shape, "Ps={ps}: wrong cursor shape",);
+            assert_eq!(t.cursor_shape(), want_shape, "Ps={ps}: wrong cursor shape");
             assert_eq!(t.cursor_blink(), want_blink, "Ps={ps}: wrong blink");
         }
     }
@@ -10931,7 +10928,7 @@ mod major_place_tests {
         let p = t.image_grid().iter().next().expect("placement created");
         let cols = p.col_range().end - p.col_range().start;
         let rows = p.rows;
-        let expected_rows = (((10u32 * cpw * 100) + (200 * cph) - 1) / (200 * cph)).max(1) as u16;
+        let expected_rows = (10u32 * cpw * 100).div_ceil(200 * cph).max(1) as u16;
         assert_eq!(cols, 10, "c=10 honored");
         assert_eq!(
             rows, expected_rows,

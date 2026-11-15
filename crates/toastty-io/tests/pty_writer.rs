@@ -64,7 +64,7 @@ fn collect_until(
 fn bracketed_paste(text_len: usize) -> Vec<u8> {
     let mut v = Vec::with_capacity(6 + text_len + 6);
     v.extend_from_slice(b"\x1b[200~");
-    v.extend(std::iter::repeat(b'x').take(text_len));
+    v.extend(std::iter::repeat_n(b'x', text_len));
     v.extend_from_slice(b"\x1b[201~");
     v
 }
